@@ -3,6 +3,7 @@ const terminal_mod = @import("terminal/terminal.zig");
 const kitty_mod = @import("terminal/kitty_graphics.zig");
 const input_mod = @import("terminal/input.zig");
 const screen_mod = @import("terminal/screen.zig");
+const prompt_mod = @import("terminal/prompt.zig");
 const cdp = @import("chrome/cdp_client.zig");
 const screenshot_api = @import("chrome/screenshot.zig");
 const scroll_api = @import("chrome/scroll.zig");
@@ -12,6 +13,14 @@ const KittyGraphics = kitty_mod.KittyGraphics;
 const InputReader = input_mod.InputReader;
 const Screen = screen_mod.Screen;
 const Key = input_mod.Key;
+const PromptBuffer = prompt_mod.PromptBuffer;
+
+pub const ViewerMode = enum {
+    normal,       // Scroll, navigate, refresh
+    url_prompt,   // Entering URL (g key)
+    form_mode,    // Selecting form elements (f key, Tab navigation)
+    text_input,   // Typing into form field
+};
 
 pub const Viewer = struct {
     allocator: std.mem.Allocator,
@@ -21,6 +30,9 @@ pub const Viewer = struct {
     input: InputReader,
     current_url: []const u8,
     running: bool,
+    mode: ViewerMode,
+    prompt_buffer: ?PromptBuffer,
+    form_context: ?*anyopaque, // Placeholder for FormContext (will be used in Phase 2)
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -35,6 +47,9 @@ pub const Viewer = struct {
             .input = InputReader.init(std.posix.STDIN_FILENO),
             .current_url = url,
             .running = true,
+            .mode = .normal,
+            .prompt_buffer = null,
+            .form_context = null,
         };
     }
 
@@ -110,8 +125,18 @@ pub const Viewer = struct {
         try self.drawStatus();
     }
 
-    /// Handle key press
+    /// Handle key press - dispatches to mode-specific handlers
     fn handleKey(self: *Viewer, key: Key) !void {
+        switch (self.mode) {
+            .normal => try self.handleNormalMode(key),
+            .url_prompt => try self.handleUrlPromptMode(key),
+            .form_mode => {}, // TODO: Phase 2
+            .text_input => {}, // TODO: Phase 3
+        }
+    }
+
+    /// Handle key press in normal mode
+    fn handleNormalMode(self: *Viewer, key: Key) !void {
         // Get viewport size for scroll calculations
         const size = try self.terminal.getSize();
         const vw = size.width_px;
@@ -152,8 +177,10 @@ pub const Viewer = struct {
                         try self.refresh();
                     },
                     'g', 'G' => {
-                        // TODO M4: Prompt for new URL
-                        std.debug.print("Navigate to new URL (not implemented yet)\n", .{});
+                        // Enter URL prompt mode
+                        self.mode = .url_prompt;
+                        self.prompt_buffer = try PromptBuffer.init(self.allocator);
+                        try self.drawStatus();
                     },
                     else => {},
                 }
@@ -189,6 +216,44 @@ pub const Viewer = struct {
         }
     }
 
+    /// Handle key press in URL prompt mode
+    fn handleUrlPromptMode(self: *Viewer, key: Key) !void {
+        var prompt = &self.prompt_buffer.?;
+
+        switch (key) {
+            .char => |c| {
+                if (c == 8 or c == 127) { // Backspace (ASCII 8 or 127)
+                    prompt.backspace();
+                } else if (c >= 32 and c <= 126) { // Printable characters
+                    try prompt.insertChar(c);
+                }
+                try self.drawStatus();
+            },
+            .enter => {
+                const url = prompt.getString();
+                if (url.len > 0) {
+                    // Navigate to the entered URL
+                    try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url);
+                    try self.refresh();
+                }
+
+                // Exit URL prompt mode
+                prompt.deinit();
+                self.prompt_buffer = null;
+                self.mode = .normal;
+                try self.drawStatus();
+            },
+            .escape => {
+                // Cancel URL prompt
+                prompt.deinit();
+                self.prompt_buffer = null;
+                self.mode = .normal;
+                try self.drawStatus();
+            },
+            else => {},
+        }
+    }
+
     /// Draw status line
     fn drawStatus(self: *Viewer) !void {
         var stdout_buf: [4096]u8 = undefined;
@@ -202,11 +267,29 @@ pub const Viewer = struct {
         try Screen.moveCursor(writer, size.rows, 1);
         try Screen.clearLine(writer);
 
-        // Status text
-        try writer.print("URL: {s} | [q]uit [↑↓jk]scroll [du]½page [PgUp/Dn]page [r]efresh [R]eload [b/f]nav", .{self.current_url});
+        // Status text based on mode
+        switch (self.mode) {
+            .normal => {
+                try writer.print("URL: {s} | [q]uit [g]oto [↑↓jk]scroll [du]½page [r]efresh [R]eload [b/f]nav", .{self.current_url});
+            },
+            .url_prompt => {
+                try writer.print("Go to URL: ", .{});
+                if (self.prompt_buffer) |*p| {
+                    try p.render(writer, "");
+                }
+                try writer.print(" | [Enter] navigate [Esc] cancel", .{});
+            },
+            .form_mode => {
+                try writer.print("FORM MODE: Not yet implemented | [Esc] exit", .{});
+            },
+            .text_input => {
+                try writer.print("TEXT INPUT: Not yet implemented | [Esc] cancel", .{});
+            },
+        }
     }
 
     pub fn deinit(self: *Viewer) void {
+        if (self.prompt_buffer) |*p| p.deinit();
         self.terminal.deinit();
     }
 };
