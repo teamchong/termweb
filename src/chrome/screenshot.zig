@@ -32,7 +32,14 @@ pub fn navigateToUrl(
     allocator: std.mem.Allocator,
     url: []const u8,
 ) !void {
-    const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{url});
+    // Normalize URL - add https:// if no protocol specified
+    const normalized_url = if (std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://"))
+        url
+    else
+        try std.fmt.allocPrint(allocator, "https://{s}", .{url});
+    defer if (normalized_url.ptr != url.ptr) allocator.free(normalized_url);
+
+    const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{normalized_url});
     defer allocator.free(params);
 
     const result = try client.sendCommand("Page.navigate", params);
