@@ -91,9 +91,20 @@ pub const Viewer = struct {
         try Screen.hideCursor(writer);
         defer Screen.showCursor(writer) catch {};
 
-        // Initial render
+        // Initial render - wrapped in error handling to restore terminal on failure
         std.debug.print("[DEBUG] Starting initial refresh...\n", .{});
-        try self.refresh();
+        self.refresh() catch |err| {
+            // Restore terminal state before showing error
+            self.terminal.restore() catch {};
+            Screen.showCursor(writer) catch {};
+            Screen.clear(writer) catch {};
+            std.debug.print("\n[ERROR] Failed to refresh display: {}\n", .{err});
+            std.debug.print("This usually means:\n", .{});
+            std.debug.print("  - Screenshot capture failed\n", .{});
+            std.debug.print("  - Kitty graphics protocol not supported\n", .{});
+            std.debug.print("  - Terminal size detection failed\n", .{});
+            return err;
+        };
         std.debug.print("[DEBUG] Initial refresh complete\n", .{});
 
         // Main loop
