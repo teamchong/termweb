@@ -1,6 +1,25 @@
+/// DOM querying module for interactive form elements.
+///
+/// Provides functionality to query and interact with DOM elements via
+/// JavaScript injection through Chrome DevTools Protocol. Elements are
+/// identified by their tag, type, position, and text content.
 const std = @import("std");
 const cdp = @import("cdp_client.zig");
 
+/// InteractiveElement represents a detected form element on the page.
+///
+/// Elements are queried via JavaScript that returns position, type, and
+/// text information. The selector field is used for element targeting
+/// in subsequent interactions (focus, click, type).
+///
+/// Supported element types:
+/// - Links: <a href="...">
+/// - Buttons: <button>, <input type="submit">
+/// - Text inputs: <input type="text">, <input type="password">
+/// - Checkboxes: <input type="checkbox">
+/// - Radio buttons: <input type="radio">
+/// - Selects: <select>
+/// - Textareas: <textarea>
 pub const InteractiveElement = struct {
     index: usize,
     tag: []const u8,        // "a", "input", "button", "select"

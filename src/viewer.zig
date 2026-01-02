@@ -1,3 +1,7 @@
+/// Main viewer module for termweb.
+///
+/// Implements the interactive browser session with a mode-based state machine.
+/// Handles keyboard input, screenshot rendering, and user interaction modes.
 const std = @import("std");
 const terminal_mod = @import("terminal/terminal.zig");
 const kitty_mod = @import("terminal/kitty_graphics.zig");
@@ -18,6 +22,19 @@ const Key = input_mod.Key;
 const PromptBuffer = prompt_mod.PromptBuffer;
 const FormContext = dom_mod.FormContext;
 
+/// ViewerMode represents the current interaction mode of the viewer.
+///
+/// The viewer operates as a state machine with four distinct modes:
+/// - normal: Default browsing mode (scroll, navigate, refresh)
+/// - url_prompt: URL entry mode activated by 'g' key
+/// - form_mode: Form element selection mode activated by 'f' key
+/// - text_input: Text entry mode for filling form fields
+///
+/// Mode transitions:
+///   Normal → URL Prompt (press 'g')
+///   Normal → Form Mode (press 'f')
+///   Form Mode → Text Input (press Enter on text field)
+///   Any mode → Normal (press Esc or complete action)
 pub const ViewerMode = enum {
     normal,       // Scroll, navigate, refresh
     url_prompt,   // Entering URL (g key)
