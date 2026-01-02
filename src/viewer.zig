@@ -134,7 +134,7 @@ pub const Viewer = struct {
             .normal => try self.handleNormalMode(key),
             .url_prompt => try self.handleUrlPromptMode(key),
             .form_mode => try self.handleFormMode(key),
-            .text_input => {}, // TODO: Phase 3
+            .text_input => try self.handleTextInputMode(key),
         }
     }
 
@@ -285,13 +285,23 @@ pub const Viewer = struct {
                     } else if (std.mem.eql(u8, elem.tag, "input")) {
                         if (elem.type) |t| {
                             if (std.mem.eql(u8, t, "text") or std.mem.eql(u8, t, "password")) {
-                                // TODO: Phase 3 - Enter text input mode
-                                std.debug.print("Text input not yet implemented\n", .{});
+                                // Enter text input mode
+                                try interact_mod.focusElement(self.cdp_client, self.allocator, elem.selector);
+                                self.mode = .text_input;
+                                self.prompt_buffer = try PromptBuffer.init(self.allocator);
+                                try self.drawStatus();
                             } else if (std.mem.eql(u8, t, "checkbox")) {
                                 // TODO: Phase 4 - Toggle checkbox
-                                std.debug.print("Checkbox not yet implemented\n", .{});
+                                try interact_mod.toggleCheckbox(self.cdp_client, self.allocator, elem.selector);
+                                try self.refresh();
                             }
                         }
+                    } else if (std.mem.eql(u8, elem.tag, "textarea")) {
+                        // Treat textarea like text input
+                        try interact_mod.focusElement(self.cdp_client, self.allocator, elem.selector);
+                        self.mode = .text_input;
+                        self.prompt_buffer = try PromptBuffer.init(self.allocator);
+                        try self.drawStatus();
                     } else if (std.mem.eql(u8, elem.tag, "button")) {
                         // Click button
                         try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
@@ -305,6 +315,48 @@ pub const Viewer = struct {
                 self.allocator.destroy(ctx);
                 self.form_context = null;
                 self.mode = .normal;
+                try self.drawStatus();
+            },
+            else => {},
+        }
+    }
+
+    /// Handle key press in text input mode
+    fn handleTextInputMode(self: *Viewer, key: Key) !void {
+        var prompt = &self.prompt_buffer.?;
+
+        switch (key) {
+            .char => |c| {
+                if (c == 8 or c == 127) { // Backspace
+                    prompt.backspace();
+                } else if (c >= 32 and c <= 126) { // Printable characters
+                    try prompt.insertChar(c);
+                }
+                try self.drawStatus();
+            },
+            .enter => {
+                const text = prompt.getString();
+                if (text.len > 0) {
+                    // Type the text into the focused element
+                    try interact_mod.typeText(self.cdp_client, self.allocator, text);
+                }
+                // Press Enter to submit
+                try interact_mod.pressEnter(self.cdp_client, self.allocator);
+
+                // Cleanup prompt
+                prompt.deinit();
+                self.prompt_buffer = null;
+
+                // Return to form mode (not normal mode)
+                self.mode = .form_mode;
+                try self.refresh();
+                try self.drawStatus();
+            },
+            .escape => {
+                // Cancel text input
+                prompt.deinit();
+                self.prompt_buffer = null;
+                self.mode = .form_mode;
                 try self.drawStatus();
             },
             else => {},
@@ -348,7 +400,11 @@ pub const Viewer = struct {
                 }
             },
             .text_input => {
-                try writer.print("TEXT INPUT: Not yet implemented | [Esc] cancel", .{});
+                try writer.print("Type text: ", .{});
+                if (self.prompt_buffer) |*p| {
+                    try p.render(writer, "");
+                }
+                try writer.print(" | [Enter] submit [Esc] cancel", .{});
             },
         }
     }
