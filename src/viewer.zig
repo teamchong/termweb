@@ -5,6 +5,7 @@ const input_mod = @import("terminal/input.zig");
 const screen_mod = @import("terminal/screen.zig");
 const cdp = @import("chrome/cdp_client.zig");
 const screenshot_api = @import("chrome/screenshot.zig");
+const scroll_api = @import("chrome/scroll.zig");
 
 const Terminal = terminal_mod.Terminal;
 const KittyGraphics = kitty_mod.KittyGraphics;
@@ -111,6 +112,11 @@ pub const Viewer = struct {
 
     /// Handle key press
     fn handleKey(self: *Viewer, key: Key) !void {
+        // Get viewport size for scroll calculations
+        const size = try self.terminal.getSize();
+        const vw = size.width_px;
+        const vh = size.height_px;
+
         switch (key) {
             .char => |c| {
                 switch (c) {
@@ -128,8 +134,25 @@ pub const Viewer = struct {
                         try screenshot_api.goForward(self.cdp_client, self.allocator);
                         try self.refresh();
                     },
+                    // Vim-style scrolling
+                    'j' => {
+                        try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
+                        try self.refresh();
+                    },
+                    'k' => {
+                        try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
+                        try self.refresh();
+                    },
+                    'd' => {
+                        try scroll_api.scrollHalfPageDown(self.cdp_client, self.allocator, vw, vh);
+                        try self.refresh();
+                    },
+                    'u' => {
+                        try scroll_api.scrollHalfPageUp(self.cdp_client, self.allocator, vw, vh);
+                        try self.refresh();
+                    },
                     'g', 'G' => {
-                        // TODO M3: Prompt for new URL
+                        // TODO M4: Prompt for new URL
                         std.debug.print("Navigate to new URL (not implemented yet)\n", .{});
                     },
                     else => {},
@@ -142,6 +165,24 @@ pub const Viewer = struct {
             },
             .right => {
                 try screenshot_api.goForward(self.cdp_client, self.allocator);
+                try self.refresh();
+            },
+            // Arrow key scrolling
+            .up => {
+                try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
+                try self.refresh();
+            },
+            .down => {
+                try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
+                try self.refresh();
+            },
+            // Page key scrolling
+            .page_up => {
+                try scroll_api.scrollPageUp(self.cdp_client, self.allocator, vw, vh);
+                try self.refresh();
+            },
+            .page_down => {
+                try scroll_api.scrollPageDown(self.cdp_client, self.allocator, vw, vh);
                 try self.refresh();
             },
             else => {},
@@ -162,7 +203,7 @@ pub const Viewer = struct {
         try Screen.clearLine(writer);
 
         // Status text
-        try writer.print("URL: {s} | [q]uit [r]efresh [R]eload [b]ack [f]wd [←→] [g]oto", .{self.current_url});
+        try writer.print("URL: {s} | [q]uit [↑↓jk]scroll [du]½page [PgUp/Dn]page [r]efresh [R]eload [b/f]nav", .{self.current_url});
     }
 
     pub fn deinit(self: *Viewer) void {

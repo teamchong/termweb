@@ -9,6 +9,8 @@ pub const Key = union(enum) {
     left,
     right,
     enter,
+    page_up,
+    page_down,
     none, // No key pressed (non-blocking)
 };
 
@@ -43,6 +45,15 @@ pub const InputReader = struct {
 
                 // Parse escape sequences
                 if (n >= 3 and self.buffer[1] == '[') {
+                    // Multi-byte sequences: ESC [ N ~
+                    if (n >= 4 and self.buffer[3] == '~') {
+                        return switch (self.buffer[2]) {
+                            '5' => .page_up,
+                            '6' => .page_down,
+                            else => .{ .char = c },
+                        };
+                    }
+                    // Single-char sequences: ESC [ X
                     return switch (self.buffer[2]) {
                         'A' => .up,
                         'B' => .down,
