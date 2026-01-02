@@ -7,6 +7,8 @@ const prompt_mod = @import("terminal/prompt.zig");
 const cdp = @import("chrome/cdp_client.zig");
 const screenshot_api = @import("chrome/screenshot.zig");
 const scroll_api = @import("chrome/scroll.zig");
+const dom_mod = @import("chrome/dom.zig");
+const interact_mod = @import("chrome/interact.zig");
 
 const Terminal = terminal_mod.Terminal;
 const KittyGraphics = kitty_mod.KittyGraphics;
@@ -14,6 +16,7 @@ const InputReader = input_mod.InputReader;
 const Screen = screen_mod.Screen;
 const Key = input_mod.Key;
 const PromptBuffer = prompt_mod.PromptBuffer;
+const FormContext = dom_mod.FormContext;
 
 pub const ViewerMode = enum {
     normal,       // Scroll, navigate, refresh
@@ -32,7 +35,7 @@ pub const Viewer = struct {
     running: bool,
     mode: ViewerMode,
     prompt_buffer: ?PromptBuffer,
-    form_context: ?*anyopaque, // Placeholder for FormContext (will be used in Phase 2)
+    form_context: ?*FormContext,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -130,7 +133,7 @@ pub const Viewer = struct {
         switch (self.mode) {
             .normal => try self.handleNormalMode(key),
             .url_prompt => try self.handleUrlPromptMode(key),
-            .form_mode => {}, // TODO: Phase 2
+            .form_mode => try self.handleFormMode(key),
             .text_input => {}, // TODO: Phase 3
         }
     }
@@ -155,10 +158,6 @@ pub const Viewer = struct {
                         try screenshot_api.goBack(self.cdp_client, self.allocator);
                         try self.refresh();
                     },
-                    'f' => { // forward
-                        try screenshot_api.goForward(self.cdp_client, self.allocator);
-                        try self.refresh();
-                    },
                     // Vim-style scrolling
                     'j' => {
                         try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
@@ -180,6 +179,18 @@ pub const Viewer = struct {
                         // Enter URL prompt mode
                         self.mode = .url_prompt;
                         self.prompt_buffer = try PromptBuffer.init(self.allocator);
+                        try self.drawStatus();
+                    },
+                    'f' => {
+                        // Enter form mode
+                        self.mode = .form_mode;
+
+                        // Query elements
+                        const ctx = try self.allocator.create(FormContext);
+                        ctx.* = FormContext.init(self.allocator);
+                        ctx.elements = try dom_mod.queryElements(self.cdp_client, self.allocator);
+                        self.form_context = ctx;
+
                         try self.drawStatus();
                     },
                     else => {},
@@ -254,6 +265,52 @@ pub const Viewer = struct {
         }
     }
 
+    /// Handle key press in form mode
+    fn handleFormMode(self: *Viewer, key: Key) !void {
+        var ctx = self.form_context orelse return;
+
+        switch (key) {
+            .char => |c| {
+                if (c == '\t' or c == 9) { // Tab
+                    ctx.next();
+                    try self.drawStatus();
+                }
+            },
+            .enter => {
+                if (ctx.current()) |elem| {
+                    if (std.mem.eql(u8, elem.tag, "a")) {
+                        // Click link
+                        try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
+                        try self.refresh();
+                    } else if (std.mem.eql(u8, elem.tag, "input")) {
+                        if (elem.type) |t| {
+                            if (std.mem.eql(u8, t, "text") or std.mem.eql(u8, t, "password")) {
+                                // TODO: Phase 3 - Enter text input mode
+                                std.debug.print("Text input not yet implemented\n", .{});
+                            } else if (std.mem.eql(u8, t, "checkbox")) {
+                                // TODO: Phase 4 - Toggle checkbox
+                                std.debug.print("Checkbox not yet implemented\n", .{});
+                            }
+                        }
+                    } else if (std.mem.eql(u8, elem.tag, "button")) {
+                        // Click button
+                        try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
+                        try self.refresh();
+                    }
+                }
+            },
+            .escape => {
+                // Exit form mode
+                ctx.deinit();
+                self.allocator.destroy(ctx);
+                self.form_context = null;
+                self.mode = .normal;
+                try self.drawStatus();
+            },
+            else => {},
+        }
+    }
+
     /// Draw status line
     fn drawStatus(self: *Viewer) !void {
         var stdout_buf: [4096]u8 = undefined;
@@ -270,7 +327,7 @@ pub const Viewer = struct {
         // Status text based on mode
         switch (self.mode) {
             .normal => {
-                try writer.print("URL: {s} | [q]uit [g]oto [↑↓jk]scroll [du]½page [r]efresh [R]eload [b/f]nav", .{self.current_url});
+                try writer.print("URL: {s} | [q]uit [f]orm [g]oto [↑↓jk]scroll [r]efresh [R]eload [b]ack [←→]nav", .{self.current_url});
             },
             .url_prompt => {
                 try writer.print("Go to URL: ", .{});
@@ -280,7 +337,15 @@ pub const Viewer = struct {
                 try writer.print(" | [Enter] navigate [Esc] cancel", .{});
             },
             .form_mode => {
-                try writer.print("FORM MODE: Not yet implemented | [Esc] exit", .{});
+                if (self.form_context) |ctx| {
+                    if (ctx.current()) |elem| {
+                        var desc_buf: [200]u8 = undefined;
+                        const desc = try elem.describe(&desc_buf);
+                        try writer.print("FORM [{d}/{d}]: {s} | [Tab] next [Enter] activate [Esc] exit", .{ ctx.current_index + 1, ctx.elements.len, desc });
+                    } else {
+                        try writer.print("FORM: No elements | [Esc] exit", .{});
+                    }
+                }
             },
             .text_input => {
                 try writer.print("TEXT INPUT: Not yet implemented | [Esc] cancel", .{});
@@ -290,6 +355,10 @@ pub const Viewer = struct {
 
     pub fn deinit(self: *Viewer) void {
         if (self.prompt_buffer) |*p| p.deinit();
+        if (self.form_context) |ctx| {
+            ctx.deinit();
+            self.allocator.destroy(ctx);
+        }
         self.terminal.deinit();
     }
 };
