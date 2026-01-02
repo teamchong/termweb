@@ -7,7 +7,7 @@ const screenshot_api = @import("chrome/screenshot.zig");
 const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 
-const VERSION = "0.1.0";
+const VERSION = "0.6.0";
 
 const Command = enum {
     open,

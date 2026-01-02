@@ -4,29 +4,67 @@ Web browser in your terminal using Kitty graphics protocol.
 
 ## Overview
 
-`termweb` renders web pages via Playwright and displays them inside Kitty-graphics-capable terminals (Ghostty, Kitty, WezTerm) using pixel frames.
+`termweb` renders web pages via Chrome DevTools Protocol and displays them inside Kitty-graphics-capable terminals (Ghostty, Kitty, WezTerm) using pixel frames.
+
+## Features
+
+- 🖼️ **Full Web Rendering** - Display complete web pages with images, CSS, and JavaScript
+- ⌨️ **Vim-Style Navigation** - Scroll with j/k, d/u for half-page, Page Up/Down for full page
+- 🔗 **Interactive Forms** - Fill text inputs, click links, toggle checkboxes, submit buttons
+- 🌐 **URL Navigation** - Press 'g' to enter URLs directly, navigate back/forward through history
+- 📱 **Mobile Testing** - Use `--mobile` flag for mobile viewport testing
+- 🔍 **Zoom Control** - Adjust page scale with `--scale` option
+- 🖱️ **Tab Navigation** - Press 'f' to enter form mode, Tab through interactive elements
+- 🔄 **Page Refresh** - 'r' for screenshot refresh, 'R' for full page reload
 
 ## Status
 
-**Current version:** 0.1.0 (M0 - Project Skeleton)
+**Current version:** 0.6.0 (M5 - Packaging + Documentation)
 
 ### Milestones
 
-- ✅ **M0** - Project skeleton
+- ✅ **M0** - Project skeleton (0.1)
   - CLI commands: `open`, `doctor`, `version`, `help`
   - Build system with Zig
   - Terminal capability detection
 
-- ⏳ **M1** - Static render viewer (0.2)
-  - Playwright integration
-  - Screenshot capture
-  - Kitty graphics display
-  - Basic key controls (q, r, g)
+- ✅ **M1** - Static render viewer (0.2)
+  - Chrome/Chromium integration via CDP
+  - Screenshot capture and display
+  - Kitty graphics protocol
+  - Basic key controls (q, r)
 
-- 🔲 **M2** - Scroll + persistent page (0.3)
-- 🔲 **M3** - Navigation basics (0.4)
-- 🔲 **M4** - Interactive-lite inputs (0.5)
-- 🔲 **M5** - Packaging + docs (0.6)
+- ✅ **M2** - WebSocket CDP + Navigation (0.3)
+  - Real-time WebSocket CDP connection
+  - Page navigation (back, forward)
+  - Persistent browser sessions
+
+- ✅ **M3** - Scroll support (0.4)
+  - Vim-style scrolling (j/k, d/u)
+  - Arrow key and Page Up/Down scrolling
+  - Page reload (r/R)
+
+- ✅ **M4** - Interactive inputs (0.5)
+  - URL navigation prompt (g key)
+  - Form mode with DOM querying (f key)
+  - Full form interaction (text inputs, checkboxes, buttons)
+  - Tab navigation between elements
+
+- ⏳ **M5** - Packaging + docs (0.6)
+  - Comprehensive documentation suite
+  - Installation and usage guides
+  - Architecture documentation
+  - Git tags and release process
+
+## Documentation
+
+- [Installation Guide](INSTALLATION.md) - Setup instructions and dependencies
+- [Keyboard Controls](KEYBINDINGS.md) - Complete keybindings reference
+- [Usage Guide](USAGE.md) - Detailed usage examples and workflows
+- [Architecture](ARCHITECTURE.md) - System design and module overview
+- [Contributing](CONTRIBUTING.md) - Development setup and guidelines
+- [Troubleshooting](TROUBLESHOOTING.md) - Common issues and solutions
+- [Changelog](CHANGELOG.md) - Version history and release notes
 
 ## Requirements
 
