@@ -115,15 +115,35 @@ pub const Viewer = struct {
             .char => |c| {
                 switch (c) {
                     'q', 'Q' => self.running = false,
-                    'r', 'R' => try self.refresh(),
+                    'r' => try self.refresh(), // lowercase = refresh screenshot only
+                    'R' => { // uppercase = reload page from server
+                        try screenshot_api.reload(self.cdp_client, self.allocator, false);
+                        try self.refresh();
+                    },
+                    'b' => { // back
+                        try screenshot_api.goBack(self.cdp_client, self.allocator);
+                        try self.refresh();
+                    },
+                    'f' => { // forward
+                        try screenshot_api.goForward(self.cdp_client, self.allocator);
+                        try self.refresh();
+                    },
                     'g', 'G' => {
-                        // TODO M2: Prompt for new URL
+                        // TODO M3: Prompt for new URL
                         std.debug.print("Navigate to new URL (not implemented yet)\n", .{});
                     },
                     else => {},
                 }
             },
             .ctrl_c, .escape => self.running = false,
+            .left => { // Arrow key navigation
+                try screenshot_api.goBack(self.cdp_client, self.allocator);
+                try self.refresh();
+            },
+            .right => {
+                try screenshot_api.goForward(self.cdp_client, self.allocator);
+                try self.refresh();
+            },
             else => {},
         }
     }
@@ -142,7 +162,7 @@ pub const Viewer = struct {
         try Screen.clearLine(writer);
 
         // Status text
-        try writer.print("URL: {s} | [q]uit [r]efresh [g]oto", .{self.current_url});
+        try writer.print("URL: {s} | [q]uit [r]efresh [R]eload [b]ack [f]wd [←→] [g]oto", .{self.current_url});
     }
 
     pub fn deinit(self: *Viewer) void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const websocket_cdp = @import("websocket_cdp.zig");
 
 pub const CdpError = error{
     ConnectionFailed,
@@ -10,13 +11,13 @@ pub const CdpError = error{
     OutOfMemory,
 };
 
-/// Simplified CDP Client for M1 using HTTP endpoints
-/// For M2+, we'll add full WebSocket support
+/// CDP Client using WebSocket for real-time communication
 pub const CdpClient = struct {
     allocator: std.mem.Allocator,
+    ws_client: *websocket_cdp.WebSocketCdpClient,
     http_client: std.http.Client,
     base_url: []const u8,
-    page_id: ?[]const u8,
+    page_id: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, ws_url: []const u8) !*CdpClient {
         // Extract HTTP base URL from WebSocket URL
@@ -26,71 +27,113 @@ pub const CdpClient = struct {
         const client = try allocator.create(CdpClient);
         client.* = .{
             .allocator = allocator,
+            .ws_client = undefined,  // Will be set after discovering page WebSocket URL
             .http_client = std.http.Client{ .allocator = allocator },
             .base_url = base_url,
-            .page_id = null,
+            .page_id = undefined,  // Will be set by discoverPage
         };
 
-        // Get the first page target
-        try client.discoverPage();
+        // Discover the page's WebSocket URL via HTTP /json/list
+        const page_ws_url = try client.discoverPageWebSocketUrl();
+        defer allocator.free(page_ws_url);
+
+        // Connect to page's WebSocket endpoint
+        client.ws_client = try websocket_cdp.WebSocketCdpClient.connect(allocator, page_ws_url);
 
         return client;
     }
 
     pub fn deinit(self: *CdpClient) void {
+        self.ws_client.deinit();
         self.http_client.deinit();
         self.allocator.free(self.base_url);
-        if (self.page_id) |id| {
-            self.allocator.free(id);
-        }
+        self.allocator.free(self.page_id);
         self.allocator.destroy(self);
     }
 
-    /// Discover the first page target
-    fn discoverPage(self: *CdpClient) !void {
-        // For M1: Use a default page ID
-        // TODO M2: Implement proper HTTP fetch to /json/list
-        self.page_id = try self.allocator.dupe(u8, "default-page-id");
-        _ = self.http_client;
-        _ = self.base_url;
+    /// Discover the first page target's WebSocket URL via HTTP /json/list
+    fn discoverPageWebSocketUrl(self: *CdpClient) ![]const u8 {
+        // Build URL for /json/list endpoint
+        const list_url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/json/list",
+            .{self.base_url},
+        );
+        defer self.allocator.free(list_url);
+
+        const uri = try std.Uri.parse(list_url);
+
+        // Make HTTP request
+        var req = try self.http_client.request(.GET, uri, .{});
+        defer req.deinit();
+
+        try req.sendBodiless();
+
+        // Read response head
+        var redirect_buf: [1024]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+
+        // Read response body
+        var reader_buf: [4096]u8 = undefined;
+        var reader = response.reader(&reader_buf);
+        const body = try reader.allocRemaining(self.allocator, .unlimited);
+        defer self.allocator.free(body);
+
+        // Parse JSON array: [{"id": "...", "type": "page", ...}, ...]
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+        defer parsed.deinit();
+
+        // Find first page target and extract its WebSocket URL
+        switch (parsed.value) {
+            .array => |arr| {
+                for (arr.items) |target| {
+                    switch (target) {
+                        .object => |obj| {
+                            if (obj.get("type")) |type_val| {
+                                switch (type_val) {
+                                    .string => |type_str| {
+                                        if (std.mem.eql(u8, type_str, "page")) {
+                                            // Get both ID and WebSocket URL
+                                            if (obj.get("id")) |id_val| {
+                                                switch (id_val) {
+                                                    .string => |id_str| {
+                                                        self.page_id = try self.allocator.dupe(u8, id_str);
+                                                    },
+                                                    else => {},
+                                                }
+                                            }
+                                            if (obj.get("webSocketDebuggerUrl")) |ws_val| {
+                                                switch (ws_val) {
+                                                    .string => |ws_url| {
+                                                        return try self.allocator.dupe(u8, ws_url);
+                                                    },
+                                                    else => {},
+                                                }
+                                            }
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+
+        return CdpError.InvalidResponse;  // No page target found
     }
 
-    /// Send CDP command via HTTP (simplified for M1)
+    /// Send CDP command via WebSocket
     pub fn sendCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        const page_id = self.page_id orelse return CdpError.InvalidResponse;
-
-        // Build JSON payload
-        const payload = if (params) |p|
-            try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"id\":1,\"method\":\"{s}\",\"params\":{s}}}",
-                .{ method, p },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"id\":1,\"method\":\"{s}\"}}",
-                .{method},
-            );
-        defer self.allocator.free(payload);
-
-        // Send to page-specific endpoint
-        // For M1: Return mock CDP response
-        // TODO M2: Implement proper HTTP POST with fetch
-        _ = page_id;
-        _ = self.http_client;
-
-        // Mock response for screenshot command
-        if (std.mem.indexOf(u8, payload, "captureScreenshot")) |_| {
-            return try self.allocator.dupe(u8, "{\"id\":1,\"result\":{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\"}}");
-        }
-
-        // Default response
-        return try self.allocator.dupe(u8, "{\"id\":1,\"result\":{}}");
+        // Delegate to WebSocket client
+        return self.ws_client.sendCommand(method, params);
     }
 };
 

@@ -89,3 +89,45 @@ pub fn setViewport(
     const result = try client.sendCommand("Emulation.setDeviceMetricsOverride", params);
     defer allocator.free(result);
 }
+
+/// Navigate back in browser history
+pub fn goBack(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+) !void {
+    const result = try client.sendCommand("Page.goBack", null);
+    defer allocator.free(result);
+
+    // Wait for navigation (temporary - M3 will use events)
+    std.Thread.sleep(1 * std.time.ns_per_s);
+}
+
+/// Navigate forward in browser history
+pub fn goForward(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+) !void {
+    const result = try client.sendCommand("Page.goForward", null);
+    defer allocator.free(result);
+
+    std.Thread.sleep(1 * std.time.ns_per_s);
+}
+
+/// Reload current page
+pub fn reload(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    ignore_cache: bool,
+) !void {
+    const params = try std.fmt.allocPrint(
+        allocator,
+        "{{\"ignoreCache\":{s}}}",
+        .{if (ignore_cache) "true" else "false"},
+    );
+    defer allocator.free(params);
+
+    const result = try client.sendCommand("Page.reload", params);
+    defer allocator.free(result);
+
+    std.Thread.sleep(2 * std.time.ns_per_s);
+}

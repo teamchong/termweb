@@ -101,11 +101,8 @@ pub fn launchChrome(
 
     try child.spawn();
 
-    // 5. Extract WebSocket URL
-    // For M1: Use mock URL (proper parsing in M2)
-    // TODO M2: Parse Chrome stderr for "DevTools listening on ws://..."
-    const ws_url = try allocator.dupe(u8, "ws://127.0.0.1:9222/devtools/browser/mock");
-    _ = child.stderr;
+    // 5. Extract WebSocket URL from Chrome stderr
+    const ws_url = try extractDebugUrl(allocator, child.stderr.?);
 
     return ChromeInstance{
         .process = child,
@@ -117,34 +114,36 @@ pub fn launchChrome(
 /// Extract WebSocket URL from Chrome stderr output
 /// Reads until it finds "DevTools listening on ws://..." line
 fn extractDebugUrl(allocator: std.mem.Allocator, stderr: std.fs.File) ![]const u8 {
-    var reader_buf: [4096]u8 = undefined;
-    const reader = stderr.reader(&reader_buf);
-    var buf: [1024]u8 = undefined;
+    // Read stderr output in chunks
+    var output_buf: [8192]u8 = undefined;
+    var total_read: usize = 0;
 
     // Wait up to 5 seconds for Chrome to print debug URL
     const timeout_ns = 5 * std.time.ns_per_s;
     const start_time = std.time.nanoTimestamp();
 
     while (std.time.nanoTimestamp() - start_time < timeout_ns) {
-        const line = reader.readUntilDelimiterOrEof(&buf, '\n') catch |err| switch (err) {
-            error.EndOfStream => {
-                // Wait a bit and retry
-                std.Thread.sleep(100 * std.time.ns_per_ms);
-                continue;
-            },
-            else => return err,
-        } orelse {
-            // No data yet, wait and retry
+        const bytes_read = stderr.read(output_buf[total_read..]) catch {
             std.Thread.sleep(100 * std.time.ns_per_ms);
             continue;
         };
 
-        // Look for "DevTools listening on ws://"
-        if (std.mem.indexOf(u8, line, "DevTools listening on ")) |idx| {
+        if (bytes_read == 0) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        }
+
+        total_read += bytes_read;
+
+        // Look for "DevTools listening on ws://" in accumulated output
+        const output_so_far = output_buf[0..total_read];
+        if (std.mem.indexOf(u8, output_so_far, "DevTools listening on ws://")) |idx| {
             const ws_start = idx + "DevTools listening on ".len;
-            if (ws_start < line.len) {
-                // Extract URL (trim whitespace)
-                const url = std.mem.trim(u8, line[ws_start..], " \r\n\t");
+            // Find end of URL (newline or end of buffer)
+            const url_end = std.mem.indexOfAnyPos(u8, output_so_far, ws_start, "\r\n") orelse output_so_far.len;
+            const url = std.mem.trim(u8, output_so_far[ws_start..url_end], " \r\n\t");
+
+            if (std.mem.startsWith(u8, url, "ws://")) {
                 return try allocator.dupe(u8, url);
             }
         }
