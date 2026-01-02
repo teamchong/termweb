@@ -172,6 +172,34 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try viewer.run();
 }
 
+/// Check if terminal supports Kitty graphics protocol
+fn checkTerminalSupport(allocator: std.mem.Allocator) !bool {
+    const term_program = std.process.getEnvVarOwned(allocator, "TERM_PROGRAM") catch null;
+    defer if (term_program) |t| allocator.free(t);
+
+    if (term_program) |tp| {
+        if (std.mem.eql(u8, tp, "ghostty") or
+            std.mem.eql(u8, tp, "kitty") or
+            std.mem.eql(u8, tp, "WezTerm"))
+        {
+            return true;
+        }
+    }
+
+    // Not supported - show helpful error
+    std.debug.print("Error: Unsupported terminal\n", .{});
+    std.debug.print("termweb requires a terminal that supports the Kitty graphics protocol.\n\n", .{});
+    std.debug.print("Detected terminal: {s}\n\n", .{term_program orelse "unknown"});
+    std.debug.print("Supported terminals:\n", .{});
+    std.debug.print("  • Ghostty - https://ghostty.org/\n", .{});
+    std.debug.print("  • Kitty   - https://sw.kovidgoyal.net/kitty/\n", .{});
+    std.debug.print("  • WezTerm - https://wezfurlong.org/wezterm/\n\n", .{});
+    std.debug.print("Please install one of these terminals and try again.\n", .{});
+    std.debug.print("Run 'termweb doctor' to check your system configuration.\n", .{});
+
+    return false;
+}
+
 fn cmdDoctor(allocator: std.mem.Allocator) !void {
     std.debug.print("termweb doctor - System capability check\n", .{});
     std.debug.print("========================================\n\n", .{});
