@@ -4,6 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Vendor modules
+    const json_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/json/json.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const websocket_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/websocket/websocket.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "termweb",
@@ -13,6 +26,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+
+    // Add vendor imports
+    exe.root_module.addImport("json", json_mod);
+    exe.root_module.addImport("websocket", websocket_mod);
 
     b.installArtifact(exe);
 

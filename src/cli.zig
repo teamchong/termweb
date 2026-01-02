@@ -1,5 +1,12 @@
 const std = @import("std");
 
+const detector = @import("chrome/detector.zig");
+const launcher = @import("chrome/launcher.zig");
+const cdp = @import("chrome/cdp_client.zig");
+const screenshot_api = @import("chrome/screenshot.zig");
+const terminal_mod = @import("terminal/terminal.zig");
+const viewer_mod = @import("viewer.zig");
+
 const VERSION = "0.1.0";
 
 const Command = enum {
@@ -50,8 +57,6 @@ fn parseCommand(arg: []const u8) Command {
 }
 
 fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    _ = allocator;
-
     if (args.len < 1) {
         std.debug.print("Error: URL required\n", .{});
         std.debug.print("Usage: termweb open <url> [--mobile] [--scale N]\n", .{});
@@ -78,10 +83,60 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    std.debug.print("Opening: {s}\n", .{url});
-    std.debug.print("Mobile mode: {}\n", .{mobile});
-    std.debug.print("Scale: {d:.2}\n", .{scale});
-    std.debug.print("\n[Not implemented yet - M1 milestone]\n", .{});
+    std.debug.print("Launching Chrome...\n", .{});
+
+    // Get terminal size for viewport
+    var term = terminal_mod.Terminal.init();
+    const size = term.getSize() catch blk: {
+        std.debug.print("Warning: Could not detect terminal size, using defaults\n", .{});
+        break :blk terminal_mod.TerminalSize{
+            .cols = 80,
+            .rows = 24,
+            .width_px = 1280,
+            .height_px = 720,
+        };
+    };
+
+    // Calculate viewport size (use pixel dimensions or estimate from cols/rows)
+    const viewport_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
+    const viewport_height: u32 = if (size.height_px > 0) size.height_px else @as(u32, size.rows) * 20;
+
+    // Launch Chrome
+    var chrome_instance = launcher.launchChrome(allocator, .{
+        .viewport_width = viewport_width,
+        .viewport_height = viewport_height,
+    }) catch |err| {
+        std.debug.print("Error launching Chrome: {}\n", .{err});
+        std.debug.print("Make sure Chrome is installed or set $CHROME_BIN\n", .{});
+        std.process.exit(1);
+    };
+    defer chrome_instance.deinit();
+
+    std.debug.print("Chrome launched\n", .{});
+
+    // Connect CDP client
+    var client = cdp.CdpClient.init(allocator, chrome_instance.ws_url) catch |err| {
+        std.debug.print("Error connecting to Chrome DevTools Protocol: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer client.deinit();
+
+    std.debug.print("Connected to Chrome\n", .{});
+    std.debug.print("Navigating to: {s}\n", .{url});
+
+    // Navigate to URL
+    screenshot_api.navigateToUrl(client, allocator, url) catch |err| {
+        std.debug.print("Error navigating to URL: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    std.debug.print("Page loaded\n", .{});
+
+    // Run viewer
+    var viewer = try viewer_mod.Viewer.init(allocator, client, url);
+    defer viewer.deinit();
+
+    try viewer.run();
 }
 
 fn cmdDoctor(allocator: std.mem.Allocator) !void {
@@ -139,9 +194,18 @@ fn cmdDoctor(allocator: std.mem.Allocator) !void {
         std.debug.print("  ✗ Not detected\n", .{});
     }
 
-    // Check for Playwright/Node.js
-    std.debug.print("\nBrowser automation:\n", .{});
-    std.debug.print("  [Not implemented yet - checking for Node.js/Playwright]\n", .{});
+    // Check for Chrome
+    std.debug.print("\nChrome/Chromium:\n", .{});
+    if (detector.detectChrome(allocator)) |chrome| {
+        defer {
+            var mut_chrome = chrome;
+            mut_chrome.deinit();
+        }
+        std.debug.print("  ✓ Found: {s}\n", .{chrome.path});
+    } else |_| {
+        std.debug.print("  ✗ Not found\n", .{});
+        std.debug.print("  Install Chrome or set $CHROME_BIN environment variable\n", .{});
+    }
 
     // Overall status
     std.debug.print("\nOverall:\n", .{});
