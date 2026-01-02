@@ -290,9 +290,13 @@ pub const Viewer = struct {
                                 self.mode = .text_input;
                                 self.prompt_buffer = try PromptBuffer.init(self.allocator);
                                 try self.drawStatus();
-                            } else if (std.mem.eql(u8, t, "checkbox")) {
-                                // TODO: Phase 4 - Toggle checkbox
+                            } else if (std.mem.eql(u8, t, "checkbox") or std.mem.eql(u8, t, "radio")) {
+                                // Toggle checkbox or select radio button
                                 try interact_mod.toggleCheckbox(self.cdp_client, self.allocator, elem.selector);
+                                try self.refresh();
+                            } else if (std.mem.eql(u8, t, "submit")) {
+                                // Submit button - click it
+                                try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
                                 try self.refresh();
                             }
                         }
@@ -302,6 +306,10 @@ pub const Viewer = struct {
                         self.mode = .text_input;
                         self.prompt_buffer = try PromptBuffer.init(self.allocator);
                         try self.drawStatus();
+                    } else if (std.mem.eql(u8, elem.tag, "select")) {
+                        // Click select to activate dropdown
+                        try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
+                        try self.refresh();
                     } else if (std.mem.eql(u8, elem.tag, "button")) {
                         // Click button
                         try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
