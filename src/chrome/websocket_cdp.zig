@@ -1,3 +1,11 @@
+/// WebSocket client implementation for Chrome DevTools Protocol.
+///
+/// Low-level WebSocket protocol handling including:
+/// - HTTP-to-WebSocket upgrade handshake with Sec-WebSocket-Key
+/// - Frame parsing and serialization (text, binary, ping/pong, close)
+/// - Message masking for client-to-server frames
+/// - Request/response correlation via CDP message IDs
+/// - Automatic ping/pong handling for connection keep-alive
 const std = @import("std");
 
 pub const WebSocketError = error{

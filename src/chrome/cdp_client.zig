@@ -1,3 +1,9 @@
+/// Chrome DevTools Protocol (CDP) client implementation.
+///
+/// Provides high-level interface for communicating with Chrome/Chromium browser
+/// via WebSocket. Handles page discovery, connection management, and command
+/// dispatch. Uses HTTP /json/list endpoint to discover page targets, then
+/// establishes WebSocket connection for real-time CDP communication.
 const std = @import("std");
 const websocket_cdp = @import("websocket_cdp.zig");
 
