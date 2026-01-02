@@ -69,6 +69,7 @@ pub const WebSocketCdpClient = struct {
     pub fn sendCommand(self: *WebSocketCdpClient, method: []const u8, params: ?[]const u8) ![]u8 {
         // Get unique ID
         const id = self.next_id.fetchAdd(1, .monotonic);
+        std.debug.print("[WS] sendCommand id={d} method={s}\n", .{ id, method });
 
         // Build JSON command
         const command = if (params) |p|
@@ -85,13 +86,18 @@ pub const WebSocketCdpClient = struct {
             );
         defer self.allocator.free(command);
 
+        std.debug.print("[WS] Sending: {s}\n", .{command});
+
         // Send as WebSocket text frame
         try self.sendFrame(0x1, command);
+        std.debug.print("[WS] Frame sent, waiting for response...\n", .{});
 
         // Wait for response with matching ID
         while (true) {
+            std.debug.print("[WS] Calling recvFrame()...\n", .{});
             var frame = try self.recvFrame();
             defer frame.deinit();
+            std.debug.print("[WS] Received frame with {} bytes\n", .{frame.payload.len});
 
             // Parse JSON to find ID
             if (std.mem.indexOf(u8, frame.payload, "\"id\":")) |id_pos| {

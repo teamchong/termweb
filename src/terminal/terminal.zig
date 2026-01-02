@@ -20,6 +20,13 @@ pub const Terminal = struct {
 
     /// Enter raw mode (disable line buffering, echo)
     pub fn enterRawMode(self: *Terminal) !void {
+        // Check if stdin is a TTY
+        if (!std.posix.isatty(self.stdin_fd)) {
+            std.debug.print("Error: stdin is not a terminal\n", .{});
+            std.debug.print("termweb requires an interactive terminal (TTY) to run.\n", .{});
+            return error.NotATty;
+        }
+
         // Save original settings
         self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
 

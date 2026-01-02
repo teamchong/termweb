@@ -75,20 +75,26 @@ pub const Viewer = struct {
 
     /// Main event loop
     pub fn run(self: *Viewer) !void {
+        std.debug.print("[DEBUG] Viewer.run() starting\n", .{});
+
         var stdout_buf: [4096]u8 = undefined;
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
         const writer = &stdout_writer.interface;
 
         // Setup terminal
+        std.debug.print("[DEBUG] Entering raw mode...\n", .{});
         try self.terminal.enterRawMode();
         defer self.terminal.restore() catch {};
 
+        std.debug.print("[DEBUG] Hiding cursor...\n", .{});
         try Screen.hideCursor(writer);
         defer Screen.showCursor(writer) catch {};
 
         // Initial render
+        std.debug.print("[DEBUG] Starting initial refresh...\n", .{});
         try self.refresh();
+        std.debug.print("[DEBUG] Initial refresh complete\n", .{});
 
         // Main loop
         while (self.running) {
@@ -109,40 +115,58 @@ pub const Viewer = struct {
 
     /// Refresh display (re-capture and draw)
     fn refresh(self: *Viewer) !void {
+        std.debug.print("[DEBUG] refresh() starting\n", .{});
+
         var stdout_buf: [4096]u8 = undefined;
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
         const writer = &stdout_writer.interface;
 
         // Clear screen
+        std.debug.print("[DEBUG] Clearing screen...\n", .{});
         try Screen.clear(writer);
         try self.kitty.clearAll(writer);
 
         // Get terminal size
+        std.debug.print("[DEBUG] Getting terminal size...\n", .{});
         const size = try self.terminal.getSize();
+        std.debug.print("[DEBUG] Terminal size: {}x{} ({}x{} px)\n", .{
+            size.cols,
+            size.rows,
+            size.width_px,
+            size.height_px,
+        });
 
         // Capture screenshot
+        std.debug.print("[DEBUG] Capturing screenshot...\n", .{});
         const base64_png = try screenshot_api.captureScreenshot(
             self.cdp_client,
             self.allocator,
             .{ .format = .png },
         );
         defer self.allocator.free(base64_png);
+        std.debug.print("[DEBUG] Screenshot captured ({} bytes base64)\n", .{base64_png.len});
 
         // Decode base64
+        std.debug.print("[DEBUG] Decoding base64...\n", .{});
         const decoder = std.base64.standard.Decoder;
         const png_size = try decoder.calcSizeForSlice(base64_png);
         const png_data = try self.allocator.alloc(u8, png_size);
         defer self.allocator.free(png_data);
         try decoder.decode(png_data, base64_png);
+        std.debug.print("[DEBUG] Decoded to {} bytes PNG\n", .{png_data.len});
 
         // Display image (leave room for status line)
+        std.debug.print("[DEBUG] Displaying PNG via Kitty graphics...\n", .{});
         try self.kitty.displayPNG(writer, png_data, .{
             .rows = if (size.rows > 1) size.rows - 1 else size.rows,
         });
+        std.debug.print("[DEBUG] PNG displayed\n", .{});
 
         // Draw status line
+        std.debug.print("[DEBUG] Drawing status line...\n", .{});
         try self.drawStatus();
+        std.debug.print("[DEBUG] refresh() complete\n", .{});
     }
 
     /// Handle key press - dispatches to mode-specific handlers

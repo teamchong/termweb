@@ -32,6 +32,8 @@ pub fn navigateToUrl(
     allocator: std.mem.Allocator,
     url: []const u8,
 ) !void {
+    std.debug.print("[DEBUG] navigateToUrl() starting with url: {s}\n", .{url});
+
     // Normalize URL - add https:// if no protocol specified
     const normalized_url = if (std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://"))
         url
@@ -39,15 +41,21 @@ pub fn navigateToUrl(
         try std.fmt.allocPrint(allocator, "https://{s}", .{url});
     defer if (normalized_url.ptr != url.ptr) allocator.free(normalized_url);
 
+    std.debug.print("[DEBUG] Normalized URL: {s}\n", .{normalized_url});
+
     const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{normalized_url});
     defer allocator.free(params);
 
+    std.debug.print("[DEBUG] Sending Page.navigate command...\n", .{});
     const result = try client.sendCommand("Page.navigate", params);
     defer allocator.free(result);
+    std.debug.print("[DEBUG] Page.navigate response: {s}\n", .{result});
 
     // Wait for page to load (simple approach - wait fixed time)
     // TODO M2: Use Page.loadEventFired event for proper synchronization
+    std.debug.print("[DEBUG] Waiting 3 seconds for page load...\n", .{});
     std.Thread.sleep(3 * std.time.ns_per_s);
+    std.debug.print("[DEBUG] navigateToUrl() complete\n", .{});
 }
 
 /// Capture screenshot and return base64-encoded PNG/JPEG data
