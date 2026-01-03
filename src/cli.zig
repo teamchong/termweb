@@ -105,8 +105,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Calculate viewport size (use pixel dimensions or estimate from cols/rows)
     // Min size: 800x600 to ensure websites render properly
     // Max size: Use full terminal size, reserving 1 row for status line
-    const MIN_WIDTH: u32 = 800;
-    const MIN_HEIGHT: u32 = 600;
+    // Use exact terminal resolution - no minimum constraints
+    // This ensures 1:1 pixel mapping with Kitty graphics
 
     const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
 
@@ -118,22 +118,17 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const content_rows: u32 = if (size.rows > 1) size.rows - 1 else 1;
     const available_height = content_rows * row_height;
 
-    // Apply min constraints to ensure websites render properly
-    const viewport_width: u32 = @max(MIN_WIDTH, raw_width);
-    const viewport_height: u32 = @max(MIN_HEIGHT, available_height);
+    // Use exact terminal dimensions for 1:1 pixel mapping
+    const viewport_width: u32 = raw_width;
+    const viewport_height: u32 = available_height;
 
-    std.debug.print("Terminal: {}x{} ({} cols x {} rows)\n", .{
+    std.debug.print("Terminal: {}x{} px ({} cols x {} rows)\n", .{
         size.width_px,
         size.height_px,
         size.cols,
         size.rows,
     });
-    std.debug.print("Viewport: {}x{} (min: {}x{})\n", .{
-        viewport_width,
-        viewport_height,
-        MIN_WIDTH,
-        MIN_HEIGHT,
-    });
+    std.debug.print("Viewport: {}x{}\n", .{ viewport_width, viewport_height });
 
     // Launch Chrome
     var chrome_instance = launcher.launchChrome(allocator, .{
