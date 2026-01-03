@@ -87,6 +87,9 @@ pub const Viewer = struct {
     mouse_visible: bool,
     cursor_image_id: ?u32,  // Track cursor image ID for cleanup
 
+    // Input throttling (batch mode)
+    last_input_time: i128,
+
     // Debug flags
     debug_input: bool,
 
@@ -135,6 +138,7 @@ pub const Viewer = struct {
             .mouse_y = 0,
             .mouse_visible = false,
             .cursor_image_id = null,
+            .last_input_time = 0,
             .debug_input = enable_input_debug,
         };
     }
@@ -879,6 +883,14 @@ pub const Viewer = struct {
                 }
             },
             .wheel => {
+                // Throttle scroll events to avoid flooding CDP (max ~30 events/sec)
+                const now = std.time.nanoTimestamp();
+                const min_interval = 33 * std.time.ns_per_ms; // ~30fps
+                if (now - self.last_input_time < min_interval) {
+                    return; // Skip this event, too soon
+                }
+                self.last_input_time = now;
+
                 // Get viewport size for scroll calculations
                 const size = try self.terminal.getSize();
                 const vw = size.width_px;
@@ -886,19 +898,16 @@ pub const Viewer = struct {
 
                 // Scroll based on delta_y direction
                 if (mouse.delta_y > 0) {
-                    // Positive delta = scroll down
                     if (self.debug_input) {
                         self.log("[MOUSE] Wheel scroll down\n", .{});
                     }
                     try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
                 } else if (mouse.delta_y < 0) {
-                    // Negative delta = scroll up
                     if (self.debug_input) {
                         self.log("[MOUSE] Wheel scroll up\n", .{});
                     }
                     try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
                 }
-                try self.refresh();
             },
             else => {}, // Ignore release, move, drag events
         }
