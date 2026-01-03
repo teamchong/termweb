@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html class="THEME_CLASS">
+<head>
+  <link rel="stylesheet" href="../shared.css">
+  <style>
+    body {
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .glass-btn {
+      width: 28px;
+      height: 28px;
+    }
+    .glass-btn.hover {
+      background: rgba(255, 59, 48, 0.8);
+    }
+    .glass-btn.hover svg {
+      fill: white;
+    }
+    .glass-btn.active {
+      background: rgba(255, 59, 48, 1);
+    }
+    .glass-btn.active svg {
+      fill: white;
+    }
+  </style>
+</head>
+<body>
+  <div class="glass-btn STATE_CLASS">
+    <svg viewBox="0 0 24 24">
+      <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+    </svg>
+  </div>
+</body>
+</html>

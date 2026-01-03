@@ -1,0 +1,135 @@
+/* Glassmorphism Theme Variables */
+:root {
+  /* Dark theme (default) */
+  --bg-glass: rgba(30, 30, 30, 0.7);
+  --bg-glass-hover: rgba(50, 50, 50, 0.8);
+  --bg-glass-active: rgba(60, 60, 60, 0.9);
+  --bg-glass-disabled: rgba(20, 20, 20, 0.4);
+  --border-glass: rgba(255, 255, 255, 0.1);
+  --border-glass-hover: rgba(255, 255, 255, 0.2);
+  --shadow-glass: 0 4px 16px rgba(0, 0, 0, 0.3);
+  --shadow-inner: inset 0 1px 1px rgba(255, 255, 255, 0.1);
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0a0;
+  --text-disabled: #606060;
+  --backdrop-blur: blur(12px);
+  --accent: #4a9eff;
+  --accent-glow: rgba(74, 158, 255, 0.3);
+}
+
+:root.light {
+  /* Light theme */
+  --bg-glass: rgba(255, 255, 255, 0.7);
+  --bg-glass-hover: rgba(255, 255, 255, 0.85);
+  --bg-glass-active: rgba(240, 240, 240, 0.9);
+  --bg-glass-disabled: rgba(200, 200, 200, 0.4);
+  --border-glass: rgba(0, 0, 0, 0.1);
+  --border-glass-hover: rgba(0, 0, 0, 0.2);
+  --shadow-glass: 0 4px 16px rgba(0, 0, 0, 0.1);
+  --shadow-inner: inset 0 1px 1px rgba(255, 255, 255, 0.8);
+  --text-primary: #1a1a1a;
+  --text-secondary: #666666;
+  --text-disabled: #aaaaaa;
+  --backdrop-blur: blur(12px);
+  --accent: #0066cc;
+  --accent-glow: rgba(0, 102, 204, 0.2);
+}
+
+/* Reset */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: transparent;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Glassmorphism button base */
+.glass-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-glass);
+  backdrop-filter: var(--backdrop-blur);
+  -webkit-backdrop-filter: var(--backdrop-blur);
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  box-shadow: var(--shadow-glass), var(--shadow-inner);
+  transition: all 0.15s ease;
+}
+
+.glass-btn svg {
+  fill: var(--text-primary);
+  width: 16px;
+  height: 16px;
+}
+
+.glass-btn.hover {
+  background: var(--bg-glass-hover);
+  border-color: var(--border-glass-hover);
+  transform: translateY(-1px);
+}
+
+.glass-btn.active {
+  background: var(--bg-glass-active);
+  transform: translateY(0);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.glass-btn.disabled {
+  background: var(--bg-glass-disabled);
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.glass-btn.disabled svg {
+  fill: var(--text-disabled);
+}
+
+/* Glassmorphism bar */
+.glass-bar {
+  background: var(--bg-glass);
+  backdrop-filter: var(--backdrop-blur);
+  -webkit-backdrop-filter: var(--backdrop-blur);
+  border-bottom: 1px solid var(--border-glass);
+  box-shadow: var(--shadow-glass);
+}
+
+/* Address bar */
+.address-bar {
+  display: flex;
+  align-items: center;
+  background: var(--bg-glass);
+  backdrop-filter: var(--backdrop-blur);
+  border: 1px solid var(--border-glass);
+  border-radius: 20px;
+  padding: 0 12px;
+  height: 28px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.address-bar input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.address-bar input::placeholder {
+  color: var(--text-secondary);
+}
+
+/* Loading spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading svg {
+  animation: spin 1s linear infinite;
+}

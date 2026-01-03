@@ -468,13 +468,10 @@ pub const Viewer = struct {
         try self.displayFrameWithDimensions(frame.data, frame_width, frame_height);
         self.last_frame_time = now;
 
-        // Update navigation state for button rendering
-        self.updateNavigationState();
-
         return true;
     }
 
-    /// Update navigation button states from Chrome history
+    /// Update navigation button states from Chrome history (call after navigation events)
     fn updateNavigationState(self: *Viewer) void {
         const nav_state = screenshot_api.getNavigationState(self.cdp_client, self.allocator) catch return;
         self.ui_state.can_go_back = nav_state.can_go_back;
@@ -807,22 +804,17 @@ pub const Viewer = struct {
         } else if (col <= 5) {
             // Back button
             self.log("[TABBAR] Back button clicked\n", .{});
-            const navigated = try screenshot_api.goBack(self.cdp_client, self.allocator);
-            if (navigated) {
-                try self.refresh();
-            }
+            _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
+            self.updateNavigationState();
         } else if (col <= 8) {
             // Forward button
             self.log("[TABBAR] Forward button clicked\n", .{});
-            const navigated = try screenshot_api.goForward(self.cdp_client, self.allocator);
-            if (navigated) {
-                try self.refresh();
-            }
+            _ = try screenshot_api.goForward(self.cdp_client, self.allocator);
+            self.updateNavigationState();
         } else if (col <= 11) {
             // Refresh button
             self.log("[TABBAR] Refresh button clicked\n", .{});
             try screenshot_api.reload(self.cdp_client, self.allocator, false);
-            try self.refresh();
         } else if (col >= 13) {
             // Location bar - enter URL prompt mode
             self.log("[TABBAR] Location bar clicked\n", .{});
@@ -878,7 +870,8 @@ pub const Viewer = struct {
                             .browser_y = coords.y,
                         };
 
-                        try self.refresh();
+                        // Update navigation state (click may have navigated)
+                        self.updateNavigationState();
                     } else {
                         // Click is in tab bar - handle button clicks
                         try self.handleTabBarClick(mouse.x, mapper);

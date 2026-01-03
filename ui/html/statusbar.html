@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html class="THEME_CLASS">
+<head>
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    body {
+      width: WIDTH_PX;
+      height: 24px;
+    }
+    .statusbar {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      height: 100%;
+      padding: 0 12px;
+      gap: 16px;
+      background: var(--bg-glass);
+      backdrop-filter: var(--backdrop-blur);
+      -webkit-backdrop-filter: var(--backdrop-blur);
+      border-top: 1px solid var(--border-glass);
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .status-left {
+      display: flex;
+      gap: 12px;
+    }
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .status-item kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 4px;
+      background: var(--bg-glass);
+      border: 1px solid var(--border-glass);
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: inherit;
+      color: var(--text-primary);
+    }
+    .status-right {
+      margin-left: auto;
+      display: flex;
+      gap: 12px;
+    }
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+    .dot.loading {
+      animation: pulse 1s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+  </style>
+</head>
+<body>
+  <div class="statusbar">
+    <div class="status-left">
+      <div class="status-item">
+        <kbd>?</kbd>
+        <span>Help</span>
+      </div>
+      <div class="status-item">
+        <kbd>g</kbd>
+        <span>Go to</span>
+      </div>
+      <div class="status-item">
+        <kbd>f</kbd>
+        <span>Forms</span>
+      </div>
+      <div class="status-item">
+        <kbd>q</kbd>
+        <span>Quit</span>
+      </div>
+    </div>
+    <div class="status-right">
+      <div class="status-indicator">
+        <span class="dot"></span>
+        <span>Ready</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
