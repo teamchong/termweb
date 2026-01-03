@@ -20,9 +20,7 @@ fn scrollByDelta(
 
     const result = try client.sendCommand("Input.dispatchMouseEvent", params);
     defer allocator.free(result);
-
-    // Small delay for browser to process wheel event
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    // Screencast mode: frames arrive automatically, no delay needed
 }
 
 /// Scroll down by one line (~20px)
