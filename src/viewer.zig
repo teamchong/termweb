@@ -267,31 +267,20 @@ pub const Viewer = struct {
 
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
 
-        // Debug to stderr (bypasses any buffering issues)
-        std.debug.print("[EXIT] Main loop exited\n", .{});
-
         // Stop screencast - don't wait for response (non-blocking)
-        self.log("[DEBUG] Stopping screencast...\n", .{});
-        std.debug.print("[EXIT] Stopping screencast...\n", .{});
         if (self.screencast_mode) {
             // Stop reader thread first to prevent blocking on sendCommand
             self.cdp_client.ws_client.stopReaderThread();
             self.screencast_mode = false;
         }
-        self.log("[DEBUG] Screencast stopped\n", .{});
-        std.debug.print("[EXIT] Screencast stopped\n", .{});
 
         // Cleanup - clear images, reset screen, show cursor
-        self.log("[DEBUG] Cleaning up terminal...\n", .{});
-        std.debug.print("[EXIT] Cleaning up terminal...\n", .{});
         self.kitty.clearAll(writer) catch {};
         Screen.clear(writer) catch {};
         Screen.showCursor(writer) catch {};
         Screen.moveCursor(writer, 1, 1) catch {};
         writer.writeAll("\x1b[0m") catch {}; // Reset all attributes
         writer.flush() catch {};
-        self.log("[DEBUG] Terminal cleanup done, run() returning\n", .{});
-        std.debug.print("[EXIT] Terminal cleanup done, run() returning\n", .{});
     }
 
     /// Handle terminal resize (SIGWINCH)
@@ -1279,7 +1268,6 @@ pub const Viewer = struct {
     }
 
     pub fn deinit(self: *Viewer) void {
-        std.debug.print("[EXIT] Viewer.deinit() starting\n", .{});
         if (self.prompt_buffer) |*p| p.deinit();
         if (self.form_context) |ctx| {
             ctx.deinit();
@@ -1288,8 +1276,6 @@ pub const Viewer = struct {
         if (self.debug_log) |file| {
             file.close();
         }
-        std.debug.print("[EXIT] Calling terminal.deinit()\n", .{});
         self.terminal.deinit();
-        std.debug.print("[EXIT] Viewer.deinit() done\n", .{});
     }
 };
