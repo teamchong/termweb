@@ -139,9 +139,33 @@ pub const Terminal = struct {
 
     /// Restore original terminal settings
     pub fn restore(self: *Terminal) !void {
+        // Disable mouse first (while still in raw mode)
         self.disableMouse() catch {};
+
+        // Drain any buffered input (mouse events, etc.)
+        self.drainInput();
+
+        // Restore original terminal settings
         if (self.original_termios) |orig| {
             try std.posix.tcsetattr(self.stdin_fd, .FLUSH, orig);
+        }
+    }
+
+    /// Drain any pending input from stdin
+    fn drainInput(self: *Terminal) void {
+        var buf: [256]u8 = undefined;
+        // O_NONBLOCK value (0x0004 on macOS, 0x800 on Linux)
+        const O_NONBLOCK: usize = if (@import("builtin").os.tag == .macos) 0x0004 else 0x800;
+
+        // Set non-blocking read temporarily
+        const flags = std.posix.fcntl(self.stdin_fd, std.posix.F.GETFL, 0) catch return;
+        _ = std.posix.fcntl(self.stdin_fd, std.posix.F.SETFL, flags | O_NONBLOCK) catch return;
+        defer _ = std.posix.fcntl(self.stdin_fd, std.posix.F.SETFL, flags) catch {};
+
+        // Read and discard all pending input
+        while (true) {
+            const n = std.posix.read(self.stdin_fd, &buf) catch break;
+            if (n == 0) break;
         }
     }
 
