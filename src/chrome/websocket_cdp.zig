@@ -124,6 +124,29 @@ pub const WebSocketCdpClient = struct {
         self.allocator.destroy(self);
     }
 
+    /// Send command without waiting for response (fire-and-forget)
+    /// Use for actions like scroll, click, mouse events
+    pub fn sendCommandAsync(self: *WebSocketCdpClient, method: []const u8, params: ?[]const u8) !void {
+        const id = self.next_id.fetchAdd(1, .monotonic);
+
+        const command = if (params) |p|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
+                .{ id, method, p },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":{d},\"method\":\"{s}\"}}",
+                .{ id, method },
+            );
+        defer self.allocator.free(command);
+
+        try self.sendFrame(0x1, command);
+        // Don't wait for response - fire and forget
+    }
+
     pub fn sendCommand(self: *WebSocketCdpClient, method: []const u8, params: ?[]const u8) ![]u8 {
         // Get unique ID
         const id = self.next_id.fetchAdd(1, .monotonic);

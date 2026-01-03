@@ -18,9 +18,8 @@ fn scrollByDelta(
     );
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Input.dispatchMouseEvent", params);
-    defer allocator.free(result);
-    // Screencast mode: frames arrive automatically, no delay needed
+    // Fire-and-forget: don't wait for response
+    try client.sendCommandAsync("Input.dispatchMouseEvent", params);
 }
 
 /// Scroll down by one line (~20px)

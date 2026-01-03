@@ -142,6 +142,15 @@ pub const CdpClient = struct {
         return self.ws_client.sendCommand(method, params);
     }
 
+    /// Send CDP command without waiting for response (fire-and-forget)
+    pub fn sendCommandAsync(
+        self: *CdpClient,
+        method: []const u8,
+        params: ?[]const u8,
+    ) !void {
+        return self.ws_client.sendCommandAsync(method, params);
+    }
+
     /// Start screencast streaming with exact viewport dimensions for 1:1 coordinate mapping
     pub fn startScreencast(
         self: *CdpClient,

@@ -9,33 +9,25 @@ pub fn clickAt(
     x: u32,
     y: u32,
 ) !void {
-    // Mouse pressed
+    // Mouse pressed - fire and forget
     const press_params = try std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"mousePressed\",\"x\":{d},\"y\":{d},\"button\":\"left\",\"clickCount\":1}}",
         .{ x, y },
     );
     defer allocator.free(press_params);
+    try client.sendCommandAsync("Input.dispatchMouseEvent", press_params);
 
-    const press_result = try client.sendCommand("Input.dispatchMouseEvent", press_params);
-    defer allocator.free(press_result);
-
-    // Small delay
-    std.Thread.sleep(50 * std.time.ns_per_ms);
-
-    // Mouse released
+    // Mouse released - fire and forget
     const release_params = try std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"mouseReleased\",\"x\":{d},\"y\":{d},\"button\":\"left\",\"clickCount\":1}}",
         .{ x, y },
     );
     defer allocator.free(release_params);
+    try client.sendCommandAsync("Input.dispatchMouseEvent", release_params);
 
-    const release_result = try client.sendCommand("Input.dispatchMouseEvent", release_params);
-    defer allocator.free(release_result);
-
-    // Wait for potential navigation
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    // Screencast mode: frames arrive automatically, no blocking waits needed
 }
 
 /// Click on an element (center of bounding box)
