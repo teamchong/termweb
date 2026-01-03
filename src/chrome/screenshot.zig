@@ -130,8 +130,7 @@ pub fn goBack(
     };
     defer allocator.free(result);
 
-    // Wait for navigation (temporary - M3 will use events)
-    std.Thread.sleep(1 * std.time.ns_per_s);
+    // In screencast mode, new frames arrive automatically - no need to block
     return true;
 }
 
@@ -147,7 +146,7 @@ pub fn goForward(
     };
     defer allocator.free(result);
 
-    std.Thread.sleep(1 * std.time.ns_per_s);
+    // In screencast mode, new frames arrive automatically - no need to block
     return true;
 }
 
@@ -167,7 +166,7 @@ pub fn reload(
     const result = try client.sendCommand("Page.reload", params);
     defer allocator.free(result);
 
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    // In screencast mode, new frames arrive automatically - no need to block
 }
 
 /// Start screencast streaming (event-driven)
