@@ -110,17 +110,15 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
 
-    // Reserve space for tab bar + status bar (2 rows)
-    // IMPORTANT: Calculate consistently with CoordinateMapper to avoid click offset bugs
-    // Use (rows - 2) * row_height, NOT height_px - 2*row_height, due to integer division
+    // Reserve 1 row for tab bar at top (no status bar)
     const row_height: u32 = if (size.height_px > 0 and size.rows > 0)
         @as(u32, size.height_px) / size.rows
     else
         20;
-    const content_rows: u32 = if (size.rows > 2) size.rows - 2 else 1;
+    const content_rows: u32 = if (size.rows > 1) size.rows - 1 else 1;
     const available_height = content_rows * row_height;
 
-    // Apply min/max constraints
+    // Apply min constraints to ensure websites render properly
     const viewport_width: u32 = @max(MIN_WIDTH, raw_width);
     const viewport_height: u32 = @max(MIN_HEIGHT, available_height);
 
@@ -146,7 +144,11 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.debug.print("Make sure Chrome is installed or set $CHROME_BIN\n", .{});
         std.process.exit(1);
     };
-    defer chrome_instance.deinit();
+    defer {
+        std.debug.print("[EXIT] cli: chrome_instance.deinit() starting\n", .{});
+        chrome_instance.deinit();
+        std.debug.print("[EXIT] cli: chrome_instance.deinit() done\n", .{});
+    }
 
     std.debug.print("Chrome launched\n", .{});
 
@@ -155,7 +157,11 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.debug.print("Error connecting to Chrome DevTools Protocol: {}\n", .{err});
         std.process.exit(1);
     };
-    defer client.deinit();
+    defer {
+        std.debug.print("[EXIT] cli: client.deinit() starting\n", .{});
+        client.deinit();
+        std.debug.print("[EXIT] cli: client.deinit() done\n", .{});
+    }
 
     std.debug.print("Connected to Chrome\n", .{});
     std.debug.print("Navigating to: {s}\n", .{url});
@@ -170,9 +176,15 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Run viewer
     var viewer = try viewer_mod.Viewer.init(allocator, client, url, viewport_width, viewport_height);
-    defer viewer.deinit();
+    defer {
+        std.debug.print("[EXIT] cli: viewer.deinit() starting\n", .{});
+        viewer.deinit();
+        std.debug.print("[EXIT] cli: viewer.deinit() done\n", .{});
+    }
 
+    std.debug.print("[EXIT] cli: calling viewer.run()\n", .{});
     try viewer.run();
+    std.debug.print("[EXIT] cli: viewer.run() returned\n", .{});
 }
 
 /// Check if terminal supports Kitty graphics protocol

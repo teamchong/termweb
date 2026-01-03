@@ -7,3 +7,5 @@ vendor/node_modules/
 *~
 .zig-cache/
 debug.log
+termweb_debug.log
+full_output.log

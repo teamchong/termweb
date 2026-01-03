@@ -222,7 +222,24 @@ pub const WebSocketCdpClient = struct {
     pub fn stopReaderThread(self: *WebSocketCdpClient) void {
         if (self.reader_thread) |thread| {
             self.running.store(false, .release);
-            thread.join();
+
+            // Set a short read timeout to unblock the reader thread
+            // This allows the thread to check the running flag and exit
+            const timeout = std.posix.timeval{
+                .sec = 0,
+                .usec = 100_000, // 100ms timeout
+            };
+            std.posix.setsockopt(self.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+
+            // Wait for thread with timeout - if it doesn't exit quickly, detach it
+            // Give it a chance to exit cleanly
+            var waited: u32 = 0;
+            while (waited < 10) : (waited += 1) {
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                // Check if thread has exited by trying a non-blocking join
+                // (Zig doesn't have tryJoin, so we just wait briefly and hope)
+            }
+            thread.detach(); // Don't block forever waiting for thread
             self.reader_thread = null;
         }
     }
@@ -252,9 +269,14 @@ pub const WebSocketCdpClient = struct {
         while (self.running.load(.acquire)) {
             var frame = self.recvFrame() catch |err| {
                 if (err == error.ConnectionClosed) break;
+                // On timeout or other errors, check if we should stop
+                if (!self.running.load(.acquire)) break;
                 continue;
             };
             defer frame.deinit();
+
+            // Check if we should stop before processing
+            if (!self.running.load(.acquire)) break;
 
             // Route message based on type
             if (std.mem.indexOf(u8, frame.payload, "\"method\":")) |_| {

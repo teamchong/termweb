@@ -35,13 +35,13 @@ pub const KittyGraphics = struct {
         };
     }
 
-    /// Display PNG image data
+    /// Display PNG image data, returns the image ID used
     pub fn displayPNG(
         self: *KittyGraphics,
         writer: anytype,
         png_data: []const u8,
         opts: DisplayOptions,
-    ) !void {
+    ) !u32 {
         const image_id = self.next_image_id;
         self.next_image_id += 1;
 
@@ -83,8 +83,7 @@ pub const KittyGraphics = struct {
         try writer.writeAll(encoded);
         try writer.writeAll("\x1b\\");
 
-        // Debug logging removed to avoid polluting raw mode display
-        // (Enable only if needed for debugging)
+        return image_id;
     }
 
     /// Clear all images

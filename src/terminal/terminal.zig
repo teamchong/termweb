@@ -7,17 +7,47 @@ pub const TerminalSize = struct {
     height_px: u16,
 };
 
+/// Global flag for SIGWINCH (terminal resize) detection
+/// Using atomic to safely communicate between signal handler and main thread
+var resize_pending = std.atomic.Value(bool).init(false);
+
+/// SIGWINCH signal handler - sets the resize flag
+fn handleSigwinch(_: c_int) callconv(.c) void {
+    resize_pending.store(true, .release);
+}
+
 pub const Terminal = struct {
     stdin_fd: std.posix.fd_t,
     original_termios: ?std.posix.termios,
     mouse_enabled: bool,
+    sigwinch_installed: bool,
 
     pub fn init() Terminal {
         return .{
             .stdin_fd = std.posix.STDIN_FILENO,
             .original_termios = null,
             .mouse_enabled = false,
+            .sigwinch_installed = false,
         };
+    }
+
+    /// Install SIGWINCH handler for terminal resize detection
+    pub fn installResizeHandler(self: *Terminal) !void {
+        if (self.sigwinch_installed) return;
+
+        const act = std.posix.Sigaction{
+            .handler = .{ .handler = handleSigwinch },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+
+        std.posix.sigaction(std.posix.SIG.WINCH, &act, null);
+        self.sigwinch_installed = true;
+    }
+
+    /// Check if terminal was resized (clears the flag)
+    pub fn checkResize(_: *Terminal) bool {
+        return resize_pending.swap(false, .acq_rel);
     }
 
     /// Enter raw mode (disable line buffering, echo)

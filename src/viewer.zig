@@ -163,6 +163,10 @@ pub const Viewer = struct {
         self.log("[DEBUG] Raw mode enabled successfully\n", .{});
         defer self.terminal.restore() catch {};
 
+        // Install resize handler for SIGWINCH
+        try self.terminal.installResizeHandler();
+        self.log("[DEBUG] Resize handler installed\n", .{});
+
         self.log("[DEBUG] Enabling mouse...\n", .{});
         try self.terminal.enableMouse();
         self.input.mouse_enabled = true;
@@ -222,6 +226,12 @@ pub const Viewer = struct {
                 });
             }
 
+            // Check for terminal resize (SIGWINCH)
+            if (self.terminal.checkResize()) {
+                self.log("[RESIZE] Terminal resized, updating viewport...\n", .{});
+                try self.handleResize();
+            }
+
             // Check for input (non-blocking)
             const input = self.input.readInput() catch |err| {
                 self.log("[ERROR] readInput() failed: {}\n", .{err});
@@ -242,14 +252,13 @@ pub const Viewer = struct {
             if (self.screencast_mode and self.mode == .normal) {
                 _ = self.tryRenderScreencast() catch {};
 
-                // Always render UI chrome on top
+                // Render UI overlays
                 var stdout_buf2: [8192]u8 = undefined;
                 const stdout_file2 = std.fs.File.stdout();
                 var stdout_writer2 = stdout_file2.writer(&stdout_buf2);
                 const writer2 = &stdout_writer2.interface;
                 self.renderCursor(writer2) catch {};
-                self.renderUIChrome(writer2) catch {};
-                self.drawStatus() catch {};
+                self.renderUIChrome(writer2) catch {}; // Tab bar only (no status bar)
             }
 
             // Small sleep to avoid busy-waiting
@@ -258,15 +267,110 @@ pub const Viewer = struct {
 
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
 
-        // Stop screencast
+        // Debug to stderr (bypasses any buffering issues)
+        std.debug.print("[EXIT] Main loop exited\n", .{});
+
+        // Stop screencast - don't wait for response (non-blocking)
+        self.log("[DEBUG] Stopping screencast...\n", .{});
+        std.debug.print("[EXIT] Stopping screencast...\n", .{});
         if (self.screencast_mode) {
-            screenshot_api.stopScreencast(self.cdp_client, self.allocator) catch {};
+            // Stop reader thread first to prevent blocking on sendCommand
+            self.cdp_client.ws_client.stopReaderThread();
+            self.screencast_mode = false;
+        }
+        self.log("[DEBUG] Screencast stopped\n", .{});
+        std.debug.print("[EXIT] Screencast stopped\n", .{});
+
+        // Cleanup - clear images, reset screen, show cursor
+        self.log("[DEBUG] Cleaning up terminal...\n", .{});
+        std.debug.print("[EXIT] Cleaning up terminal...\n", .{});
+        self.kitty.clearAll(writer) catch {};
+        Screen.clear(writer) catch {};
+        Screen.showCursor(writer) catch {};
+        Screen.moveCursor(writer, 1, 1) catch {};
+        writer.writeAll("\x1b[0m") catch {}; // Reset all attributes
+        writer.flush() catch {};
+        self.log("[DEBUG] Terminal cleanup done, run() returning\n", .{});
+        std.debug.print("[EXIT] Terminal cleanup done, run() returning\n", .{});
+    }
+
+    /// Handle terminal resize (SIGWINCH)
+    fn handleResize(self: *Viewer) !void {
+        // Get new terminal size
+        const size = try self.terminal.getSize();
+
+        // Calculate new viewport dimensions (same logic as cli.zig)
+        const MIN_WIDTH: u32 = 800;
+        const MIN_HEIGHT: u32 = 600;
+
+        const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
+
+        // Reserve 1 row for tab bar at top (no status bar)
+        const row_height: u32 = if (size.height_px > 0 and size.rows > 0)
+            @as(u32, size.height_px) / size.rows
+        else
+            20;
+        const content_rows: u32 = if (size.rows > 1) size.rows - 1 else 1;
+        const available_height = content_rows * row_height;
+
+        const new_width: u32 = @max(MIN_WIDTH, raw_width);
+        const new_height: u32 = @max(MIN_HEIGHT, available_height);
+
+        self.log("[RESIZE] New size: {}x{} px, {}x{} cells -> viewport {}x{}\n", .{
+            size.width_px, size.height_px, size.cols, size.rows, new_width, new_height,
+        });
+
+        // Skip if dimensions haven't changed significantly
+        if (new_width == self.viewport_width and new_height == self.viewport_height) {
+            self.log("[RESIZE] Dimensions unchanged, skipping\n", .{});
+            return;
         }
 
-        // Cleanup
+        // Update stored viewport dimensions
+        self.viewport_width = new_width;
+        self.viewport_height = new_height;
+
+        // Stop current screencast
+        if (self.screencast_mode) {
+            screenshot_api.stopScreencast(self.cdp_client, self.allocator) catch {};
+            self.screencast_mode = false;
+        }
+
+        // Update Chrome viewport
+        try screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height);
+
+        // Clear screen and all Kitty images
+        var stdout_buf: [8192]u8 = undefined;
+        const stdout_file = std.fs.File.stdout();
+        var stdout_writer = stdout_file.writer(&stdout_buf);
+        const writer = &stdout_writer.interface;
         try self.kitty.clearAll(writer);
         try Screen.clear(writer);
+        try Screen.moveCursor(writer, 1, 1); // Reset cursor to top-left
         try writer.flush();
+
+        // Restart screencast with new dimensions
+        try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
+            .format = .png,
+            .width = new_width,
+            .height = new_height,
+        });
+        self.screencast_mode = true;
+
+        // Reset frame time and wait for first frame before rendering UI
+        self.last_frame_time = 0;
+
+        // Wait for first frame after resize (blocking, with timeout)
+        var retries: u32 = 0;
+        while (retries < 50) : (retries += 1) {
+            if (try self.tryRenderScreencast()) {
+                self.log("[RESIZE] First frame after resize received\n", .{});
+                break;
+            }
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+        }
+
+        self.log("[RESIZE] Viewport updated to {}x{}\n", .{ new_width, new_height });
     }
 
     /// Refresh display - no-op in screencast mode (frames arrive automatically)
@@ -391,15 +495,10 @@ pub const Viewer = struct {
         defer self.allocator.free(png_data);
         try decoder.decode(png_data, base64_png);
 
-        // Get terminal size
+        // Get terminal size - reserve 1 row for tab bar at top
         const size = try self.terminal.getSize();
-        // Reserve 1 row for tab bar at top, 1 row for status bar at bottom
         const tabbar_rows: u32 = 1;
-        const statusbar_rows: u32 = 1;
-        const content_rows = if (size.rows > tabbar_rows + statusbar_rows)
-            size.rows - tabbar_rows - statusbar_rows
-        else
-            1;
+        const content_rows = if (size.rows > tabbar_rows) size.rows - tabbar_rows else 1;
         const display_cols = if (size.cols > 0) size.cols else 80;
 
         // Update coordinate mapper with ACTUAL frame dimensions from CDP
@@ -417,11 +516,10 @@ pub const Viewer = struct {
             png_data.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
         });
 
-        // Move cursor to row 2 (after tab bar) before displaying content
-        try writer.print("\x1b[{d};1H", .{tabbar_rows + 1});
+        // Move cursor to row 2 (after tab bar)
+        try writer.writeAll("\x1b[2;1H");
 
-        // Display via Kitty graphics protocol with z-index layering
-        // Web content is at z=0, UI chrome will be at z=5-10
+        // Display via Kitty graphics protocol - content area (below tab bar)
         _ = try self.kitty.displayPNG(writer, png_data, .{
             .rows = content_rows,
             .columns = display_cols,
@@ -486,6 +584,10 @@ pub const Viewer = struct {
 
         // Dark background for tab bar
         try writer.writeAll("\x1b[48;2;30;30;30m"); // Dark grey background
+
+        // Close button (leftmost) - red on hover style
+        try writer.writeAll("\x1b[38;2;255;95;87m"); // Red color
+        try writer.writeAll(" \xe2\x9c\x95 "); // ✕
 
         // Back button
         if (self.ui_state.can_go_back) {
@@ -683,6 +785,53 @@ pub const Viewer = struct {
         }
     }
 
+    /// Handle click on tab bar buttons
+    fn handleTabBarClick(self: *Viewer, pixel_x: u16, mapper: CoordinateMapper) !void {
+        // Calculate cell width for button positions
+        const cell_width: u16 = if (mapper.terminal_cols > 0)
+            mapper.terminal_width_px / mapper.terminal_cols
+        else
+            14;
+
+        // Convert pixel X to column (0-indexed)
+        const col = pixel_x / cell_width;
+
+        // Tab bar layout: " ✕  ◀  ▶  ↻ │ URL..."
+        // Close: cols 0-2, Back: cols 3-5, Forward: cols 6-8, Refresh: cols 9-11, URL: cols 13+
+        self.log("[TABBAR] Click at col {}\n", .{col});
+
+        if (col <= 2) {
+            // Close button - quit
+            self.log("[TABBAR] Close button clicked\n", .{});
+            self.running = false;
+        } else if (col <= 5) {
+            // Back button
+            self.log("[TABBAR] Back button clicked\n", .{});
+            const navigated = try screenshot_api.goBack(self.cdp_client, self.allocator);
+            if (navigated) {
+                try self.refresh();
+            }
+        } else if (col <= 8) {
+            // Forward button
+            self.log("[TABBAR] Forward button clicked\n", .{});
+            const navigated = try screenshot_api.goForward(self.cdp_client, self.allocator);
+            if (navigated) {
+                try self.refresh();
+            }
+        } else if (col <= 11) {
+            // Refresh button
+            self.log("[TABBAR] Refresh button clicked\n", .{});
+            try screenshot_api.reload(self.cdp_client, self.allocator, false);
+            try self.refresh();
+        } else if (col >= 13) {
+            // Location bar - enter URL prompt mode
+            self.log("[TABBAR] Location bar clicked\n", .{});
+            self.mode = .url_prompt;
+            self.prompt_buffer = try PromptBuffer.init(self.allocator);
+            try self.drawStatus();
+        }
+    }
+
     /// Handle mouse event in normal mode
     fn handleMouseNormal(self: *Viewer, mouse: MouseEvent) !void {
         const mapper = self.coord_mapper orelse return;
@@ -731,9 +880,8 @@ pub const Viewer = struct {
 
                         try self.refresh();
                     } else {
-                        if (self.debug_input) {
-                            self.log("[MOUSE] Click in status line, ignoring\n", .{});
-                        }
+                        // Click is in tab bar - handle button clicks
+                        try self.handleTabBarClick(mouse.x, mapper);
                     }
                 }
             },
@@ -1029,8 +1177,11 @@ pub const Viewer = struct {
         }
     }
 
-    /// Draw status line
+    /// Draw status line (only for non-normal modes that need user input)
     fn drawStatus(self: *Viewer) !void {
+        // Don't show status bar in normal mode - use tab bar instead
+        if (self.mode == .normal) return;
+
         var stdout_buf: [8192]u8 = undefined;
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
@@ -1038,46 +1189,14 @@ pub const Viewer = struct {
 
         const size = try self.terminal.getSize();
 
-        // Move to last row
+        // Move to last row and show dark background
         try Screen.moveCursor(writer, size.rows, 1);
         try Screen.clearLine(writer);
+        try writer.writeAll("\x1b[48;2;40;40;40m\x1b[38;2;220;220;220m"); // Dark bg, light text
 
         // Status text based on mode
         switch (self.mode) {
-            .normal => {
-                // Truncate URL if needed
-                const max_url_len = 40;
-                var url_display: [64]u8 = undefined;
-                const url_str = if (self.current_url.len > max_url_len) blk: {
-                    const truncated = std.fmt.bufPrint(&url_display, "{s}...", .{self.current_url[0..@min(max_url_len - 3, self.current_url.len)]}) catch self.current_url;
-                    break :blk truncated;
-                } else self.current_url;
-
-                if (self.last_click) |click| {
-                    // Show click coordinates for debugging
-                    if (self.coord_mapper) |mapper| {
-                        try writer.print("{s} | T({d},{d}) B({d},{d}) [{d}x{d}px / {d}x{d}cells]", .{
-                            url_str,
-                            click.term_x,
-                            click.term_y,
-                            click.browser_x,
-                            click.browser_y,
-                            mapper.terminal_width_px,
-                            mapper.terminal_height_px,
-                            mapper.terminal_cols,
-                            mapper.terminal_rows,
-                        });
-                    } else {
-                        try writer.print("{s} | Click:({d},{d}) | [?]help", .{
-                            url_str,
-                            click.term_x,
-                            click.term_y,
-                        });
-                    }
-                } else {
-                    try writer.print("{s} | [?]help [Ctrl+Q]uit [f]orm [g]oto [jk]scroll [r]efresh [b]ack", .{url_str});
-                }
-            },
+            .normal => unreachable, // Already returned above
             .url_prompt => {
                 try writer.print("Go to URL: ", .{});
                 if (self.prompt_buffer) |*p| {
@@ -1107,7 +1226,8 @@ pub const Viewer = struct {
                 try writer.print("HELP | [?] or [q] to close | [Ctrl+Q/W/C] or [ESC] to quit", .{});
             },
         }
-        try writer.flush();  // Flush status line
+        try writer.writeAll("\x1b[0m"); // Reset colors
+        try writer.flush();
     }
 
     /// Draw help overlay
@@ -1159,6 +1279,7 @@ pub const Viewer = struct {
     }
 
     pub fn deinit(self: *Viewer) void {
+        std.debug.print("[EXIT] Viewer.deinit() starting\n", .{});
         if (self.prompt_buffer) |*p| p.deinit();
         if (self.form_context) |ctx| {
             ctx.deinit();
@@ -1167,6 +1288,8 @@ pub const Viewer = struct {
         if (self.debug_log) |file| {
             file.close();
         }
+        std.debug.print("[EXIT] Calling terminal.deinit()\n", .{});
         self.terminal.deinit();
+        std.debug.print("[EXIT] Viewer.deinit() done\n", .{});
     }
 };

@@ -82,9 +82,14 @@ pub fn scrollPageDown(
     viewport_width: u32,
     viewport_height: u32,
 ) !void {
+    if (viewport_height == 0) return; // Nothing to scroll
     const x = viewport_width / 2;
     const y = viewport_height / 2;
-    const delta = -@as(i32, @intCast(viewport_height - 40));
+    const delta_val = if (viewport_height > 40)
+        viewport_height - 40
+    else
+        viewport_height;
+    const delta = -@as(i32, @intCast(delta_val));
     try scrollByDelta(client, allocator, x, y, delta);
 }
 
@@ -95,8 +100,12 @@ pub fn scrollPageUp(
     viewport_width: u32,
     viewport_height: u32,
 ) !void {
+    if (viewport_height == 0) return; // Nothing to scroll
     const x = viewport_width / 2;
     const y = viewport_height / 2;
-    const delta = @as(i32, @intCast(viewport_height - 40));
+    const delta = if (viewport_height > 40)
+        @as(i32, @intCast(viewport_height - 40))
+    else
+        @as(i32, @intCast(viewport_height));
     try scrollByDelta(client, allocator, x, y, delta);
 }

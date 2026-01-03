@@ -175,10 +175,10 @@ fn parseElementsFromJson(allocator: std.mem.Allocator, json: []const u8) ![]Inte
                 if (h == .string) try allocator.dupe(u8, h.string) else null
             else
                 null,
-            .x = @intCast(elem_obj.get("x").?.integer),
-            .y = @intCast(elem_obj.get("y").?.integer),
-            .width = @intCast(elem_obj.get("width").?.integer),
-            .height = @intCast(elem_obj.get("height").?.integer),
+            .x = std.math.cast(u32, elem_obj.get("x").?.integer) orelse continue,
+            .y = std.math.cast(u32, elem_obj.get("y").?.integer) orelse continue,
+            .width = std.math.cast(u32, elem_obj.get("width").?.integer) orelse continue,
+            .height = std.math.cast(u32, elem_obj.get("height").?.integer) orelse continue,
             .selector = try allocator.dupe(u8, elem_obj.get("selector").?.string),
         };
     }

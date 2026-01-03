@@ -31,9 +31,8 @@ pub const CoordinateMapper = struct {
         else
             20; // fallback
 
-        // Content rows = total rows - tab bar - status bar
-        const content_rows: u16 = if (terminal_rows > 2) terminal_rows - 2 else 1;
-        // Actual pixel height the image is rendered in
+        // Reserve 1 row for tab bar at top (no status bar)
+        const content_rows: u16 = if (terminal_rows > 1) terminal_rows - 1 else 1;
         const content_pixel_height = content_rows * cell_height;
 
         return CoordinateMapper{
