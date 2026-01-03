@@ -141,6 +141,45 @@ pub const CdpClient = struct {
         // Delegate to WebSocket client
         return self.ws_client.sendCommand(method, params);
     }
+
+    /// Start screencast streaming with exact viewport dimensions for 1:1 coordinate mapping
+    pub fn startScreencast(
+        self: *CdpClient,
+        format: []const u8,
+        quality: u8,
+        width: u32,
+        height: u32,
+    ) !void {
+        // Use exact viewport dimensions - no scaling needed, coordinates are 1:1
+        const params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"format\":\"{s}\",\"quality\":{d},\"maxWidth\":{d},\"maxHeight\":{d},\"everyNthFrame\":1}}",
+            .{ format, quality, width, height },
+        );
+        defer self.allocator.free(params);
+
+        const result = try self.sendCommand("Page.startScreencast", params);
+        defer self.allocator.free(result);
+
+        // Start reader thread for event handling
+        try self.ws_client.startReaderThread();
+    }
+
+    /// Stop screencast streaming
+    pub fn stopScreencast(self: *CdpClient) !void {
+        const result = try self.sendCommand("Page.stopScreencast", null);
+        defer self.allocator.free(result);
+    }
+
+    /// Get latest screencast frame (non-blocking)
+    pub fn getLatestFrame(self: *CdpClient) ?websocket_cdp.ScreencastFrame {
+        return self.ws_client.getLatestFrame();
+    }
+
+    /// Get count of frames received (for debugging)
+    pub fn getFrameCount(self: *CdpClient) u32 {
+        return self.ws_client.getFrameCount();
+    }
 };
 
 /// Extract HTTP URL from WebSocket URL

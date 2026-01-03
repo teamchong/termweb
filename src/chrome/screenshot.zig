@@ -26,8 +26,11 @@ pub const ScreenshotFormat = enum {
 
 pub const ScreenshotOptions = struct {
     format: ScreenshotFormat = .png,
-    quality: ?u8 = null, // 0-100, only for JPEG
+    quality: u8 = 80, // 0-100, for JPEG (ignored for PNG)
     full_page: bool = false,
+    // Viewport dimensions for screencast (1:1 coordinate mapping)
+    width: u32 = 1920,
+    height: u32 = 1080,
 };
 
 /// Navigate to URL and wait for load
@@ -39,13 +42,14 @@ pub fn navigateToUrl(
     // std.debug.print("[DEBUG] navigateToUrl() starting with url: {s}\n", .{url});
 
     // Normalize URL - add https:// if no protocol specified
-    const normalized_url = if (std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://"))
+    const has_protocol = std.mem.indexOf(u8, url, "://") != null;
+    const normalized_url = if (has_protocol)
         url
     else
         try std.fmt.allocPrint(allocator, "https://{s}", .{url});
     defer if (normalized_url.ptr != url.ptr) allocator.free(normalized_url);
 
-    // std.debug.print("[DEBUG] Normalized URL: {s}\n", .{normalized_url});
+    std.debug.print("[DEBUG] navigateToUrl: {s}\n", .{normalized_url});
 
     const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{normalized_url});
     defer allocator.free(params);
@@ -167,13 +171,19 @@ pub fn reload(
 }
 
 /// Start screencast streaming (event-driven)
+/// Pass exact viewport dimensions for 1:1 coordinate mapping (no scaling)
 pub fn startScreencast(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
     options: ScreenshotOptions,
 ) !void {
     _ = allocator;
-    return client.startScreencast(options.format.toString(), 30);
+    return client.startScreencast(
+        options.format.toString(),
+        options.quality,
+        options.width,
+        options.height,
+    );
 }
 
 /// Stop screencast streaming

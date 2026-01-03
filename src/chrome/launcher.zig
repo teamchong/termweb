@@ -78,6 +78,7 @@ pub fn launchChrome(
     // Additional flags for stability and performance
     try args.append(allocator, "--no-first-run");
     try args.append(allocator, "--no-default-browser-check");
+    try args.append(allocator, "--allow-file-access-from-files");
     if (options.disable_gpu) {
         try args.append(allocator, "--disable-gpu");
     }

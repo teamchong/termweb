@@ -85,6 +85,7 @@ pub const Viewer = struct {
     mouse_x: u16,
     mouse_y: u16,
     mouse_visible: bool,
+    cursor_image_id: ?u32,  // Track cursor image ID for cleanup
 
     // Debug flags
     debug_input: bool,
@@ -133,6 +134,7 @@ pub const Viewer = struct {
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
+            .cursor_image_id = null,
             .debug_input = enable_input_debug,
         };
     }
@@ -177,9 +179,13 @@ pub const Viewer = struct {
         try self.kitty.clearAll(writer);
         try writer.flush();
 
-        // Start screencast streaming (always use screencast for best FPS)
-        self.log("[DEBUG] Starting screencast...\n", .{});
-        try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{ .format = .png });
+        // Start screencast streaming with exact viewport dimensions for 1:1 coordinate mapping
+        self.log("[DEBUG] Starting screencast {}x{}...\n", .{ self.viewport_width, self.viewport_height });
+        try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
+            .format = .png,
+            .width = self.viewport_width,
+            .height = self.viewport_height,
+        });
         self.screencast_mode = true;
         self.log("[DEBUG] Screencast started\n", .{});
 
@@ -327,7 +333,7 @@ pub const Viewer = struct {
 
         self.log("[DEBUG] Display dimensions: rows={}, cols={}\n", .{display_rows, display_cols});
 
-        try self.kitty.displayPNG(writer, png_data, .{
+        _ = try self.kitty.displayPNG(writer, png_data, .{
             .rows = display_rows,
             .columns = display_cols,
             .placement_id = 1,
@@ -356,14 +362,23 @@ pub const Viewer = struct {
         var frame = screenshot_api.getLatestScreencastFrame(self.cdp_client) orelse return false;
         defer frame.deinit(); // Proper cleanup!
 
-        self.log("[RENDER] Got frame, {} bytes base64\n", .{frame.data.len});
-        try self.displayFrame(frame.data);
+        // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
+        // Chrome may send different size than requested viewport
+        const frame_width = if (frame.device_width > 0) frame.device_width else self.viewport_width;
+        const frame_height = if (frame.device_height > 0) frame.device_height else self.viewport_height;
+
+        self.log("[RENDER] Frame {}x{} (viewport {}x{}), {} bytes\n", .{
+            frame_width, frame_height,
+            self.viewport_width, self.viewport_height,
+            frame.data.len,
+        });
+        try self.displayFrameWithDimensions(frame.data, frame_width, frame_height);
         self.last_frame_time = now;
         return true;
     }
 
-    /// Display a base64 PNG frame (extracted from refresh logic)
-    fn displayFrame(self: *Viewer, base64_png: []const u8) !void {
+    /// Display a base64 PNG frame with specific dimensions for coordinate mapping
+    fn displayFrameWithDimensions(self: *Viewer, base64_png: []const u8, frame_width: u32, frame_height: u32) !void {
         var stdout_buf: [8192]u8 = undefined;
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
@@ -387,8 +402,19 @@ pub const Viewer = struct {
             1;
         const display_cols = if (size.cols > 0) size.cols else 80;
 
-        self.log("[RENDER] displayFrame: png={} bytes, term={}x{}, display={}x{}\n", .{
-            png_data.len, size.cols, size.rows, display_cols, content_rows,
+        // Update coordinate mapper with ACTUAL frame dimensions from CDP
+        // This ensures click coordinates match what Chrome is rendering
+        self.coord_mapper = CoordinateMapper.init(
+            size.width_px,
+            size.height_px,
+            size.cols,
+            size.rows,
+            frame_width,   // Use actual frame width, not viewport
+            frame_height,  // Use actual frame height, not viewport
+        );
+
+        self.log("[RENDER] displayFrame: png={} bytes, term={}x{}, display={}x{}, frame={}x{}\n", .{
+            png_data.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
         });
 
         // Move cursor to row 2 (after tab bar) before displaying content
@@ -396,7 +422,7 @@ pub const Viewer = struct {
 
         // Display via Kitty graphics protocol with z-index layering
         // Web content is at z=0, UI chrome will be at z=5-10
-        try self.kitty.displayPNG(writer, png_data, .{
+        _ = try self.kitty.displayPNG(writer, png_data, .{
             .rows = content_rows,
             .columns = display_cols,
             .placement_id = Placement.CONTENT,
@@ -406,23 +432,47 @@ pub const Viewer = struct {
         self.log("[RENDER] displayFrame complete\n", .{});
     }
 
+    /// Display a base64 PNG frame (legacy, uses viewport dimensions)
+    fn displayFrame(self: *Viewer, base64_png: []const u8) !void {
+        try self.displayFrameWithDimensions(base64_png, self.viewport_width, self.viewport_height);
+    }
+
     /// Render mouse cursor at current mouse position
     fn renderCursor(self: *Viewer, writer: anytype) !void {
         if (!self.mouse_visible) return;
 
-        // Delete old cursor placement first to prevent trailing
-        try self.kitty.deletePlacement(writer, Placement.CURSOR);
+        // Delete old cursor image to prevent trailing
+        if (self.cursor_image_id) |old_id| {
+            try self.kitty.deleteImage(writer, old_id);
+        }
 
-        // Mouse coordinates are 1-indexed cell coordinates from terminal
-        // Position cursor at mouse cell location, then display cursor PNG
+        // With SGR pixel mode (1016h), mouse_x/y are pixel coordinates
+        // Convert to cell coordinates for ANSI cursor positioning
+        const mapper = self.coord_mapper orelse return;
+        const cell_width = if (mapper.terminal_cols > 0)
+            mapper.terminal_width_px / mapper.terminal_cols
+        else
+            14;
+        const cell_height = mapper.cell_height;
 
-        // Move cursor to mouse position (1-indexed)
-        try writer.print("\x1b[{d};{d}H", .{ self.mouse_y, self.mouse_x });
+        // Calculate cell position (1-indexed for ANSI)
+        const cell_col = if (cell_width > 0) (self.mouse_x / cell_width) + 1 else 1;
+        const cell_row = if (cell_height > 0) (self.mouse_y / cell_height) + 1 else 1;
 
-        // Display cursor PNG with z-index above content
-        try self.kitty.displayPNG(writer, cursor_asset, .{
+        // Calculate pixel offset within cell for precise positioning
+        const x_offset = if (cell_width > 0) self.mouse_x % cell_width else 0;
+        const raw_y_offset = if (cell_height > 0) self.mouse_y % cell_height else 0;
+        const y_offset = if (raw_y_offset > 0) raw_y_offset - 1 else 0; // Adjust for cursor tip alignment
+
+        // Move cursor to cell position
+        try writer.print("\x1b[{d};{d}H", .{ cell_row, cell_col });
+
+        // Display cursor PNG with pixel offset for precision
+        self.cursor_image_id = try self.kitty.displayPNG(writer, cursor_asset, .{
             .placement_id = Placement.CURSOR,
             .z = ZIndex.CURSOR,
+            .x_offset = x_offset,
+            .y_offset = y_offset,
         });
     }
 
@@ -642,17 +692,24 @@ pub const Viewer = struct {
                 if (mouse.button == .left) {
                     // Log mapper details for debugging (if enabled)
                     if (self.debug_input) {
-                        self.log("[MOUSE] Terminal: {}x{} px, Viewport: {}x{}, Status line: {} px\n", .{
+                        self.log("[MOUSE] Terminal: {}x{} px, Viewport: {}x{}, Cell height: {} px\n", .{
                             mapper.terminal_width_px,
                             mapper.terminal_height_px,
                             mapper.viewport_width,
                             mapper.viewport_height,
-                            mapper.status_line_height,
+                            mapper.cell_height,
                         });
                     }
 
                     // Map terminal coordinates to browser viewport
+                    self.log("[COORD] term={}x{} term_px=({},{}) tab_h={} viewport={}x{}\n", .{
+                        mapper.terminal_width_px, mapper.terminal_height_px,
+                        mouse.x, mouse.y,
+                        mapper.tabbar_height,
+                        mapper.viewport_width, mapper.viewport_height,
+                    });
                     if (mapper.terminalToBrowser(mouse.x, mouse.y)) |coords| {
+                        self.log("[COORD] -> browser=({},{})\n", .{ coords.x, coords.y });
                         if (self.debug_input) {
                             self.log("[MOUSE] Terminal coords ({},{}) -> Browser coords ({},{})\n", .{
                                 mouse.x,

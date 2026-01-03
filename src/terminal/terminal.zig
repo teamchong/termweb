@@ -10,11 +10,13 @@ pub const TerminalSize = struct {
 pub const Terminal = struct {
     stdin_fd: std.posix.fd_t,
     original_termios: ?std.posix.termios,
+    mouse_enabled: bool,
 
     pub fn init() Terminal {
         return .{
             .stdin_fd = std.posix.STDIN_FILENO,
             .original_termios = null,
+            .mouse_enabled = false,
         };
     }
 
@@ -55,8 +57,59 @@ pub const Terminal = struct {
         try std.posix.tcsetattr(self.stdin_fd, .FLUSH, raw);
     }
 
+    /// Enable Kitty mouse protocol with pixel coordinates
+    pub fn enableMouse(self: *Terminal) !void {
+        if (self.mouse_enabled) return;
+
+        var stdout_buf: [256]u8 = undefined;
+        const stdout_file = std.fs.File.stdout();
+        var stdout_writer = stdout_file.writer(&stdout_buf);
+        const writer = &stdout_writer.interface;
+
+        // Enable mouse tracking (all events: press, release, move)
+        try writer.writeAll("\x1b[?1003h");
+
+        // Enable SGR extended mouse mode (for better coordinate parsing)
+        try writer.writeAll("\x1b[?1006h");
+
+        // Enable SGR pixel mouse mode (actual pixel coordinates, not cells)
+        try writer.writeAll("\x1b[?1016h");
+
+        // Enable Kitty keyboard protocol (level 1 - disambiguate escape codes)
+        try writer.writeAll("\x1b[>1u");
+
+        try writer.flush();
+        self.mouse_enabled = true;
+    }
+
+    /// Disable mouse protocol
+    pub fn disableMouse(self: *Terminal) !void {
+        if (!self.mouse_enabled) return;
+
+        var stdout_buf: [256]u8 = undefined;
+        const stdout_file = std.fs.File.stdout();
+        var stdout_writer = stdout_file.writer(&stdout_buf);
+        const writer = &stdout_writer.interface;
+
+        // Disable Kitty keyboard protocol
+        try writer.writeAll("\x1b[<u");
+
+        // Disable SGR pixel mouse mode
+        try writer.writeAll("\x1b[?1016l");
+
+        // Disable mouse tracking
+        try writer.writeAll("\x1b[?1003l");
+
+        // Disable SGR mouse mode
+        try writer.writeAll("\x1b[?1006l");
+
+        try writer.flush();
+        self.mouse_enabled = false;
+    }
+
     /// Restore original terminal settings
     pub fn restore(self: *Terminal) !void {
+        self.disableMouse() catch {};
         if (self.original_termios) |orig| {
             try std.posix.tcsetattr(self.stdin_fd, .FLUSH, orig);
         }

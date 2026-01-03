@@ -63,6 +63,11 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
+    // Check terminal support first
+    if (!try checkTerminalSupport(allocator)) {
+        std.process.exit(1);
+    }
+
     const url = args[0];
     var mobile = false;
     var scale: f32 = 1.0;
@@ -104,18 +109,16 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const MIN_HEIGHT: u32 = 600;
 
     const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
-    const raw_height: u32 = if (size.height_px > 0) size.height_px else @as(u32, size.rows) * 20;
 
-    // Reserve space for status line (approximately 1 row = ~20px)
-    const status_line_height: u32 = if (size.height_px > 0)
-        @as(u32, size.height_px) / size.rows  // Calculate pixels per row
+    // Reserve space for tab bar + status bar (2 rows)
+    // IMPORTANT: Calculate consistently with CoordinateMapper to avoid click offset bugs
+    // Use (rows - 2) * row_height, NOT height_px - 2*row_height, due to integer division
+    const row_height: u32 = if (size.height_px > 0 and size.rows > 0)
+        @as(u32, size.height_px) / size.rows
     else
-        20;  // Default estimate
-
-    const available_height = if (raw_height > status_line_height)
-        raw_height - status_line_height
-    else
-        raw_height;
+        20;
+    const content_rows: u32 = if (size.rows > 2) size.rows - 2 else 1;
+    const available_height = content_rows * row_height;
 
     // Apply min/max constraints
     const viewport_width: u32 = @max(MIN_WIDTH, raw_width);
@@ -166,7 +169,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     std.debug.print("Page loaded\n", .{});
 
     // Run viewer
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, url, viewport_width, viewport_height);
     defer viewer.deinit();
 
     try viewer.run();
@@ -193,7 +196,7 @@ fn checkTerminalSupport(allocator: std.mem.Allocator) !bool {
     std.debug.print("Supported terminals:\n", .{});
     std.debug.print("  • Ghostty - https://ghostty.org/\n", .{});
     std.debug.print("  • Kitty   - https://sw.kovidgoyal.net/kitty/\n", .{});
-    std.debug.print("  • WezTerm - https://wezfurlong.org/wezterm/\n\n", .{});
+    std.debug.print("  • WezTerm - https://wezterm.org/\n\n", .{});
     std.debug.print("Please install one of these terminals and try again.\n", .{});
     std.debug.print("Run 'termweb doctor' to check your system configuration.\n", .{});
 
