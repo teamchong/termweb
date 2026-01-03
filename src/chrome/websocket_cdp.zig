@@ -390,10 +390,18 @@ pub const WebSocketCdpClient = struct {
         // Extract ID from payload
         const id = try self.extractMessageId(payload);
 
-        // Add to response queue
         self.response_mutex.lock();
         defer self.response_mutex.unlock();
 
+        // Limit queue size to prevent memory growth from fire-and-forget commands
+        // Drop oldest responses if queue is too large
+        const MAX_QUEUE_SIZE = 50;
+        while (self.response_queue.items.len >= MAX_QUEUE_SIZE) {
+            var old = self.response_queue.swapRemove(0);
+            old.deinit();
+        }
+
+        // Add to response queue
         try self.response_queue.append(self.allocator, .{
             .id = id,
             .payload = try self.allocator.dupe(u8, payload),
