@@ -410,6 +410,9 @@ pub const Viewer = struct {
     fn renderCursor(self: *Viewer, writer: anytype) !void {
         if (!self.mouse_visible) return;
 
+        // Delete old cursor placement first to prevent trailing
+        try self.kitty.deletePlacement(writer, Placement.CURSOR);
+
         // Mouse coordinates are 1-indexed cell coordinates from terminal
         // Position cursor at mouse cell location, then display cursor PNG
 

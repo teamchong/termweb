@@ -9,12 +9,19 @@ pub const DisplayOptions = struct {
     width: ?u32 = null,
     height: ?u32 = null,
 
-    // Positioning
+    // Cell-based positioning
     x: u32 = 0, // Column offset
     y: u32 = 0, // Row offset
 
-    // Z-index
+    // Pixel-based positioning within cell
+    x_offset: ?u32 = null, // X pixel offset within cell
+    y_offset: ?u32 = null, // Y pixel offset within cell
+
+    // Z-index for layering
     z: i32 = 0,
+
+    // Placement ID (use same ID to replace in place)
+    placement_id: ?u32 = null,
 };
 
 pub const KittyGraphics = struct {
@@ -50,12 +57,23 @@ pub const KittyGraphics = struct {
         try writer.writeAll("\x1b_G");
 
         // Control data (key=value pairs)
-        try writer.print("a=T,f=100,t=d,i={d}", .{image_id});
+        // q=2 suppresses OK responses (only show errors)
+        try writer.print("a=T,f=100,t=d,i={d},q=2", .{image_id});
+
+        // Use placement ID if provided (for in-place replacement)
+        if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
 
         if (opts.columns) |c| try writer.print(",c={d}", .{c});
         if (opts.rows) |r| try writer.print(",r={d}", .{r});
         if (opts.width) |w| try writer.print(",s={d}", .{w});
         if (opts.height) |h| try writer.print(",v={d}", .{h});
+
+        // Z-index for layering (negative = behind text, positive = in front)
+        if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
+
+        // Pixel offsets within cell
+        if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
+        if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
 
         // Don't move cursor after displaying
         try writer.writeAll(",C=1");
@@ -64,6 +82,9 @@ pub const KittyGraphics = struct {
         try writer.writeByte(';');
         try writer.writeAll(encoded);
         try writer.writeAll("\x1b\\");
+
+        // Debug logging removed to avoid polluting raw mode display
+        // (Enable only if needed for debugging)
     }
 
     /// Clear all images
@@ -77,5 +98,12 @@ pub const KittyGraphics = struct {
     pub fn deleteImage(self: *KittyGraphics, writer: anytype, id: u32) !void {
         _ = self;
         try writer.print("\x1b_Ga=d,d=i,i={d}\x1b\\", .{id});
+    }
+
+    /// Delete specific placement by placement ID
+    pub fn deletePlacement(self: *KittyGraphics, writer: anytype, placement_id: u32) !void {
+        _ = self;
+        // d=p deletes by placement ID, p=<id> specifies which placement
+        try writer.print("\x1b_Ga=d,d=p,p={d}\x1b\\", .{placement_id});
     }
 };
