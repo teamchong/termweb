@@ -467,7 +467,18 @@ pub const Viewer = struct {
         });
         try self.displayFrameWithDimensions(frame.data, frame_width, frame_height);
         self.last_frame_time = now;
+
+        // Update navigation state for button rendering
+        self.updateNavigationState();
+
         return true;
+    }
+
+    /// Update navigation button states from Chrome history
+    fn updateNavigationState(self: *Viewer) void {
+        const nav_state = screenshot_api.getNavigationState(self.cdp_client, self.allocator) catch return;
+        self.ui_state.can_go_back = nav_state.can_go_back;
+        self.ui_state.can_go_forward = nav_state.can_go_forward;
     }
 
     /// Display a base64 PNG frame with specific dimensions for coordinate mapping

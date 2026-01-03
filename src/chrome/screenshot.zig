@@ -169,6 +169,52 @@ pub fn reload(
     // In screencast mode, new frames arrive automatically - no need to block
 }
 
+/// Navigation history state
+pub const NavigationState = struct {
+    can_go_back: bool,
+    can_go_forward: bool,
+};
+
+/// Get current navigation history state
+pub fn getNavigationState(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+) !NavigationState {
+    const result = try client.sendCommand("Page.getNavigationHistory", null);
+    defer allocator.free(result);
+
+    // Parse response: {"id":N,"result":{"currentIndex":X,"entries":[...]}}
+    // Can go back if currentIndex > 0
+    // Can go forward if currentIndex < entries.length - 1
+
+    var current_index: i32 = 0;
+    var entry_count: i32 = 0;
+
+    // Find currentIndex
+    if (std.mem.indexOf(u8, result, "\"currentIndex\":")) |idx| {
+        const start = idx + "\"currentIndex\":".len;
+        var end = start;
+        while (end < result.len and (result[end] >= '0' and result[end] <= '9')) : (end += 1) {}
+        if (end > start) {
+            current_index = std.fmt.parseInt(i32, result[start..end], 10) catch 0;
+        }
+    }
+
+    // Count entries by counting "url": occurrences in entries array
+    if (std.mem.indexOf(u8, result, "\"entries\":[")) |entries_start| {
+        var pos = entries_start;
+        while (std.mem.indexOfPos(u8, result, pos, "\"url\":")) |url_pos| {
+            entry_count += 1;
+            pos = url_pos + 1;
+        }
+    }
+
+    return NavigationState{
+        .can_go_back = current_index > 0,
+        .can_go_forward = current_index < entry_count - 1,
+    };
+}
+
 /// Start screencast streaming (event-driven)
 /// Pass exact viewport dimensions for 1:1 coordinate mapping (no scaling)
 pub fn startScreencast(
