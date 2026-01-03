@@ -49,8 +49,6 @@ pub fn navigateToUrl(
         try std.fmt.allocPrint(allocator, "https://{s}", .{url});
     defer if (normalized_url.ptr != url.ptr) allocator.free(normalized_url);
 
-    std.debug.print("[DEBUG] navigateToUrl: {s}\n", .{normalized_url});
-
     const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{normalized_url});
     defer allocator.free(params);
 
