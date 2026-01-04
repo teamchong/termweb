@@ -11,9 +11,32 @@ pub const TerminalSize = struct {
 /// Using atomic to safely communicate between signal handler and main thread
 var resize_pending = std.atomic.Value(bool).init(false);
 
+/// Global state for emergency cleanup on signal
+var global_original_termios: ?std.posix.termios = null;
+var global_stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO;
+
 /// SIGWINCH signal handler - sets the resize flag
 fn handleSigwinch(_: c_int) callconv(.c) void {
     resize_pending.store(true, .release);
+}
+
+/// Emergency cleanup signal handler for SIGINT/SIGTERM
+/// Restores terminal and exits
+fn handleTermSignal(_: c_int) callconv(.c) void {
+    // Disable mouse tracking (write directly, can't use allocator in signal handler)
+    const disable_mouse = "\x1b[<u\x1b[?1016l\x1b[?1003l\x1b[?1006l";
+    _ = std.posix.write(std.posix.STDOUT_FILENO, disable_mouse) catch {};
+
+    // Show cursor
+    _ = std.posix.write(std.posix.STDOUT_FILENO, "\x1b[?25h") catch {};
+
+    // Restore original termios if saved
+    if (global_original_termios) |orig| {
+        std.posix.tcsetattr(global_stdin_fd, .FLUSH, orig) catch {};
+    }
+
+    // Exit with signal-appropriate code
+    std.process.exit(130); // 128 + SIGINT (2)
 }
 
 pub const Terminal = struct {
@@ -62,6 +85,19 @@ pub const Terminal = struct {
         // Save original settings
         self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
 
+        // Save global state for emergency signal cleanup
+        global_original_termios = self.original_termios;
+        global_stdin_fd = self.stdin_fd;
+
+        // Install emergency cleanup handlers for SIGINT/SIGTERM
+        const term_act = std.posix.Sigaction{
+            .handler = .{ .handler = handleTermSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &term_act, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &term_act, null);
+
         var raw = self.original_termios.?;
 
         // Disable canonical mode, echo, signals
@@ -97,6 +133,7 @@ pub const Terminal = struct {
         const writer = &stdout_writer.interface;
 
         // Enable mouse tracking (all events: press, release, move)
+        // 1003h = all motion tracking (needed for cursor display)
         try writer.writeAll("\x1b[?1003h");
 
         // Enable SGR extended mouse mode (for better coordinate parsing)
@@ -149,6 +186,9 @@ pub const Terminal = struct {
         if (self.original_termios) |orig| {
             try std.posix.tcsetattr(self.stdin_fd, .FLUSH, orig);
         }
+
+        // Clear global state (prevents signal handler from double-restoring)
+        global_original_termios = null;
     }
 
     /// Drain any pending input from stdin

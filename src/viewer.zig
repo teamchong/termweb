@@ -87,8 +87,13 @@ pub const Viewer = struct {
     mouse_visible: bool,
     cursor_image_id: ?u32,  // Track cursor image ID for cleanup
 
-    // Input throttling (batch mode)
+    // Input throttling
     last_input_time: i128,
+    last_mouse_move_time: i128,  // Separate throttle for mouse move events
+
+    // Frame tracking for skip detection
+    last_rendered_generation: u64,
+    frames_skipped: u32,  // Counter for monitoring
 
     // Debug flags
     debug_input: bool,
@@ -139,6 +144,9 @@ pub const Viewer = struct {
             .mouse_visible = false,
             .cursor_image_id = null,
             .last_input_time = 0,
+            .last_mouse_move_time = 0,
+            .last_rendered_generation = 0,
+            .frames_skipped = 0,
             .debug_input = enable_input_debug,
         };
     }
@@ -236,14 +244,17 @@ pub const Viewer = struct {
                 try self.handleResize();
             }
 
-            // Check for input (non-blocking)
-            const input = self.input.readInput() catch |err| {
-                self.log("[ERROR] readInput() failed: {}\n", .{err});
-                return err;
-            };
+            // Drain ALL pending input to avoid backlog (process up to 100 events per iteration)
+            var events_processed: u32 = 0;
+            while (events_processed < 100) : (events_processed += 1) {
+                const input = self.input.readInput() catch |err| {
+                    self.log("[ERROR] readInput() failed: {}\n", .{err});
+                    return err;
+                };
 
-            if (input != .none) {
-                // Always log input events for debugging
+                if (input == .none) break; // No more pending input
+
+                // Log and process (throttling happens inside handleMouse)
                 switch (input) {
                     .key => |key| self.log("[INPUT] Key: {any}\n", .{key}),
                     .mouse => |m| self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y }),
@@ -265,8 +276,8 @@ pub const Viewer = struct {
                 self.renderUIChrome(writer2) catch {}; // Tab bar only (no status bar)
             }
 
-            // Small sleep to avoid busy-waiting
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            // Short sleep to avoid busy-waiting (5ms = 200 iterations/sec max)
+            std.Thread.sleep(5 * std.time.ns_per_ms);
         }
 
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
@@ -412,15 +423,6 @@ pub const Viewer = struct {
         defer self.allocator.free(base64_png);
         self.log("[DEBUG] Screenshot captured ({} bytes base64)\n", .{base64_png.len});
 
-        // Decode base64
-        self.log("[DEBUG] Decoding base64...\n", .{});
-        const decoder = std.base64.standard.Decoder;
-        const png_size = try decoder.calcSizeForSlice(base64_png);
-        const png_data = try self.allocator.alloc(u8, png_size);
-        defer self.allocator.free(png_data);
-        try decoder.decode(png_data, base64_png);
-        self.log("[DEBUG] Decoded to {} bytes PNG\n", .{png_data.len});
-
         // Display image (leave room for status line)
         self.log("[DEBUG] Displaying PNG via Kitty graphics...\n", .{});
 
@@ -430,7 +432,8 @@ pub const Viewer = struct {
 
         self.log("[DEBUG] Display dimensions: rows={}, cols={}\n", .{display_rows, display_cols});
 
-        _ = try self.kitty.displayPNG(writer, png_data, .{
+        // Pass base64 directly (no decode/encode roundtrip)
+        _ = try self.kitty.displayBase64PNG(writer, base64_png, .{
             .rows = display_rows,
             .columns = display_cols,
             .placement_id = 1,
@@ -459,15 +462,28 @@ pub const Viewer = struct {
         var frame = screenshot_api.getLatestScreencastFrame(self.cdp_client) orelse return false;
         defer frame.deinit(); // Proper cleanup!
 
+        // Frame skip detection: Check if we skipped frames
+        if (self.last_rendered_generation > 0 and frame.generation > self.last_rendered_generation + 1) {
+            const skipped = frame.generation - self.last_rendered_generation - 1;
+            self.frames_skipped += @intCast(skipped);
+            self.log("[RENDER] Skipped {} frames (gen {} -> {})\n", .{
+                skipped,
+                self.last_rendered_generation,
+                frame.generation,
+            });
+        }
+        self.last_rendered_generation = frame.generation;
+
         // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
         // Chrome may send different size than requested viewport
         const frame_width = if (frame.device_width > 0) frame.device_width else self.viewport_width;
         const frame_height = if (frame.device_height > 0) frame.device_height else self.viewport_height;
 
-        self.log("[RENDER] Frame {}x{} (viewport {}x{}), {} bytes\n", .{
+        self.log("[RENDER] Frame {}x{} (viewport {}x{}), {} bytes, gen={}\n", .{
             frame_width, frame_height,
             self.viewport_width, self.viewport_height,
             frame.data.len,
+            frame.generation,
         });
         try self.displayFrameWithDimensions(frame.data, frame_width, frame_height);
         self.last_frame_time = now;
@@ -484,17 +500,11 @@ pub const Viewer = struct {
 
     /// Display a base64 PNG frame with specific dimensions for coordinate mapping
     fn displayFrameWithDimensions(self: *Viewer, base64_png: []const u8, frame_width: u32, frame_height: u32) !void {
-        var stdout_buf: [8192]u8 = undefined;
+        // Larger buffer reduces write syscalls (frames can be 300KB+)
+        var stdout_buf: [65536]u8 = undefined;  // 64KB buffer
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
         const writer = &stdout_writer.interface;
-
-        // Decode base64
-        const decoder = std.base64.standard.Decoder;
-        const png_size = try decoder.calcSizeForSlice(base64_png);
-        const png_data = try self.allocator.alloc(u8, png_size);
-        defer self.allocator.free(png_data);
-        try decoder.decode(png_data, base64_png);
 
         // Get terminal size - reserve 1 row for tab bar at top
         const size = try self.terminal.getSize();
@@ -513,15 +523,15 @@ pub const Viewer = struct {
             frame_height,  // Use actual frame height, not viewport
         );
 
-        self.log("[RENDER] displayFrame: png={} bytes, term={}x{}, display={}x{}, frame={}x{}\n", .{
-            png_data.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
+        self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}\n", .{
+            base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
         });
 
         // Move cursor to row 2 (after tab bar)
         try writer.writeAll("\x1b[2;1H");
 
-        // Display via Kitty graphics protocol - content area (below tab bar)
-        _ = try self.kitty.displayPNG(writer, png_data, .{
+        // Display via Kitty graphics protocol - pass base64 directly (no decode/encode roundtrip)
+        _ = try self.kitty.displayBase64PNG(writer, base64_png, .{
             .rows = content_rows,
             .columns = display_cols,
             .placement_id = Placement.CONTENT,
@@ -760,7 +770,19 @@ pub const Viewer = struct {
 
     /// Handle mouse event - dispatches to mode-specific handlers
     fn handleMouse(self: *Viewer, mouse: MouseEvent) !void {
-        // Track mouse position for all events (for cursor rendering)
+        const now = std.time.nanoTimestamp();
+
+        // Throttle mouse MOVE events to ~60fps (16ms) to avoid flooding
+        // Clicks, releases, and wheel events are always processed immediately
+        if (mouse.type == .move or mouse.type == .drag) {
+            const min_interval = 16 * std.time.ns_per_ms; // ~60fps
+            if (now - self.last_mouse_move_time < min_interval) {
+                return; // Skip this move event, too soon
+            }
+            self.last_mouse_move_time = now;
+        }
+
+        // Track mouse position for cursor rendering
         self.mouse_x = mouse.x;
         self.mouse_y = mouse.y;
         self.mouse_visible = true;
@@ -799,7 +821,7 @@ pub const Viewer = struct {
 
         // Tab bar layout: " ✕  ◀  ▶  ↻ │ URL..."
         // Close: cols 0-2, Back: cols 3-5, Forward: cols 6-8, Refresh: cols 9-11, URL: cols 13+
-        self.log("[TABBAR] Click at col {}\n", .{col});
+        self.log("[TABBAR] Click at pixel_x={}, cell_width={}, col={}\n", .{ pixel_x, cell_width, col });
 
         if (col <= 2) {
             // Close button - quit
@@ -807,13 +829,15 @@ pub const Viewer = struct {
             self.running = false;
         } else if (col <= 5) {
             // Back button
-            self.log("[TABBAR] Back button clicked\n", .{});
-            _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
+            self.log("[TABBAR] Back button clicked (can_go_back={})\n", .{self.ui_state.can_go_back});
+            const went_back = try screenshot_api.goBack(self.cdp_client, self.allocator);
+            self.log("[TABBAR] goBack result: {}\n", .{went_back});
             self.updateNavigationState();
         } else if (col <= 8) {
             // Forward button
-            self.log("[TABBAR] Forward button clicked\n", .{});
-            _ = try screenshot_api.goForward(self.cdp_client, self.allocator);
+            self.log("[TABBAR] Forward button clicked (can_go_forward={})\n", .{self.ui_state.can_go_forward});
+            const went_fwd = try screenshot_api.goForward(self.cdp_client, self.allocator);
+            self.log("[TABBAR] goForward result: {}\n", .{went_fwd});
             self.updateNavigationState();
         } else if (col <= 11) {
             // Refresh button
@@ -878,8 +902,17 @@ pub const Viewer = struct {
                         self.updateNavigationState();
                     } else {
                         // Click is in tab bar - handle button clicks
+                        self.log("[CLICK] In tab bar: mouse=({},{}) tabbar_height={}\n", .{
+                            mouse.x, mouse.y, mapper.tabbar_height,
+                        });
                         try self.handleTabBarClick(mouse.x, mapper);
                     }
+                }
+            },
+            .move, .drag => {
+                // Forward mouse move to Chrome for hover effects (throttled in handleMouse)
+                if (mapper.terminalToBrowser(mouse.x, mouse.y)) |coords| {
+                    try interact_mod.mouseMove(self.cdp_client, self.allocator, coords.x, coords.y);
                 }
             },
             .wheel => {
@@ -909,7 +942,7 @@ pub const Viewer = struct {
                     try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
                 }
             },
-            else => {}, // Ignore release, move, drag events
+            else => {}, // Ignore release events
         }
     }
 

@@ -105,4 +105,47 @@ pub const KittyGraphics = struct {
         // d=p deletes by placement ID, p=<id> specifies which placement
         try writer.print("\x1b_Ga=d,d=p,p={d}\x1b\\", .{placement_id});
     }
+
+    /// Display already base64-encoded PNG data directly (avoids decode/encode roundtrip)
+    pub fn displayBase64PNG(
+        self: *KittyGraphics,
+        writer: anytype,
+        base64_data: []const u8,
+        opts: DisplayOptions,
+    ) !u32 {
+        const image_id = self.next_image_id;
+        self.next_image_id += 1;
+
+        // Write Kitty graphics escape sequence
+        try writer.writeAll("\x1b_G");
+
+        // Control data (key=value pairs)
+        // q=2 suppresses OK responses (only show errors)
+        try writer.print("a=T,f=100,t=d,i={d},q=2", .{image_id});
+
+        // Use placement ID if provided (for in-place replacement)
+        if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
+
+        if (opts.columns) |c| try writer.print(",c={d}", .{c});
+        if (opts.rows) |r| try writer.print(",r={d}", .{r});
+        if (opts.width) |w| try writer.print(",s={d}", .{w});
+        if (opts.height) |h| try writer.print(",v={d}", .{h});
+
+        // Z-index for layering
+        if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
+
+        // Pixel offsets within cell
+        if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
+        if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
+
+        // Don't move cursor after displaying
+        try writer.writeAll(",C=1");
+
+        // Send payload (already base64 encoded!)
+        try writer.writeByte(';');
+        try writer.writeAll(base64_data);
+        try writer.writeAll("\x1b\\");
+
+        return image_id;
+    }
 };

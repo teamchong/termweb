@@ -7,6 +7,8 @@
 /// - Request/response correlation via CDP message IDs
 /// - Automatic ping/pong handling for connection keep-alive
 const std = @import("std");
+const simd = @import("../simd/dispatch.zig");
+const FramePool = @import("../simd/frame_pool.zig").FramePool;
 
 pub const WebSocketError = error{
     ConnectionFailed,
@@ -39,16 +41,20 @@ const ResponseQueueEntry = struct {
     }
 };
 
-// Screencast frame structure with metadata
+const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
+
+// Screencast frame structure with zero-copy reference to pool slot
 pub const ScreencastFrame = struct {
-    data: []u8,  // base64 PNG data
+    data: []const u8,   // base64 PNG data (zero-copy reference to pool)
+    slot: *FrameSlot,   // Reference to pool slot (for release)
     session_id: u32,
     device_width: u32,  // Actual frame width from CDP metadata
     device_height: u32, // Actual frame height from CDP metadata
-    allocator: std.mem.Allocator,
+    generation: u64,    // Pool generation for validity checking
 
+    /// Release the pool slot reference
     pub fn deinit(self: *ScreencastFrame) void {
-        self.allocator.free(self.data);
+        self.slot.release();
     }
 };
 
@@ -71,10 +77,12 @@ pub const WebSocketCdpClient = struct {
     response_queue: std.ArrayList(ResponseQueueEntry),
     response_mutex: std.Thread.Mutex,
 
-    // Frame buffer for screencast frames
-    current_frame: ?ScreencastFrame,
-    frame_mutex: std.Thread.Mutex,
+    // Zero-copy frame pool for screencast frames (avoids per-frame allocations)
+    frame_pool: *FramePool,
     frame_count: std.atomic.Value(u32),  // Debug: count received frames
+
+    // Write mutex to prevent concurrent WebSocket writes (reader acks vs main thread commands)
+    write_mutex: std.Thread.Mutex,
 
     pub fn connect(allocator: std.mem.Allocator, ws_url: []const u8) !*WebSocketCdpClient {
         const parsed = try parseWsUrl(allocator, ws_url);
@@ -85,6 +93,9 @@ pub const WebSocketCdpClient = struct {
         const address = try std.net.Address.parseIp(parsed.host, parsed.port);
         const stream = try std.net.tcpConnectToAddress(address);
 
+        // Initialize frame pool (triple-buffered, 512KB slots)
+        const frame_pool = try FramePool.init(allocator);
+
         const client = try allocator.create(WebSocketCdpClient);
         client.* = .{
             .allocator = allocator,
@@ -94,9 +105,9 @@ pub const WebSocketCdpClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .response_queue = try std.ArrayList(ResponseQueueEntry).initCapacity(allocator, 0),
             .response_mutex = .{},
-            .current_frame = null,
-            .frame_mutex = .{},
+            .frame_pool = frame_pool,
             .frame_count = std.atomic.Value(u32).init(0),
+            .write_mutex = .{},
         };
 
         // Perform WebSocket handshake
@@ -109,10 +120,8 @@ pub const WebSocketCdpClient = struct {
         // Stop reader thread if running
         self.stopReaderThread();
 
-        // Free current frame if exists
-        if (self.current_frame) |*frame| {
-            frame.deinit();
-        }
+        // Free frame pool
+        self.frame_pool.deinit();
 
         // Free response queue
         for (self.response_queue.items) |*entry| {
@@ -267,19 +276,20 @@ pub const WebSocketCdpClient = struct {
         }
     }
 
-    /// Get latest screencast frame (non-blocking)
-    /// Consumes the frame - subsequent calls return null until new frame arrives
+    /// Get latest screencast frame (non-blocking, zero-copy with reference counting)
+    /// Returns a zero-copy reference to pool data - MUST call deinit() when done
     pub fn getLatestFrame(self: *WebSocketCdpClient) ?ScreencastFrame {
-        self.frame_mutex.lock();
-        defer self.frame_mutex.unlock();
+        // Acquire slot with reference count (prevents overwrite during use)
+        const slot = self.frame_pool.acquireLatestFrame() orelse return null;
 
-        if (self.current_frame) |frame| {
-            // Take ownership of the frame (no copy needed)
-            const result = frame;
-            self.current_frame = null;
-            return result;
-        }
-        return null;
+        return ScreencastFrame{
+            .data = slot.data(),
+            .slot = slot,
+            .session_id = slot.session_id,
+            .device_width = slot.device_width,
+            .device_height = slot.device_height,
+            .generation = slot.generation,
+        };
     }
 
     /// Get count of frames received (for debugging)
@@ -329,38 +339,29 @@ pub const WebSocketCdpClient = struct {
         // Future: Add generic event callback here
     }
 
-    /// Handle screencast frame event
+    /// Handle screencast frame event (zero-copy to pool)
     fn handleScreencastFrame(self: *WebSocketCdpClient, payload: []const u8) !void {
         // Parse sessionId
         const session_id = try self.extractSessionId(payload);
 
-        // Parse base64 data
+        // Parse base64 data (zero-copy slice into payload)
         const base64_data = try self.extractScreencastData(payload);
 
         // Parse metadata dimensions
         const device_width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
         const device_height = self.extractMetadataInt(payload, "deviceHeight") catch 0;
 
-        // Create new frame with metadata
-        const new_frame = ScreencastFrame{
-            .data = try self.allocator.dupe(u8, base64_data),
-            .session_id = session_id,
-            .device_width = device_width,
-            .device_height = device_height,
-            .allocator = self.allocator,
-        };
-
-        // Atomic swap into current_frame
-        self.frame_mutex.lock();
-        defer self.frame_mutex.unlock();
-
-        if (self.current_frame) |*old_frame| {
-            old_frame.deinit();  // Free old frame
+        // Write to frame pool (single memcpy, reuses pre-allocated buffers)
+        // Returns null if all slots are in use (backpressure - drop frame)
+        if (try self.frame_pool.writeFrame(
+            base64_data,
+            session_id,
+            device_width,
+            device_height,
+        )) |_| {
+            _ = self.frame_count.fetchAdd(1, .monotonic);
         }
-        self.current_frame = new_frame;
-        _ = self.frame_count.fetchAdd(1, .monotonic);  // Increment frame counter
-
-        // Send acknowledgment (fire-and-forget)
+        // Always acknowledge to prevent Chrome from stalling
         self.acknowledgeFrame(session_id) catch {};
     }
 
@@ -409,9 +410,10 @@ pub const WebSocketCdpClient = struct {
         });
     }
 
-    /// Extract message ID from JSON payload
+    /// Extract message ID from JSON payload (SIMD-accelerated)
     fn extractMessageId(_: *WebSocketCdpClient, payload: []const u8) !u32 {
-        const id_pos = std.mem.indexOf(u8, payload, "\"id\":") orelse return error.InvalidFormat;
+        // Use SIMD pattern search for large payloads
+        const id_pos = simd.findPattern(payload, "\"id\":", 0) orelse return error.InvalidFormat;
         const id_value_start = id_pos + "\"id\":".len;
 
         // Find end of number
@@ -425,9 +427,9 @@ pub const WebSocketCdpClient = struct {
         return try std.fmt.parseInt(u32, id_str, 10);
     }
 
-    /// Extract sessionId from screencast frame event
+    /// Extract sessionId from screencast frame event (SIMD-accelerated)
     fn extractSessionId(_: *WebSocketCdpClient, payload: []const u8) !u32 {
-        const session_pos = std.mem.indexOf(u8, payload, "\"sessionId\":") orelse return error.InvalidFormat;
+        const session_pos = simd.findPattern(payload, "\"sessionId\":", 0) orelse return error.InvalidFormat;
         const session_value_start = session_pos + "\"sessionId\":".len;
 
         // Find end of number
@@ -441,11 +443,13 @@ pub const WebSocketCdpClient = struct {
         return try std.fmt.parseInt(u32, session_str, 10);
     }
 
-    /// Extract base64 PNG data from screencast frame event
+    /// Extract base64 PNG data from screencast frame event (SIMD-accelerated)
     fn extractScreencastData(_: *WebSocketCdpClient, payload: []const u8) ![]const u8 {
-        const data_pos = std.mem.indexOf(u8, payload, "\"data\":\"") orelse return error.InvalidFormat;
+        // SIMD pattern search - big win for large payloads
+        const data_pos = simd.findPattern(payload, "\"data\":\"", 0) orelse return error.InvalidFormat;
         const data_value_start = data_pos + "\"data\":\"".len;
-        const data_value_end = std.mem.indexOfPos(u8, payload, data_value_start, "\"") orelse return error.InvalidFormat;
+        // Use SIMD to find closing quote
+        const data_value_end = simd.findClosingQuote(payload, data_value_start) orelse return error.InvalidFormat;
 
         return payload[data_value_start..data_value_end];
     }
@@ -522,6 +526,10 @@ pub const WebSocketCdpClient = struct {
     }
 
     fn sendFrame(self: *WebSocketCdpClient, opcode: u8, payload: []const u8) !void {
+        // Mutex protects against concurrent writes from reader thread (acks) and main thread (commands)
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+
         var frame_buf: [16384]u8 = undefined;
         var frame_len: usize = 0;
         const payload_len = payload.len;

@@ -2,6 +2,22 @@ const std = @import("std");
 const cdp = @import("cdp_client.zig");
 const dom = @import("dom.zig");
 
+/// Move mouse to coordinates (for hover effects) - fire and forget
+pub fn mouseMove(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    x: u32,
+    y: u32,
+) !void {
+    const params = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"mouseMoved\",\"x\":{d},\"y\":{d}}}",
+        .{ x, y },
+    );
+    defer allocator.free(params);
+    try client.sendCommandAsync("Input.dispatchMouseEvent", params);
+}
+
 /// Click at specific coordinates
 pub fn clickAt(
     client: *cdp.CdpClient,
