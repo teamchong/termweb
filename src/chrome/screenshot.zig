@@ -25,7 +25,7 @@ pub const ScreenshotFormat = enum {
 };
 
 pub const ScreenshotOptions = struct {
-    format: ScreenshotFormat = .png,
+    format: ScreenshotFormat = .jpeg,  // JPEG is faster to decode than PNG
     quality: u8 = 80, // 0-100, for JPEG (ignored for PNG)
     full_page: bool = false,
     // Viewport dimensions for screencast (1:1 coordinate mapping)

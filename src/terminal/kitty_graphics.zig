@@ -106,8 +106,9 @@ pub const KittyGraphics = struct {
         try writer.print("\x1b_Ga=d,d=p,p={d}\x1b\\", .{placement_id});
     }
 
-    /// Display already base64-encoded PNG data directly (avoids decode/encode roundtrip)
-    pub fn displayBase64PNG(
+    /// Display already base64-encoded image data directly (PNG or JPEG)
+    /// Uses f=100 which tells Kitty to auto-detect format from data
+    pub fn displayBase64Image(
         self: *KittyGraphics,
         writer: anytype,
         base64_data: []const u8,
@@ -119,7 +120,7 @@ pub const KittyGraphics = struct {
         // Write Kitty graphics escape sequence
         try writer.writeAll("\x1b_G");
 
-        // Control data (key=value pairs)
+        // Control data: a=T (transmit+display), f=100 (auto-detect PNG/JPEG), t=d (direct data)
         // q=2 suppresses OK responses (only show errors)
         try writer.print("a=T,f=100,t=d,i={d},q=2", .{image_id});
 
@@ -147,5 +148,15 @@ pub const KittyGraphics = struct {
         try writer.writeAll("\x1b\\");
 
         return image_id;
+    }
+
+    /// Alias for backwards compatibility
+    pub fn displayBase64PNG(
+        self: *KittyGraphics,
+        writer: anytype,
+        base64_data: []const u8,
+        opts: DisplayOptions,
+    ) !u32 {
+        return self.displayBase64Image(writer, base64_data, opts);
     }
 };
