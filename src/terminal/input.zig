@@ -387,17 +387,36 @@ pub const InputReader = struct {
         const y = std.fmt.parseInt(u16, y_str, 10) catch return null;
 
         // Determine button and event type
+        // SGR mouse protocol button_code:
+        // - bits 0-1: button (0=left, 1=middle, 2=right, 3=none/release)
+        // - bit 5 (32): motion flag
+        // - bits 6-7 (64, 128): scroll wheel
         var button: MouseButton = .none;
-        var event_type: MouseEventType = if (terminator == 'M') .press else .release;
+        var event_type: MouseEventType = .press;
         var delta_y: i16 = 0;
 
-        // Handle wheel events
-        if (button_code == 64 or button_code == 65) {
-            button = .left;
+        const motion_flag = (button_code & 32) != 0;
+        const base_button = button_code & 3;
+
+        // Handle wheel events (bit 6 set)
+        if ((button_code & 64) != 0) {
+            button = .none;
             event_type = .wheel;
-            delta_y = if (button_code == 64) -120 else 120;
+            // 64 = scroll up, 65 = scroll down
+            delta_y = if ((button_code & 1) == 0) -120 else 120;
+        } else if (motion_flag) {
+            // Motion event (bit 5 set)
+            event_type = if (base_button == 3) .move else .drag;
+            button = switch (base_button) {
+                0 => .left,
+                1 => .middle,
+                2 => .right,
+                else => .none,
+            };
         } else {
-            button = switch (button_code) {
+            // Press or release
+            event_type = if (terminator == 'M') .press else .release;
+            button = switch (base_button) {
                 0 => .left,
                 1 => .middle,
                 2 => .right,

@@ -16,6 +16,8 @@ pub const CoordinateMapper = struct {
     tabbar_height: u16,
     content_pixel_height: u16, // Actual rendered content height
 
+    is_pixel_mode: bool,
+
     /// Initialize coordinate mapper with terminal and viewport dimensions
     pub fn init(
         terminal_width_px: u16,
@@ -35,6 +37,9 @@ pub const CoordinateMapper = struct {
         const content_rows: u16 = if (terminal_rows > 1) terminal_rows - 1 else 1;
         const content_pixel_height = content_rows * cell_height;
 
+        // If terminal reports pixel dimensions, assume we're using SGR pixel mode (1016h)
+        const is_pixel_mode = terminal_width_px > 0;
+
         return CoordinateMapper{
             .terminal_width_px = terminal_width_px,
             .terminal_height_px = terminal_height_px,
@@ -45,6 +50,7 @@ pub const CoordinateMapper = struct {
             .cell_height = cell_height,
             .tabbar_height = cell_height, // 1 row for tab bar
             .content_pixel_height = content_pixel_height,
+            .is_pixel_mode = is_pixel_mode,
         };
     }
 
@@ -65,23 +71,43 @@ pub const CoordinateMapper = struct {
         else
             14; // Fallback
 
+        // ANSI coordinates are 1-indexed
+        const c_x = if (col > 0) col - 1 else 0;
+        const c_y = if (row > 0) row - 1 else 0;
+
         // Convert to pixel coordinates (center of cell)
-        const pixel_x = col * cell_width;
-        const pixel_y = row * cell_height;
+        const pixel_x = c_x * cell_width + cell_width / 2;
+        const pixel_y = c_y * cell_height + cell_height / 2;
 
         return .{ .x = pixel_x, .y = pixel_y };
     }
 
-    /// Convert terminal pixel coordinates to browser viewport coordinates.
-    /// With SGR pixel mode (1016h), coordinates are actual pixels.
+    /// Convert terminal coordinates to browser viewport coordinates.
+    /// Handles both pixel coordinates (SGR 1016h) and cell
+    /// coordinates (SGR 1006h fallback).
     /// Returns null if the coordinates are in the tab bar, status bar, or letterbox padding.
     pub fn terminalToBrowser(
         self: *const CoordinateMapper,
-        term_x: u16,
-        term_y: u16,
+        pixel_x_in: u16,
+        pixel_y_in: u16,
     ) ?struct { x: u32, y: u32 } {
-        const pixel_x = term_x;
-        const pixel_y = term_y;
+        var pixel_x: u16 = undefined;
+        var pixel_y: u16 = undefined;
+
+        if (self.is_pixel_mode) {
+            // Already pixels (expecting 0-indexed)
+            pixel_x = pixel_x_in;
+            pixel_y = pixel_y_in;
+        } else {
+            // Convert cell coordinates to pixel coordinates (center of cell)
+            const cell_width = if (self.terminal_cols > 0)
+                @divTrunc(self.terminal_width_px, self.terminal_cols)
+            else
+                14;
+            
+            pixel_x = pixel_x_in * cell_width + cell_width / 2;
+            pixel_y = pixel_y_in * self.cell_height + self.cell_height / 2;
+        }
 
         // Check if click is in tab bar (top)
         if (pixel_y < self.tabbar_height) return null;

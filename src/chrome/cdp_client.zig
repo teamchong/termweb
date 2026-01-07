@@ -26,21 +26,52 @@ pub const CdpClient = struct {
     page_id: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, ws_url: []const u8) !*CdpClient {
-        // Extract HTTP base URL from WebSocket URL
-        // ws://127.0.0.1:9222/devtools/browser/xxx -> http://127.0.0.1:9222
-        const base_url = try extractHttpUrl(allocator, ws_url);
-
+        // Init client check
         const client = try allocator.create(CdpClient);
         client.* = .{
             .allocator = allocator,
-            .ws_client = undefined,  // Will be set after discovering page WebSocket URL
+            .ws_client = undefined,
             .http_client = std.http.Client{ .allocator = allocator },
-            .base_url = base_url,
-            .page_id = undefined,  // Will be set by discoverPage
+            .base_url = undefined,
+            .page_id = undefined,
         };
 
+        // If the URL already looks like a valid page target (has /devtools/page/), use it directly
+        // Otherwise, assume it's a browser endpoint and try to discover a page
+        if (std.mem.indexOf(u8, ws_url, "/devtools/page/") != null) {
+            // Extract the page ID from the URL (last segment)
+            // ws://.../devtools/page/THIS_IS_THE_ID
+            const last_slash = std.mem.lastIndexOf(u8, ws_url, "/") orelse ws_url.len;
+            if (last_slash < ws_url.len) {
+                client.page_id = try allocator.dupe(u8, ws_url[last_slash + 1 ..]);
+            } else {
+                client.page_id = try allocator.dupe(u8, "unknown");
+            }
+            client.base_url = try extractHttpUrl(allocator, ws_url);
+            client.ws_client = try websocket_cdp.WebSocketCdpClient.connect(allocator, ws_url);
+            return client;
+        }
+
+        // Extract HTTP base URL from WebSocket URL
+        // ws://127.0.0.1:9222 -> http://127.0.0.1:9222
+        client.base_url = try extractHttpUrl(allocator, ws_url);
+
         // Discover the page's WebSocket URL via HTTP /json/list
-        const page_ws_url = try client.discoverPageWebSocketUrl();
+        // Retry a few times - Chrome may not have pages ready immediately after launch
+        var page_ws_url: []const u8 = undefined;
+        var attempts: u32 = 0;
+        while (attempts < 30) : (attempts += 1) {
+            page_ws_url = client.discoverPageWebSocketUrl() catch {
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                continue;
+            };
+            break;
+        }
+        if (attempts >= 30) {
+            allocator.free(client.base_url);
+            allocator.destroy(client);
+            return CdpError.InvalidResponse;
+        }
         defer allocator.free(page_ws_url);
 
         // Connect to page's WebSocket endpoint
@@ -159,6 +190,11 @@ pub const CdpClient = struct {
         width: u32,
         height: u32,
     ) !void {
+        // CRITICAL: Start reader thread BEFORE sending startScreencast command
+        // Otherwise Chrome sends first frame immediately, we don't ACK it (no reader),
+        // and Chrome stops sending more frames
+        try self.ws_client.startReaderThread();
+
         // Use exact viewport dimensions - no scaling needed, coordinates are 1:1
         const params = try std.fmt.allocPrint(
             self.allocator,
@@ -170,8 +206,20 @@ pub const CdpClient = struct {
         const result = try self.sendCommand("Page.startScreencast", params);
         defer self.allocator.free(result);
 
-        // Start reader thread for event handling
-        try self.ws_client.startReaderThread();
+        // Activate page AFTER screencast starts (Chrome pauses animations on unfocused pages)
+        // Try Target.activateTarget with page_id
+        const activate_params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"targetId\":\"{s}\"}}",
+            .{self.page_id},
+        );
+        defer self.allocator.free(activate_params);
+
+        if (self.sendCommand("Target.activateTarget", activate_params)) |activate_result| {
+            self.allocator.free(activate_result);
+        } else |_| {
+            // Ignore activation errors - not critical
+        }
     }
 
     /// Stop screencast streaming

@@ -11,7 +11,7 @@ pub fn mouseMove(
 ) !void {
     const params = try std.fmt.allocPrint(
         allocator,
-        "{{\"type\":\"mouseMoved\",\"x\":{d},\"y\":{d}}}",
+        "{{\"type\":\"mouseMoved\",\"x\":{d},\"y\":{d},\"buttons\":0,\"modifiers\":0}}",
         .{ x, y },
     );
     defer allocator.free(params);
@@ -25,25 +25,37 @@ pub fn clickAt(
     x: u32,
     y: u32,
 ) !void {
-    // Mouse pressed - fire and forget
+    // First move mouse to position (some pages require hover before click)
+    const move_params = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"mouseMoved\",\"x\":{d},\"y\":{d},\"buttons\":0,\"modifiers\":0}}",
+        .{ x, y },
+    );
+    defer allocator.free(move_params);
+    const move_result = try client.sendCommand("Input.dispatchMouseEvent", move_params);
+    allocator.free(move_result);
+
+    // Mouse pressed
+    // buttons: 1 = left button
     const press_params = try std.fmt.allocPrint(
         allocator,
-        "{{\"type\":\"mousePressed\",\"x\":{d},\"y\":{d},\"button\":\"left\",\"clickCount\":1}}",
+        "{{\"type\":\"mousePressed\",\"x\":{d},\"y\":{d},\"button\":\"left\",\"buttons\":1,\"clickCount\":1,\"modifiers\":0}}",
         .{ x, y },
     );
     defer allocator.free(press_params);
-    try client.sendCommandAsync("Input.dispatchMouseEvent", press_params);
+    const press_result = try client.sendCommand("Input.dispatchMouseEvent", press_params);
+    allocator.free(press_result);
 
-    // Mouse released - fire and forget
+    // Mouse released
+    // buttons: 0 = none
     const release_params = try std.fmt.allocPrint(
         allocator,
-        "{{\"type\":\"mouseReleased\",\"x\":{d},\"y\":{d},\"button\":\"left\",\"clickCount\":1}}",
+        "{{\"type\":\"mouseReleased\",\"x\":{d},\"y\":{d},\"button\":\"left\",\"buttons\":0,\"clickCount\":1,\"modifiers\":0}}",
         .{ x, y },
     );
     defer allocator.free(release_params);
-    try client.sendCommandAsync("Input.dispatchMouseEvent", release_params);
-
-    // Screencast mode: frames arrive automatically, no blocking waits needed
+    const release_result = try client.sendCommand("Input.dispatchMouseEvent", release_params);
+    allocator.free(release_result);
 }
 
 /// Click on an element (center of bounding box)
@@ -77,7 +89,7 @@ pub fn focusElement(
     defer allocator.free(result);
 }
 
-/// Type text into focused element
+/// Type text into focused element (fire-and-forget for low latency)
 pub fn typeText(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -86,8 +98,7 @@ pub fn typeText(
     const params = try std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{text});
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Input.insertText", params);
-    defer allocator.free(result);
+    try client.sendCommandAsync("Input.insertText", params);
 }
 
 /// Toggle checkbox using JavaScript
@@ -110,20 +121,50 @@ pub fn toggleCheckbox(
     defer allocator.free(result);
 }
 
-/// Press Enter key
+/// Send raw mouse event (synchronous for press/release, async for move)
+pub fn sendMouseEvent(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    event_type: []const u8, // "mousePressed", "mouseReleased", "mouseMoved"
+    x: u32,
+    y: u32,
+    button: []const u8,    // "left", "middle", "right", "none"
+    buttons: u32,         // Bitmask: 1=left, 2=right, 4=middle
+    click_count: u32,
+) !void {
+    // Note: clickCount is only used for mousePressed/mouseReleased
+    // modifiers: 0 = no modifiers (Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8)
+    // pointerType: mouse, pen, touch (default is mouse)
+    const params = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"{s}\",\"buttons\":{d},\"clickCount\":{d},\"modifiers\":0,\"pointerType\":\"mouse\"}}",
+        .{ event_type, x, y, button, buttons, click_count },
+    );
+    defer allocator.free(params);
+
+    // Use synchronous send for press/release to ensure proper timing
+    // Use async for move to avoid blocking
+    const is_move = std.mem.eql(u8, event_type, "mouseMoved");
+    if (is_move) {
+        try client.sendCommandAsync("Input.dispatchMouseEvent", params);
+    } else {
+        const result = try client.sendCommand("Input.dispatchMouseEvent", params);
+        allocator.free(result);
+    }
+}
+
+/// Press Enter key (fire-and-forget for low latency)
 pub fn pressEnter(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !void {
-    const down_result = try client.sendCommand(
+    _ = allocator;
+    try client.sendCommandAsync(
         "Input.dispatchKeyEvent",
-        "{{\"type\":\"keyDown\",\"key\":\"Enter\"}}",
+        "{\"type\":\"keyDown\",\"key\":\"Enter\"}",
     );
-    defer allocator.free(down_result);
-
-    const up_result = try client.sendCommand(
+    try client.sendCommandAsync(
         "Input.dispatchKeyEvent",
-        "{{\"type\":\"keyUp\",\"key\":\"Enter\"}}",
+        "{\"type\":\"keyUp\",\"key\":\"Enter\"}",
     );
-    defer allocator.free(up_result);
 }

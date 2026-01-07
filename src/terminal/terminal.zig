@@ -202,10 +202,18 @@ pub const Terminal = struct {
         _ = std.posix.fcntl(self.stdin_fd, std.posix.F.SETFL, flags | O_NONBLOCK) catch return;
         defer _ = std.posix.fcntl(self.stdin_fd, std.posix.F.SETFL, flags) catch {};
 
-        // Read and discard all pending input
-        while (true) {
-            const n = std.posix.read(self.stdin_fd, &buf) catch break;
-            if (n == 0) break;
+        // Read and discard all pending input - loop multiple times to catch any stragglers
+        var attempts: u32 = 0;
+        while (attempts < 10) : (attempts += 1) {
+            var drained_any = false;
+            while (true) {
+                const n = std.posix.read(self.stdin_fd, &buf) catch break;
+                if (n == 0) break;
+                drained_any = true;
+            }
+            if (!drained_any) break;
+            // Small delay to let more input arrive
+            std.Thread.sleep(5 * std.time.ns_per_ms);
         }
     }
 

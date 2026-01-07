@@ -1,4 +1,6 @@
 const std = @import("std");
+const ShmBuffer = @import("shm.zig").ShmBuffer;
+const decode = @import("../image/decode.zig");
 
 pub const DisplayOptions = struct {
     // Image placement
@@ -106,48 +108,78 @@ pub const KittyGraphics = struct {
         try writer.print("\x1b_Ga=d,d=p,p={d}\x1b\\", .{placement_id});
     }
 
-    /// Display already base64-encoded image data directly (PNG or JPEG)
-    /// Uses f=100 which tells Kitty to auto-detect format from data
+    fn displayBase64ImageWithFormat(
+        self: *KittyGraphics,
+        writer: anytype,
+        base64_data: []const u8,
+        opts: DisplayOptions,
+        format_code: u32,
+    ) !u32 {
+        const image_id = self.next_image_id;
+        self.next_image_id += 1;
+
+        // Kitty protocol chunk size (4096 bytes max per chunk)
+        const CHUNK_SIZE: usize = 4096;
+
+        var offset: usize = 0;
+        var first_chunk = true;
+
+        while (offset < base64_data.len) {
+            const remaining = base64_data.len - offset;
+            const chunk_len = @min(remaining, CHUNK_SIZE);
+            const is_last = (offset + chunk_len >= base64_data.len);
+
+            // Write escape sequence start
+            try writer.writeAll("\x1b_G");
+
+            if (first_chunk) {
+                // First chunk: include all control data
+                // a=T (transmit+display), t=d (direct data)
+                // m=1 means more data coming, m=0 means this is the last chunk
+                try writer.print("a=T,f={d},t=d,i={d},q=2,m={d}", .{
+                    format_code,
+                    image_id,
+                    if (is_last) @as(u8, 0) else @as(u8, 1),
+                });
+
+                if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
+                if (opts.columns) |c| try writer.print(",c={d}", .{c});
+                if (opts.rows) |r| try writer.print(",r={d}", .{r});
+                if (opts.width) |w| try writer.print(",s={d}", .{w});
+                if (opts.height) |h| try writer.print(",v={d}", .{h});
+                if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
+                if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
+                if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
+
+                // Don't move cursor after displaying
+                try writer.writeAll(",C=1");
+
+                first_chunk = false;
+            } else {
+                // Continuation chunks: only need m flag (and i for safety)
+                try writer.print("m={d}", .{if (is_last) @as(u8, 0) else @as(u8, 1)});
+            }
+
+            // Send payload for this chunk
+            try writer.writeByte(';');
+            try writer.writeAll(base64_data[offset..offset + chunk_len]);
+            try writer.writeAll("\x1b\\");
+
+            offset += chunk_len;
+        }
+
+        return image_id;
+    }
+
+    /// Display already base64-encoded image data directly
+    /// Uses chunked transfer for large images (Kitty protocol requirement)
     pub fn displayBase64Image(
         self: *KittyGraphics,
         writer: anytype,
         base64_data: []const u8,
         opts: DisplayOptions,
     ) !u32 {
-        const image_id = self.next_image_id;
-        self.next_image_id += 1;
-
-        // Write Kitty graphics escape sequence
-        try writer.writeAll("\x1b_G");
-
-        // Control data: a=T (transmit+display), f=100 (auto-detect PNG/JPEG), t=d (direct data)
-        // q=2 suppresses OK responses (only show errors)
-        try writer.print("a=T,f=100,t=d,i={d},q=2", .{image_id});
-
-        // Use placement ID if provided (for in-place replacement)
-        if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
-
-        if (opts.columns) |c| try writer.print(",c={d}", .{c});
-        if (opts.rows) |r| try writer.print(",r={d}", .{r});
-        if (opts.width) |w| try writer.print(",s={d}", .{w});
-        if (opts.height) |h| try writer.print(",v={d}", .{h});
-
-        // Z-index for layering
-        if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
-
-        // Pixel offsets within cell
-        if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
-        if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
-
-        // Don't move cursor after displaying
-        try writer.writeAll(",C=1");
-
-        // Send payload (already base64 encoded!)
-        try writer.writeByte(';');
-        try writer.writeAll(base64_data);
-        try writer.writeAll("\x1b\\");
-
-        return image_id;
+        return self.displayBase64ImageWithFormat(writer, base64_data, opts, 32);
     }
 
     /// Alias for backwards compatibility
@@ -157,6 +189,89 @@ pub const KittyGraphics = struct {
         base64_data: []const u8,
         opts: DisplayOptions,
     ) !u32 {
-        return self.displayBase64Image(writer, base64_data, opts);
+        return self.displayBase64ImageWithFormat(writer, base64_data, opts, 100);
+    }
+
+    /// Display raw RGBA data via SHM (t=s)
+    pub fn displayRGBA(
+        self: *KittyGraphics,
+        writer: anytype,
+        shm: *const ShmBuffer,
+        width: u32,
+        height: u32,
+        opts: DisplayOptions,
+    ) !u32 {
+        const image_id = self.next_image_id;
+        self.next_image_id += 1;
+
+        // Use proper POSIX Shared Memory (t=s)
+        // Data is already in the buffer via shm.write()
+        const shm_name = shm.getName();
+
+        // Write Kitty graphics escape sequence
+        try writer.writeAll("\x1b_G");
+
+        // f=32 = raw RGBA, t=s = shared memory
+        try writer.print("a=T,f=32,t=s,s={d},v={d},i={d},q=2", .{ width, height, image_id });
+
+        // Placement options
+        if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
+        if (opts.columns) |c_col| try writer.print(",c={d}", .{c_col});
+        if (opts.rows) |r| try writer.print(",r={d}", .{r});
+        if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
+        if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
+        if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
+
+        // Don't move cursor
+        try writer.writeAll(",C=1");
+
+        // SHM name must be base64 encoded
+        try writer.writeByte(';');
+        const encoder = std.base64.standard.Encoder;
+        var encoded_buf: [256]u8 = undefined;
+        const encoded = encoder.encode(&encoded_buf, shm_name);
+        try writer.writeAll(encoded);
+        try writer.writeAll("\x1b\\");
+
+        return image_id;
+    }
+
+    /// Decode base64 image and display via SHM (decode once, zero-copy transfer)
+    /// Returns null if decode fails, image_id on success
+    pub fn displayBase64ImageViaSHM(
+        self: *KittyGraphics,
+        writer: anytype,
+        base64_data: []const u8,
+        shm: *ShmBuffer,
+        opts: DisplayOptions,
+    ) !?u32 {
+        // Decode base64 to get raw bytes
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(base64_data) catch return null;
+
+        // Use stack buffer for small images, allocate for large
+        var stack_buf: [256 * 1024]u8 = undefined;
+        var decoded: []u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |buf| self.allocator.free(buf);
+
+        if (decoded_len <= stack_buf.len) {
+            decoded = stack_buf[0..decoded_len];
+        } else {
+            heap_buf = try self.allocator.alloc(u8, decoded_len);
+            decoded = heap_buf.?;
+        }
+
+        decoder.decode(decoded, base64_data) catch return null;
+
+        // Decode image to RGBA
+        var img = decode.decode(decoded) orelse return null;
+        defer img.deinit();
+
+        // Write RGBA to SHM
+        shm.write(img.data);
+
+        // Display via SHM
+        return try self.displayRGBA(writer, shm, img.width, img.height, opts);
     }
 };

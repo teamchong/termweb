@@ -26,7 +26,11 @@ pub const LaunchOptions = struct {
     viewport_width: u32 = 1280,
     viewport_height: u32 = 720,
     user_data_dir: ?[]const u8 = null,
-    disable_gpu: bool = true,
+    disable_gpu: bool = false,
+    /// Specific browser to use by name (e.g., "chrome", "edge", "brave")
+    browser: ?[]const u8 = null,
+    /// Direct path to browser binary (takes precedence over browser name)
+    browser_path: ?[]const u8 = null,
 };
 
 /// Launch Chrome with CDP and return WebSocket URL
@@ -34,11 +38,27 @@ pub fn launchChrome(
     allocator: std.mem.Allocator,
     options: LaunchOptions,
 ) !ChromeInstance {
-    // 1. Detect Chrome binary
-    var chrome_bin = detector.detectChrome(allocator) catch {
-        return LaunchError.ChromeNotFound;
-    };
-    defer chrome_bin.deinit();
+    // 1. Detect browser binary (browser_path takes precedence over browser name)
+    var chrome_bin: detector.ChromeBinary = undefined;
+    var owns_path = true;
+
+    if (options.browser_path) |path| {
+        // Direct path provided - use it directly (no allocation needed)
+        chrome_bin = detector.ChromeBinary{
+            .path = path,
+            .allocator = allocator,
+        };
+        owns_path = false; // Don't free, we don't own it
+    } else if (options.browser) |browser_name| {
+        chrome_bin = detector.detectBrowserByName(allocator, browser_name) catch {
+            return LaunchError.ChromeNotFound;
+        };
+    } else {
+        chrome_bin = detector.detectChrome(allocator) catch {
+            return LaunchError.ChromeNotFound;
+        };
+    }
+    defer if (owns_path) chrome_bin.deinit();
 
     // 2. Create temporary user data directory if not provided
     var temp_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -119,8 +139,8 @@ fn extractDebugUrl(allocator: std.mem.Allocator, stderr: std.fs.File) ![]const u
     var output_buf: [8192]u8 = undefined;
     var total_read: usize = 0;
 
-    // Wait up to 5 seconds for Chrome to print debug URL
-    const timeout_ns = 5 * std.time.ns_per_s;
+    // Wait up to 10 seconds for Chrome to print debug URL (profiles can be slow)
+    const timeout_ns = 10 * std.time.ns_per_s;
     const start_time = std.time.nanoTimestamp();
 
     while (std.time.nanoTimestamp() - start_time < timeout_ns) {
@@ -148,6 +168,13 @@ fn extractDebugUrl(allocator: std.mem.Allocator, stderr: std.fs.File) ![]const u
                 return try allocator.dupe(u8, url);
             }
         }
+    }
+
+    // Debug: print what we got from Chrome
+    if (total_read > 0) {
+        std.debug.print("\n[DEBUG] Chrome stderr output ({} bytes):\n{s}\n", .{ total_read, output_buf[0..total_read] });
+    } else {
+        std.debug.print("\n[DEBUG] Chrome produced no stderr output\n", .{});
     }
 
     return LaunchError.TimeoutWaitingForDebugUrl;

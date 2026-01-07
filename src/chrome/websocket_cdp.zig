@@ -90,8 +90,7 @@ pub const WebSocketCdpClient = struct {
         defer allocator.free(parsed.path);
 
         // TCP connect
-        const address = try std.net.Address.parseIp(parsed.host, parsed.port);
-        const stream = try std.net.tcpConnectToAddress(address);
+        const stream = try std.net.tcpConnectToHost(allocator, parsed.host, parsed.port);
 
         // Initialize frame pool (triple-buffered, 512KB slots)
         const frame_pool = try FramePool.init(allocator);
@@ -152,7 +151,8 @@ pub const WebSocketCdpClient = struct {
             );
         defer self.allocator.free(command);
 
-        try self.sendFrame(0x1, command);
+        // Use priority send for input commands to minimize latency
+        try self.sendFramePriority(0x1, command);
         // Don't wait for response - fire and forget
     }
 
@@ -330,6 +330,16 @@ pub const WebSocketCdpClient = struct {
         const method_end = std.mem.indexOfPos(u8, payload, method_value_start, "\"") orelse return;
         const method = payload[method_value_start..method_end];
 
+        // Debug: log all received events
+        {
+            const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch return;
+            defer log_file.close();
+            log_file.seekFromEnd(0) catch {};
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[CDP EVENT] method={s}, payload_len={}\n", .{ method, payload.len }) catch return;
+            log_file.writeAll(msg) catch {};
+        }
+
         // Special handling for screencast frames
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             try self.handleScreencastFrame(payload);
@@ -342,10 +352,27 @@ pub const WebSocketCdpClient = struct {
     /// Handle screencast frame event (zero-copy to pool)
     fn handleScreencastFrame(self: *WebSocketCdpClient, payload: []const u8) !void {
         // Parse sessionId
-        const session_id = try self.extractSessionId(payload);
+        const session_id = self.extractSessionId(payload) catch |err| {
+            // Debug: log parse error
+            const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch return;
+            defer log_file.close();
+            log_file.seekFromEnd(0) catch {};
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[CDP] extractSessionId failed: {}\n", .{err}) catch return;
+            log_file.writeAll(msg) catch {};
+            return err;
+        };
 
         // Parse base64 data (zero-copy slice into payload)
-        const base64_data = try self.extractScreencastData(payload);
+        const base64_data = self.extractScreencastData(payload) catch |err| {
+            const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch return;
+            defer log_file.close();
+            log_file.seekFromEnd(0) catch {};
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[CDP] extractScreencastData failed: {}\n", .{err}) catch return;
+            log_file.writeAll(msg) catch {};
+            return err;
+        };
 
         // Parse metadata dimensions
         const device_width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
@@ -358,8 +385,23 @@ pub const WebSocketCdpClient = struct {
             session_id,
             device_width,
             device_height,
-        )) |_| {
+        )) |gen| {
             _ = self.frame_count.fetchAdd(1, .monotonic);
+            // Debug: log successful frame write
+            const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch return;
+            defer log_file.close();
+            log_file.seekFromEnd(0) catch {};
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[CDP] Frame written: session={}, gen={}, size={}, {}x{}\n", .{ session_id, gen, base64_data.len, device_width, device_height }) catch return;
+            log_file.writeAll(msg) catch {};
+        } else {
+            // Debug: log dropped frame
+            const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch return;
+            defer log_file.close();
+            log_file.seekFromEnd(0) catch {};
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[CDP] Frame DROPPED (all slots in use): session={}\n", .{session_id}) catch return;
+            log_file.writeAll(msg) catch {};
         }
         // Always acknowledge to prevent Chrome from stalling
         self.acknowledgeFrame(session_id) catch {};
@@ -525,12 +567,51 @@ pub const WebSocketCdpClient = struct {
         return WebSocketError.HandshakeFailed;
     }
 
+    /// Send frame with priority - uses tryLock to avoid blocking on ack traffic
+    /// Retries with exponential backoff if lock is contended
+    fn sendFramePriority(self: *WebSocketCdpClient, opcode: u8, payload: []const u8) !void {
+        var attempts: u32 = 0;
+        while (attempts < 10) : (attempts += 1) {
+            if (self.write_mutex.tryLock()) {
+                defer self.write_mutex.unlock();
+                return self.sendFrameUnlocked(opcode, payload);
+            }
+            // Brief spin before retry (exponential: 10us, 20us, 40us...)
+            const shift: u6 = @intCast(@min(attempts, 4));
+            std.Thread.sleep(@as(u64, @as(u64, 10) << shift) * std.time.ns_per_us);
+        }
+        // Fall back to blocking if all retries failed
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        return self.sendFrameUnlocked(opcode, payload);
+    }
+
     fn sendFrame(self: *WebSocketCdpClient, opcode: u8, payload: []const u8) !void {
         // Mutex protects against concurrent writes from reader thread (acks) and main thread (commands)
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
+        return self.sendFrameUnlocked(opcode, payload);
+    }
 
-        var frame_buf: [16384]u8 = undefined;
+    fn sendFrameUnlocked(self: *WebSocketCdpClient, opcode: u8, payload: []const u8) !void {
+
+        const header_len_max = 14;
+        const required_len = payload.len + header_len_max;
+
+        // Use stack buffer for small frames, allocate for large ones
+        var stack_buf: [16384]u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |b| self.allocator.free(b);
+
+        var frame_buf: []u8 = undefined;
+
+        if (required_len <= stack_buf.len) {
+            frame_buf = stack_buf[0..];
+        } else {
+            heap_buf = try self.allocator.alloc(u8, required_len);
+            frame_buf = heap_buf.?;
+        }
+
         var frame_len: usize = 0;
         const payload_len = payload.len;
 

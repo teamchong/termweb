@@ -27,6 +27,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Add stb_image C library
+    exe.addCSourceFile(.{
+        .file = b.path("src/vendor/stb_image.c"),
+        .flags = &.{"-O2"},
+    });
+    exe.addIncludePath(b.path("src/vendor"));
+    exe.linkLibC();
+
     // Add vendor imports
     exe.root_module.addImport("json", json_mod);
     exe.root_module.addImport("websocket", websocket_mod);

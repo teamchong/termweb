@@ -5,6 +5,7 @@
 const std = @import("std");
 const terminal_mod = @import("terminal/terminal.zig");
 const kitty_mod = @import("terminal/kitty_graphics.zig");
+const shm_mod = @import("terminal/shm.zig");
 const input_mod = @import("terminal/input.zig");
 const screen_mod = @import("terminal/screen.zig");
 const prompt_mod = @import("terminal/prompt.zig");
@@ -18,6 +19,7 @@ const ui_mod = @import("ui/mod.zig");
 
 const Terminal = terminal_mod.Terminal;
 const KittyGraphics = kitty_mod.KittyGraphics;
+const ShmBuffer = shm_mod.ShmBuffer;
 const InputReader = input_mod.InputReader;
 const Screen = screen_mod.Screen;
 const Key = input_mod.Key;
@@ -33,6 +35,31 @@ const cursor_asset = ui_mod.assets.cursor;
 
 /// Line ending for raw terminal mode (carriage return + line feed)
 const CRLF = "\r\n";
+
+fn envVarTruthy(allocator: std.mem.Allocator, name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(allocator, name) catch return false;
+    defer allocator.free(value);
+
+    return std.mem.eql(u8, value, "1") or
+        std.mem.eql(u8, value, "true") or
+        std.mem.eql(u8, value, "yes");
+}
+
+fn isGhosttyTerminal(allocator: std.mem.Allocator) bool {
+    const term_program = std.process.getEnvVarOwned(allocator, "TERM_PROGRAM") catch null;
+    if (term_program) |tp| {
+        defer allocator.free(tp);
+        if (std.mem.eql(u8, tp, "ghostty")) return true;
+    }
+
+    const term = std.process.getEnvVarOwned(allocator, "TERM") catch null;
+    if (term) |t| {
+        defer allocator.free(t);
+        if (std.mem.indexOf(u8, t, "ghostty") != null) return true;
+    }
+
+    return false;
+}
 
 /// ViewerMode represents the current interaction mode of the viewer.
 ///
@@ -76,6 +103,7 @@ pub const Viewer = struct {
 
     // Screencast streaming
     screencast_mode: bool,
+    screencast_format: screenshot_api.ScreenshotFormat,
     last_frame_time: i128,
 
     // UI state for layered rendering
@@ -85,18 +113,24 @@ pub const Viewer = struct {
     mouse_x: u16,
     mouse_y: u16,
     mouse_visible: bool,
+    mouse_buttons: u32, // Bitmask of currently pressed buttons
     cursor_image_id: ?u32,  // Track cursor image ID for cleanup
 
     // Input throttling
     last_input_time: i128,
     last_mouse_move_time: i128,  // Separate throttle for mouse move events
 
-    // Frame tracking for skip detection
+    // Frame tracking for skip detection and throttling
     last_rendered_generation: u64,
+    last_content_image_id: ?u32, // Track content image ID for cleanup
     frames_skipped: u32,  // Counter for monitoring
 
     // Debug flags
     debug_input: bool,
+    ui_dirty: bool, // Track if UI needs re-rendering
+
+    // Shared memory buffer for zero-copy Kitty graphics
+    shm_buffer: ?ShmBuffer,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -120,6 +154,15 @@ pub const Viewer = struct {
             break :blk std.mem.eql(u8, debug_input, "1");
         };
 
+        // Initialize SHM buffer for zero-copy Kitty rendering
+        // Size: max viewport * 4 bytes (RGBA)
+        const shm_size = viewport_width * viewport_height * 4;
+        const force_shm = envVarTruthy(allocator, "TERMWEB_FORCE_SHM");
+        const disable_shm = envVarTruthy(allocator, "TERMWEB_DISABLE_SHM") or
+            (!force_shm and isGhosttyTerminal(allocator));
+        const shm_buffer = if (disable_shm) null else ShmBuffer.init(shm_size) catch null;
+        const screencast_format: screenshot_api.ScreenshotFormat = if (shm_buffer == null) .png else .jpeg;
+
         return Viewer{
             .allocator = allocator,
             .terminal = Terminal.init(),
@@ -137,17 +180,22 @@ pub const Viewer = struct {
             .coord_mapper = null,
             .last_click = null,
             .screencast_mode = false,
+            .screencast_format = screencast_format,
             .last_frame_time = 0,
             .ui_state = UIState{},
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
+            .mouse_buttons = 0,
             .cursor_image_id = null,
             .last_input_time = 0,
             .last_mouse_move_time = 0,
             .last_rendered_generation = 0,
+            .last_content_image_id = null,
             .frames_skipped = 0,
             .debug_input = enable_input_debug,
+            .ui_dirty = true,
+            .shm_buffer = shm_buffer,
         };
     }
 
@@ -195,10 +243,13 @@ pub const Viewer = struct {
         try self.kitty.clearAll(writer);
         try writer.flush();
 
-        // Start screencast streaming with exact viewport dimensions for 1:1 coordinate mapping
+        // Start screencast streaming with viewport dimensions
+        // Note: cli.zig already scales viewport for High-DPI displays
         self.log("[DEBUG] Starting screencast {}x{}...\n", .{ self.viewport_width, self.viewport_height });
+            
         try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-            .format = .png,
+            .format = self.screencast_format,
+            .quality = 80,
             .width = self.viewport_width,
             .height = self.viewport_height,
         });
@@ -256,7 +307,10 @@ pub const Viewer = struct {
 
                 // Log and process (throttling happens inside handleMouse)
                 switch (input) {
-                    .key => |key| self.log("[INPUT] Key: {any}\n", .{key}),
+                    .key => |key| {
+                        self.log("[INPUT] Key: {any}\n", .{key});
+                        self.ui_dirty = true;
+                    },
                     .mouse => |m| self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y }),
                     .none => {},
                 }
@@ -265,18 +319,21 @@ pub const Viewer = struct {
 
             // Render new screencast frames (non-blocking) - only in normal mode
             if (self.screencast_mode and self.mode == .normal) {
-                _ = self.tryRenderScreencast() catch {};
-
-                // Render UI overlays
-                var stdout_buf2: [8192]u8 = undefined;
-                const stdout_file2 = std.fs.File.stdout();
-                var stdout_writer2 = stdout_file2.writer(&stdout_buf2);
-                const writer2 = &stdout_writer2.interface;
-                self.renderCursor(writer2) catch {};
-                self.renderUIChrome(writer2) catch {}; // Tab bar only (no status bar)
+                const new_frame = self.tryRenderScreencast() catch false;
+                
+                // Redraw UI overlays ONLY if we got a new frame or UI is dirty (e.g. mouse moved)
+                if (new_frame or self.ui_dirty) {
+                    var stdout_buf2: [8192]u8 = undefined;
+                    const stdout_file2 = std.fs.File.stdout();
+                    var stdout_writer2 = stdout_file2.writer(&stdout_buf2);
+                    const writer2 = &stdout_writer2.interface;
+                    self.renderCursor(writer2) catch {};
+                    self.renderUIChrome(writer2) catch {}; // Tab bar only (no status bar)
+                    self.ui_dirty = false;
+                }
             }
 
-            // Short sleep to avoid busy-waiting (5ms = 200 iterations/sec max)
+            // Throttle inner loop slightly to prevent flooding input/output
             std.Thread.sleep(5 * std.time.ns_per_ms);
         }
 
@@ -340,6 +397,8 @@ pub const Viewer = struct {
             self.screencast_mode = false;
         }
 
+        self.ui_dirty = true;
+
         // Update Chrome viewport
         try screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height);
 
@@ -355,7 +414,8 @@ pub const Viewer = struct {
 
         // Restart screencast with new dimensions
         try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-            .format = .png,
+            .format = self.screencast_format,
+            .quality = 80,
             .width = new_width,
             .height = new_height,
         });
@@ -451,16 +511,16 @@ pub const Viewer = struct {
     /// Try to render latest screencast frame (non-blocking)
     /// Returns true if frame was rendered, false if no new frame
     fn tryRenderScreencast(self: *Viewer) !bool {
-        // Frame rate limiting: Don't render faster than 30fps (~33ms per frame)
         const now = std.time.nanoTimestamp();
-        const min_frame_interval = 33 * std.time.ns_per_ms;
-        if (self.last_frame_time > 0 and (now - self.last_frame_time) < min_frame_interval) {
-            return false; // Too soon since last frame
-        }
 
         // Get frame with proper ownership - MUST call deinit when done
         var frame = screenshot_api.getLatestScreencastFrame(self.cdp_client) orelse return false;
         defer frame.deinit(); // Proper cleanup!
+
+        // Throttle: Don't re-render the same frame multiple times
+        if (self.last_rendered_generation > 0 and frame.generation <= self.last_rendered_generation) {
+            return false;
+        }
 
         // Frame skip detection: Check if we skipped frames
         if (self.last_rendered_generation > 0 and frame.generation > self.last_rendered_generation + 1) {
@@ -510,7 +570,11 @@ pub const Viewer = struct {
         const size = try self.terminal.getSize();
         const tabbar_rows: u32 = 1;
         const content_rows = if (size.rows > tabbar_rows) size.rows - tabbar_rows else 1;
-        const display_cols = if (size.cols > 0) size.cols else 80;
+        const display_cols: u16 = if (size.cols > 0) size.cols else 80;
+
+        // Note: We use the full column count from ioctl
+        // The image will be scaled to fill all columns (2x scaling on Retina)
+        // This is correct because cli.zig already halved the viewport width
 
         // Update coordinate mapper with ACTUAL frame dimensions from CDP
         // This ensures click coordinates match what Chrome is rendering
@@ -530,15 +594,49 @@ pub const Viewer = struct {
         // Move cursor to row 2 (after tab bar)
         try writer.writeAll("\x1b[2;1H");
 
-        // Display via Kitty graphics protocol - pass base64 directly (no decode/encode roundtrip)
-        _ = try self.kitty.displayBase64PNG(writer, base64_png, .{
+        // Use placement ID and Z-index to ensure correct layering and replacement
+        const display_opts = kitty_mod.DisplayOptions{
             .rows = content_rows,
             .columns = display_cols,
             .placement_id = Placement.CONTENT,
             .z = ZIndex.CONTENT,
-        });
+        };
+
+        // Track old image ID for cleanup
+        const old_image_id = self.last_content_image_id;
+        var new_image_id: ?u32 = null;
+
+        // Try SHM path first (decode image, write to SHM, zero-copy transfer to Kitty)
+        if (self.shm_buffer) |*shm| {
+            if (self.kitty.displayBase64ImageViaSHM(writer, base64_png, shm, display_opts) catch null) |id| {
+                new_image_id = id;
+                self.log("[RENDER] displayFrame via SHM complete (id={d})\n", .{id});
+            } else {
+                self.log("[RENDER] SHM path failed, falling back to base64\n", .{});
+            }
+        }
+
+        // Fallback: Display via base64
+        if (new_image_id == null) {
+            if (self.screencast_format == .png) {
+                new_image_id = try self.kitty.displayBase64PNG(writer, base64_png, display_opts);
+            } else {
+                new_image_id = try self.kitty.displayBase64Image(writer, base64_png, display_opts);
+            }
+            self.log("[RENDER] displayFrame via base64 complete (id={d})\n", .{new_image_id.?});
+        }
+
+        // Update tracking
+        self.last_content_image_id = new_image_id;
+        
+        // IMPORTANT: Flush the new image to screen immediately
         try writer.flush();
-        self.log("[RENDER] displayFrame complete\n", .{});
+
+        // Delete previous image resource to prevent terminal memory bloat
+        if (old_image_id) |id| {
+            try self.kitty.deleteImage(writer, id);
+            try writer.flush();
+        }
     }
 
     /// Display a base64 PNG frame (legacy, uses viewport dimensions)
@@ -782,16 +880,23 @@ pub const Viewer = struct {
             self.last_mouse_move_time = now;
         }
 
+        // ANSI mouse coordinates are 1-indexed. Normalize to 0-indexed for internal use.
+        const norm_x = if (mouse.x > 0) mouse.x - 1 else 0;
+        const norm_y = if (mouse.y > 0) mouse.y - 1 else 0;
+
         // Track mouse position for cursor rendering
-        self.mouse_x = mouse.x;
-        self.mouse_y = mouse.y;
+        self.mouse_x = norm_x;
+        self.mouse_y = norm_y;
         self.mouse_visible = true;
+        self.ui_dirty = true;
 
         // Log parsed mouse events (if enabled)
         if (self.debug_input) {
-            self.log("[MOUSE] type={s} button={s} x={} y={} delta_y={}\n", .{
+            self.log("[MOUSE] type={s} button={s} x={} y={} (raw={},{}) delta_y={}\n", .{
                 @tagName(mouse.type),
                 @tagName(mouse.button),
+                norm_x,
+                norm_y,
                 mouse.x,
                 mouse.y,
                 mouse.delta_y,
@@ -856,63 +961,149 @@ pub const Viewer = struct {
     fn handleMouseNormal(self: *Viewer, mouse: MouseEvent) !void {
         const mapper = self.coord_mapper orelse return;
 
+        // Determine button mask and name
+        var button_mask: u32 = 0;
+        var button_name: []const u8 = "none";
+        
+        switch (mouse.button) {
+            .left => { button_mask = 1; button_name = "left"; },
+            .right => { button_mask = 2; button_name = "right"; },
+            .middle => { button_mask = 4; button_name = "middle"; },
+            else => {},
+        }
+
         switch (mouse.type) {
             .press => {
-                if (mouse.button == .left) {
-                    // Log mapper details for debugging (if enabled)
-                    if (self.debug_input) {
-                        self.log("[MOUSE] Terminal: {}x{} px, Viewport: {}x{}, Cell height: {} px\n", .{
-                            mapper.terminal_width_px,
-                            mapper.terminal_height_px,
-                            mapper.viewport_width,
-                            mapper.viewport_height,
-                            mapper.cell_height,
-                        });
+                // Update button state (add pressed button)
+                self.mouse_buttons |= button_mask;
+
+                // Log mapper details for debugging (if enabled)
+                if (self.debug_input) {
+                    self.log("[MOUSE] Press: {} ({s}) mask={} total={}\n", .{
+                        mouse.button, button_name, button_mask, self.mouse_buttons
+                    });
+                }
+
+                if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
+                    self.log("[COORD] -> browser=({},{})\n", .{ coords.x, coords.y });
+
+                    self.log("[INPUT] Sending mousePressed: ({},{}) button={s} buttons={} clickCount=1\n", .{
+                        coords.x, coords.y, button_name, self.mouse_buttons
+                    });
+
+                    // WORKAROUND: Try both mousePressed and click
+                    try interact_mod.sendMouseEvent(
+                        self.cdp_client,
+                        self.allocator,
+                        "mousePressed",
+                        coords.x,
+                        coords.y,
+                        button_name,
+                        self.mouse_buttons,
+                        1
+                    );
+
+                    // Also try simulated click via JavaScript as fallback
+                    if (mouse.button == .left) {
+                        // First check what element is at this position
+                        const check_js = try std.fmt.allocPrint(
+                            self.allocator,
+                            "(()=>{{const el=document.elementFromPoint({d},{d});return el?el.tagName+' '+el.className:'null'}})()",
+                            .{ coords.x, coords.y }
+                        );
+                        defer self.allocator.free(check_js);
+
+                        const check_params = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{{\"expression\":\"{s}\"}}",
+                            .{check_js}
+                        );
+                        defer self.allocator.free(check_params);
+
+                        if (self.cdp_client.sendCommand("Runtime.evaluate", check_params)) |check_result| {
+                            self.log("[JS] Element at ({},{}): {s}\n", .{ coords.x, coords.y, check_result });
+                            self.allocator.free(check_result);
+                        } else |_| {}
+
+                        // Now try to click it
+                        const js = try std.fmt.allocPrint(
+                            self.allocator,
+                            "(()=>{{const el=document.elementFromPoint({d},{d});if(el){{el.click();return true}}return false}})()",
+                            .{ coords.x, coords.y }
+                        );
+                        defer self.allocator.free(js);
+
+                        const js_params = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{{\"expression\":\"{s}\"}}",
+                            .{js}
+                        );
+                        defer self.allocator.free(js_params);
+
+                        const js_result = self.cdp_client.sendCommand("Runtime.evaluate", js_params) catch |err| blk: {
+                            self.log("[JS CLICK] Error: {}\n", .{err});
+                            break :blk null;
+                        };
+                        if (js_result) |r| {
+                            self.log("[JS CLICK] Result: {s}\n", .{r});
+                            self.allocator.free(r);
+                        }
                     }
 
-                    // Map terminal coordinates to browser viewport
-                    self.log("[COORD] term={}x{} term_px=({},{}) tab_h={} viewport={}x{}\n", .{
-                        mapper.terminal_width_px, mapper.terminal_height_px,
-                        mouse.x, mouse.y,
-                        mapper.tabbar_height,
-                        mapper.viewport_width, mapper.viewport_height,
-                    });
-                    if (mapper.terminalToBrowser(mouse.x, mouse.y)) |coords| {
-                        self.log("[COORD] -> browser=({},{})\n", .{ coords.x, coords.y });
-                        if (self.debug_input) {
-                            self.log("[MOUSE] Terminal coords ({},{}) -> Browser coords ({},{})\n", .{
-                                mouse.x,
-                                mouse.y,
-                                coords.x,
-                                coords.y,
-                            });
-                        }
-
-                        try interact_mod.clickAt(self.cdp_client, self.allocator, coords.x, coords.y);
-
-                        // Store click info for status line display (after click, before refresh)
+                    // Store click info for status line display
+                    // Note: This is now just "last interaction position" effectively
+                    if (mouse.button == .left) {
                         self.last_click = .{
-                            .term_x = mouse.x,
-                            .term_y = mouse.y,
+                            .term_x = self.mouse_x,
+                            .term_y = self.mouse_y,
                             .browser_x = coords.x,
                             .browser_y = coords.y,
                         };
-
                         // Update navigation state (click may have navigated)
                         self.updateNavigationState();
-                    } else {
-                        // Click is in tab bar - handle button clicks
-                        self.log("[CLICK] In tab bar: mouse=({},{}) tabbar_height={}\n", .{
-                            mouse.x, mouse.y, mapper.tabbar_height,
-                        });
-                        try self.handleTabBarClick(mouse.x, mapper);
                     }
+                } else {
+                    // Click is in tab bar - handle button clicks
+                    // We handle this on PRESS for immediate feedback (like most UI buttons)
+                    self.log("[CLICK] In tab bar: mouse=({},{}) tabbar_height={}\n", .{
+                        self.mouse_x, self.mouse_y, mapper.tabbar_height,
+                    });
+                    try self.handleTabBarClick(self.mouse_x, mapper);
+                }
+            },
+            .release => {
+                // Update button state (remove released button)
+                self.mouse_buttons &= ~button_mask;
+
+                if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
+                    self.log("[INPUT] Sending mouseReleased: ({},{}) button={s} buttons={} clickCount=1\n", .{
+                        coords.x, coords.y, button_name, self.mouse_buttons
+                    });
+                    try interact_mod.sendMouseEvent(
+                        self.cdp_client,
+                        self.allocator,
+                        "mouseReleased",
+                        coords.x,
+                        coords.y,
+                        button_name, // Release event needs the button that changed state
+                        self.mouse_buttons,
+                        1
+                    );
                 }
             },
             .move, .drag => {
-                // Forward mouse move to Chrome for hover effects (throttled in handleMouse)
-                if (mapper.terminalToBrowser(mouse.x, mouse.y)) |coords| {
-                    try interact_mod.mouseMove(self.cdp_client, self.allocator, coords.x, coords.y);
+                // Forward mouse move to Chrome for hover and drag effects
+                if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
+                    try interact_mod.sendMouseEvent(
+                        self.cdp_client, 
+                        self.allocator, 
+                        "mouseMoved", 
+                        coords.x, 
+                        coords.y, 
+                        "none", // Move events don't have a "changed" button
+                        self.mouse_buttons, 
+                        0
+                    );
                 }
             },
             .wheel => {
@@ -942,7 +1133,7 @@ pub const Viewer = struct {
                     try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
                 }
             },
-            else => {}, // Ignore release events
+
         }
     }
 
@@ -1321,6 +1512,9 @@ pub const Viewer = struct {
         }
         if (self.debug_log) |file| {
             file.close();
+        }
+        if (self.shm_buffer) |*shm| {
+            shm.deinit();
         }
         self.terminal.deinit();
     }

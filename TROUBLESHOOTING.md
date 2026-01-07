@@ -422,6 +422,14 @@ google-chrome "https://example.com"  # Linux
 Some sites detect headless Chrome. Not much can be done currently.
 Workaround: Use a different site or wait for future anti-detection features.
 
+**Cause 4:** Ghostty does not support Kitty SHM transfers on your build (UI renders but page area is blank)
+
+**Fix:**
+```bash
+TERMWEB_DISABLE_SHM=1 termweb open https://example.com
+# To override auto-disable: TERMWEB_FORCE_SHM=1
+```
+
 ### Forms Not Working
 
 **Error:** Pressing 'f' shows "No elements"
