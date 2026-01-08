@@ -27,12 +27,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Add stb_image C library
+    // Add C libraries
     exe.addCSourceFile(.{
         .file = b.path("src/vendor/stb_image.c"),
         .flags = &.{"-O2"},
     });
     exe.addIncludePath(b.path("src/vendor"));
+
+    // Link notcurses
+    exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    exe.linkSystemLibrary("notcurses-core");
     exe.linkLibC();
 
     // Add vendor imports
