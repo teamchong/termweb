@@ -29,14 +29,21 @@ pub const ChromePipeInstance = struct {
     pid: std.posix.pid_t, // Chrome process ID
     read_fd: std.posix.fd_t, // FD to read from Chrome (Chrome's FD 4)
     write_fd: std.posix.fd_t, // FD to write to Chrome (Chrome's FD 3)
+    user_data_dir: []const u8, // Path to temporary user data directory
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ChromePipeInstance) void {
-        // Close pipes first, then terminate
+        // Close pipes first
         std.posix.close(self.read_fd);
         std.posix.close(self.write_fd);
-        // Send SIGTERM to Chrome
+
+        // Send SIGTERM to Chrome and wait for it to exit
         std.posix.kill(self.pid, std.posix.SIG.TERM) catch {};
+        _ = std.posix.waitpid(self.pid, 0);
+
+        // Recursively delete temporary user data directory
+        std.fs.cwd().deleteTree(self.user_data_dir) catch {};
+        self.allocator.free(self.user_data_dir);
     }
 };
 
@@ -51,7 +58,139 @@ pub const LaunchOptions = struct {
     browser: ?[]const u8 = null,
     /// Direct path to browser binary (takes precedence over browser name)
     browser_path: ?[]const u8 = null,
+    /// Clone from an existing Chrome profile (e.g., "Default", "Profile 1")
+    /// Copies bookmarks, history, cookies, extensions, etc.
+    /// Set to "Default" by default, use empty string "" to skip cloning
+    clone_profile: ?[]const u8 = "Default",
 };
+
+/// Get Chrome user data directory path for the current platform
+pub fn getChromeUserDataDir(allocator: std.mem.Allocator) ![]const u8 {
+    const builtin = @import("builtin");
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
+    defer allocator.free(home);
+
+    return switch (builtin.os.tag) {
+        .macos => try std.fmt.allocPrint(allocator, "{s}/Library/Application Support/Google/Chrome", .{home}),
+        .linux => try std.fmt.allocPrint(allocator, "{s}/.config/google-chrome", .{home}),
+        else => error.UnsupportedPlatform,
+    };
+}
+
+/// List available Chrome profiles
+pub fn listProfiles(allocator: std.mem.Allocator) ![][]const u8 {
+    const user_data_dir = try getChromeUserDataDir(allocator);
+    defer allocator.free(user_data_dir);
+
+    var profiles = try std.ArrayList([]const u8).initCapacity(allocator, 8);
+    errdefer {
+        for (profiles.items) |p| allocator.free(p);
+        profiles.deinit(allocator);
+    }
+
+    var dir = std.fs.cwd().openDir(user_data_dir, .{ .iterate = true }) catch return try profiles.toOwnedSlice(allocator);
+
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+
+        // Check if this looks like a profile directory
+        if (std.mem.eql(u8, entry.name, "Default") or
+            std.mem.startsWith(u8, entry.name, "Profile "))
+        {
+            // Verify it has a Preferences file
+            var profile_dir = dir.openDir(entry.name, .{}) catch continue;
+            defer profile_dir.close();
+            profile_dir.access("Preferences", .{}) catch continue;
+
+            try profiles.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+    }
+
+    return try profiles.toOwnedSlice(allocator);
+}
+
+/// Clone a Chrome profile to a temporary directory
+/// Copies: Bookmarks, Cookies, History, Login Data, Preferences, Extensions
+/// Skips: Sessions, Current Session, Current Tabs (to avoid lock conflicts)
+fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir: []const u8) !void {
+    const user_data_dir = try getChromeUserDataDir(allocator);
+    defer allocator.free(user_data_dir);
+
+    const source_profile = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ user_data_dir, profile_name });
+    defer allocator.free(source_profile);
+
+    // Create destination profile directory
+    const dest_profile = try std.fmt.allocPrint(allocator, "{s}/Default", .{dest_dir});
+    defer allocator.free(dest_profile);
+
+    std.fs.cwd().makePath(dest_profile) catch |err| {
+        std.debug.print("Failed to create profile dir: {}\n", .{err});
+        return error.CloneFailed;
+    };
+
+    // Files to copy (essential for preserving user data)
+    const files_to_copy = [_][]const u8{
+        "Preferences",
+        "Bookmarks",
+        "Cookies",
+        "History",
+        "Login Data",
+        "Web Data",
+        "Favicons",
+        "Top Sites",
+        "Shortcuts",
+    };
+
+    var source_dir = std.fs.cwd().openDir(source_profile, .{}) catch |err| {
+        std.debug.print("Failed to open source profile '{s}': {}\n", .{ profile_name, err });
+        return error.ProfileNotFound;
+    };
+    defer source_dir.close();
+
+    var dest_dir_handle = std.fs.cwd().openDir(dest_profile, .{}) catch return error.CloneFailed;
+    defer dest_dir_handle.close();
+
+    var copied: u32 = 0;
+    for (files_to_copy) |filename| {
+        source_dir.copyFile(filename, dest_dir_handle, filename, .{}) catch continue;
+        copied += 1;
+    }
+
+    // Copy Extensions directory if it exists
+    copyDirRecursive(allocator, source_dir, dest_dir_handle, "Extensions") catch {};
+
+    std.debug.print("Cloned profile '{s}' ({} files copied)\n", .{ profile_name, copied });
+}
+
+/// Recursively copy a directory
+fn copyDirRecursive(allocator: std.mem.Allocator, source_parent: std.fs.Dir, dest_parent: std.fs.Dir, dir_name: []const u8) !void {
+    var source = source_parent.openDir(dir_name, .{ .iterate = true }) catch return error.OpenFailed;
+    defer source.close();
+
+    dest_parent.makeDir(dir_name) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var dest = dest_parent.openDir(dir_name, .{}) catch return error.OpenFailed;
+    defer dest.close();
+
+    var iter = source.iterate();
+    while (try iter.next()) |entry| {
+        switch (entry.kind) {
+            .file => {
+                source.copyFile(entry.name, dest, entry.name, .{}) catch continue;
+            },
+            .directory => {
+                copyDirRecursive(allocator, source, dest, entry.name) catch continue;
+            },
+            else => {},
+        }
+    }
+}
 
 /// Launch Chrome with Pipe-based CDP (preferred for better throughput)
 /// Uses --remote-debugging-pipe which communicates via FD 3/4
@@ -96,6 +235,14 @@ pub fn launchChromePipe(
         };
         break :blk temp_dir;
     };
+
+    // 2b. Clone profile if requested
+    if (options.clone_profile) |profile_name| {
+        cloneProfile(allocator, profile_name, user_data_dir) catch |err| {
+            std.debug.print("Warning: Could not clone profile '{s}': {}\n", .{ profile_name, err });
+            std.debug.print("Starting with fresh profile instead.\n", .{});
+        };
+    }
 
     // 3. Create pipes for Chrome communication
     // We need two pipes:
@@ -212,6 +359,7 @@ pub fn launchChromePipe(
         .pid = pid,
         .write_fd = pipe_to_chrome[1],
         .read_fd = pipe_from_chrome[0],
+        .user_data_dir = try allocator.dupe(u8, user_data_dir),
         .allocator = allocator,
     };
 }

@@ -50,36 +50,28 @@ fn parseCommand(arg: []const u8) Command {
 }
 
 fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len < 1) {
-        std.debug.print("Error: URL required\n", .{});
-        std.debug.print("Usage: termweb open <url> [--mobile] [--scale N]\n", .{});
-        std.process.exit(1);
-    }
-
-    // Check terminal support first
-    if (!try checkTerminalSupport(allocator)) {
-        std.process.exit(1);
-    }
-
-    const url = args[0];
-    var mobile = false;
-    var scale: f32 = 1.0;
-
-    // Parse flags
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--mobile")) {
-            mobile = true;
-        } else if (std.mem.eql(u8, arg, "--scale")) {
-            if (i + 1 >= args.len) {
-                std.debug.print("Error: --scale requires a value\n", .{});
+    // Handle list commands first (they don't need a URL)
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--list-profiles")) {
+            const profiles = launcher.listProfiles(allocator) catch |err| {
+                std.debug.print("Error listing profiles: {}\n", .{err});
                 std.process.exit(1);
+            };
+            defer {
+                for (profiles) |p| allocator.free(p);
+                allocator.free(profiles);
             }
-            i += 1;
-            scale = try std.fmt.parseFloat(f32, args[i]);
+
+            std.debug.print("Available Chrome profiles:\n", .{});
+            for (profiles) |profile| {
+                std.debug.print("  {s}\n", .{profile});
+            }
+            if (profiles.len == 0) {
+                std.debug.print("  (no profiles found)\n", .{});
+            }
+            std.debug.print("\nUse --profile <name> to clone a profile.\n", .{});
+            return;
         } else if (std.mem.eql(u8, arg, "--list-browsers")) {
-            // List available browsers and exit
             const browsers = detector.listAvailableBrowsers(allocator) catch {
                 std.debug.print("Error listing browsers\n", .{});
                 std.process.exit(1);
@@ -96,6 +88,85 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             std.debug.print("\nUse --browser <name> to select one, or set $CHROME_BIN\n", .{});
             return;
         }
+    }
+
+    if (args.len < 1) {
+        std.debug.print("Error: URL required\n", .{});
+        std.debug.print("Usage: termweb open <url> [--mobile] [--scale N]\n", .{});
+        std.process.exit(1);
+    }
+
+    // Check terminal support first
+    if (!try checkTerminalSupport(allocator)) {
+        std.process.exit(1);
+    }
+
+    var url = args[0];
+    var normalized_url: ?[]const u8 = null;
+    defer if (normalized_url) |u| allocator.free(u);
+
+    // Normalize URL
+    if (std.mem.startsWith(u8, url, "/")) {
+        // Absolute path
+        normalized_url = try std.fmt.allocPrint(allocator, "file://{s}", .{url});
+        url = normalized_url.?;
+    } else if (std.mem.startsWith(u8, url, "./") or std.mem.startsWith(u8, url, "../") or std.mem.eql(u8, url, ".")) {
+        // Relative path
+        const abs_path = try std.fs.cwd().realpathAlloc(allocator, url);
+        defer allocator.free(abs_path);
+        normalized_url = try std.fmt.allocPrint(allocator, "file://{s}", .{abs_path});
+        url = normalized_url.?;
+    } else if (!std.mem.containsAtLeast(u8, url, 1, "://")) {
+        // Check if it's a local file that exists even without prefix
+        if (std.fs.cwd().access(url, .{})) |_| {
+            const abs_path = try std.fs.cwd().realpathAlloc(allocator, url);
+            defer allocator.free(abs_path);
+            normalized_url = try std.fmt.allocPrint(allocator, "file://{s}", .{abs_path});
+            url = normalized_url.?;
+        } else |_| {
+            // Assume it's a web URL missing protocol
+            normalized_url = try std.fmt.allocPrint(allocator, "https://{s}", .{url});
+            url = normalized_url.?;
+        }
+    }
+    var mobile = false;
+    var scale: f32 = 1.0;
+    var clone_profile: ?[]const u8 = null; // null means use default from LaunchOptions
+    var no_profile = false;
+    var browser_path: ?[]const u8 = null;
+
+    // Parse flags
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--mobile")) {
+            mobile = true;
+        } else if (std.mem.eql(u8, arg, "--scale")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --scale requires a value\n", .{});
+                std.process.exit(1);
+            }
+            i += 1;
+            scale = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --profile requires a profile name (e.g., 'Default', 'Profile 1')\n", .{});
+                std.debug.print("Use --list-profiles to see available profiles.\n", .{});
+                std.process.exit(1);
+            }
+            i += 1;
+            clone_profile = args[i];
+        } else if (std.mem.eql(u8, arg, "--browser-path")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --browser-path requires a path to browser executable\n", .{});
+                std.process.exit(1);
+            }
+            i += 1;
+            browser_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--no-profile")) {
+            no_profile = true;
+        }
+        // --list-profiles and --list-browsers are handled at the start of cmdOpen
     }
 
     // TODO: Implement mobile viewport and scaling
@@ -149,12 +220,39 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Launch Chrome with Pipe transport
     std.debug.print("Launching Chrome (Pipe mode)...\n", .{});
 
-    var chrome_instance = launcher.launchChromePipe(allocator, .{
+    // Determine profile cloning behavior:
+    // - Default: clone "Default" profile (from LaunchOptions default)
+    // - --profile X: clone profile X
+    // - --no-profile: don't clone any profile (fresh)
+    var launch_opts = launcher.LaunchOptions{
         .viewport_width = viewport_width,
         .viewport_height = viewport_height,
-    }) catch |err| {
-        std.debug.print("Error launching Chrome: {}\n", .{err});
-        std.debug.print("Make sure Chrome is installed or set $CHROME_BIN\n", .{});
+        .browser_path = browser_path,
+    };
+
+    // Only override clone_profile if explicitly set
+    if (no_profile) {
+        launch_opts.clone_profile = null;
+    } else if (clone_profile) |p| {
+        launch_opts.clone_profile = p;
+    }
+
+    var chrome_instance = launcher.launchChromePipe(allocator, launch_opts) catch |err| {
+        switch (err) {
+            error.ChromeNotFound => {
+                std.debug.print("\nError: Chrome/Chromium browser not found.\n\n", .{});
+                std.debug.print("Options:\n", .{});
+                std.debug.print("  1. Install Chrome: https://www.google.com/chrome/\n", .{});
+                std.debug.print("  2. Set CHROME_BIN environment variable:\n", .{});
+                std.debug.print("     export CHROME_BIN=/path/to/chrome\n", .{});
+                std.debug.print("  3. Use --browser-path flag:\n", .{});
+                std.debug.print("     termweb open <url> --browser-path /path/to/chrome\n\n", .{});
+                std.debug.print("Run 'termweb open --list-browsers' to see detected browsers.\n", .{});
+            },
+            else => {
+                std.debug.print("Error launching Chrome: {}\n", .{err});
+            },
+        }
         std.process.exit(1);
     };
     defer chrome_instance.deinit();
@@ -303,15 +401,21 @@ fn printHelp() void {
         \\Commands:
         \\  open <url>     Open a URL in the terminal browser
         \\                 Options:
-        \\                   --list-browsers  Show available browsers
-        \\                   --mobile         Use mobile viewport
-        \\                   --scale N        Set zoom scale (default: 1.0)
+        \\                   --profile <name>      Clone Chrome profile (default: 'Default')
+        \\                   --no-profile          Start with fresh profile (no cloning)
+        \\                   --browser-path <path> Path to browser executable
+        \\                   --list-profiles       Show available Chrome profiles
+        \\                   --list-browsers       Show available browsers
+        \\                   --mobile              Use mobile viewport
+        \\                   --scale N             Set zoom scale (default: 1.0)
         \\  doctor         Check system capabilities
         \\  version        Show version information
         \\  help           Show this help message
         \\
         \\Examples:
         \\  termweb open https://example.com
+        \\  termweb open https://github.com --profile Default
+        \\  termweb open ./local.html --browser-path /opt/chrome/chrome
         \\
         \\Environment:
         \\  CHROME_BIN     Path to browser executable (overrides auto-detection)
