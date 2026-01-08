@@ -61,6 +61,33 @@ fn isGhosttyTerminal(allocator: std.mem.Allocator) bool {
     return false;
 }
 
+/// Detect if macOS natural scrolling is enabled
+/// Returns true if natural scrolling is ON (default on macOS)
+fn isNaturalScrollEnabled() bool {
+    // Check override env var first
+    const override = std.process.getEnvVarOwned(std.heap.page_allocator, "TERMWEB_NATURAL_SCROLL") catch null;
+    if (override) |val| {
+        defer std.heap.page_allocator.free(val);
+        if (std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false")) return false;
+        if (std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true")) return true;
+    }
+
+    // On macOS, read system preference
+    // `defaults read NSGlobalDomain com.apple.swipescrolldirection` returns 1 for natural
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{
+            "defaults", "read", "NSGlobalDomain", "com.apple.swipescrolldirection",
+        },
+    }) catch return true; // Default to natural scroll if can't detect
+    defer std.heap.page_allocator.free(result.stdout);
+    defer std.heap.page_allocator.free(result.stderr);
+
+    // Trim whitespace and check value
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\n\r");
+    return !std.mem.eql(u8, trimmed, "0"); // 1 or missing = natural scroll
+}
+
 /// ViewerMode represents the current interaction mode of the viewer.
 ///
 /// The viewer operates as a state machine with five distinct modes:
@@ -132,6 +159,15 @@ pub const Viewer = struct {
     // Shared memory buffer for zero-copy Kitty graphics
     shm_buffer: ?ShmBuffer,
 
+    // Scroll direction (true = natural scrolling inverts delta)
+    natural_scroll: bool,
+
+    // Performance profiling
+    perf_frame_count: u64,
+    perf_total_render_ns: i128,
+    perf_max_render_ns: i128,
+    perf_last_report_time: i128,
+
     pub fn init(
         allocator: std.mem.Allocator,
         cdp_client: *cdp.CdpClient,
@@ -196,7 +232,31 @@ pub const Viewer = struct {
             .debug_input = enable_input_debug,
             .ui_dirty = true,
             .shm_buffer = shm_buffer,
+            .natural_scroll = isNaturalScrollEnabled(),
+            .perf_frame_count = 0,
+            .perf_total_render_ns = 0,
+            .perf_max_render_ns = 0,
+            .perf_last_report_time = 0,
         };
+    }
+
+    /// Calculate max FPS based on viewport resolution
+    /// Larger resolutions get lower FPS to maintain responsiveness
+    fn getMaxFpsForResolution(self: *Viewer) u32 {
+        const pixels = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
+
+        // Thresholds based on total pixels
+        if (pixels <= 800 * 600) return 60;           // Small: 60fps
+        if (pixels <= 1280 * 720) return 45;          // 720p: 45fps
+        if (pixels <= 1920 * 1080) return 30;         // 1080p: 30fps
+        if (pixels <= 2560 * 1440) return 24;         // 1440p: 24fps
+        return 15;                                     // 4K+: 15fps
+    }
+
+    /// Get minimum frame interval in nanoseconds based on resolution
+    fn getMinFrameInterval(self: *Viewer) i128 {
+        const max_fps = self.getMaxFpsForResolution();
+        return @divFloor(std.time.ns_per_s, max_fps);
     }
 
     fn log(self: *Viewer, comptime fmt: []const u8, args: anytype) void {
@@ -341,8 +401,8 @@ pub const Viewer = struct {
 
         // Stop screencast - don't wait for response (non-blocking)
         if (self.screencast_mode) {
-            // Stop reader thread first to prevent blocking on sendCommand
-            self.cdp_client.ws_client.stopReaderThread();
+            // Stop reader thread via client
+            self.cdp_client.stopScreencast() catch {};
             self.screencast_mode = false;
         }
 
@@ -513,6 +573,12 @@ pub const Viewer = struct {
     fn tryRenderScreencast(self: *Viewer) !bool {
         const now = std.time.nanoTimestamp();
 
+        // Resolution-based FPS limiting
+        const min_interval = self.getMinFrameInterval();
+        if (self.last_frame_time > 0 and (now - self.last_frame_time) < min_interval) {
+            return false; // Too soon, skip to maintain target FPS
+        }
+
         // Get frame with proper ownership - MUST call deinit when done
         var frame = screenshot_api.getLatestScreencastFrame(self.cdp_client) orelse return false;
         defer frame.deinit(); // Proper cleanup!
@@ -539,15 +605,39 @@ pub const Viewer = struct {
         const frame_width = if (frame.device_width > 0) frame.device_width else self.viewport_width;
         const frame_height = if (frame.device_height > 0) frame.device_height else self.viewport_height;
 
-        self.log("[RENDER] Frame {}x{} (viewport {}x{}), {} bytes, gen={}\n", .{
-            frame_width, frame_height,
-            self.viewport_width, self.viewport_height,
-            frame.data.len,
-            frame.generation,
-        });
-        try self.displayFrameWithDimensions(frame.data, frame_width, frame_height);
-        self.last_frame_time = now;
+        // Profile render time
+        const render_start = std.time.nanoTimestamp();
 
+        try self.displayFrameWithDimensions(frame.data, frame_width, frame_height);
+
+        const render_elapsed = std.time.nanoTimestamp() - render_start;
+        self.perf_frame_count += 1;
+        self.perf_total_render_ns += render_elapsed;
+        if (render_elapsed > self.perf_max_render_ns) {
+            self.perf_max_render_ns = render_elapsed;
+        }
+
+        // Log performance stats every 5 seconds
+        if (now - self.perf_last_report_time > 5 * std.time.ns_per_s) {
+            const avg_ms = if (self.perf_frame_count > 0)
+                @divFloor(@divFloor(self.perf_total_render_ns, @as(i128, self.perf_frame_count)), @as(i128, std.time.ns_per_ms))
+            else
+                0;
+            const max_ms = @divFloor(self.perf_max_render_ns, @as(i128, std.time.ns_per_ms));
+            const target_fps = self.getMaxFpsForResolution();
+
+            self.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}\n", .{
+                self.perf_frame_count, avg_ms, max_ms, target_fps, self.frames_skipped,
+            });
+
+            // Reset counters
+            self.perf_frame_count = 0;
+            self.perf_total_render_ns = 0;
+            self.perf_max_render_ns = 0;
+            self.perf_last_report_time = now;
+        }
+
+        self.last_frame_time = now;
         return true;
     }
 
@@ -1121,16 +1211,25 @@ pub const Viewer = struct {
                 const vh = size.height_px;
 
                 // Scroll based on delta_y direction
-                if (mouse.delta_y > 0) {
-                    if (self.debug_input) {
-                        self.log("[MOUSE] Wheel scroll down\n", .{});
+                // Natural scroll: swipe up = scroll down (content moves up)
+                // Traditional: swipe up = scroll up (content moves down)
+                const scroll_down = if (self.natural_scroll)
+                    mouse.delta_y < 0  // Natural: negative delta = scroll down
+                else
+                    mouse.delta_y > 0; // Traditional: positive delta = scroll down
+
+                if (mouse.delta_y != 0) {
+                    if (scroll_down) {
+                        if (self.debug_input) {
+                            self.log("[MOUSE] Wheel scroll down (natural={})\n", .{self.natural_scroll});
+                        }
+                        try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
+                    } else {
+                        if (self.debug_input) {
+                            self.log("[MOUSE] Wheel scroll up (natural={})\n", .{self.natural_scroll});
+                        }
+                        try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
                     }
-                    try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
-                } else if (mouse.delta_y < 0) {
-                    if (self.debug_input) {
-                        self.log("[MOUSE] Wheel scroll up\n", .{});
-                    }
-                    try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
                 }
             },
 

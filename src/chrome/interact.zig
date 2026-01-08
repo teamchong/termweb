@@ -2,7 +2,7 @@ const std = @import("std");
 const cdp = @import("cdp_client.zig");
 const dom = @import("dom.zig");
 
-/// Move mouse to coordinates (for hover effects) - fire and forget
+/// Move mouse to coordinates (for hover effects) - fire and forget via dedicated mouse WS
 pub fn mouseMove(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -15,10 +15,10 @@ pub fn mouseMove(
         .{ x, y },
     );
     defer allocator.free(params);
-    try client.sendCommandAsync("Input.dispatchMouseEvent", params);
+    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
 }
 
-/// Click at specific coordinates
+/// Click at specific coordinates - uses dedicated mouse WebSocket
 pub fn clickAt(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -32,8 +32,7 @@ pub fn clickAt(
         .{ x, y },
     );
     defer allocator.free(move_params);
-    const move_result = try client.sendCommand("Input.dispatchMouseEvent", move_params);
-    allocator.free(move_result);
+    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", move_params);
 
     // Mouse pressed
     // buttons: 1 = left button
@@ -43,8 +42,7 @@ pub fn clickAt(
         .{ x, y },
     );
     defer allocator.free(press_params);
-    const press_result = try client.sendCommand("Input.dispatchMouseEvent", press_params);
-    allocator.free(press_result);
+    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", press_params);
 
     // Mouse released
     // buttons: 0 = none
@@ -54,8 +52,7 @@ pub fn clickAt(
         .{ x, y },
     );
     defer allocator.free(release_params);
-    const release_result = try client.sendCommand("Input.dispatchMouseEvent", release_params);
-    allocator.free(release_result);
+    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", release_params);
 }
 
 /// Click on an element (center of bounding box)
@@ -90,6 +87,7 @@ pub fn focusElement(
 }
 
 /// Type text into focused element (fire-and-forget for low latency)
+/// Type text into focused element - uses dedicated keyboard WS
 pub fn typeText(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -98,7 +96,7 @@ pub fn typeText(
     const params = try std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{text});
     defer allocator.free(params);
 
-    try client.sendCommandAsync("Input.insertText", params);
+    try client.sendKeyboardCommandAsync("Input.insertText", params);
 }
 
 /// Toggle checkbox using JavaScript
@@ -142,28 +140,22 @@ pub fn sendMouseEvent(
     );
     defer allocator.free(params);
 
-    // Use synchronous send for press/release to ensure proper timing
-    // Use async for move to avoid blocking
-    const is_move = std.mem.eql(u8, event_type, "mouseMoved");
-    if (is_move) {
-        try client.sendCommandAsync("Input.dispatchMouseEvent", params);
-    } else {
-        const result = try client.sendCommand("Input.dispatchMouseEvent", params);
-        allocator.free(result);
-    }
+    // Use dedicated mouse WebSocket for all mouse events (non-blocking)
+    // This separates mouse traffic from screencast for better responsiveness
+    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
 }
 
-/// Press Enter key (fire-and-forget for low latency)
+/// Press Enter key (fire-and-forget for low latency) - uses dedicated keyboard WS
 pub fn pressEnter(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !void {
     _ = allocator;
-    try client.sendCommandAsync(
+    try client.sendKeyboardCommandAsync(
         "Input.dispatchKeyEvent",
         "{\"type\":\"keyDown\",\"key\":\"Enter\"}",
     );
-    try client.sendCommandAsync(
+    try client.sendKeyboardCommandAsync(
         "Input.dispatchKeyEvent",
         "{\"type\":\"keyUp\",\"key\":\"Enter\"}",
     );

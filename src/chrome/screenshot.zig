@@ -1,9 +1,8 @@
 const std = @import("std");
 const cdp = @import("cdp_client.zig");
-const websocket_cdp = @import("websocket_cdp.zig");
 
 /// Re-export ScreencastFrame for caller use
-pub const ScreencastFrame = websocket_cdp.ScreencastFrame;
+pub const ScreencastFrame = cdp.ScreencastFrame;
 
 pub const ScreenshotError = error{
     CaptureFailed,
@@ -52,10 +51,9 @@ pub fn navigateToUrl(
     const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{normalized_url});
     defer allocator.free(params);
 
-    // std.debug.print("[DEBUG] Sending Page.navigate command...\n", .{});
-    const result = try client.sendCommand("Page.navigate", params);
+    // Use dedicated nav WebSocket for Page.navigate
+    const result = try client.sendNavCommand("Page.navigate", params);
     defer allocator.free(result);
-    // std.debug.print("[DEBUG] Page.navigate response: {s}\n", .{result});
 
     // Wait for page to load (simple approach - wait fixed time)
     // TODO M2: Use Page.loadEventFired event for proper synchronization
@@ -116,13 +114,13 @@ pub fn setViewport(
     defer allocator.free(result);
 }
 
-/// Navigate back in browser history
+/// Navigate back in browser history - uses dedicated nav WebSocket
 /// Returns true if navigation happened, false if there was no history
 pub fn goBack(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !bool {
-    const result = client.sendCommand("Page.goBack", null) catch {
+    const result = client.sendNavCommand("Page.goBack", null) catch {
         // No history to go back to
         return false;
     };
@@ -132,13 +130,13 @@ pub fn goBack(
     return true;
 }
 
-/// Navigate forward in browser history
+/// Navigate forward in browser history - uses dedicated nav WebSocket
 /// Returns true if navigation happened, false if there was no history
 pub fn goForward(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !bool {
-    const result = client.sendCommand("Page.goForward", null) catch {
+    const result = client.sendNavCommand("Page.goForward", null) catch {
         // No forward history
         return false;
     };
@@ -148,7 +146,7 @@ pub fn goForward(
     return true;
 }
 
-/// Reload current page
+/// Reload current page - uses dedicated nav WebSocket
 pub fn reload(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -161,7 +159,7 @@ pub fn reload(
     );
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Page.reload", params);
+    const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
 
     // In screencast mode, new frames arrive automatically - no need to block
@@ -173,12 +171,12 @@ pub const NavigationState = struct {
     can_go_forward: bool,
 };
 
-/// Get current navigation history state
+/// Get current navigation history state - uses dedicated nav WebSocket
 pub fn getNavigationState(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !NavigationState {
-    const result = try client.sendCommand("Page.getNavigationHistory", null);
+    const result = try client.sendNavCommand("Page.getNavigationHistory", null);
     defer allocator.free(result);
 
     // Parse response: {"id":N,"result":{"currentIndex":X,"entries":[...]}}

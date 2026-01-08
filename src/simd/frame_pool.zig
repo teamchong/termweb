@@ -50,8 +50,8 @@ pub const FramePool = struct {
     /// Buffer size for each slot
     slot_size: usize,
 
-    const DEFAULT_SLOT_COUNT = 5; // 5 slots: 1 reading + 4 write buffer (prevents overwrite during slow I/O)
-    const DEFAULT_SLOT_SIZE = 512 * 1024; // 512KB per slot (enough for most frames)
+    const DEFAULT_SLOT_COUNT = 16; // 16 slots for more headroom
+    const DEFAULT_SLOT_SIZE = 1024 * 1024; // 1MB per slot (enough for most frames)
 
     pub fn init(allocator: std.mem.Allocator) !*FramePool {
         return initWithConfig(allocator, DEFAULT_SLOT_COUNT, DEFAULT_SLOT_SIZE);

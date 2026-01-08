@@ -1,0 +1,20 @@
+install
++- install termweb
+   +- compile exe termweb Debug native 1 errors
+src/viewer.zig:1006:18: error: unreachable else prong; all cases already handled
+            else => {}, // Ignore release events
+            ~~~~~^~~~~
+referenced by:
+    handleMouse: src/viewer.zig:831:50
+    handleInput: src/viewer.zig:788:51
+    8 reference(s) hidden; use '-freference-trace=10' to see all references
+error: the following command failed with 1 compilation errors:
+/Users/steven_chong/.local/share/mise/installs/zig/0.15.2/zig build-exe -cflags -O2 -- /Users/steven_chong/Downloads/repos/termweb/src/vendor/stb_image.c -ODebug -I /Users/steven_chong/Downloads/repos/termweb/src/vendor --dep json --dep websocket -Mroot=/Users/steven_chong/Downloads/repos/termweb/src/main.zig -ODebug -Mjson=/Users/steven_chong/Downloads/repos/termweb/vendor/json/json.zig -ODebug -Mwebsocket=/Users/steven_chong/Downloads/repos/termweb/vendor/websocket/websocket.zig -lc --cache-dir .zig-cache --global-cache-dir /Users/steven_chong/.cache/zig --name termweb --zig-lib-dir /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/lib/ --listen=-
+
+Build Summary: 0/3 steps succeeded; 1 failed
+install transitive failure
++- install termweb transitive failure
+   +- compile exe termweb Debug native 1 errors
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/23eb823ba6b769a52361f05748b811f1/build /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/zig /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/lib /Users/steven_chong/Downloads/repos/termweb .zig-cache /Users/steven_chong/.cache/zig --seed 0x571ceabe -Z720fc42a8605bd98 --summary all

@@ -1,11 +1,12 @@
 /// Chrome DevTools Protocol (CDP) client implementation.
 ///
-/// Provides high-level interface for communicating with Chrome/Chromium browser
-/// via WebSocket. Handles page discovery, connection management, and command
-/// dispatch. Uses HTTP /json/list endpoint to discover page targets, then
-/// establishes WebSocket connection for real-time CDP communication.
+/// Uses Pipe transport (--remote-debugging-pipe) for communication with Chrome.
+/// Pipe mode provides higher throughput than WebSocket by eliminating TCP overhead.
+///
+/// In Pipe mode, we connect to the Browser target first, then must attach to a Page
+/// target to send page-level commands like Page.navigate.
 const std = @import("std");
-const websocket_cdp = @import("websocket_cdp.zig");
+const cdp_pipe = @import("cdp_pipe.zig");
 
 pub const CdpError = error{
     ConnectionFailed,
@@ -15,174 +16,205 @@ pub const CdpError = error{
     CommandFailed,
     TimeoutWaitingForResponse,
     OutOfMemory,
+    NoPageTarget,
 };
 
-/// CDP Client using WebSocket for real-time communication
+/// Re-export ScreencastFrame from pipe module
+pub const ScreencastFrame = cdp_pipe.ScreencastFrame;
+
+/// CDP Client using Pipe for real-time communication
+/// Wraps PipeCdpClient with the same interface used by viewer/screenshot modules
 pub const CdpClient = struct {
     allocator: std.mem.Allocator,
-    ws_client: *websocket_cdp.WebSocketCdpClient,
-    http_client: std.http.Client,
-    base_url: []const u8,
-    page_id: []const u8,
+    pipe_client: *cdp_pipe.PipeCdpClient,
+    session_id: ?[]const u8, // Session ID for page-level commands
 
-    pub fn init(allocator: std.mem.Allocator, ws_url: []const u8) !*CdpClient {
-        // Init client check
+    /// Initialize CDP client from pipe file descriptors
+    /// read_fd: FD to read from Chrome (Chrome's FD 4)
+    /// write_fd: FD to write to Chrome (Chrome's FD 3)
+    pub fn initFromPipe(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*CdpClient {
         const client = try allocator.create(CdpClient);
         client.* = .{
             .allocator = allocator,
-            .ws_client = undefined,
-            .http_client = std.http.Client{ .allocator = allocator },
-            .base_url = undefined,
-            .page_id = undefined,
+            .pipe_client = try cdp_pipe.PipeCdpClient.init(allocator, read_fd, write_fd),
+            .session_id = null,
         };
 
-        // If the URL already looks like a valid page target (has /devtools/page/), use it directly
-        // Otherwise, assume it's a browser endpoint and try to discover a page
-        if (std.mem.indexOf(u8, ws_url, "/devtools/page/") != null) {
-            // Extract the page ID from the URL (last segment)
-            // ws://.../devtools/page/THIS_IS_THE_ID
-            const last_slash = std.mem.lastIndexOf(u8, ws_url, "/") orelse ws_url.len;
-            if (last_slash < ws_url.len) {
-                client.page_id = try allocator.dupe(u8, ws_url[last_slash + 1 ..]);
-            } else {
-                client.page_id = try allocator.dupe(u8, "unknown");
-            }
-            client.base_url = try extractHttpUrl(allocator, ws_url);
-            client.ws_client = try websocket_cdp.WebSocketCdpClient.connect(allocator, ws_url);
-            return client;
-        }
+        // Attach to page target to enable page-level commands
+        try client.attachToPageTarget();
 
-        // Extract HTTP base URL from WebSocket URL
-        // ws://127.0.0.1:9222 -> http://127.0.0.1:9222
-        client.base_url = try extractHttpUrl(allocator, ws_url);
-
-        // Discover the page's WebSocket URL via HTTP /json/list
-        // Retry a few times - Chrome may not have pages ready immediately after launch
-        var page_ws_url: []const u8 = undefined;
-        var attempts: u32 = 0;
-        while (attempts < 30) : (attempts += 1) {
-            page_ws_url = client.discoverPageWebSocketUrl() catch {
-                std.Thread.sleep(200 * std.time.ns_per_ms);
-                continue;
-            };
-            break;
-        }
-        if (attempts >= 30) {
-            allocator.free(client.base_url);
-            allocator.destroy(client);
-            return CdpError.InvalidResponse;
-        }
-        defer allocator.free(page_ws_url);
-
-        // Connect to page's WebSocket endpoint
-        client.ws_client = try websocket_cdp.WebSocketCdpClient.connect(allocator, page_ws_url);
+        // Enable domains for consistent event delivery
+        const page_enable = try client.sendCommand("Page.enable", null);
+        allocator.free(page_enable);
+        const network_enable = try client.sendCommand("Network.enable", null);
+        allocator.free(network_enable);
 
         return client;
     }
 
+    /// Attach to a page target to enable page-level commands
+    fn attachToPageTarget(self: *CdpClient) !void {
+        // Step 1: Get list of targets
+        const targets_response = try self.pipe_client.sendCommand("Target.getTargets", null);
+        defer self.allocator.free(targets_response);
+
+        // Parse targetId from response - look for type "page"
+        // Format: {"id":N,"result":{"targetInfos":[{"targetId":"XXX","type":"page",...}]}}
+        const target_id = try self.extractPageTargetId(targets_response);
+        defer self.allocator.free(target_id);
+
+        // Step 2: Attach to the page target with flatten mode
+        const params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"targetId\":\"{s}\",\"flatten\":true}}",
+            .{target_id},
+        );
+        defer self.allocator.free(params);
+
+        const attach_response = try self.pipe_client.sendCommand("Target.attachToTarget", params);
+        defer self.allocator.free(attach_response);
+
+        // Extract sessionId from response
+        // Format: {"id":N,"result":{"sessionId":"XXX"}}
+        self.session_id = try self.extractSessionId(attach_response);
+    }
+
+    /// Extract page targetId from Target.getTargets response
+    fn extractPageTargetId(self: *CdpClient, response: []const u8) ![]const u8 {
+        // Find "type":"page" first
+        const type_pos = std.mem.indexOf(u8, response, "\"type\":\"page\"") orelse
+            return CdpError.NoPageTarget;
+
+        // Search backwards for targetId
+        const search_start = if (type_pos > 200) type_pos - 200 else 0;
+        const search_slice = response[search_start..type_pos];
+
+        const target_id_marker = "\"targetId\":\"";
+        const target_id_pos = std.mem.lastIndexOf(u8, search_slice, target_id_marker) orelse
+            return CdpError.NoPageTarget;
+
+        const id_start = search_start + target_id_pos + target_id_marker.len;
+        const id_end_marker = std.mem.indexOfPos(u8, response, id_start, "\"") orelse
+            return CdpError.NoPageTarget;
+
+        return try self.allocator.dupe(u8, response[id_start..id_end_marker]);
+    }
+
+    /// Extract sessionId from Target.attachToTarget response
+    fn extractSessionId(self: *CdpClient, response: []const u8) ![]const u8 {
+        const session_marker = "\"sessionId\":\"";
+        const session_pos = std.mem.indexOf(u8, response, session_marker) orelse
+            return CdpError.InvalidResponse;
+
+        const id_start = session_pos + session_marker.len;
+        const id_end = std.mem.indexOfPos(u8, response, id_start, "\"") orelse
+            return CdpError.InvalidResponse;
+
+        return try self.allocator.dupe(u8, response[id_start..id_end]);
+    }
+
     pub fn deinit(self: *CdpClient) void {
-        self.ws_client.deinit();
-        self.http_client.deinit();
-        self.allocator.free(self.base_url);
-        self.allocator.free(self.page_id);
+        if (self.session_id) |sid| self.allocator.free(sid);
+        self.pipe_client.deinit();
         self.allocator.destroy(self);
     }
 
-    /// Discover the first page target's WebSocket URL via HTTP /json/list
-    fn discoverPageWebSocketUrl(self: *CdpClient) ![]const u8 {
-        // Build URL for /json/list endpoint
-        const list_url = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/json/list",
-            .{self.base_url},
-        );
-        defer self.allocator.free(list_url);
-
-        const uri = try std.Uri.parse(list_url);
-
-        // Make HTTP request
-        var req = try self.http_client.request(.GET, uri, .{});
-        defer req.deinit();
-
-        try req.sendBodiless();
-
-        // Read response head
-        var redirect_buf: [1024]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
-
-        // Read response body
-        var reader_buf: [4096]u8 = undefined;
-        var reader = response.reader(&reader_buf);
-        const body = try reader.allocRemaining(self.allocator, .unlimited);
-        defer self.allocator.free(body);
-
-        // Parse JSON array: [{"id": "...", "type": "page", ...}, ...]
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
-        defer parsed.deinit();
-
-        // Find first page target and extract its WebSocket URL
-        switch (parsed.value) {
-            .array => |arr| {
-                for (arr.items) |target| {
-                    switch (target) {
-                        .object => |obj| {
-                            if (obj.get("type")) |type_val| {
-                                switch (type_val) {
-                                    .string => |type_str| {
-                                        if (std.mem.eql(u8, type_str, "page")) {
-                                            // Get both ID and WebSocket URL
-                                            if (obj.get("id")) |id_val| {
-                                                switch (id_val) {
-                                                    .string => |id_str| {
-                                                        self.page_id = try self.allocator.dupe(u8, id_str);
-                                                    },
-                                                    else => {},
-                                                }
-                                            }
-                                            if (obj.get("webSocketDebuggerUrl")) |ws_val| {
-                                                switch (ws_val) {
-                                                    .string => |ws_url| {
-                                                        return try self.allocator.dupe(u8, ws_url);
-                                                    },
-                                                    else => {},
-                                                }
-                                            }
-                                        }
-                                    },
-                                    else => {},
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            },
-            else => {},
+    /// Format a command with sessionId for page-level commands
+    fn formatSessionCommand(self: *CdpClient, method: []const u8, params: ?[]const u8) ![]const u8 {
+        if (self.session_id) |sid| {
+            if (params) |p| {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"sessionId\":\"{s}\",\"method\":\"{s}\",\"params\":{s}}}",
+                    .{ sid, method, p },
+                );
+            } else {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"sessionId\":\"{s}\",\"method\":\"{s}\"}}",
+                    .{ sid, method },
+                );
+            }
+        } else {
+            // No session - shouldn't happen after init
+            return CdpError.InvalidResponse;
         }
-
-        return CdpError.InvalidResponse;  // No page target found
     }
 
-    /// Send CDP command via WebSocket
+    /// Send mouse command (fire-and-forget) - uses session
+    pub fn sendMouseCommandAsync(
+        self: *CdpClient,
+        method: []const u8,
+        params: ?[]const u8,
+    ) !void {
+        if (self.session_id != null) {
+            // For session commands, we need to embed sessionId in the JSON
+            return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
+        }
+        return self.pipe_client.sendCommandAsync(method, params);
+    }
+
+    /// Send keyboard command (fire-and-forget) - uses session
+    pub fn sendKeyboardCommandAsync(
+        self: *CdpClient,
+        method: []const u8,
+        params: ?[]const u8,
+    ) !void {
+        if (self.session_id != null) {
+            return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
+        }
+        return self.pipe_client.sendCommandAsync(method, params);
+    }
+
+    /// Send navigation command and wait for response - uses session
+    pub fn sendNavCommand(
+        self: *CdpClient,
+        method: []const u8,
+        params: ?[]const u8,
+    ) ![]u8 {
+        if (self.session_id != null) {
+            return self.pipe_client.sendSessionCommand(self.session_id.?, method, params);
+        }
+        return self.pipe_client.sendCommand(method, params);
+    }
+
+    /// Send navigation command (fire-and-forget) - uses session
+    pub fn sendNavCommandAsync(
+        self: *CdpClient,
+        method: []const u8,
+        params: ?[]const u8,
+    ) !void {
+        if (self.session_id != null) {
+            return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
+        }
+        return self.pipe_client.sendCommandAsync(method, params);
+    }
+
+    /// Send CDP command and wait for response - uses session
     pub fn sendCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // Delegate to WebSocket client
-        return self.ws_client.sendCommand(method, params);
+        if (self.session_id != null) {
+            return self.pipe_client.sendSessionCommand(self.session_id.?, method, params);
+        }
+        return self.pipe_client.sendCommand(method, params);
     }
 
-    /// Send CDP command without waiting for response (fire-and-forget)
+    /// Send CDP command without waiting for response - uses session
     pub fn sendCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) !void {
-        return self.ws_client.sendCommandAsync(method, params);
+        if (self.session_id != null) {
+            return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
+        }
+        return self.pipe_client.sendCommandAsync(method, params);
     }
 
-    /// Start screencast streaming with exact viewport dimensions for 1:1 coordinate mapping
+    /// Start screencast streaming
     pub fn startScreencast(
         self: *CdpClient,
         format: []const u8,
@@ -190,12 +222,10 @@ pub const CdpClient = struct {
         width: u32,
         height: u32,
     ) !void {
-        // CRITICAL: Start reader thread BEFORE sending startScreencast command
-        // Otherwise Chrome sends first frame immediately, we don't ACK it (no reader),
-        // and Chrome stops sending more frames
-        try self.ws_client.startReaderThread();
+        // Start reader thread first
+        try self.pipe_client.startReaderThread();
 
-        // Use exact viewport dimensions - no scaling needed, coordinates are 1:1
+        // Send startScreencast command with session
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"format\":\"{s}\",\"quality\":{d},\"maxWidth\":{d},\"maxHeight\":{d},\"everyNthFrame\":1}}",
@@ -205,54 +235,20 @@ pub const CdpClient = struct {
 
         const result = try self.sendCommand("Page.startScreencast", params);
         defer self.allocator.free(result);
-
-        // Activate page AFTER screencast starts (Chrome pauses animations on unfocused pages)
-        // Try Target.activateTarget with page_id
-        const activate_params = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"targetId\":\"{s}\"}}",
-            .{self.page_id},
-        );
-        defer self.allocator.free(activate_params);
-
-        if (self.sendCommand("Target.activateTarget", activate_params)) |activate_result| {
-            self.allocator.free(activate_result);
-        } else |_| {
-            // Ignore activation errors - not critical
-        }
     }
 
     /// Stop screencast streaming
     pub fn stopScreencast(self: *CdpClient) !void {
-        const result = try self.sendCommand("Page.stopScreencast", null);
-        defer self.allocator.free(result);
+        self.pipe_client.stopReaderThread();
     }
 
     /// Get latest screencast frame (non-blocking)
-    pub fn getLatestFrame(self: *CdpClient) ?websocket_cdp.ScreencastFrame {
-        return self.ws_client.getLatestFrame();
+    pub fn getLatestFrame(self: *CdpClient) ?ScreencastFrame {
+        return self.pipe_client.getLatestFrame();
     }
 
-    /// Get count of frames received (for debugging)
+    /// Get count of frames received
     pub fn getFrameCount(self: *CdpClient) u32 {
-        return self.ws_client.getFrameCount();
+        return self.pipe_client.getFrameCount();
     }
 };
-
-/// Extract HTTP URL from WebSocket URL
-/// ws://127.0.0.1:9222/... -> http://127.0.0.1:9222
-fn extractHttpUrl(allocator: std.mem.Allocator, ws_url: []const u8) ![]const u8 {
-    // Find the end of the authority (host:port)
-    // ws://127.0.0.1:9222/devtools/browser/xxx
-    const prefix = "ws://";
-    if (!std.mem.startsWith(u8, ws_url, prefix)) {
-        return error.InvalidResponse;
-    }
-
-    const after_prefix = ws_url[prefix.len..];
-    const slash_idx = std.mem.indexOf(u8, after_prefix, "/") orelse after_prefix.len;
-
-    const authority = after_prefix[0..slash_idx];
-
-    return try std.fmt.allocPrint(allocator, "http://{s}", .{authority});
-}

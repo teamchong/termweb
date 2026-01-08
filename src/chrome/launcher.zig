@@ -7,8 +7,10 @@ pub const LaunchError = error{
     TimeoutWaitingForDebugUrl,
     InvalidDebugUrl,
     OutOfMemory,
+    PipeSetupFailed,
 };
 
+/// WebSocket-based Chrome instance (legacy, for --connect mode)
 pub const ChromeInstance = struct {
     process: std.process.Child,
     ws_url: []const u8,
@@ -20,6 +22,24 @@ pub const ChromeInstance = struct {
         self.allocator.free(self.ws_url);
     }
 };
+
+/// Pipe-based Chrome instance (preferred for new launches)
+/// Uses --remote-debugging-pipe for higher throughput
+pub const ChromePipeInstance = struct {
+    pid: std.posix.pid_t, // Chrome process ID
+    read_fd: std.posix.fd_t, // FD to read from Chrome (Chrome's FD 4)
+    write_fd: std.posix.fd_t, // FD to write to Chrome (Chrome's FD 3)
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ChromePipeInstance) void {
+        // Close pipes first, then terminate
+        std.posix.close(self.read_fd);
+        std.posix.close(self.write_fd);
+        // Send SIGTERM to Chrome
+        std.posix.kill(self.pid, std.posix.SIG.TERM) catch {};
+    }
+};
+
 
 pub const LaunchOptions = struct {
     headless: bool = true,
@@ -33,7 +53,171 @@ pub const LaunchOptions = struct {
     browser_path: ?[]const u8 = null,
 };
 
-/// Launch Chrome with CDP and return WebSocket URL
+/// Launch Chrome with Pipe-based CDP (preferred for better throughput)
+/// Uses --remote-debugging-pipe which communicates via FD 3/4
+/// Note: Uses manual fork/dup2/exec since Zig 0.15 Child doesn't support extra_fds
+pub fn launchChromePipe(
+    allocator: std.mem.Allocator,
+    options: LaunchOptions,
+) !ChromePipeInstance {
+    // 1. Detect browser binary
+    var chrome_bin: detector.ChromeBinary = undefined;
+    var owns_path = true;
+
+    if (options.browser_path) |path| {
+        chrome_bin = detector.ChromeBinary{
+            .path = path,
+            .allocator = allocator,
+        };
+        owns_path = false;
+    } else if (options.browser) |browser_name| {
+        chrome_bin = detector.detectBrowserByName(allocator, browser_name) catch {
+            return LaunchError.ChromeNotFound;
+        };
+    } else {
+        chrome_bin = detector.detectChrome(allocator) catch {
+            return LaunchError.ChromeNotFound;
+        };
+    }
+    defer if (owns_path) chrome_bin.deinit();
+
+    // 2. Create temporary user data directory if not provided
+    var temp_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const user_data_dir = if (options.user_data_dir) |dir|
+        dir
+    else blk: {
+        const temp_dir = std.fmt.bufPrint(&temp_dir_buf, "/tmp/termweb-chrome-{d}", .{
+            std.time.timestamp(),
+        }) catch return LaunchError.OutOfMemory;
+
+        std.fs.cwd().makeDir(temp_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return LaunchError.LaunchFailed,
+        };
+        break :blk temp_dir;
+    };
+
+    // 3. Create pipes for Chrome communication
+    // We need two pipes:
+    // - pipe_to_chrome: Parent writes -> Chrome reads (Chrome's FD 3)
+    // - pipe_from_chrome: Chrome writes -> Parent reads (Chrome's FD 4)
+    const pipe_to_chrome = try std.posix.pipe(); // [0]=read, [1]=write
+    const pipe_from_chrome = try std.posix.pipe(); // [0]=read, [1]=write
+
+    // 4. Build Chrome arguments
+    var args_list = try std.ArrayList([]const u8).initCapacity(allocator, 16);
+    defer args_list.deinit(allocator);
+
+    try args_list.append(allocator, chrome_bin.path);
+
+    if (options.headless) {
+        try args_list.append(allocator, "--headless=new");
+    }
+
+    try args_list.append(allocator, "--remote-debugging-pipe");
+
+    const user_data_arg = try std.fmt.allocPrint(allocator, "--user-data-dir={s}", .{user_data_dir});
+    defer allocator.free(user_data_arg);
+    try args_list.append(allocator, user_data_arg);
+
+    try args_list.append(allocator, "--no-first-run");
+    try args_list.append(allocator, "--no-default-browser-check");
+    try args_list.append(allocator, "--allow-file-access-from-files");
+
+    if (options.disable_gpu) {
+        try args_list.append(allocator, "--disable-gpu");
+    }
+
+    const window_size = try std.fmt.allocPrint(allocator, "--window-size={d},{d}", .{ options.viewport_width, options.viewport_height });
+    defer allocator.free(window_size);
+    try args_list.append(allocator, window_size);
+
+    try args_list.append(allocator, "about:blank");
+
+    // Convert to null-terminated pointers
+    const argv = try allocator.alloc(?[*:0]const u8, args_list.items.len + 1);
+    defer allocator.free(argv);
+
+    for (args_list.items, 0..) |arg, i| {
+        argv[i] = try allocator.dupeZ(u8, arg);
+    }
+    // Defer freeing the individual strings in the parent
+    defer {
+        for (argv[0..args_list.items.len]) |arg| {
+            if (arg) |a| allocator.free(std.mem.span(a));
+        }
+    }
+    argv[args_list.items.len] = null;
+
+    const path_z = try allocator.dupeZ(u8, chrome_bin.path);
+    defer allocator.free(path_z);
+
+    // 5. Fork and exec
+    const pid = try std.posix.fork();
+
+    if (pid == 0) {
+        // === CHILD PROCESS ===
+
+        // Close parent ends of pipes
+        std.posix.close(pipe_to_chrome[1]); // Parent's write end
+        std.posix.close(pipe_from_chrome[0]); // Parent's read end
+
+        // Set up FD 3 (Chrome reads commands from us)
+        if (pipe_to_chrome[0] != 3) {
+            std.posix.dup2(pipe_to_chrome[0], 3) catch std.posix.exit(1);
+            std.posix.close(pipe_to_chrome[0]);
+        }
+
+        // Set up FD 4 (Chrome writes responses to us)
+        if (pipe_from_chrome[1] != 4) {
+            std.posix.dup2(pipe_from_chrome[1], 4) catch std.posix.exit(1);
+            std.posix.close(pipe_from_chrome[1]);
+        }
+
+        // CRITICAL: Clear O_CLOEXEC on FD 3 and 4 so they survive exec
+        const fd3_flags = std.posix.fcntl(3, 1, 0) catch 0;
+        _ = std.posix.fcntl(3, 2, fd3_flags & ~@as(usize, 1)) catch {};
+        const fd4_flags = std.posix.fcntl(4, 1, 0) catch 0;
+        _ = std.posix.fcntl(4, 2, fd4_flags & ~@as(usize, 1)) catch {};
+
+        // Redirect stdout and stderr to /dev/null
+        const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(1);
+        std.posix.dup2(dev_null, 1) catch std.posix.exit(1);
+        std.posix.dup2(dev_null, 2) catch std.posix.exit(1);
+        std.posix.close(dev_null);
+
+        // Preparation for exec - the strings are on the heap
+        const path = path_z;
+        const envp = std.c.environ;
+
+        std.posix.execveZ(path, @ptrCast(argv.ptr), envp) catch {
+            std.posix.exit(1);
+        };
+        std.posix.exit(1);
+    }
+
+    // === PARENT PROCESS ===
+
+    // Close child ends of pipes
+    std.posix.close(pipe_to_chrome[0]); // Chrome's read end
+    std.posix.close(pipe_from_chrome[1]); // Chrome's write end
+
+    // Give Chrome a moment to initialize the pipe
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // Parent uses:
+    // - pipe_to_chrome[1] to WRITE to Chrome (Chrome's FD 3)
+    // - pipe_from_chrome[0] to READ from Chrome (Chrome's FD 4)
+    return ChromePipeInstance{
+        .pid = pid,
+        .write_fd = pipe_to_chrome[1],
+        .read_fd = pipe_from_chrome[0],
+        .allocator = allocator,
+    };
+}
+
+
+/// Launch Chrome with WebSocket-based CDP (legacy, for --connect compatibility)
 pub fn launchChrome(
     allocator: std.mem.Allocator,
     options: LaunchOptions,
