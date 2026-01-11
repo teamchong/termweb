@@ -89,6 +89,12 @@ pub const ToolbarSvg = struct {
         \\</svg>
     ;
 
+    pub const back_hover =
+        \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        \\  <path d="M15 18l-6-6 6-6" fill="none" stroke="#4da3ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        \\</svg>
+    ;
+
     pub const back_disabled =
         \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
         \\  <path d="M15 18l-6-6 6-6" fill="none" stroke="#555555" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -99,6 +105,12 @@ pub const ToolbarSvg = struct {
     pub const forward_normal =
         \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
         \\  <path d="M9 18l6-6-6-6" fill="none" stroke="#007aff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        \\</svg>
+    ;
+
+    pub const forward_hover =
+        \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        \\  <path d="M9 18l6-6-6-6" fill="none" stroke="#4da3ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
         \\</svg>
     ;
 
@@ -113,6 +125,26 @@ pub const ToolbarSvg = struct {
         \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
         \\  <path d="M23 4v6h-6" fill="none" stroke="#007aff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
         \\  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" fill="none" stroke="#007aff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        \\</svg>
+    ;
+
+    pub const refresh_hover =
+        \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        \\  <path d="M23 4v6h-6" fill="none" stroke="#4da3ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        \\  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" fill="none" stroke="#4da3ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        \\</svg>
+    ;
+
+    /// Stop button (X mark for loading state)
+    pub const stop_normal =
+        \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        \\  <path d="M6 6l12 12M18 6l-12 12" fill="none" stroke="#ff3b30" stroke-width="2" stroke-linecap="round"/>
+        \\</svg>
+    ;
+
+    pub const stop_hover =
+        \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        \\  <path d="M6 6l12 12M18 6l-12 12" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linecap="round"/>
         \\</svg>
     ;
 
@@ -153,11 +185,15 @@ pub const ToolbarCache = struct {
     close_normal: ?[]u8 = null,
     close_hover: ?[]u8 = null,
     back_normal: ?[]u8 = null,
+    back_hover: ?[]u8 = null,
     back_disabled: ?[]u8 = null,
     forward_normal: ?[]u8 = null,
+    forward_hover: ?[]u8 = null,
     forward_disabled: ?[]u8 = null,
     refresh_normal: ?[]u8 = null,
-    refresh_loading: ?[]u8 = null,
+    refresh_hover: ?[]u8 = null,
+    stop_normal: ?[]u8 = null,
+    stop_hover: ?[]u8 = null,
 
     pub const BUTTON_SIZE: u32 = 28;
 
@@ -172,11 +208,15 @@ pub const ToolbarCache = struct {
         if (self.close_normal) |b| self.allocator.free(b);
         if (self.close_hover) |b| self.allocator.free(b);
         if (self.back_normal) |b| self.allocator.free(b);
+        if (self.back_hover) |b| self.allocator.free(b);
         if (self.back_disabled) |b| self.allocator.free(b);
         if (self.forward_normal) |b| self.allocator.free(b);
+        if (self.forward_hover) |b| self.allocator.free(b);
         if (self.forward_disabled) |b| self.allocator.free(b);
         if (self.refresh_normal) |b| self.allocator.free(b);
-        if (self.refresh_loading) |b| self.allocator.free(b);
+        if (self.refresh_hover) |b| self.allocator.free(b);
+        if (self.stop_normal) |b| self.allocator.free(b);
+        if (self.stop_hover) |b| self.allocator.free(b);
         self.renderer.deinit();
     }
 
@@ -204,18 +244,8 @@ pub const ToolbarCache = struct {
         }
     }
 
-    pub fn getBackButton(self: *ToolbarCache, enabled: bool) ![]u8 {
-        if (enabled) {
-            if (self.back_normal == null) {
-                self.back_normal = try self.renderer.renderToRgba(
-                    self.allocator,
-                    ToolbarSvg.back_normal,
-                    BUTTON_SIZE,
-                    BUTTON_SIZE,
-                );
-            }
-            return self.back_normal.?;
-        } else {
+    pub fn getBackButton(self: *ToolbarCache, enabled: bool, hover: bool) ![]u8 {
+        if (!enabled) {
             if (self.back_disabled == null) {
                 self.back_disabled = try self.renderer.renderToRgba(
                     self.allocator,
@@ -226,20 +256,30 @@ pub const ToolbarCache = struct {
             }
             return self.back_disabled.?;
         }
-    }
-
-    pub fn getForwardButton(self: *ToolbarCache, enabled: bool) ![]u8 {
-        if (enabled) {
-            if (self.forward_normal == null) {
-                self.forward_normal = try self.renderer.renderToRgba(
+        if (hover) {
+            if (self.back_hover == null) {
+                self.back_hover = try self.renderer.renderToRgba(
                     self.allocator,
-                    ToolbarSvg.forward_normal,
+                    ToolbarSvg.back_hover,
                     BUTTON_SIZE,
                     BUTTON_SIZE,
                 );
             }
-            return self.forward_normal.?;
-        } else {
+            return self.back_hover.?;
+        }
+        if (self.back_normal == null) {
+            self.back_normal = try self.renderer.renderToRgba(
+                self.allocator,
+                ToolbarSvg.back_normal,
+                BUTTON_SIZE,
+                BUTTON_SIZE,
+            );
+        }
+        return self.back_normal.?;
+    }
+
+    pub fn getForwardButton(self: *ToolbarCache, enabled: bool, hover: bool) ![]u8 {
+        if (!enabled) {
             if (self.forward_disabled == null) {
                 self.forward_disabled = try self.renderer.renderToRgba(
                     self.allocator,
@@ -250,29 +290,71 @@ pub const ToolbarCache = struct {
             }
             return self.forward_disabled.?;
         }
+        if (hover) {
+            if (self.forward_hover == null) {
+                self.forward_hover = try self.renderer.renderToRgba(
+                    self.allocator,
+                    ToolbarSvg.forward_hover,
+                    BUTTON_SIZE,
+                    BUTTON_SIZE,
+                );
+            }
+            return self.forward_hover.?;
+        }
+        if (self.forward_normal == null) {
+            self.forward_normal = try self.renderer.renderToRgba(
+                self.allocator,
+                ToolbarSvg.forward_normal,
+                BUTTON_SIZE,
+                BUTTON_SIZE,
+            );
+        }
+        return self.forward_normal.?;
     }
 
-    pub fn getRefreshButton(self: *ToolbarCache, loading: bool) ![]u8 {
-        if (loading) {
-            if (self.refresh_loading == null) {
-                self.refresh_loading = try self.renderer.renderToRgba(
+    pub fn getRefreshButton(self: *ToolbarCache, hover: bool) ![]u8 {
+        if (hover) {
+            if (self.refresh_hover == null) {
+                self.refresh_hover = try self.renderer.renderToRgba(
                     self.allocator,
-                    ToolbarSvg.refresh_loading,
+                    ToolbarSvg.refresh_hover,
                     BUTTON_SIZE,
                     BUTTON_SIZE,
                 );
             }
-            return self.refresh_loading.?;
-        } else {
-            if (self.refresh_normal == null) {
-                self.refresh_normal = try self.renderer.renderToRgba(
-                    self.allocator,
-                    ToolbarSvg.refresh_normal,
-                    BUTTON_SIZE,
-                    BUTTON_SIZE,
-                );
-            }
-            return self.refresh_normal.?;
+            return self.refresh_hover.?;
         }
+        if (self.refresh_normal == null) {
+            self.refresh_normal = try self.renderer.renderToRgba(
+                self.allocator,
+                ToolbarSvg.refresh_normal,
+                BUTTON_SIZE,
+                BUTTON_SIZE,
+            );
+        }
+        return self.refresh_normal.?;
+    }
+
+    pub fn getStopButton(self: *ToolbarCache, hover: bool) ![]u8 {
+        if (hover) {
+            if (self.stop_hover == null) {
+                self.stop_hover = try self.renderer.renderToRgba(
+                    self.allocator,
+                    ToolbarSvg.stop_hover,
+                    BUTTON_SIZE,
+                    BUTTON_SIZE,
+                );
+            }
+            return self.stop_hover.?;
+        }
+        if (self.stop_normal == null) {
+            self.stop_normal = try self.renderer.renderToRgba(
+                self.allocator,
+                ToolbarSvg.stop_normal,
+                BUTTON_SIZE,
+                BUTTON_SIZE,
+            );
+        }
+        return self.stop_normal.?;
     }
 };

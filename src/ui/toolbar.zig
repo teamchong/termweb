@@ -58,6 +58,10 @@ pub const ToolbarRenderer = struct {
 
     // Current states
     close_hover: bool = false,
+    back_hover: bool = false,
+    forward_hover: bool = false,
+    refresh_hover: bool = false,
+    url_bar_hover: bool = false,
     can_go_back: bool = false,
     can_go_forward: bool = false,
     is_loading: bool = false,
@@ -275,7 +279,7 @@ pub const ToolbarRenderer = struct {
         x_offset += BUTTON_SIZE + BUTTON_PADDING;
 
         // Back button
-        const back_rgba = try self.svg_cache.getBackButton(self.can_go_back);
+        const back_rgba = try self.svg_cache.getBackButton(self.can_go_back, self.back_hover);
         _ = try self.kitty.displayRawRGBA(writer, back_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
             .placement_id = Placement.BACK_BTN,
             .z = 51,
@@ -285,7 +289,7 @@ pub const ToolbarRenderer = struct {
         x_offset += BUTTON_SIZE + BUTTON_PADDING;
 
         // Forward button
-        const forward_rgba = try self.svg_cache.getForwardButton(self.can_go_forward);
+        const forward_rgba = try self.svg_cache.getForwardButton(self.can_go_forward, self.forward_hover);
         _ = try self.kitty.displayRawRGBA(writer, forward_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
             .placement_id = Placement.FWD_BTN,
             .z = 51,
@@ -294,8 +298,11 @@ pub const ToolbarRenderer = struct {
         });
         x_offset += BUTTON_SIZE + BUTTON_PADDING;
 
-        // Refresh button
-        const refresh_rgba = try self.svg_cache.getRefreshButton(self.is_loading);
+        // Refresh/Stop button (shows stop icon when loading)
+        const refresh_rgba = if (self.is_loading)
+            try self.svg_cache.getStopButton(self.refresh_hover)
+        else
+            try self.svg_cache.getRefreshButton(self.refresh_hover);
         _ = try self.kitty.displayRawRGBA(writer, refresh_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
             .placement_id = Placement.REFRESH_BTN,
             .z = 51,

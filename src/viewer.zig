@@ -1160,14 +1160,44 @@ pub const Viewer = struct {
             .move, .drag => {
                 // Check if mouse is hovering over toolbar buttons
                 if (self.toolbar_renderer) |*renderer| {
-                    const old_hover = renderer.close_hover;
+                    // Track previous hover states
+                    const old_close = renderer.close_hover;
+                    const old_back = renderer.back_hover;
+                    const old_forward = renderer.forward_hover;
+                    const old_refresh = renderer.refresh_hover;
+                    const old_url = renderer.url_bar_hover;
+
+                    // Reset all hover states
+                    renderer.close_hover = false;
+                    renderer.back_hover = false;
+                    renderer.forward_hover = false;
+                    renderer.refresh_hover = false;
+                    renderer.url_bar_hover = false;
+
+                    // Set hover for the button under cursor
                     if (renderer.hitTest(self.mouse_x, self.mouse_y)) |button| {
-                        renderer.close_hover = (button == .close);
-                    } else {
-                        renderer.close_hover = false;
+                        switch (button) {
+                            .close => renderer.close_hover = true,
+                            .back => renderer.back_hover = true,
+                            .forward => renderer.forward_hover = true,
+                            .refresh => renderer.refresh_hover = true,
+                        }
+                    } else if (self.mouse_y < 40) {
+                        // Check URL bar hover (within toolbar area)
+                        if (self.mouse_x >= renderer.url_bar_x and
+                            self.mouse_x < renderer.url_bar_x + renderer.url_bar_width)
+                        {
+                            renderer.url_bar_hover = true;
+                        }
                     }
-                    // Re-render toolbar if hover state changed
-                    if (renderer.close_hover != old_hover) {
+
+                    // Re-render toolbar if any hover state changed
+                    if (renderer.close_hover != old_close or
+                        renderer.back_hover != old_back or
+                        renderer.forward_hover != old_forward or
+                        renderer.refresh_hover != old_refresh or
+                        renderer.url_bar_hover != old_url)
+                    {
                         self.ui_dirty = true;
                     }
                 }
