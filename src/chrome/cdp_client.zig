@@ -93,6 +93,11 @@ pub const CdpClient = struct {
             client.mouse_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, url) catch null;
             client.keyboard_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, url) catch null;
             client.nav_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, url) catch null;
+
+            // Start reader threads for each WebSocket (enables sendCommand to work)
+            if (client.mouse_ws) |ws| ws.startReaderThread() catch {};
+            if (client.keyboard_ws) |ws| ws.startReaderThread() catch {};
+            if (client.nav_ws) |ws| ws.startReaderThread() catch {};
         }
 
         return client;
@@ -249,14 +254,16 @@ pub const CdpClient = struct {
         return self.pipe_client.sendCommandAsync(method, params);
     }
 
-    /// Send navigation command and wait for response - uses pipe with session
-    /// Note: We use pipe instead of WebSocket because nav_ws doesn't have a reader thread
+    /// Send navigation command and wait for response - uses dedicated nav WebSocket
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // Always use pipe with session for navigation - WebSocket blocks without reader thread
+        if (self.nav_ws) |ws| {
+            return ws.sendCommand(method, params);
+        }
+        // Fallback to pipe if websocket not connected
         if (self.session_id != null) {
             return self.pipe_client.sendSessionCommand(self.session_id.?, method, params);
         }
