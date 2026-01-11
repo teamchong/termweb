@@ -10,6 +10,7 @@ pub const TerminalSize = struct {
 /// Global flag for SIGWINCH (terminal resize) detection
 /// Using atomic to safely communicate between signal handler and main thread
 var resize_pending = std.atomic.Value(bool).init(false);
+var interrupt_pending = std.atomic.Value(bool).init(false);
 
 /// Global state for emergency cleanup on signal
 var global_original_termios: ?std.posix.termios = null;
@@ -20,23 +21,13 @@ fn handleSigwinch(_: c_int) callconv(.c) void {
     resize_pending.store(true, .release);
 }
 
-/// Emergency cleanup signal handler for SIGINT/SIGTERM
-/// Restores terminal and exits
+/// Signal handler for SIGINT/SIGTERM
+/// Sets a flag so the main loop can exit cleanly
 fn handleTermSignal(_: c_int) callconv(.c) void {
-    // Disable mouse tracking (write directly, can't use allocator in signal handler)
-    const disable_mouse = "\x1b[<u\x1b[?1016l\x1b[?1003l\x1b[?1006l";
-    _ = std.posix.write(std.posix.STDOUT_FILENO, disable_mouse) catch {};
-
-    // Show cursor
-    _ = std.posix.write(std.posix.STDOUT_FILENO, "\x1b[?25h") catch {};
-
-    // Restore original termios if saved
-    if (global_original_termios) |orig| {
-        std.posix.tcsetattr(global_stdin_fd, .FLUSH, orig) catch {};
+    if (interrupt_pending.swap(true, .acq_rel)) {
+        // Force exit on second signal
+        std.process.exit(1);
     }
-
-    // Exit with signal-appropriate code
-    std.process.exit(130); // 128 + SIGINT (2)
 }
 
 pub const Terminal = struct {
@@ -71,6 +62,11 @@ pub const Terminal = struct {
     /// Check if terminal was resized (clears the flag)
     pub fn checkResize(_: *Terminal) bool {
         return resize_pending.swap(false, .acq_rel);
+    }
+
+    /// Check if an interrupt signal was received
+    pub fn checkInterrupt(_: *Terminal) bool {
+        return interrupt_pending.load(.acquire);
     }
 
     /// Enter raw mode (disable line buffering, echo)

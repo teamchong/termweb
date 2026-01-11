@@ -191,6 +191,27 @@ pub const KittyGraphics = struct {
     ) !u32 {
         return self.displayBase64ImageWithFormat(writer, base64_data, opts, 100);
     }
+    /// Display raw RGBA pixel data from memory
+    pub fn displayRawRGBA(
+        self: *KittyGraphics,
+        writer: anytype,
+        rgba_data: []const u8,
+        width: u32,
+        height: u32,
+        opts: DisplayOptions,
+    ) !u32 {
+        const encoder = std.base64.standard.Encoder;
+        const encoded_len = encoder.calcSize(rgba_data.len);
+        const encoded = try self.allocator.alloc(u8, encoded_len);
+        defer self.allocator.free(encoded);
+        _ = encoder.encode(encoded, rgba_data);
+
+        var local_opts = opts;
+        if (local_opts.width == null) local_opts.width = width;
+        if (local_opts.height == null) local_opts.height = height;
+
+        return self.displayBase64ImageWithFormat(writer, encoded, local_opts, 32);
+    }
 
     /// Display raw RGBA data via SHM (t=s)
     pub fn displayRGBA(

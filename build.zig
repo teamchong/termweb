@@ -32,12 +32,16 @@ pub fn build(b: *std.Build) void {
         .file = b.path("src/vendor/stb_image.c"),
         .flags = &.{"-O2"},
     });
+    exe.addCSourceFile(.{
+        .file = b.path("src/vendor/stb_truetype.c"),
+        .flags = &.{"-O2"},
+    });
+    exe.addCSourceFile(.{
+        .file = b.path("src/vendor/nanosvg.c"),
+        .flags = &.{ "-O2", "-fno-strict-aliasing" },
+    });
     exe.addIncludePath(b.path("src/vendor"));
 
-    // Link notcurses
-    exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    exe.linkSystemLibrary("notcurses-core");
     exe.linkLibC();
 
     // Add vendor imports

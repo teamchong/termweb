@@ -44,6 +44,17 @@ const ResponseQueueEntry = struct {
     }
 };
 
+const EventQueueEntry = struct {
+    method: []const u8,
+    payload: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *EventQueueEntry, gpa: std.mem.Allocator) void {
+        gpa.free(self.method);
+        gpa.free(self.payload);
+    }
+};
+
 /// Pipe-based CDP client
 pub const PipeCdpClient = struct {
     allocator: std.mem.Allocator,
@@ -56,6 +67,9 @@ pub const PipeCdpClient = struct {
 
     response_queue: std.ArrayList(ResponseQueueEntry),
     response_mutex: std.Thread.Mutex,
+
+    event_queue: std.ArrayList(EventQueueEntry),
+    event_mutex: std.Thread.Mutex,
 
     frame_pool: *FramePool,
     frame_count: std.atomic.Value(u32),
@@ -81,6 +95,8 @@ pub const PipeCdpClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .response_queue = try std.ArrayList(ResponseQueueEntry).initCapacity(allocator, 0),
             .response_mutex = .{},
+            .event_queue = try std.ArrayList(EventQueueEntry).initCapacity(allocator, 0),
+            .event_mutex = .{},
             .frame_pool = frame_pool,
             .frame_count = std.atomic.Value(u32).init(0),
             .write_mutex = .{},
@@ -95,10 +111,21 @@ pub const PipeCdpClient = struct {
         self.stopReaderThread();
         self.frame_pool.deinit();
 
+        // Free response queue entries with lock
+        self.response_mutex.lock();
         for (self.response_queue.items) |*entry| {
             entry.deinit();
         }
         self.response_queue.deinit(self.allocator);
+        self.response_mutex.unlock();
+
+        // Free event queue entries with lock
+        self.event_mutex.lock();
+        for (self.event_queue.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.event_queue.deinit(self.allocator);
+        self.event_mutex.unlock();
 
         self.allocator.free(self.read_buffer);
         self.allocator.destroy(self);
@@ -297,11 +324,8 @@ pub const PipeCdpClient = struct {
     pub fn stopReaderThread(self: *PipeCdpClient) void {
         if (self.reader_thread) |thread| {
             self.running.store(false, .release);
-            var waited: u32 = 0;
-            while (waited < 10) : (waited += 1) {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
-            }
-            thread.detach();
+            // Join the thread to ensure it's fully stopped before we free resources
+            thread.join();
             self.reader_thread = null;
         }
     }
@@ -320,6 +344,21 @@ pub const PipeCdpClient = struct {
 
     pub fn getFrameCount(self: *PipeCdpClient) u32 {
         return self.frame_count.load(.monotonic);
+    }
+
+    pub fn nextEvent(self: *PipeCdpClient, allocator: std.mem.Allocator) !?struct { method: []const u8, payload: []const u8 } {
+        self.event_mutex.lock();
+        defer self.event_mutex.unlock();
+
+        if (self.event_queue.items.len == 0) return null;
+
+        var entry = self.event_queue.orderedRemove(0);
+        defer entry.deinit(self.allocator);
+
+        return .{
+            .method = try allocator.dupe(u8, entry.method),
+            .payload = try allocator.dupe(u8, entry.payload),
+        };
     }
 
     fn readerThreadMain(self: *PipeCdpClient) void {
@@ -347,6 +386,22 @@ pub const PipeCdpClient = struct {
 
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             try self.handleScreencastFrame(payload);
+        } else {
+            // Queue other events for the main thread to process
+            self.event_mutex.lock();
+            defer self.event_mutex.unlock();
+
+            const MAX_EVENT_QUEUE = 50;
+            if (self.event_queue.items.len >= MAX_EVENT_QUEUE) {
+                var old = self.event_queue.orderedRemove(0);
+                old.deinit(self.allocator);
+            }
+
+            try self.event_queue.append(self.allocator, .{
+                .method = try self.allocator.dupe(u8, method),
+                .payload = try self.allocator.dupe(u8, payload),
+                .allocator = self.allocator,
+            });
         }
     }
 

@@ -1,0 +1,23 @@
+install
++- install termweb
+   +- compile exe termweb Debug native 1 errors
+src/chrome/interact.zig:174:39: error: struct 'array_list.Aligned(u8,null)' has no member named 'init'
+    var files_json = std.ArrayList(u8).init(allocator);
+                     ~~~~~~~~~~~~~~~~~^~~~~
+/Users/steven_chong/.local/share/mise/installs/zig/0.15.2/lib/std/array_list.zig:606:12: note: struct declared here
+    return struct {
+           ^~~~~~
+referenced by:
+    handleFilePickerMode: src/viewer.zig:1473:55
+    handleKey: src/viewer.zig:1304:58
+    9 reference(s) hidden; use '-freference-trace=11' to see all references
+error: the following command failed with 1 compilation errors:
+/Users/steven_chong/.local/share/mise/installs/zig/0.15.2/zig build-exe -cflags -O2 -- /Users/steven_chong/Downloads/repos/termweb/src/vendor/stb_image.c -cflags -O2 -- /Users/steven_chong/Downloads/repos/termweb/src/vendor/nanosvg.c -ODebug -I /Users/steven_chong/Downloads/repos/termweb/src/vendor --dep json --dep websocket -Mroot=/Users/steven_chong/Downloads/repos/termweb/src/main.zig -ODebug -Mjson=/Users/steven_chong/Downloads/repos/termweb/vendor/json/json.zig -ODebug -Mwebsocket=/Users/steven_chong/Downloads/repos/termweb/vendor/websocket/websocket.zig -lc --cache-dir .zig-cache --global-cache-dir /Users/steven_chong/.cache/zig --name termweb --zig-lib-dir /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/lib/ --listen=-
+
+Build Summary: 0/3 steps succeeded; 1 failed
+install transitive failure
++- install termweb transitive failure
+   +- compile exe termweb Debug native 1 errors
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/ef17187f3155f4d7321bf37af0ca6986/build /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/zig /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/lib /Users/steven_chong/Downloads/repos/termweb .zig-cache /Users/steven_chong/.cache/zig --seed 0x67c1d945 -Zf22665f70c9e9a32

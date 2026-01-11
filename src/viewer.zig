@@ -136,6 +136,9 @@ pub const Viewer = struct {
     // UI state for layered rendering
     ui_state: UIState,
 
+    // Toolbar renderer (Kitty graphics based)
+    toolbar_renderer: ?ui_mod.ToolbarRenderer,
+
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
     mouse_y: u16,
@@ -219,6 +222,7 @@ pub const Viewer = struct {
             .screencast_format = screencast_format,
             .last_frame_time = 0,
             .ui_state = UIState{},
+            .toolbar_renderer = null,
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -272,7 +276,7 @@ pub const Viewer = struct {
     pub fn run(self: *Viewer) !void {
         self.log("[DEBUG] Viewer.run() starting\n", .{});
 
-        var stdout_buf: [8192]u8 = undefined;
+        var stdout_buf: [262144]u8 = undefined; // 256KB for toolbar graphics
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
         const writer = &stdout_writer.interface;
@@ -301,6 +305,24 @@ pub const Viewer = struct {
         self.log("[DEBUG] Initial screen clear...\n", .{});
         try Screen.clear(writer);
         try self.kitty.clearAll(writer);
+        try writer.flush();
+
+        // Initialize toolbar renderer with terminal pixel width
+        const term_size = try self.terminal.getSize();
+        const cell_width = if (term_size.cols > 0) term_size.width_px / term_size.cols else 10;
+        self.toolbar_renderer = ui_mod.ToolbarRenderer.init(self.allocator, &self.kitty, term_size.width_px, cell_width) catch |err| blk: {
+            self.log("[DEBUG] Toolbar init error: {}\n", .{err});
+            break :blk null;
+        };
+        if (self.toolbar_renderer) |*renderer| {
+            self.log("[DEBUG] Toolbar initialized, font_renderer={}\n", .{renderer.font_renderer != null});
+            renderer.setUrl(self.current_url);
+        } else {
+            self.log("[DEBUG] Toolbar is null\n", .{});
+        }
+
+        // Render initial toolbar using Kitty graphics
+        try self.renderToolbar(writer);
         try writer.flush();
 
         // Start screencast streaming with viewport dimensions
@@ -380,17 +402,35 @@ pub const Viewer = struct {
             // Render new screencast frames (non-blocking) - only in normal mode
             if (self.screencast_mode and self.mode == .normal) {
                 const new_frame = self.tryRenderScreencast() catch false;
-                
+
                 // Redraw UI overlays ONLY if we got a new frame or UI is dirty (e.g. mouse moved)
                 if (new_frame or self.ui_dirty) {
-                    var stdout_buf2: [8192]u8 = undefined;
+                    var stdout_buf2: [262144]u8 = undefined; // 256KB for toolbar graphics
                     const stdout_file2 = std.fs.File.stdout();
                     var stdout_writer2 = stdout_file2.writer(&stdout_buf2);
                     const writer2 = &stdout_writer2.interface;
                     self.renderCursor(writer2) catch {};
-                    self.renderUIChrome(writer2) catch {}; // Tab bar only (no status bar)
+                    self.renderToolbar(writer2) catch {};
+                    writer2.flush() catch {};
                     self.ui_dirty = false;
                 }
+            }
+
+            // In URL prompt mode, re-render toolbar when dirty (for cursor updates)
+            if (self.mode == .url_prompt and self.ui_dirty) {
+                self.log("[URL_PROMPT] Rendering toolbar...\n", .{});
+                var stdout_buf3: [262144]u8 = undefined; // 256KB for toolbar graphics
+                const stdout_file3 = std.fs.File.stdout();
+                var stdout_writer3 = stdout_file3.writer(&stdout_buf3);
+                const writer3 = &stdout_writer3.interface;
+                self.renderToolbar(writer3) catch |err| {
+                    self.log("[URL_PROMPT] Toolbar render error: {}\n", .{err});
+                };
+                writer3.flush() catch |err| {
+                    self.log("[URL_PROMPT] Flush error: {}\n", .{err});
+                };
+                self.log("[URL_PROMPT] Toolbar rendered\n", .{});
+                self.ui_dirty = false;
             }
 
             // Throttle inner loop slightly to prevent flooding input/output
@@ -773,65 +813,13 @@ pub const Viewer = struct {
         });
     }
 
-    /// Render UI chrome layers (tab bar with text-based buttons)
-    fn renderUIChrome(self: *Viewer, writer: anytype) !void {
-        // Move cursor to row 1, column 1
-        try writer.writeAll("\x1b[1;1H");
-
-        // Clear the tab bar row
-        try writer.writeAll("\x1b[2K");
-
-        // Dark background for tab bar
-        try writer.writeAll("\x1b[48;2;30;30;30m"); // Dark grey background
-
-        // Close button (leftmost) - red on hover style
-        try writer.writeAll("\x1b[38;2;255;95;87m"); // Red color
-        try writer.writeAll(" \xe2\x9c\x95 "); // ✕
-
-        // Back button
-        if (self.ui_state.can_go_back) {
-            try writer.writeAll("\x1b[38;2;200;200;200m"); // Light text
-        } else {
-            try writer.writeAll("\x1b[38;2;80;80;80m"); // Dim text
+    /// Render the toolbar using Kitty graphics
+    fn renderToolbar(self: *Viewer, writer: anytype) !void {
+        if (self.toolbar_renderer) |*renderer| {
+            renderer.setNavState(self.ui_state.can_go_back, self.ui_state.can_go_forward, self.ui_state.is_loading);
+            renderer.setUrl(self.current_url);
+            try renderer.render(writer);
         }
-        try writer.writeAll(" \xe2\x97\x80 "); // ◀
-
-        // Forward button
-        if (self.ui_state.can_go_forward) {
-            try writer.writeAll("\x1b[38;2;200;200;200m");
-        } else {
-            try writer.writeAll("\x1b[38;2;80;80;80m");
-        }
-        try writer.writeAll(" \xe2\x96\xb6 "); // ▶
-
-        // Refresh button
-        if (self.ui_state.is_loading) {
-            try writer.writeAll("\x1b[38;2;74;158;255m"); // Blue when loading
-        } else {
-            try writer.writeAll("\x1b[38;2;200;200;200m");
-        }
-        try writer.writeAll(" \xe2\x86\xbb "); // ↻
-
-        // Separator
-        try writer.writeAll("\x1b[38;2;60;60;60m\xe2\x94\x82"); // │
-
-        // URL display
-        try writer.writeAll("\x1b[38;2;150;150;150m ");
-        const max_url = 50;
-        if (self.current_url.len > max_url) {
-            try writer.writeAll(self.current_url[0..max_url]);
-            try writer.writeAll("...");
-        } else {
-            try writer.writeAll(self.current_url);
-        }
-
-        // Fill rest of line with background
-        try writer.writeAll("\x1b[0K");
-
-        // Reset colors
-        try writer.writeAll("\x1b[0m");
-
-        try writer.flush();
     }
 
     /// Handle input event - dispatches to key or mouse handlers
@@ -1012,38 +1000,67 @@ pub const Viewer = struct {
             14;
 
         // Convert pixel X to column (0-indexed)
-        const col = pixel_x / cell_width;
+        const col: i32 = @intCast(pixel_x / cell_width);
 
-        // Tab bar layout: " ✕  ◀  ▶  ↻ │ URL..."
-        // Close: cols 0-2, Back: cols 3-5, Forward: cols 6-8, Refresh: cols 9-11, URL: cols 13+
         self.log("[TABBAR] Click at pixel_x={}, cell_width={}, col={}\n", .{ pixel_x, cell_width, col });
 
+        // Use toolbar hit test if available
+        if (self.toolbar_renderer) |*renderer| {
+            if (renderer.hitTest(pixel_x, mapper.tabbar_height)) |button| {
+                switch (button) {
+                    .close => {
+                        self.log("[TABBAR] Close button clicked\n", .{});
+                        self.running = false;
+                    },
+                    .back => {
+                        self.log("[TABBAR] Back button clicked\n", .{});
+                        if (self.ui_state.can_go_back) {
+                            _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
+                            self.updateNavigationState();
+                        }
+                    },
+                    .forward => {
+                        self.log("[TABBAR] Forward button clicked\n", .{});
+                        if (self.ui_state.can_go_forward) {
+                            _ = try screenshot_api.goForward(self.cdp_client, self.allocator);
+                            self.updateNavigationState();
+                        }
+                    },
+                    .refresh => {
+                        self.log("[TABBAR] Refresh button clicked\n", .{});
+                        try screenshot_api.reload(self.cdp_client, self.allocator, false);
+                    },
+                }
+                return;
+            }
+
+            // Check if click is in URL bar area
+            if (pixel_x >= renderer.url_bar_x and pixel_x < renderer.url_bar_x + renderer.url_bar_width) {
+                self.log("[TABBAR] URL bar clicked\n", .{});
+                renderer.focusUrl();
+                self.mode = .url_prompt;
+                self.ui_dirty = true;
+                return;
+            }
+        }
+
+        // Fallback: column-based detection
         if (col <= 2) {
-            // Close button - quit
-            self.log("[TABBAR] Close button clicked\n", .{});
             self.running = false;
-        } else if (col <= 5) {
-            // Back button
-            self.log("[TABBAR] Back button clicked (can_go_back={})\n", .{self.ui_state.can_go_back});
-            const went_back = try screenshot_api.goBack(self.cdp_client, self.allocator);
-            self.log("[TABBAR] goBack result: {}\n", .{went_back});
+        } else if (col >= 4 and col <= 6 and self.ui_state.can_go_back) {
+            _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
             self.updateNavigationState();
-        } else if (col <= 8) {
-            // Forward button
-            self.log("[TABBAR] Forward button clicked (can_go_forward={})\n", .{self.ui_state.can_go_forward});
-            const went_fwd = try screenshot_api.goForward(self.cdp_client, self.allocator);
-            self.log("[TABBAR] goForward result: {}\n", .{went_fwd});
+        } else if (col >= 8 and col <= 10 and self.ui_state.can_go_forward) {
+            _ = try screenshot_api.goForward(self.cdp_client, self.allocator);
             self.updateNavigationState();
-        } else if (col <= 11) {
-            // Refresh button
-            self.log("[TABBAR] Refresh button clicked\n", .{});
+        } else if (col >= 12 and col <= 14) {
             try screenshot_api.reload(self.cdp_client, self.allocator, false);
-        } else if (col >= 13) {
-            // Location bar - enter URL prompt mode
-            self.log("[TABBAR] Location bar clicked\n", .{});
+        } else if (col >= 18) {
             self.mode = .url_prompt;
-            self.prompt_buffer = try PromptBuffer.init(self.allocator);
-            try self.drawStatus();
+            if (self.toolbar_renderer) |*renderer| {
+                renderer.focusUrl();
+            }
+            self.ui_dirty = true;
         }
     }
 
@@ -1092,53 +1109,6 @@ pub const Viewer = struct {
                         self.mouse_buttons,
                         1
                     );
-
-                    // Also try simulated click via JavaScript as fallback
-                    if (mouse.button == .left) {
-                        // First check what element is at this position
-                        const check_js = try std.fmt.allocPrint(
-                            self.allocator,
-                            "(()=>{{const el=document.elementFromPoint({d},{d});return el?el.tagName+' '+el.className:'null'}})()",
-                            .{ coords.x, coords.y }
-                        );
-                        defer self.allocator.free(check_js);
-
-                        const check_params = try std.fmt.allocPrint(
-                            self.allocator,
-                            "{{\"expression\":\"{s}\"}}",
-                            .{check_js}
-                        );
-                        defer self.allocator.free(check_params);
-
-                        if (self.cdp_client.sendCommand("Runtime.evaluate", check_params)) |check_result| {
-                            self.log("[JS] Element at ({},{}): {s}\n", .{ coords.x, coords.y, check_result });
-                            self.allocator.free(check_result);
-                        } else |_| {}
-
-                        // Now try to click it
-                        const js = try std.fmt.allocPrint(
-                            self.allocator,
-                            "(()=>{{const el=document.elementFromPoint({d},{d});if(el){{el.click();return true}}return false}})()",
-                            .{ coords.x, coords.y }
-                        );
-                        defer self.allocator.free(js);
-
-                        const js_params = try std.fmt.allocPrint(
-                            self.allocator,
-                            "{{\"expression\":\"{s}\"}}",
-                            .{js}
-                        );
-                        defer self.allocator.free(js_params);
-
-                        const js_result = self.cdp_client.sendCommand("Runtime.evaluate", js_params) catch |err| blk: {
-                            self.log("[JS CLICK] Error: {}\n", .{err});
-                            break :blk null;
-                        };
-                        if (js_result) |r| {
-                            self.log("[JS CLICK] Result: {s}\n", .{r});
-                            self.allocator.free(r);
-                        }
-                    }
 
                     // Store click info for status line display
                     // Note: This is now just "last interaction position" effectively
@@ -1358,41 +1328,85 @@ pub const Viewer = struct {
 
     /// Handle key press in URL prompt mode
     fn handleUrlPromptMode(self: *Viewer, key: Key) !void {
-        var prompt = &self.prompt_buffer.?;
+        // Use toolbar renderer for URL editing if available
+        if (self.toolbar_renderer) |*renderer| {
+            switch (key) {
+                .char => |c| {
+                    renderer.handleChar(c);
+                    self.ui_dirty = true;
+                },
+                .backspace => {
+                    renderer.handleBackspace();
+                    self.ui_dirty = true;
+                },
+                .left => {
+                    renderer.handleLeft();
+                    self.ui_dirty = true;
+                },
+                .right => {
+                    renderer.handleRight();
+                    self.ui_dirty = true;
+                },
+                .home => {
+                    renderer.handleHome();
+                    self.ui_dirty = true;
+                },
+                .end => {
+                    renderer.handleEnd();
+                    self.ui_dirty = true;
+                },
+                .enter => {
+                    const url = renderer.getUrlText();
+                    if (url.len > 0) {
+                        try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url);
+                        self.updateNavigationState();
+                    }
+                    renderer.blurUrl();
+                    self.mode = .normal;
+                    self.ui_dirty = true;
+                },
+                .escape => {
+                    renderer.blurUrl();
+                    self.mode = .normal;
+                    self.ui_dirty = true;
+                },
+                else => {},
+            }
+            return;
+        }
 
-        switch (key) {
-            .char => |c| {
-                if (c >= 32 and c <= 126) { // Printable characters
-                    try prompt.insertChar(c);
-                }
-                try self.drawStatus();
-            },
-            .backspace => {
-                prompt.backspace();
-                try self.drawStatus();
-            },
-            .enter => {
-                const url = prompt.getString();
-                if (url.len > 0) {
-                    // Navigate to the entered URL
-                    try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url);
-                    try self.refresh();
-                }
-
-                // Exit URL prompt mode
-                prompt.deinit();
-                self.prompt_buffer = null;
-                self.mode = .normal;
-                try self.drawStatus();
-            },
-            .escape => {
-                // Cancel URL prompt
-                prompt.deinit();
-                self.prompt_buffer = null;
-                self.mode = .normal;
-                try self.drawStatus();
-            },
-            else => {},
+        // Fallback to old prompt buffer
+        if (self.prompt_buffer) |*prompt| {
+            switch (key) {
+                .char => |c| {
+                    if (c >= 32 and c <= 126) {
+                        try prompt.insertChar(c);
+                    }
+                    try self.drawStatus();
+                },
+                .backspace => {
+                    prompt.backspace();
+                    try self.drawStatus();
+                },
+                .enter => {
+                    const url = prompt.getString();
+                    if (url.len > 0) {
+                        try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url);
+                        try self.refresh();
+                    }
+                    prompt.deinit();
+                    self.prompt_buffer = null;
+                    self.mode = .normal;
+                    try self.drawStatus();
+                },
+                .escape => {
+                    prompt.deinit();
+                    self.prompt_buffer = null;
+                    self.mode = .normal;
+                    try self.drawStatus();
+                },
+                else => {},
+            }
         }
     }
 
