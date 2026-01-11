@@ -260,9 +260,32 @@ pub const CdpClient = struct {
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        if (self.nav_ws) |ws| {
-            return ws.sendCommand(method, params);
+        // Debug logging
+        const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null;
+        if (log_file) |f| {
+            defer f.close();
+            f.seekFromEnd(0) catch {};
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[CDP NAV] sendNavCommand method={s} has_nav_ws={}\n", .{ method, self.nav_ws != null }) catch "";
+            f.writeAll(msg) catch {};
         }
+
+        if (self.nav_ws) |ws| {
+            const result = ws.sendCommand(method, params) catch |err| {
+                if (log_file) |f| {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "[CDP NAV] nav_ws.sendCommand failed: {}\n", .{err}) catch "";
+                    f.writeAll(msg) catch {};
+                }
+                return err;
+            };
+            return result;
+        }
+
+        if (log_file) |f| {
+            f.writeAll("[CDP NAV] Fallback to pipe (nav_ws null)\n") catch {};
+        }
+
         // Fallback to pipe if websocket not connected
         if (self.session_id != null) {
             return self.pipe_client.sendSessionCommand(self.session_id.?, method, params);

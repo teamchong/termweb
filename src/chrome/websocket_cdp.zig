@@ -299,9 +299,25 @@ pub const WebSocketCdpClient = struct {
 
     /// Background thread main function - continuously reads WebSocket frames
     fn readerThreadMain(self: *WebSocketCdpClient) void {
+        const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null;
+        if (log_file) |f| { f.seekFromEnd(0) catch {}; f.writeAll("[WS] Reader thread started\n") catch {}; f.close(); }
+
         while (self.running.load(.acquire)) {
             var frame = self.recvFrame() catch |err| {
-                if (err == error.ConnectionClosed) break;
+                // Safer logging:
+                 if (std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    var buf: [64]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "[WS] recvFrame error: {}\n", .{err}) catch "";
+                    f.writeAll(msg) catch {};
+                }
+
+                if (err == error.ConnectionClosed or 
+                    err == error.EndOfStream or 
+                    err == error.BrokenPipe or 
+                    err == error.ConnectionResetByPeer) break;
+                
                 // On timeout or other errors, check if we should stop
                 if (!self.running.load(.acquire)) break;
                 continue;
@@ -317,8 +333,19 @@ pub const WebSocketCdpClient = struct {
                 self.handleEvent(frame.payload) catch {};
             } else if (std.mem.indexOf(u8, frame.payload, "\"id\":")) |_| {
                 // RESPONSE (reply to our command)
+                // Log response processing
+                 if (std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    f.writeAll("[WS] Processing response\n") catch {};
+                }
                 self.handleResponse(frame.payload) catch {};
             }
+        }
+        if (std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null) |f| {
+            defer f.close();
+            f.seekFromEnd(0) catch {};
+            f.writeAll("[WS] Reader thread exiting\n") catch {};
         }
     }
 
