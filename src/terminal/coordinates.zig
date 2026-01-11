@@ -33,9 +33,12 @@ pub const CoordinateMapper = struct {
         else
             20; // fallback
 
-        // Reserve 1 row for tab bar at top (no status bar)
-        const content_rows: u16 = if (terminal_rows > 1) terminal_rows - 1 else 1;
-        const content_pixel_height = content_rows * cell_height;
+        // Content area is terminal height minus fixed 40px toolbar
+        const toolbar_height: u16 = 40;
+        const content_pixel_height = if (terminal_height_px > toolbar_height) 
+            terminal_height_px - toolbar_height 
+        else 
+            terminal_height_px;
 
         // If terminal reports pixel dimensions, assume we're using SGR pixel mode (1016h)
         const is_pixel_mode = terminal_width_px > 0;
@@ -48,7 +51,7 @@ pub const CoordinateMapper = struct {
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .cell_height = cell_height,
-            .tabbar_height = cell_height, // 1 row for tab bar
+            .tabbar_height = 40, // Fixed 40px toolbar height (matches TOOLBAR_HEIGHT in toolbar.zig)
             .content_pixel_height = content_pixel_height,
             .is_pixel_mode = is_pixel_mode,
         };
