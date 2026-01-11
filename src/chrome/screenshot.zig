@@ -165,6 +165,16 @@ pub fn reload(
     // In screencast mode, new frames arrive automatically - no need to block
 }
 
+/// Stop page loading - uses dedicated nav WebSocket
+pub fn stopLoading(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+) !void {
+    const result = try client.sendNavCommand("Page.stopLoading", null);
+    defer allocator.free(result);
+}
+
+
 /// Navigation history state
 pub const NavigationState = struct {
     can_go_back: bool,

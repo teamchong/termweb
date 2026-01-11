@@ -999,42 +999,44 @@ pub const Viewer = struct {
 
     /// Handle click on tab bar buttons
     fn handleTabBarClick(self: *Viewer, pixel_x: u16, pixel_y: u16, mapper: CoordinateMapper) !void {
-        // Calculate cell width for button positions
-        const cell_width: u16 = if (mapper.terminal_cols > 0)
-            mapper.terminal_width_px / mapper.terminal_cols
-        else
-            14;
-
-        // Convert pixel X to column (0-indexed)
-        const col: i32 = @intCast(pixel_x / cell_width);
-
-        self.log("[TABBAR] Click at pixel_x={}, pixel_y={}, cell_width={}, col={}\n", .{ pixel_x, pixel_y, cell_width, col });
-
-        // Use toolbar hit test if available
         if (self.toolbar_renderer) |*renderer| {
+            self.log("[CLICK] handleTabBarClick x={} y={}\n", .{ pixel_x, pixel_y });
+            
             if (renderer.hitTest(pixel_x, pixel_y)) |button| {
+                self.log("[CLICK] Button hit: {}\n", .{button});
+                
                 switch (button) {
-                    .close => {
-                        self.log("[TABBAR] Close button clicked\n", .{});
-                        self.running = false;
-                    },
                     .back => {
-                        self.log("[TABBAR] Back button clicked, can_go_back={}\\n", .{self.ui_state.can_go_back});
-                        if (self.ui_state.can_go_back) {
+                        self.log("[CLICK] Back button (can_back={})\n", .{self.ui_state.can_go_back});
+                        // Always try to go back even if state says no (state might be stale)
+                        // if (self.ui_state.can_go_back) {
                             _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
-                            self.updateNavigationState();
-                        }
+                            // Optimistic update
+                            self.ui_state.can_go_forward = true;
+                        // }
                     },
                     .forward => {
-                        self.log("[TABBAR] Forward button clicked\n", .{});
+                        self.log("[CLICK] Forward button\n", .{});
                         if (self.ui_state.can_go_forward) {
                             _ = try screenshot_api.goForward(self.cdp_client, self.allocator);
-                            self.updateNavigationState();
+                            self.ui_state.can_go_back = true;
                         }
                     },
                     .refresh => {
-                        self.log("[TABBAR] Refresh button clicked\n", .{});
-                        try screenshot_api.reload(self.cdp_client, self.allocator, false);
+                        self.log("[CLICK] Refresh button (loading={})\n", .{self.ui_state.is_loading});
+                        if (self.ui_state.is_loading) {
+                            _ = try screenshot_api.stopLoading(self.cdp_client, self.allocator);
+                            self.ui_state.is_loading = false;
+                        } else {
+                            // Ensure we call reload
+                            self.log("[CLICK] Sending reload command\n", .{});
+                            _ = try screenshot_api.reload(self.cdp_client, self.allocator, false);
+                            self.ui_state.is_loading = true;
+                        }
+                    },
+                    .close => {
+                        self.log("[CLICK] Close button\n", .{});
+                        self.running = false;
                     },
                 }
                 return;
@@ -1049,6 +1051,17 @@ pub const Viewer = struct {
                 return;
             }
         }
+
+        // Calculate cell width for button positions
+        const cell_width: u16 = if (mapper.terminal_cols > 0)
+            mapper.terminal_width_px / mapper.terminal_cols
+        else
+            14;
+
+        // Convert pixel X to column (0-indexed)
+        const col: i32 = @intCast(pixel_x / cell_width);
+
+        self.log("[TABBAR] Click at pixel_x={}, pixel_y={}, cell_width={}, col={}\n", .{ pixel_x, pixel_y, cell_width, col });
 
         // Fallback: column-based detection
         if (col <= 2) {
