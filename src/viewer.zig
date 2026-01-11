@@ -1629,6 +1629,9 @@ pub const Viewer = struct {
         if (self.shm_buffer) |*shm| {
             shm.deinit();
         }
+        if (self.toolbar_renderer) |*renderer| {
+            renderer.deinit();
+        }
         self.terminal.deinit();
     }
 };
