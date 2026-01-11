@@ -41,6 +41,12 @@ pub const ButtonIcon = enum {
     refresh,
 };
 
+/// Selection bounds for URL bar text
+pub const SelectionBounds = struct {
+    start: u32,
+    end: u32,
+};
+
 /// Toolbar renderer using Kitty graphics and SVG
 pub const ToolbarRenderer = struct {
     allocator: std.mem.Allocator,
@@ -62,6 +68,8 @@ pub const ToolbarRenderer = struct {
     url_buffer: [512]u8 = undefined,
     url_len: u32 = 0,
     url_cursor: u32 = 0,
+    url_select_start: ?u32 = null, // Selection start (null = no selection)
+    url_select_end: ?u32 = null,   // Selection end
 
     // Cached image IDs
     bg_image_id: ?u32 = null,
@@ -111,11 +119,15 @@ pub const ToolbarRenderer = struct {
     pub fn focusUrl(self: *ToolbarRenderer) void {
         self.url_focused = true;
         // Select all on focus
+        self.url_select_start = 0;
+        self.url_select_end = self.url_len;
         self.url_cursor = self.url_len;
     }
 
     pub fn blurUrl(self: *ToolbarRenderer) void {
         self.url_focused = false;
+        self.url_select_start = null;
+        self.url_select_end = null;
     }
 
     pub fn getUrlText(self: *ToolbarRenderer) []const u8 {
@@ -125,6 +137,12 @@ pub const ToolbarRenderer = struct {
     pub fn handleChar(self: *ToolbarRenderer, char: u8) void {
         if (!self.url_focused) return;
         if (char < 32 or char > 126) return;
+
+        // If there's a selection, delete it first
+        if (self.hasSelection()) {
+            self.deleteSelection();
+        }
+
         if (self.url_len >= self.url_buffer.len - 1) return;
 
         // Insert at cursor
@@ -141,6 +159,13 @@ pub const ToolbarRenderer = struct {
 
     pub fn handleBackspace(self: *ToolbarRenderer) void {
         if (!self.url_focused) return;
+
+        // If there's a selection, delete it
+        if (self.hasSelection()) {
+            self.deleteSelection();
+            return;
+        }
+
         if (self.url_cursor > 0) {
             var i = self.url_cursor - 1;
             while (i < self.url_len - 1) : (i += 1) {
@@ -152,19 +177,73 @@ pub const ToolbarRenderer = struct {
     }
 
     pub fn handleLeft(self: *ToolbarRenderer) void {
+        self.clearSelection();
         if (self.url_cursor > 0) self.url_cursor -= 1;
     }
 
     pub fn handleRight(self: *ToolbarRenderer) void {
+        self.clearSelection();
         if (self.url_cursor < self.url_len) self.url_cursor += 1;
     }
 
     pub fn handleHome(self: *ToolbarRenderer) void {
+        self.clearSelection();
         self.url_cursor = 0;
     }
 
     pub fn handleEnd(self: *ToolbarRenderer) void {
+        self.clearSelection();
         self.url_cursor = self.url_len;
+    }
+
+    /// Check if there's an active selection
+    fn hasSelection(self: *ToolbarRenderer) bool {
+        if (self.url_select_start) |start| {
+            if (self.url_select_end) |end| {
+                return start != end;
+            }
+        }
+        return false;
+    }
+
+    /// Clear the current selection
+    fn clearSelection(self: *ToolbarRenderer) void {
+        self.url_select_start = null;
+        self.url_select_end = null;
+    }
+
+    /// Delete the selected text
+    fn deleteSelection(self: *ToolbarRenderer) void {
+        const start = self.url_select_start orelse return;
+        const end = self.url_select_end orelse return;
+
+        const sel_start = @min(start, end);
+        const sel_end = @max(start, end);
+        const sel_len = sel_end - sel_start;
+
+        if (sel_len == 0) return;
+
+        // Shift remaining text left
+        var i: u32 = sel_start;
+        while (i + sel_len < self.url_len) : (i += 1) {
+            self.url_buffer[i] = self.url_buffer[i + sel_len];
+        }
+
+        self.url_len -= sel_len;
+        self.url_cursor = sel_start;
+        self.clearSelection();
+    }
+
+    /// Get selection bounds (min, max) or null if no selection
+    fn getSelectionBounds(self: *ToolbarRenderer) ?SelectionBounds {
+        if (self.url_select_start) |start| {
+            if (self.url_select_end) |end| {
+                if (start != end) {
+                    return .{ .start = @min(start, end), .end = @max(start, end) };
+                }
+            }
+        }
+        return null;
     }
 
     /// Render the toolbar using Kitty graphics
@@ -240,6 +319,7 @@ pub const ToolbarRenderer = struct {
             URL_BAR_HEIGHT,
             display_text,
             if (self.url_focused) self.url_cursor else null,
+            self.getSelectionBounds(),
         );
         defer self.allocator.free(url_rgba);
 
@@ -252,7 +332,7 @@ pub const ToolbarRenderer = struct {
     }
 
     /// Generate URL bar with text rendered directly into the image
-    fn generateUrlBarWithText(self: *ToolbarRenderer, width: u32, height: u32, text: []const u8, cursor_pos: ?u32) ![]u8 {
+    fn generateUrlBarWithText(self: *ToolbarRenderer, width: u32, height: u32, text: []const u8, cursor_pos: ?u32, selection: ?SelectionBounds) ![]u8 {
         const size = width * height * 4;
         const data = try self.allocator.alloc(u8, size);
 
@@ -318,20 +398,71 @@ pub const ToolbarRenderer = struct {
         if (self.font_renderer) |*font| {
             const text_padding: u32 = 8;
             const text_y: u32 = (height - font.getLineHeight()) / 2;
+            const line_height = font.getLineHeight();
 
-            // Text color (light gray)
+            // Render selection highlight first (before text)
+            if (selection) |sel| {
+                // Calculate pixel positions for selection
+                const sel_start_px = text_padding + font.measureText(text[0..@min(sel.start, @as(u32, @intCast(text.len)))]);
+                const sel_end_px = text_padding + font.measureText(text[0..@min(sel.end, @as(u32, @intCast(text.len)))]);
+
+                // Selection highlight color (blue)
+                const sel_color = [3]u8{ 59, 130, 246 }; // Tailwind blue-500
+
+                // Draw selection rectangle
+                var sy: u32 = text_y;
+                while (sy < text_y + line_height and sy < height) : (sy += 1) {
+                    var sx: u32 = sel_start_px;
+                    while (sx < sel_end_px and sx < width) : (sx += 1) {
+                        const sidx = (sy * width + sx) * 4;
+                        if (sidx + 3 < data.len) {
+                            data[sidx] = sel_color[0];
+                            data[sidx + 1] = sel_color[1];
+                            data[sidx + 2] = sel_color[2];
+                            data[sidx + 3] = 255;
+                        }
+                    }
+                }
+            }
+
+            // Text color (light gray, or white if selected)
             const text_color = [4]u8{ 200, 200, 200, 255 };
+            const selected_text_color = [4]u8{ 255, 255, 255, 255 };
 
             // Render text
             if (text.len > 0) {
-                font.renderTextToBuffer(data, width, height, text, text_padding, text_y, text_color);
+                if (selection) |sel| {
+                    // Render text in parts: before selection, selected, after selection
+                    const sel_start = @min(sel.start, @as(u32, @intCast(text.len)));
+                    const sel_end = @min(sel.end, @as(u32, @intCast(text.len)));
+
+                    // Before selection
+                    if (sel_start > 0) {
+                        font.renderTextToBuffer(data, width, height, text[0..sel_start], text_padding, text_y, text_color);
+                    }
+                    // Selected text (white)
+                    if (sel_end > sel_start) {
+                        const sel_x = text_padding + font.measureText(text[0..sel_start]);
+                        font.renderTextToBuffer(data, width, height, text[sel_start..sel_end], sel_x, text_y, selected_text_color);
+                    }
+                    // After selection
+                    if (sel_end < text.len) {
+                        const after_x = text_padding + font.measureText(text[0..sel_end]);
+                        font.renderTextToBuffer(data, width, height, text[sel_end..], after_x, text_y, text_color);
+                    }
+                } else {
+                    font.renderTextToBuffer(data, width, height, text, text_padding, text_y, text_color);
+                }
             }
 
-            // Render cursor if focused
+            // Render cursor if focused (and no selection, or at cursor position)
             if (cursor_pos) |pos| {
-                const cursor_color = [4]u8{ 255, 255, 255, 255 };
-                const cursor_text_color = [4]u8{ 0, 0, 0, 255 };
-                font.renderCursor(data, width, height, text, pos, text_padding, text_y, cursor_color, cursor_text_color);
+                // Don't show cursor if there's a selection (the selection is visible instead)
+                if (selection == null) {
+                    const cursor_color = [4]u8{ 255, 255, 255, 255 };
+                    const cursor_text_color = [4]u8{ 0, 0, 0, 255 };
+                    font.renderCursor(data, width, height, text, pos, text_padding, text_y, cursor_color, cursor_text_color);
+                }
             }
         }
 
