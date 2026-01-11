@@ -352,6 +352,12 @@ pub const Viewer = struct {
             return error.ScreencastTimeout;
         }
 
+        // Get initial navigation state (after page has loaded)
+        self.updateNavigationState();
+        self.log("[DEBUG] Initial nav state: can_go_back={}, can_go_forward={}\\n", .{
+            self.ui_state.can_go_back, self.ui_state.can_go_forward,
+        });
+
         self.log("[DEBUG] About to enter event loop\n", .{});
         self.log("[DEBUG] self.running = {}\n", .{self.running});
 
@@ -1013,7 +1019,7 @@ pub const Viewer = struct {
                         self.running = false;
                     },
                     .back => {
-                        self.log("[TABBAR] Back button clicked\n", .{});
+                        self.log("[TABBAR] Back button clicked, can_go_back={}\\n", .{self.ui_state.can_go_back});
                         if (self.ui_state.can_go_back) {
                             _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
                             self.updateNavigationState();
