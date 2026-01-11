@@ -998,7 +998,7 @@ pub const Viewer = struct {
     }
 
     /// Handle click on tab bar buttons
-    fn handleTabBarClick(self: *Viewer, pixel_x: u16, mapper: CoordinateMapper) !void {
+    fn handleTabBarClick(self: *Viewer, pixel_x: u16, pixel_y: u16, mapper: CoordinateMapper) !void {
         // Calculate cell width for button positions
         const cell_width: u16 = if (mapper.terminal_cols > 0)
             mapper.terminal_width_px / mapper.terminal_cols
@@ -1008,11 +1008,11 @@ pub const Viewer = struct {
         // Convert pixel X to column (0-indexed)
         const col: i32 = @intCast(pixel_x / cell_width);
 
-        self.log("[TABBAR] Click at pixel_x={}, cell_width={}, col={}\n", .{ pixel_x, cell_width, col });
+        self.log("[TABBAR] Click at pixel_x={}, pixel_y={}, cell_width={}, col={}\n", .{ pixel_x, pixel_y, cell_width, col });
 
         // Use toolbar hit test if available
         if (self.toolbar_renderer) |*renderer| {
-            if (renderer.hitTest(pixel_x, mapper.tabbar_height)) |button| {
+            if (renderer.hitTest(pixel_x, pixel_y)) |button| {
                 switch (button) {
                     .close => {
                         self.log("[TABBAR] Close button clicked\n", .{});
@@ -1134,7 +1134,7 @@ pub const Viewer = struct {
                     self.log("[CLICK] In tab bar: mouse=({},{}) tabbar_height={}\n", .{
                         self.mouse_x, self.mouse_y, mapper.tabbar_height,
                     });
-                    try self.handleTabBarClick(self.mouse_x, mapper);
+                    try self.handleTabBarClick(self.mouse_x, self.mouse_y, mapper);
                 }
             },
             .release => {
@@ -1158,6 +1158,20 @@ pub const Viewer = struct {
                 }
             },
             .move, .drag => {
+                // Check if mouse is hovering over toolbar buttons
+                if (self.toolbar_renderer) |*renderer| {
+                    const old_hover = renderer.close_hover;
+                    if (renderer.hitTest(self.mouse_x, self.mouse_y)) |button| {
+                        renderer.close_hover = (button == .close);
+                    } else {
+                        renderer.close_hover = false;
+                    }
+                    // Re-render toolbar if hover state changed
+                    if (renderer.close_hover != old_hover) {
+                        self.ui_dirty = true;
+                    }
+                }
+
                 // Forward mouse move to Chrome for hover and drag effects
                 if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
                     try interact_mod.sendMouseEvent(
