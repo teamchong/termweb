@@ -421,6 +421,9 @@ pub const PipeCdpClient = struct {
     }
 
     fn handleEvent(self: *PipeCdpClient, payload: []const u8) !void {
+        // Don't process if shutting down (prevents leak from race with deinit)
+        if (!self.running.load(.acquire)) return;
+
         const method_start = std.mem.indexOf(u8, payload, "\"method\":\"") orelse return;
         const method_v_start = method_start + "\"method\":\"".len;
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
@@ -439,6 +442,9 @@ pub const PipeCdpClient = struct {
             // Queue other events for the main thread to process
             self.event_mutex.lock();
             defer self.event_mutex.unlock();
+
+            // Double-check after acquiring lock
+            if (!self.running.load(.acquire)) return;
 
             const MAX_EVENT_QUEUE = 50;
             if (self.event_queue.items.len >= MAX_EVENT_QUEUE) {
@@ -469,9 +475,15 @@ pub const PipeCdpClient = struct {
     }
 
     fn handleResponse(self: *PipeCdpClient, payload: []const u8) !void {
+        // Don't allocate if shutting down (prevents leak from race with deinit)
+        if (!self.running.load(.acquire)) return;
+
         const id = try self.extractMessageId(payload);
         self.response_mutex.lock();
         defer self.response_mutex.unlock();
+
+        // Double-check after acquiring lock
+        if (!self.running.load(.acquire)) return;
 
         const MAX_QUEUE_SIZE = 50;
         while (self.response_queue.items.len >= MAX_QUEUE_SIZE) {

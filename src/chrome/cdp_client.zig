@@ -315,54 +315,32 @@ pub const CdpClient = struct {
         self.pipe_client.sendCommandAsync(method, params) catch {};
     }
 
-    /// Send navigation command and wait for response - uses dedicated nav WebSocket
-    /// Auto-reconnects all WebSockets if dead (cross-origin navigation creates new page target)
+    /// Send navigation command and wait for response
+    /// Uses pipe with session - browser-level connection stays valid across page target changes
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // Try existing connection first
-        if (self.nav_ws) |ws| {
-            if (ws.running.load(.acquire)) {
-                return ws.sendCommand(method, params) catch |err| {
-                    logToFile("[CDP NAV] sendCommand failed: {}, reconnecting...\n", .{err});
-                    // Reconnect and retry once
-                    self.reconnectAllWebSockets() catch |rerr| {
-                        logToFile("[CDP NAV] reconnect failed: {}\n", .{rerr});
-                        return err;
-                    };
-                    if (self.nav_ws) |new_ws| {
-                        return new_ws.sendCommand(method, params);
-                    }
-                    return err;
-                };
-            }
+        logToFile("[CDP NAV] sendNavCommand: {s} via pipe\n", .{method});
+        // Use pipe client with session - browser-level connection stays valid across page target changes
+        if (self.session_id) |sid| {
+            return self.pipe_client.sendSessionCommand(sid, method, params);
         }
-
-        // Connection not running, reconnect
-        self.reconnectAllWebSockets() catch |err| {
-            logToFile("[CDP NAV] reconnect failed: {}\n", .{err});
-            return error.WebSocketConnectionFailed;
-        };
-
-        // Send with new connection
-        if (self.nav_ws) |ws| {
-            return ws.sendCommand(method, params);
-        }
-        return error.WebSocketConnectionFailed;
+        return self.pipe_client.sendCommand(method, params);
     }
 
-    /// Send navigation command (fire-and-forget) - uses dedicated nav WebSocket
+    /// Send navigation command (fire-and-forget) - uses pipe with session
     pub fn sendNavCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        if (self.nav_ws) |ws| {
-            if (ws.running.load(.acquire)) {
-                ws.sendCommandAsync(method, params);
-            }
+        logToFile("[CDP NAV ASYNC] sendNavCommandAsync: {s} via pipe\n", .{method});
+        if (self.session_id) |sid| {
+            self.pipe_client.sendSessionCommandAsync(sid, method, params) catch {};
+        } else {
+            self.pipe_client.sendCommandAsync(method, params) catch {};
         }
     }
 
