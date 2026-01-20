@@ -316,32 +316,15 @@ pub const CdpClient = struct {
     }
 
     /// Send navigation command and wait for response - uses dedicated nav WebSocket
-    /// Falls back to pipe if WebSocket unavailable
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // Try nav_ws first (dedicated channel)
         if (self.nav_ws) |ws| {
-            if (ws.running.load(.acquire)) {
-                logToFile("[CDP NAV] sendNavCommand: {s} via nav_ws\n", .{method});
-                return ws.sendCommand(method, params) catch |err| {
-                    logToFile("[CDP NAV] nav_ws failed: {}, falling back to pipe\n", .{err});
-                    // Fall through to pipe
-                    if (self.session_id) |sid| {
-                        return self.pipe_client.sendSessionCommand(sid, method, params);
-                    }
-                    return self.pipe_client.sendCommand(method, params);
-                };
-            }
+            return ws.sendCommand(method, params);
         }
-        // Fallback to pipe
-        logToFile("[CDP NAV] sendNavCommand: {s} via pipe (fallback)\n", .{method});
-        if (self.session_id) |sid| {
-            return self.pipe_client.sendSessionCommand(sid, method, params);
-        }
-        return self.pipe_client.sendCommand(method, params);
+        return CdpError.WebSocketConnectionFailed;
     }
 
     /// Send navigation command (fire-and-forget) - uses dedicated nav WebSocket
@@ -351,18 +334,7 @@ pub const CdpClient = struct {
         params: ?[]const u8,
     ) void {
         if (self.nav_ws) |ws| {
-            if (ws.running.load(.acquire)) {
-                logToFile("[CDP NAV ASYNC] sendNavCommandAsync: {s} via nav_ws\n", .{method});
-                ws.sendCommandAsync(method, params);
-                return;
-            }
-        }
-        // Fallback to pipe
-        logToFile("[CDP NAV ASYNC] sendNavCommandAsync: {s} via pipe (fallback)\n", .{method});
-        if (self.session_id) |sid| {
-            self.pipe_client.sendSessionCommandAsync(sid, method, params) catch {};
-        } else {
-            self.pipe_client.sendCommandAsync(method, params) catch {};
+            ws.sendCommandAsync(method, params);
         }
     }
 
