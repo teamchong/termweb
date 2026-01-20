@@ -176,10 +176,20 @@ pub const ToolbarSvg = struct {
     ;
 };
 
+/// Button types for scaled rendering
+pub const ButtonType = enum {
+    close,
+    back,
+    forward,
+    refresh,
+    stop,
+};
+
 /// Pre-rendered toolbar button cache
 pub const ToolbarCache = struct {
     allocator: std.mem.Allocator,
     renderer: SvgRenderer,
+    cached_size: u32 = 0, // Track cached button size for invalidation
 
     // Cached RGBA buffers
     close_normal: ?[]u8 = null,
@@ -202,6 +212,129 @@ pub const ToolbarCache = struct {
             .allocator = allocator,
             .renderer = try SvgRenderer.init(),
         };
+    }
+
+    /// Invalidate all cached buttons (called when size changes)
+    fn invalidateCache(self: *ToolbarCache) void {
+        if (self.close_normal) |b| self.allocator.free(b);
+        if (self.close_hover) |b| self.allocator.free(b);
+        if (self.back_normal) |b| self.allocator.free(b);
+        if (self.back_hover) |b| self.allocator.free(b);
+        if (self.back_disabled) |b| self.allocator.free(b);
+        if (self.forward_normal) |b| self.allocator.free(b);
+        if (self.forward_hover) |b| self.allocator.free(b);
+        if (self.forward_disabled) |b| self.allocator.free(b);
+        if (self.refresh_normal) |b| self.allocator.free(b);
+        if (self.refresh_hover) |b| self.allocator.free(b);
+        if (self.stop_normal) |b| self.allocator.free(b);
+        if (self.stop_hover) |b| self.allocator.free(b);
+        self.close_normal = null;
+        self.close_hover = null;
+        self.back_normal = null;
+        self.back_hover = null;
+        self.back_disabled = null;
+        self.forward_normal = null;
+        self.forward_hover = null;
+        self.forward_disabled = null;
+        self.refresh_normal = null;
+        self.refresh_hover = null;
+        self.stop_normal = null;
+        self.stop_hover = null;
+    }
+
+    /// Get button scaled to specified size (with caching)
+    pub fn getButtonScaled(self: *ToolbarCache, button: ButtonType, enabled: bool, hover: bool, size: u32) ![]u8 {
+        // Invalidate cache if size changed
+        if (self.cached_size != size) {
+            self.invalidateCache();
+            self.cached_size = size;
+        }
+
+        return switch (button) {
+            .close => self.getCloseButtonInternal(hover, size),
+            .back => self.getBackButtonInternal(enabled, hover, size),
+            .forward => self.getForwardButtonInternal(enabled, hover, size),
+            .refresh => self.getRefreshButtonInternal(hover, size),
+            .stop => self.getStopButtonInternal(hover, size),
+        };
+    }
+
+    fn getCloseButtonInternal(self: *ToolbarCache, hover: bool, size: u32) ![]u8 {
+        if (hover) {
+            if (self.close_hover == null) {
+                self.close_hover = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.close_hover, size, size);
+            }
+            return self.close_hover.?;
+        } else {
+            if (self.close_normal == null) {
+                self.close_normal = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.close_normal, size, size);
+            }
+            return self.close_normal.?;
+        }
+    }
+
+    fn getBackButtonInternal(self: *ToolbarCache, enabled: bool, hover: bool, size: u32) ![]u8 {
+        if (!enabled) {
+            if (self.back_disabled == null) {
+                self.back_disabled = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.back_disabled, size, size);
+            }
+            return self.back_disabled.?;
+        }
+        if (hover) {
+            if (self.back_hover == null) {
+                self.back_hover = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.back_hover, size, size);
+            }
+            return self.back_hover.?;
+        }
+        if (self.back_normal == null) {
+            self.back_normal = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.back_normal, size, size);
+        }
+        return self.back_normal.?;
+    }
+
+    fn getForwardButtonInternal(self: *ToolbarCache, enabled: bool, hover: bool, size: u32) ![]u8 {
+        if (!enabled) {
+            if (self.forward_disabled == null) {
+                self.forward_disabled = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.forward_disabled, size, size);
+            }
+            return self.forward_disabled.?;
+        }
+        if (hover) {
+            if (self.forward_hover == null) {
+                self.forward_hover = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.forward_hover, size, size);
+            }
+            return self.forward_hover.?;
+        }
+        if (self.forward_normal == null) {
+            self.forward_normal = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.forward_normal, size, size);
+        }
+        return self.forward_normal.?;
+    }
+
+    fn getRefreshButtonInternal(self: *ToolbarCache, hover: bool, size: u32) ![]u8 {
+        if (hover) {
+            if (self.refresh_hover == null) {
+                self.refresh_hover = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.refresh_hover, size, size);
+            }
+            return self.refresh_hover.?;
+        }
+        if (self.refresh_normal == null) {
+            self.refresh_normal = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.refresh_normal, size, size);
+        }
+        return self.refresh_normal.?;
+    }
+
+    fn getStopButtonInternal(self: *ToolbarCache, hover: bool, size: u32) ![]u8 {
+        if (hover) {
+            if (self.stop_hover == null) {
+                self.stop_hover = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.stop_hover, size, size);
+            }
+            return self.stop_hover.?;
+        }
+        if (self.stop_normal == null) {
+            self.stop_normal = try self.renderer.renderToRgba(self.allocator, ToolbarSvg.stop_normal, size, size);
+        }
+        return self.stop_normal.?;
     }
 
     pub fn deinit(self: *ToolbarCache) void {

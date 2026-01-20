@@ -27,17 +27,22 @@ pub const CoordinateMapper = struct {
         viewport_width: u32,
         viewport_height: u32,
     ) CoordinateMapper {
-        // Calculate cell height (one row)
+        // Calculate cell dimensions
         const cell_height: u16 = if (terminal_rows > 0)
             @divTrunc(terminal_height_px, terminal_rows)
         else
             20; // fallback
+        const cell_width: u16 = if (terminal_cols > 0)
+            @divTrunc(terminal_width_px, terminal_cols)
+        else
+            10; // fallback
 
-        // Content area is terminal height minus fixed 40px toolbar
-        const toolbar_height: u16 = 40;
-        const content_pixel_height = if (terminal_height_px > toolbar_height) 
-            terminal_height_px - toolbar_height 
-        else 
+        // Detect High-DPI and scale toolbar height accordingly
+        const dpr: u16 = if (cell_width > 14) 2 else 1;
+        const toolbar_height: u16 = 40 * dpr;
+        const content_pixel_height = if (terminal_height_px > toolbar_height)
+            terminal_height_px - toolbar_height
+        else
             terminal_height_px;
 
         // If terminal reports pixel dimensions, assume we're using SGR pixel mode (1016h)
@@ -51,7 +56,7 @@ pub const CoordinateMapper = struct {
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .cell_height = cell_height,
-            .tabbar_height = 40, // Fixed 40px toolbar height (matches TOOLBAR_HEIGHT in toolbar.zig)
+            .tabbar_height = toolbar_height, // Scaled for High-DPI (matches toolbar.zig)
             .content_pixel_height = content_pixel_height,
             .is_pixel_mode = is_pixel_mode,
         };

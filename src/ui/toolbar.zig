@@ -9,11 +9,18 @@ const KittyGraphics = kitty_mod.KittyGraphics;
 const ToolbarCache = svg_mod.ToolbarCache;
 const FontRenderer = font_mod.FontRenderer;
 
-/// Toolbar dimensions
-pub const TOOLBAR_HEIGHT: u32 = 40;
-pub const BUTTON_SIZE: u32 = 28;
-pub const BUTTON_PADDING: u32 = 8;
-pub const URL_BAR_HEIGHT: u32 = 28;
+/// Base toolbar dimensions (scaled by DPR for High-DPI displays)
+pub const BASE_TOOLBAR_HEIGHT: u32 = 40;
+pub const BASE_BUTTON_SIZE: u32 = 28;
+pub const BASE_BUTTON_PADDING: u32 = 8;
+pub const BASE_URL_BAR_HEIGHT: u32 = 28;
+pub const BASE_FONT_SIZE: f32 = 16.0;
+
+/// Get effective toolbar height (for external use)
+pub fn getToolbarHeight(cell_width: u32) u32 {
+    const dpr: u32 = if (cell_width > 14) 2 else 1;
+    return BASE_TOOLBAR_HEIGHT * dpr;
+}
 
 /// Placement IDs for toolbar elements
 pub const Placement = struct {
@@ -56,6 +63,13 @@ pub const ToolbarRenderer = struct {
     svg_cache: ToolbarCache,
     font_renderer: ?FontRenderer,
 
+    // DPR-scaled dimensions
+    dpr: u32,
+    toolbar_height: u32,
+    button_size: u32,
+    button_padding: u32,
+    url_bar_height: u32,
+
     // Current states
     close_hover: bool = false,
     back_hover: bool = false,
@@ -84,16 +98,32 @@ pub const ToolbarRenderer = struct {
     url_bar_width: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, kitty: *KittyGraphics, width_px: u32, cell_width: u32) !ToolbarRenderer {
-        // Initialize font renderer (14px for URL bar text)
-        const font = FontRenderer.init(allocator, 14.0) catch null;
+        // Detect High-DPI: cell_width > 14 means Retina/HiDPI
+        const effective_cell_width = if (cell_width > 0) cell_width else 10;
+        const dpr: u32 = if (effective_cell_width > 14) 2 else 1;
+
+        // Scale dimensions for High-DPI
+        const toolbar_height = BASE_TOOLBAR_HEIGHT * dpr;
+        const button_size = BASE_BUTTON_SIZE * dpr;
+        const button_padding = BASE_BUTTON_PADDING * dpr;
+        const url_bar_height = BASE_URL_BAR_HEIGHT * dpr;
+        const font_size = BASE_FONT_SIZE * @as(f32, @floatFromInt(dpr));
+
+        // Initialize font renderer with scaled size
+        const font = FontRenderer.init(allocator, font_size) catch null;
 
         return .{
             .allocator = allocator,
             .kitty = kitty,
             .width_px = width_px,
-            .cell_width = if (cell_width > 0) cell_width else 10,
+            .cell_width = effective_cell_width,
             .svg_cache = try ToolbarCache.init(allocator),
             .font_renderer = font,
+            .dpr = dpr,
+            .toolbar_height = toolbar_height,
+            .button_size = button_size,
+            .button_padding = button_padding,
+            .url_bar_height = url_bar_height,
         };
     }
 
@@ -257,70 +287,70 @@ pub const ToolbarRenderer = struct {
         try writer.writeAll("\x1b[1;1H");
 
         // Render toolbar background (dark bar)
-        const bg_rgba = try generateToolbarBg(self.allocator, self.width_px, TOOLBAR_HEIGHT);
+        const bg_rgba = try generateToolbarBg(self.allocator, self.width_px, self.toolbar_height);
         defer self.allocator.free(bg_rgba);
 
-        self.bg_image_id = try self.kitty.displayRawRGBA(writer, bg_rgba, self.width_px, TOOLBAR_HEIGHT, .{
+        self.bg_image_id = try self.kitty.displayRawRGBA(writer, bg_rgba, self.width_px, self.toolbar_height, .{
             .placement_id = Placement.TOOLBAR_BG,
             .z = 50,
         });
 
         // Button positions
-        var x_offset: u32 = BUTTON_PADDING;
-        const y_offset: u32 = (TOOLBAR_HEIGHT - BUTTON_SIZE) / 2;
+        var x_offset: u32 = self.button_padding;
+        const y_offset: u32 = (self.toolbar_height - self.button_size) / 2;
 
         // Close button (red traffic light)
-        const close_rgba = try self.svg_cache.getCloseButton(self.close_hover);
-        _ = try self.kitty.displayRawRGBA(writer, close_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
+        const close_rgba = try self.svg_cache.getButtonScaled(.close, false, self.close_hover, self.button_size);
+        _ = try self.kitty.displayRawRGBA(writer, close_rgba, self.button_size, self.button_size, .{
             .placement_id = Placement.CLOSE_BTN,
             .z = 51,
             .x_offset = x_offset,
             .y_offset = y_offset,
         });
-        x_offset += BUTTON_SIZE + BUTTON_PADDING;
+        x_offset += self.button_size + self.button_padding;
 
         // Back button
-        const back_rgba = try self.svg_cache.getBackButton(self.can_go_back, self.back_hover);
-        _ = try self.kitty.displayRawRGBA(writer, back_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
+        const back_rgba = try self.svg_cache.getButtonScaled(.back, self.can_go_back, self.back_hover, self.button_size);
+        _ = try self.kitty.displayRawRGBA(writer, back_rgba, self.button_size, self.button_size, .{
             .placement_id = Placement.BACK_BTN,
             .z = 51,
             .x_offset = x_offset,
             .y_offset = y_offset,
         });
-        x_offset += BUTTON_SIZE + BUTTON_PADDING;
+        x_offset += self.button_size + self.button_padding;
 
         // Forward button
-        const forward_rgba = try self.svg_cache.getForwardButton(self.can_go_forward, self.forward_hover);
-        _ = try self.kitty.displayRawRGBA(writer, forward_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
+        const forward_rgba = try self.svg_cache.getButtonScaled(.forward, self.can_go_forward, self.forward_hover, self.button_size);
+        _ = try self.kitty.displayRawRGBA(writer, forward_rgba, self.button_size, self.button_size, .{
             .placement_id = Placement.FWD_BTN,
             .z = 51,
             .x_offset = x_offset,
             .y_offset = y_offset,
         });
-        x_offset += BUTTON_SIZE + BUTTON_PADDING;
+        x_offset += self.button_size + self.button_padding;
 
         // Refresh/Stop button (shows stop icon when loading)
         const refresh_rgba = if (self.is_loading)
-            try self.svg_cache.getStopButton(self.refresh_hover)
+            try self.svg_cache.getButtonScaled(.stop, true, self.refresh_hover, self.button_size)
         else
-            try self.svg_cache.getRefreshButton(self.refresh_hover);
+            try self.svg_cache.getButtonScaled(.refresh, true, self.refresh_hover, self.button_size);
 
         // Delete old image by ID to avoid overlap (deletePlacement doesn't remove the image data)
         if (self.refresh_image_id) |old_id| {
             try self.kitty.deleteImage(writer, old_id);
         }
 
-        self.refresh_image_id = try self.kitty.displayRawRGBA(writer, refresh_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
+        self.refresh_image_id = try self.kitty.displayRawRGBA(writer, refresh_rgba, self.button_size, self.button_size, .{
             .placement_id = Placement.REFRESH_BTN,
             .z = 51,
             .x_offset = x_offset,
             .y_offset = y_offset,
         });
-        x_offset += BUTTON_SIZE + BUTTON_PADDING * 2;
+        x_offset += self.button_size + self.button_padding * 2;
 
         // URL bar (remaining width)
         self.url_bar_x = x_offset;
-        self.url_bar_width = if (self.width_px > x_offset + BUTTON_PADDING) self.width_px - x_offset - BUTTON_PADDING else 200;
+        self.url_bar_width = if (self.width_px > x_offset + self.button_padding) self.width_px - x_offset - self.button_padding else 200;
 
         // Generate URL bar with text rendered directly
         const display_text = if (self.url_focused)
@@ -330,18 +360,18 @@ pub const ToolbarRenderer = struct {
 
         const url_rgba = try self.generateUrlBarWithText(
             self.url_bar_width,
-            URL_BAR_HEIGHT,
+            self.url_bar_height,
             display_text,
             if (self.url_focused) self.url_cursor else null,
             self.getSelectionBounds(),
         );
         defer self.allocator.free(url_rgba);
 
-        _ = try self.kitty.displayRawRGBA(writer, url_rgba, self.url_bar_width, URL_BAR_HEIGHT, .{
+        _ = try self.kitty.displayRawRGBA(writer, url_rgba, self.url_bar_width, self.url_bar_height, .{
             .placement_id = Placement.URL_BAR,
             .z = 51,
             .x_offset = x_offset,
-            .y_offset = (TOOLBAR_HEIGHT - URL_BAR_HEIGHT) / 2,
+            .y_offset = (self.toolbar_height - self.url_bar_height) / 2,
         });
     }
 
@@ -484,11 +514,11 @@ pub const ToolbarRenderer = struct {
     }
 
     /// Get button at pixel position
-    pub fn hitTest(_: *ToolbarRenderer, pixel_x: u32, pixel_y: u32) ?ButtonIcon {
+    pub fn hitTest(self: *ToolbarRenderer, pixel_x: u32, pixel_y: u32) ?ButtonIcon {
         // Debug: log to cdp_debug.log
         {
             var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "[TOOLBAR] hitTest pixel_x={} pixel_y={} TOOLBAR_HEIGHT={}\n", .{ pixel_x, pixel_y, TOOLBAR_HEIGHT }) catch "";
+            const msg = std.fmt.bufPrint(&buf, "[TOOLBAR] hitTest pixel_x={} pixel_y={} toolbar_height={}\n", .{ pixel_x, pixel_y, self.toolbar_height }) catch "";
             if (std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write })) |f| {
                 defer f.close();
                 f.seekFromEnd(0) catch {};
@@ -496,24 +526,24 @@ pub const ToolbarRenderer = struct {
             } else |_| {}
         }
 
-        if (pixel_y > TOOLBAR_HEIGHT) return null;
+        if (pixel_y > self.toolbar_height) return null;
 
-        var x: u32 = BUTTON_PADDING;
+        var x: u32 = self.button_padding;
 
-        // Close button (8-35)
-        if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .close;
-        x += BUTTON_SIZE + BUTTON_PADDING;
+        // Close button
+        if (pixel_x >= x and pixel_x < x + self.button_size) return .close;
+        x += self.button_size + self.button_padding;
 
-        // Back button (44-71)
-        if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .back;
-        x += BUTTON_SIZE + BUTTON_PADDING;
+        // Back button
+        if (pixel_x >= x and pixel_x < x + self.button_size) return .back;
+        x += self.button_size + self.button_padding;
 
-        // Forward button (80-107)
-        if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .forward;
-        x += BUTTON_SIZE + BUTTON_PADDING;
+        // Forward button
+        if (pixel_x >= x and pixel_x < x + self.button_size) return .forward;
+        x += self.button_size + self.button_padding;
 
-        // Refresh button (116-143)
-        if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .refresh;
+        // Refresh button
+        if (pixel_x >= x and pixel_x < x + self.button_size) return .refresh;
 
         return null;
     }
