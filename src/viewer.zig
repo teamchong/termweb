@@ -156,6 +156,7 @@ pub const Viewer = struct {
 
     // Navigation state debounce (avoid repeated CDP calls on rapid events)
     last_nav_state_update: i128,
+    loading_started_at: i128, // When loading started (for minimum display time)
     frames_skipped: u32,  // Counter for monitoring
 
     // Debug flags
@@ -236,6 +237,7 @@ pub const Viewer = struct {
             .last_rendered_generation = 0,
             .last_content_image_id = null,
             .last_nav_state_update = 0,
+            .loading_started_at = 0,
             .frames_skipped = 0,
             .debug_input = enable_input_debug,
             .ui_dirty = true,
@@ -414,9 +416,14 @@ pub const Viewer = struct {
                 const new_frame = self.tryRenderScreencast() catch false;
 
                 // Reset loading state when we get a new frame (page has loaded)
+                // But only after minimum 300ms to ensure user sees the stop button
                 if (new_frame and self.ui_state.is_loading) {
-                    self.ui_state.is_loading = false;
-                    self.ui_dirty = true;
+                    const now = std.time.nanoTimestamp();
+                    const min_loading_time = 300 * std.time.ns_per_ms;
+                    if (now - self.loading_started_at > min_loading_time) {
+                        self.ui_state.is_loading = false;
+                        self.ui_dirty = true;
+                    }
                 }
 
                 // Event bus pattern: Check if navigation happened and update state
@@ -437,9 +444,10 @@ pub const Viewer = struct {
                         }
                     }
                     // Set loading state on navigation event (show stop button)
-                    // Loading will be reset when new frame arrives
+                    // Loading will be reset when new frame arrives (after min display time)
                     if (!self.ui_state.is_loading) {
                         self.ui_state.is_loading = true;
+                        self.loading_started_at = std.time.nanoTimestamp();
                         self.ui_dirty = true;
                     }
                 }
@@ -1025,7 +1033,22 @@ pub const Viewer = struct {
         // Dispatch to mode-specific handlers
         switch (self.mode) {
             .normal => try self.handleMouseNormal(mouse),
-            .url_prompt => {}, // Ignore mouse in URL prompt mode
+            .url_prompt => {
+                // Click outside URL bar cancels prompt and returns to normal mode
+                if (mouse.type == .press) {
+                    if (self.toolbar_renderer) |*renderer| {
+                        const pixel_x = self.mouse_x;
+                        const in_url_bar = pixel_x >= renderer.url_bar_x and
+                            pixel_x < renderer.url_bar_x + renderer.url_bar_width and
+                            self.mouse_y <= renderer.toolbar_height;
+                        if (!in_url_bar) {
+                            renderer.blurUrl();
+                            self.mode = .normal;
+                            self.ui_dirty = true;
+                        }
+                    }
+                }
+            },
             .form_mode => {}, // TODO: Phase 6 - form mode mouse support
             .text_input => {}, // Ignore mouse in text input mode
             .help => {}, // Ignore mouse in help mode
@@ -1065,21 +1088,14 @@ pub const Viewer = struct {
                     },
                     .refresh => {
                         self.log("[CLICK] Refresh button (loading={})\n", .{self.ui_state.is_loading});
-                        if (self.ui_state.is_loading) {
-                            _ = screenshot_api.stopLoading(self.cdp_client, self.allocator) catch |err| {
-                                self.log("[CLICK] Stop loading failed: {}\n", .{err});
-                                return;
-                            };
-                            self.ui_state.is_loading = false;
-                        } else {
-                            // Ensure we call reload
-                            self.log("[CLICK] Sending reload command\n", .{});
-                            _ = screenshot_api.reload(self.cdp_client, self.allocator, true) catch |err| {
-                                self.log("[CLICK] Reload failed: {}\n", .{err});
-                                return; // Don't set is_loading if command failed
-                            };
-                            self.ui_state.is_loading = true;
-                        }
+                        // Always reload (like most browsers - clicking refresh during load restarts it)
+                        self.log("[CLICK] Sending reload command\n", .{});
+                        _ = screenshot_api.reload(self.cdp_client, self.allocator, true) catch |err| {
+                            self.log("[CLICK] Reload failed: {}\n", .{err});
+                            return;
+                        };
+                        self.ui_state.is_loading = true;
+                        self.loading_started_at = std.time.nanoTimestamp();
                         self.ui_dirty = true;
                     },
                     .close => {
