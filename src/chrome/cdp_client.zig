@@ -315,28 +315,50 @@ pub const CdpClient = struct {
         self.pipe_client.sendCommandAsync(method, params) catch {};
     }
 
-    /// Send navigation command and wait for response
-    /// Uses pipe with session - browser-level connection stays valid across page target changes
+    /// Send navigation command and wait for response - uses dedicated nav WebSocket
+    /// Falls back to pipe if WebSocket unavailable
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        logToFile("[CDP NAV] sendNavCommand: {s} via pipe\n", .{method});
-        // Use pipe client with session - browser-level connection stays valid across page target changes
+        // Try nav_ws first (dedicated channel)
+        if (self.nav_ws) |ws| {
+            if (ws.running.load(.acquire)) {
+                logToFile("[CDP NAV] sendNavCommand: {s} via nav_ws\n", .{method});
+                return ws.sendCommand(method, params) catch |err| {
+                    logToFile("[CDP NAV] nav_ws failed: {}, falling back to pipe\n", .{err});
+                    // Fall through to pipe
+                    if (self.session_id) |sid| {
+                        return self.pipe_client.sendSessionCommand(sid, method, params);
+                    }
+                    return self.pipe_client.sendCommand(method, params);
+                };
+            }
+        }
+        // Fallback to pipe
+        logToFile("[CDP NAV] sendNavCommand: {s} via pipe (fallback)\n", .{method});
         if (self.session_id) |sid| {
             return self.pipe_client.sendSessionCommand(sid, method, params);
         }
         return self.pipe_client.sendCommand(method, params);
     }
 
-    /// Send navigation command (fire-and-forget) - uses pipe with session
+    /// Send navigation command (fire-and-forget) - uses dedicated nav WebSocket
     pub fn sendNavCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        logToFile("[CDP NAV ASYNC] sendNavCommandAsync: {s} via pipe\n", .{method});
+        if (self.nav_ws) |ws| {
+            if (ws.running.load(.acquire)) {
+                logToFile("[CDP NAV ASYNC] sendNavCommandAsync: {s} via nav_ws\n", .{method});
+                ws.sendCommandAsync(method, params);
+                return;
+            }
+        }
+        // Fallback to pipe
+        logToFile("[CDP NAV ASYNC] sendNavCommandAsync: {s} via pipe (fallback)\n", .{method});
         if (self.session_id) |sid| {
             self.pipe_client.sendSessionCommandAsync(sid, method, params) catch {};
         } else {

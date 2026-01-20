@@ -1000,7 +1000,7 @@ pub const Viewer = struct {
         // Throttle mouse MOVE events to ~60fps (16ms) to avoid flooding
         // Clicks, releases, and wheel events are always processed immediately
         if (mouse.type == .move or mouse.type == .drag) {
-            const min_interval = 16 * std.time.ns_per_ms; // ~60fps
+            const min_interval = 33 * std.time.ns_per_ms; // ~30fps to avoid overwhelming CDP
             if (now - self.last_mouse_move_time < min_interval) {
                 return; // Skip this move event, too soon
             }
