@@ -131,8 +131,11 @@ pub const WebSocketCdpClient = struct {
     }
 
     pub fn deinit(self: *WebSocketCdpClient) void {
-        // Stop reader thread if running
+        // Signal thread to stop and detach it
         self.stopReaderThread();
+
+        // Close stream to unblock any pending reads
+        self.stream.close();
 
         // Free frame pool
         self.frame_pool.deinit();
@@ -143,7 +146,6 @@ pub const WebSocketCdpClient = struct {
         }
         self.response_queue.deinit(self.allocator);
 
-        self.stream.close();
         self.allocator.destroy(self);
     }
 
@@ -275,13 +277,7 @@ pub const WebSocketCdpClient = struct {
     pub fn stopReaderThread(self: *WebSocketCdpClient) void {
         if (self.reader_thread) |thread| {
             self.running.store(false, .release);
-
-            // Just wait briefly and detach - don't try to modify socket options
-            // as the socket may already be closed
-            var waited: u32 = 0;
-            while (waited < 5) : (waited += 1) {
-                std.Thread.sleep(20 * std.time.ns_per_ms);
-            }
+            // Just detach - thread will exit when socket closes or process ends
             thread.detach();
             self.reader_thread = null;
         }

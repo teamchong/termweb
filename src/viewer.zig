@@ -436,9 +436,10 @@ pub const Viewer = struct {
                             self.ui_dirty = true;
                         }
                     }
-                    // Always reset loading state on navigation event
-                    if (self.ui_state.is_loading) {
-                        self.ui_state.is_loading = false;
+                    // Set loading state on navigation event (show stop button)
+                    // Loading will be reset when new frame arrives
+                    if (!self.ui_state.is_loading) {
+                        self.ui_state.is_loading = true;
                         self.ui_dirty = true;
                     }
                 }

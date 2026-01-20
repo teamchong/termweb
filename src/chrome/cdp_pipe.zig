@@ -366,8 +366,8 @@ pub const PipeCdpClient = struct {
     pub fn stopReaderThread(self: *PipeCdpClient) void {
         if (self.reader_thread) |thread| {
             self.running.store(false, .release);
-            // Join the thread to ensure it's fully stopped before we free resources
-            thread.join();
+            // Detach thread - it will exit when pipe closes or process ends
+            thread.detach();
             self.reader_thread = null;
         }
     }
