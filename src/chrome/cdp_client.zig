@@ -61,6 +61,7 @@ pub const CdpClient = struct {
     allocator: std.mem.Allocator,
     pipe_client: *cdp_pipe.PipeCdpClient,
     session_id: ?[]const u8, // Session ID for page-level commands
+    debug_port: u16, // Chrome's debugging port for WebSocket connections
 
     // WebSocket clients for input (separate from screencast pipe)
     mouse_ws: ?*websocket_cdp.WebSocketCdpClient,
@@ -70,12 +71,14 @@ pub const CdpClient = struct {
     /// Initialize CDP client from pipe file descriptors
     /// read_fd: FD to read from Chrome (Chrome's FD 4)
     /// write_fd: FD to write to Chrome (Chrome's FD 3)
-    pub fn initFromPipe(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*CdpClient {
+    /// debug_port: Chrome's debugging port for WebSocket connections
+    pub fn initFromPipe(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t, debug_port: u16) !*CdpClient {
         const client = try allocator.create(CdpClient);
         client.* = .{
             .allocator = allocator,
             .pipe_client = try cdp_pipe.PipeCdpClient.init(allocator, read_fd, write_fd),
             .session_id = null,
+            .debug_port = debug_port,
             .mouse_ws = null,
             .keyboard_ws = null,
             .nav_ws = null,
@@ -94,8 +97,24 @@ pub const CdpClient = struct {
         const intercept_file = try client.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
         allocator.free(intercept_file);
 
+        // Inject File System Access API polyfill with full file system bridge
+        // Security: Only allows access to directories user explicitly selected via picker
+        const polyfill_script = @embedFile("fs_polyfill.js");
+        var polyfill_json_buf: [65536]u8 = undefined;
+        const polyfill_json = escapeJsonString(polyfill_script, &polyfill_json_buf) catch return error.OutOfMemory;
+
+        var polyfill_params_buf: [65536]u8 = undefined;
+        const polyfill_params = std.fmt.bufPrint(&polyfill_params_buf, "{{\"source\":{s}}}", .{polyfill_json}) catch return error.OutOfMemory;
+        const polyfill_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
+        allocator.free(polyfill_result);
+
+        // Enable Runtime domain to receive console messages
+        const runtime_enable = try client.sendCommand("Runtime.enable", null);
+        allocator.free(runtime_enable);
+
         // Connect 3 WebSockets for input (mouse, keyboard, navigation)
-        // Wait for Chrome to be ready on port 9222 with retries
+        // Wait for Chrome to be ready on the discovered port with retries
+        std.debug.print("Connecting WebSockets to port {}...\n", .{client.debug_port});
         var ws_url: ?[]const u8 = null;
         var retry: u32 = 0;
         // Increase timeout to 10s (50 * 200ms) as Chrome can be slow to start listening
@@ -111,36 +130,42 @@ pub const CdpClient = struct {
             std.debug.print("[CDP] Failed to discover page WebSocket URL after 50 retries\n", .{});
             return CdpError.WebSocketConnectionFailed;
         }
+        std.debug.print("Got WebSocket URL\n", .{});
 
         if (ws_url) |url| {
             defer allocator.free(url);
-            
+
             // Connect strictly - failure is fatal
+            std.debug.print("Connecting mouse_ws...\n", .{});
             client.mouse_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
+            std.debug.print("Connecting keyboard_ws...\n", .{});
             client.keyboard_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
+            std.debug.print("Connecting nav_ws...\n", .{});
             client.nav_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
 
             // Start reader threads strictly - failure is fatal
+            std.debug.print("Starting reader threads...\n", .{});
             try client.mouse_ws.?.startReaderThread();
             try client.keyboard_ws.?.startReaderThread();
             try client.nav_ws.?.startReaderThread();
         }
 
+        std.debug.print("CDP client ready\n", .{});
         return client;
     }
 
     /// Discover page WebSocket URL from Chrome's HTTP endpoint
     fn discoverPageWebSocketUrl(self: *CdpClient, allocator: std.mem.Allocator) ![]const u8 {
-        _ = self;
         // Connect to Chrome's /json/list endpoint to get the page's WebSocket URL
-        const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", 9222) catch |err| {
-            // std.debug.print("[CDP] TCP connect to 9222 failed: {}\n", .{err});
+        const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", self.debug_port) catch |err| {
+            // std.debug.print("[CDP] TCP connect to {} failed: {}\n", .{self.debug_port, err});
             return err;
         };
         defer stream.close();
 
         // Send HTTP request
-        const request = "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:9222\r\n\r\n";
+        var request_buf: [128]u8 = undefined;
+        const request = std.fmt.bufPrint(&request_buf, "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", .{self.debug_port}) catch return CdpError.OutOfMemory;
         _ = stream.write(request) catch return CdpError.WebSocketConnectionFailed;
 
         // Read response
@@ -451,3 +476,74 @@ pub const CdpClient = struct {
         return self.pipe_client.checkNavigationHappened();
     }
 };
+
+/// Escape a string for JSON embedding (adds surrounding quotes)
+fn escapeJsonString(input: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    if (i >= buf.len) return error.OutOfMemory;
+    buf[i] = '"';
+    i += 1;
+
+    for (input) |c| {
+        switch (c) {
+            '"' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = '"';
+                i += 2;
+            },
+            '\\' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = '\\';
+                i += 2;
+            },
+            '\n' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = 'n';
+                i += 2;
+            },
+            '\r' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = 'r';
+                i += 2;
+            },
+            '\t' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = 't';
+                i += 2;
+            },
+            else => {
+                if (c < 0x20) {
+                    // Control character - escape as \uXXXX
+                    if (i + 6 > buf.len) return error.OutOfMemory;
+                    buf[i] = '\\';
+                    buf[i + 1] = 'u';
+                    buf[i + 2] = '0';
+                    buf[i + 3] = '0';
+                    buf[i + 4] = hexDigit(@truncate(c >> 4));
+                    buf[i + 5] = hexDigit(@truncate(c & 0xf));
+                    i += 6;
+                } else {
+                    if (i >= buf.len) return error.OutOfMemory;
+                    buf[i] = c;
+                    i += 1;
+                }
+            },
+        }
+    }
+
+    if (i >= buf.len) return error.OutOfMemory;
+    buf[i] = '"';
+    i += 1;
+
+    return buf[0..i];
+}
+
+fn hexDigit(n: u4) u8 {
+    const v: u8 = n;
+    return if (v < 10) '0' + v else 'a' + v - 10;
+}

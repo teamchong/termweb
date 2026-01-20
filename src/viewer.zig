@@ -32,6 +32,10 @@ const UIState = ui_mod.UIState;
 const Placement = ui_mod.Placement;
 const ZIndex = ui_mod.ZIndex;
 const cursor_asset = ui_mod.assets.cursor;
+const DialogType = ui_mod.DialogType;
+const DialogState = ui_mod.DialogState;
+const FilePickerMode = ui_mod.FilePickerMode;
+const dialog_mod = ui_mod.dialog;
 
 /// Line ending for raw terminal mode (carriage return + line feed)
 const CRLF = "\r\n";
@@ -90,25 +94,28 @@ fn isNaturalScrollEnabled() bool {
 
 /// ViewerMode represents the current interaction mode of the viewer.
 ///
-/// The viewer operates as a state machine with five distinct modes:
+/// The viewer operates as a state machine with six distinct modes:
 /// - normal: Default browsing mode (scroll, navigate, refresh)
-/// - url_prompt: URL entry mode activated by 'g' key
+/// - url_prompt: URL entry mode activated by Ctrl+L
 /// - form_mode: Form element selection mode activated by 'f' key
 /// - text_input: Text entry mode for filling form fields
 /// - help: Help overlay showing key bindings
+/// - dialog: Modal dialog mode for JavaScript alerts/confirms/prompts
 ///
 /// Mode transitions:
-///   Normal → URL Prompt (press 'g')
+///   Normal → URL Prompt (press Ctrl+L)
 ///   Normal → Form Mode (press 'f')
 ///   Normal → Help (press '?')
+///   Normal → Dialog (JavaScript dialog event)
 ///   Form Mode → Text Input (press Enter on text field)
 ///   Any mode → Normal (press Esc or complete action)
 pub const ViewerMode = enum {
     normal,       // Scroll, navigate, refresh
-    url_prompt,   // Entering URL (g key)
+    url_prompt,   // Entering URL (Ctrl+L)
     form_mode,    // Selecting form elements (f key, Tab navigation)
     text_input,   // Typing into form field
     help,         // Help overlay (? key)
+    dialog,       // JavaScript dialog (alert/confirm/prompt)
 };
 
 pub const Viewer = struct {
@@ -174,6 +181,13 @@ pub const Viewer = struct {
     perf_total_render_ns: i128,
     perf_max_render_ns: i128,
     perf_last_report_time: i128,
+
+    // Dialog state for JavaScript dialogs (alert/confirm/prompt)
+    dialog_state: ?*DialogState,
+    dialog_message: ?[]const u8,
+
+    // File System Access API - allowed roots (security: only allow access to user-selected directories)
+    allowed_fs_roots: std.ArrayList([]const u8),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -247,6 +261,9 @@ pub const Viewer = struct {
             .perf_total_render_ns = 0,
             .perf_max_render_ns = 0,
             .perf_last_report_time = 0,
+            .dialog_state = null,
+            .dialog_message = null,
+            .allowed_fs_roots = try std.ArrayList([]const u8).initCapacity(allocator, 0),
         };
     }
 
@@ -481,6 +498,28 @@ pub const Viewer = struct {
                 self.log("[URL_PROMPT] Toolbar rendered\n", .{});
                 self.ui_dirty = false;
             }
+
+            // In dialog mode, render the dialog overlay
+            if (self.mode == .dialog and self.ui_dirty) {
+                var stdout_buf4: [8192]u8 = undefined;
+                const stdout_file4 = std.fs.File.stdout();
+                var stdout_writer4 = stdout_file4.writer(&stdout_buf4);
+                const writer4 = &stdout_writer4.interface;
+                self.renderDialog(writer4) catch {};
+                writer4.flush() catch {};
+                self.ui_dirty = false;
+            }
+
+            // Poll CDP events for JavaScript dialogs and file chooser
+            if (self.cdp_client.nextEvent(self.allocator)) |maybe_event| {
+                if (maybe_event) |*event| {
+                    var evt = event.*;
+                    defer evt.deinit();
+                    self.handleCdpEvent(&evt) catch |err| {
+                        self.log("[CDP EVENT] Error handling event: {}\n", .{err});
+                    };
+                }
+            } else |_| {}
 
             // Throttle inner loop slightly to prevent flooding input/output
             std.Thread.sleep(5 * std.time.ns_per_ms);
@@ -993,18 +1032,34 @@ pub const Viewer = struct {
         }
     }
 
+    // Mouse event priority and rate limits:
+    // 1. Click (press/release) - HIGH PRIORITY - never dropped
+    // 2. Wheel - MEDIUM PRIORITY - 60fps (16ms)
+    // 3. Move/drag - LOW PRIORITY - 30fps (33ms)
+    const MOUSE_WHEEL_INTERVAL_NS = 16 * std.time.ns_per_ms; // 60fps
+    const MOUSE_MOVE_INTERVAL_NS = 33 * std.time.ns_per_ms; // 30fps
+
     /// Handle mouse event - dispatches to mode-specific handlers
     fn handleMouse(self: *Viewer, mouse: MouseEvent) !void {
         const now = std.time.nanoTimestamp();
 
-        // Throttle mouse MOVE events to ~60fps (16ms) to avoid flooding
-        // Clicks, releases, and wheel events are always processed immediately
-        if (mouse.type == .move or mouse.type == .drag) {
-            const min_interval = 33 * std.time.ns_per_ms; // ~30fps to avoid overwhelming CDP
-            if (now - self.last_mouse_move_time < min_interval) {
-                return; // Skip this move event, too soon
-            }
-            self.last_mouse_move_time = now;
+        // Priority-based rate limiting: click > wheel > move
+        switch (mouse.type) {
+            .press, .release => {}, // HIGH PRIORITY - always process clicks
+            .wheel => {
+                // MEDIUM PRIORITY - throttle wheel to 60fps
+                if (now - self.last_input_time < MOUSE_WHEEL_INTERVAL_NS) {
+                    return;
+                }
+                self.last_input_time = now;
+            },
+            .move, .drag => {
+                // LOW PRIORITY - throttle moves to 30fps
+                if (now - self.last_mouse_move_time < MOUSE_MOVE_INTERVAL_NS) {
+                    return;
+                }
+                self.last_mouse_move_time = now;
+            },
         }
 
         // ANSI mouse coordinates are 1-indexed. Normalize to 0-indexed for internal use.
@@ -1052,6 +1107,7 @@ pub const Viewer = struct {
             .form_mode => {}, // TODO: Phase 6 - form mode mouse support
             .text_input => {}, // Ignore mouse in text input mode
             .help => {}, // Ignore mouse in help mode
+            .dialog => {}, // Ignore mouse in dialog mode (keyboard only)
         }
     }
 
@@ -1294,14 +1350,7 @@ pub const Viewer = struct {
                 }
             },
             .wheel => {
-                // Throttle scroll events to avoid flooding CDP (max ~30 events/sec)
-                const now = std.time.nanoTimestamp();
-                const min_interval = 33 * std.time.ns_per_ms; // ~30fps
-                if (now - self.last_input_time < min_interval) {
-                    return; // Skip this event, too soon
-                }
-                self.last_input_time = now;
-
+                // Throttling already handled in handleMouse (60fps)
                 // Get viewport size for scroll calculations
                 const size = try self.terminal.getSize();
                 const vw = size.width_px;
@@ -1341,6 +1390,7 @@ pub const Viewer = struct {
             .form_mode => try self.handleFormMode(key),
             .text_input => try self.handleTextInputMode(key),
             .help => {}, // Help mode only responds to Esc (handled in handleInput)
+            .dialog => try self.handleDialogMode(key),
         }
     }
 
@@ -1378,12 +1428,7 @@ pub const Viewer = struct {
                         try scroll_api.scrollHalfPageUp(self.cdp_client, self.allocator, vw, vh);
                         try self.refresh();
                     },
-                    'g', 'G' => {
-                        // Enter URL prompt mode
-                        self.mode = .url_prompt;
-                        self.prompt_buffer = try PromptBuffer.init(self.allocator);
-                        try self.drawStatus();
-                    },
+                    // 'g', 'G' removed - use Ctrl+L for address bar (Chrome-style)
                     'f' => {
                         // Enter form mode
                         self.mode = .form_mode;
@@ -1410,7 +1455,16 @@ pub const Viewer = struct {
                 try screenshot_api.reload(self.cdp_client, self.allocator, false);
                 try self.refresh();
             },
-            .ctrl_l => {}, // Reserved for future use
+            .ctrl_l => { // Chrome-style address bar focus
+                self.mode = .url_prompt;
+                if (self.toolbar_renderer) |*renderer| {
+                    renderer.setUrl(self.current_url);
+                    renderer.focusUrl();
+                } else {
+                    self.prompt_buffer = try PromptBuffer.init(self.allocator);
+                }
+                self.ui_dirty = true;
+            },
             .ctrl_f => { // Chrome-style find (use for forms)
                 self.mode = .form_mode;
                 const ctx = try self.allocator.create(FormContext);
@@ -1695,6 +1749,10 @@ pub const Viewer = struct {
             .help => {
                 try writer.print("HELP | [?] or [q] to close | [Ctrl+Q/W/C] or [ESC] to quit", .{});
             },
+            .dialog => {
+                // Dialog mode - status shown in dialog overlay
+                try writer.print("DIALOG | [Enter] OK [Esc] Cancel", .{});
+            },
         }
         try writer.writeAll("\x1b[0m"); // Reset colors
         try writer.flush();
@@ -1716,11 +1774,12 @@ pub const Viewer = struct {
         try writer.writeAll("│              TERMWEB - KEYBOARD & MOUSE HELP                │" ++ CRLF);
         try writer.writeAll("└─────────────────────────────────────────────────────────────┘\x1b[0m" ++ CRLF ++ CRLF);
 
-        // Chrome shortcuts
-        try writer.writeAll("\x1b[1;36mCHROME-STYLE SHORTCUTS:\x1b[0m" ++ CRLF);
+        // Chrome key bindings
+        try writer.writeAll("\x1b[1;36mCHROME-STYLE KEYS:\x1b[0m" ++ CRLF);
+        try writer.writeAll("  Ctrl+L        Focus address bar" ++ CRLF);
         try writer.writeAll("  Ctrl+R        Reload page from server" ++ CRLF);
         try writer.writeAll("  Ctrl+F        Enter form mode (find/forms)" ++ CRLF);
-        try writer.writeAll("  Ctrl+W/Q      Quit termweb" ++ CRLF ++ CRLF);
+        try writer.writeAll("  Ctrl+Q/W      Quit termweb" ++ CRLF ++ CRLF);
 
         // Navigation
         try writer.writeAll("\x1b[1;36mNAVIGATION:\x1b[0m" ++ CRLF);
@@ -1739,13 +1798,537 @@ pub const Viewer = struct {
 
         // Other
         try writer.writeAll("\x1b[1;36mOTHER:\x1b[0m" ++ CRLF);
-        try writer.writeAll("  ?             Toggle this help" ++ CRLF);
-        try writer.writeAll("  g, G          Go to URL (address prompt)" ++ CRLF ++ CRLF);
+        try writer.writeAll("  ?             Toggle this help" ++ CRLF ++ CRLF);
 
         try writer.writeAll("\x1b[2m(Press ? or q to close help. Ctrl+Q quits anytime)\x1b[0m" ++ CRLF);
 
         try writer.flush();
         try self.drawStatus();
+    }
+
+    /// Handle CDP events (JavaScript dialogs, file chooser, console messages)
+    fn handleCdpEvent(self: *Viewer, event: *cdp.CdpEvent) !void {
+        self.log("[CDP EVENT] method={s}\n", .{event.method});
+
+        if (std.mem.eql(u8, event.method, "Page.javascriptDialogOpening")) {
+            try self.showJsDialog(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Page.fileChooserOpened")) {
+            try self.showFileChooser(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Runtime.consoleAPICalled")) {
+            try self.handleConsoleMessage(event.payload);
+        }
+    }
+
+    /// Handle console messages - look for __TERMWEB_PICKER__ or __TERMWEB_FS__ markers
+    fn handleConsoleMessage(self: *Viewer, payload: []const u8) !void {
+        // Debug: log first 200 chars of payload
+        const debug_len = @min(payload.len, 200);
+        self.log("[CONSOLE MSG] payload={s}\n", .{payload[0..debug_len]});
+
+        // Check for file system operation marker
+        const fs_marker = "__TERMWEB_FS__:";
+        if (std.mem.indexOf(u8, payload, fs_marker)) |fs_pos| {
+            self.log("[CONSOLE MSG] Found FS marker at {d}\n", .{fs_pos});
+            try self.handleFsRequest(payload, fs_pos + fs_marker.len);
+            return;
+        }
+
+        // Check for picker marker
+        const picker_marker = "__TERMWEB_PICKER__:";
+        const marker_pos = std.mem.indexOf(u8, payload, picker_marker) orelse {
+            self.log("[CONSOLE MSG] No picker marker found\n", .{});
+            return;
+        };
+        self.log("[CONSOLE MSG] Found picker marker at {d}\n", .{marker_pos});
+
+        // Extract picker type: file, directory, or save
+        const type_start = marker_pos + picker_marker.len;
+        const type_end = std.mem.indexOfPos(u8, payload, type_start, ":") orelse
+            std.mem.indexOfPos(u8, payload, type_start, "\"") orelse return;
+        const picker_type = payload[type_start..type_end];
+
+        self.log("[PICKER] type={s}\n", .{picker_type});
+
+        // Determine native picker mode
+        const mode: FilePickerMode = if (std.mem.eql(u8, picker_type, "directory"))
+            .folder
+        else if (std.mem.eql(u8, picker_type, "file"))
+            .single
+        else if (std.mem.eql(u8, picker_type, "save"))
+            .single // save uses single file picker
+        else
+            return;
+
+        // Show native OS file picker
+        const file_path = try dialog_mod.showNativeFilePicker(self.allocator, mode);
+        defer if (file_path) |p| self.allocator.free(p);
+
+        // Send result back to JavaScript
+        if (file_path) |path| {
+            // Remove trailing slash if present
+            const trimmed_path = if (path.len > 1 and path[path.len - 1] == '/')
+                path[0 .. path.len - 1]
+            else
+                path;
+
+            // Extract just the name from the path
+            const name = if (std.mem.lastIndexOfScalar(u8, trimmed_path, '/')) |idx|
+                trimmed_path[idx + 1 ..]
+            else
+                trimmed_path;
+
+            const is_dir = mode == .folder;
+
+            // Add to allowed roots for security (only selected directories/files can be accessed)
+            // Use trimmed path (without trailing slash) for consistency
+            const path_copy = try self.allocator.dupe(u8, trimmed_path);
+            try self.allowed_fs_roots.append(self.allocator, path_copy);
+            self.log("[PICKER] Added allowed root: {s}\n", .{trimmed_path});
+
+            // Call the JavaScript callback
+            var script_buf: [4096]u8 = undefined;
+            const script = std.fmt.bufPrint(&script_buf,
+                "window.__termwebPickerResult(true, '{s}', '{s}', {s})",
+                .{ trimmed_path, name, if (is_dir) "true" else "false" },
+            ) catch return;
+
+            try self.evalJavaScript(script);
+        } else {
+            // User cancelled
+            try self.evalJavaScript("window.__termwebPickerResult(false)");
+        }
+    }
+
+    /// Handle file system operation request
+    fn handleFsRequest(self: *Viewer, payload: []const u8, start: usize) !void {
+        // Format: __TERMWEB_FS__:id:type:path[:data]
+        // Find the end of the console message string (look for closing quote)
+        var end = start;
+        while (end < payload.len and payload[end] != '"') : (end += 1) {}
+
+        const request = payload[start..end];
+        self.log("[FS] Request: {s}\n", .{request});
+
+        // Parse id:type:path[:data]
+        var iter = std.mem.splitScalar(u8, request, ':');
+        const id_str = iter.next() orelse return;
+        const op_type = iter.next() orelse return;
+        const path = iter.next() orelse return;
+        const data = iter.next(); // optional
+
+        const id = std.fmt.parseInt(u32, id_str, 10) catch return;
+
+        // Security check: path must be within allowed roots
+        if (!self.isPathAllowed(path)) {
+            self.log("[FS] Path not allowed: {s}\n", .{path});
+            try self.sendFsResponse(id, false, "Path not allowed");
+            return;
+        }
+
+        // Dispatch to operation handler
+        if (std.mem.eql(u8, op_type, "readdir")) {
+            try self.handleFsReadDir(id, path);
+        } else if (std.mem.eql(u8, op_type, "readfile")) {
+            try self.handleFsReadFile(id, path);
+        } else if (std.mem.eql(u8, op_type, "writefile")) {
+            try self.handleFsWriteFile(id, path, data orelse "");
+        } else if (std.mem.eql(u8, op_type, "stat")) {
+            try self.handleFsStat(id, path);
+        } else if (std.mem.eql(u8, op_type, "mkdir")) {
+            try self.handleFsMkDir(id, path);
+        } else if (std.mem.eql(u8, op_type, "remove")) {
+            try self.handleFsRemove(id, path, data);
+        } else if (std.mem.eql(u8, op_type, "createfile")) {
+            try self.handleFsCreateFile(id, path);
+        } else {
+            try self.sendFsResponse(id, false, "Unknown operation");
+        }
+    }
+
+    /// Check if path is within allowed roots
+    fn isPathAllowed(self: *Viewer, path: []const u8) bool {
+        for (self.allowed_fs_roots.items) |root| {
+            if (std.mem.startsWith(u8, path, root)) {
+                // Path is within or equal to allowed root
+                // Make sure it's not escaping via ..
+                if (std.mem.indexOf(u8, path, "..") == null) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Send file system response back to JavaScript
+    fn sendFsResponse(self: *Viewer, id: u32, success: bool, data: []const u8) !void {
+        var script_buf: [65536]u8 = undefined;
+        const script = std.fmt.bufPrint(&script_buf,
+            "window.__termwebFSResponse({d}, {s}, {s})",
+            .{ id, if (success) "true" else "false", data },
+        ) catch return;
+
+        try self.evalJavaScript(script);
+    }
+
+    /// Execute JavaScript in the browser
+    fn evalJavaScript(self: *Viewer, script: []const u8) !void {
+        // Escape the script for JSON
+        var escaped_buf: [131072]u8 = undefined;
+        const escaped = escapeJsonString(script, &escaped_buf) catch return;
+
+        var params_buf: [131072]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{escaped}) catch return;
+        _ = self.cdp_client.sendCommand("Runtime.evaluate", params) catch |err| {
+            self.log("[FS] evalJavaScript error: {}\n", .{err});
+        };
+    }
+
+    /// Handle readdir operation
+    fn handleFsReadDir(self: *Viewer, id: u32, path: []const u8) !void {
+        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch {
+            try self.sendFsResponse(id, false, "\"Cannot open directory\"");
+            return;
+        };
+        defer dir.close();
+
+        // Build JSON array of entries
+        var result_buf: [65536]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&result_buf);
+        const writer = stream.writer();
+
+        try writer.writeAll("[");
+        var first = true;
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (!first) try writer.writeAll(",");
+            first = false;
+
+            const is_dir = entry.kind == .directory;
+            try writer.print("{{\"name\":\"{s}\",\"isDirectory\":{s}}}", .{
+                entry.name,
+                if (is_dir) "true" else "false",
+            });
+        }
+        try writer.writeAll("]");
+
+        try self.sendFsResponse(id, true, stream.getWritten());
+    }
+
+    /// Handle readfile operation
+    fn handleFsReadFile(self: *Viewer, id: u32, path: []const u8) !void {
+        const file = std.fs.openFileAbsolute(path, .{}) catch {
+            try self.sendFsResponse(id, false, "\"Cannot open file\"");
+            return;
+        };
+        defer file.close();
+
+        const stat = file.stat() catch {
+            try self.sendFsResponse(id, false, "\"Cannot stat file\"");
+            return;
+        };
+
+        // Read file content
+        const content = file.readToEndAlloc(self.allocator, 100 * 1024 * 1024) catch {
+            try self.sendFsResponse(id, false, "\"File too large or read error\"");
+            return;
+        };
+        defer self.allocator.free(content);
+
+        // Base64 encode
+        const base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const base64_len = ((content.len + 2) / 3) * 4;
+        const base64 = self.allocator.alloc(u8, base64_len) catch {
+            try self.sendFsResponse(id, false, "\"Out of memory\"");
+            return;
+        };
+        defer self.allocator.free(base64);
+
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < content.len) {
+            const b0 = content[i];
+            const b1: u8 = if (i + 1 < content.len) content[i + 1] else 0;
+            const b2: u8 = if (i + 2 < content.len) content[i + 2] else 0;
+
+            base64[j] = base64_alphabet[b0 >> 2];
+            base64[j + 1] = base64_alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+            base64[j + 2] = if (i + 1 < content.len) base64_alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)] else '=';
+            base64[j + 3] = if (i + 2 < content.len) base64_alphabet[b2 & 0x3f] else '=';
+
+            i += 3;
+            j += 4;
+        }
+
+        // Get MIME type from extension
+        const ext = if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot|
+            path[dot..]
+        else
+            "";
+        const mime_type = getMimeType(ext);
+
+        // Build response
+        var response_buf: [131072]u8 = undefined;
+        const last_modified = @divTrunc(stat.mtime, std.time.ns_per_ms);
+        const response = std.fmt.bufPrint(&response_buf,
+            "{{\"content\":\"{s}\",\"size\":{d},\"type\":\"{s}\",\"lastModified\":{d}}}",
+            .{ base64, stat.size, mime_type, last_modified },
+        ) catch {
+            try self.sendFsResponse(id, false, "\"Response too large\"");
+            return;
+        };
+
+        try self.sendFsResponse(id, true, response);
+    }
+
+    /// Handle writefile operation
+    fn handleFsWriteFile(self: *Viewer, id: u32, path: []const u8, base64_data: []const u8) !void {
+        // Base64 decode
+        const decoded_len = (base64_data.len / 4) * 3;
+        const decoded = self.allocator.alloc(u8, decoded_len) catch {
+            try self.sendFsResponse(id, false, "\"Out of memory\"");
+            return;
+        };
+        defer self.allocator.free(decoded);
+
+        var actual_len: usize = 0;
+        var i: usize = 0;
+        while (i + 4 <= base64_data.len) {
+            const c0 = base64Decode(base64_data[i]);
+            const c1 = base64Decode(base64_data[i + 1]);
+            const c2 = base64Decode(base64_data[i + 2]);
+            const c3 = base64Decode(base64_data[i + 3]);
+
+            if (c0 == 255 or c1 == 255) break;
+
+            decoded[actual_len] = (c0 << 2) | (c1 >> 4);
+            actual_len += 1;
+
+            if (c2 != 255) {
+                decoded[actual_len] = ((c1 & 0x0f) << 4) | (c2 >> 2);
+                actual_len += 1;
+            }
+            if (c3 != 255) {
+                decoded[actual_len] = ((c2 & 0x03) << 6) | c3;
+                actual_len += 1;
+            }
+
+            i += 4;
+        }
+
+        // Write to file
+        const file = std.fs.createFileAbsolute(path, .{}) catch {
+            try self.sendFsResponse(id, false, "\"Cannot create file\"");
+            return;
+        };
+        defer file.close();
+
+        file.writeAll(decoded[0..actual_len]) catch {
+            try self.sendFsResponse(id, false, "\"Write error\"");
+            return;
+        };
+
+        try self.sendFsResponse(id, true, "true");
+    }
+
+    /// Handle stat operation
+    fn handleFsStat(self: *Viewer, id: u32, path: []const u8) !void {
+        // Try as directory first
+        if (std.fs.openDirAbsolute(path, .{})) |dir| {
+            var d = dir;
+            d.close();
+            try self.sendFsResponse(id, true, "{\"isDirectory\":true}");
+            return;
+        } else |_| {}
+
+        // Try as file
+        const file = std.fs.openFileAbsolute(path, .{}) catch {
+            try self.sendFsResponse(id, false, "\"Path not found\"");
+            return;
+        };
+        defer file.close();
+
+        const stat = file.stat() catch {
+            try self.sendFsResponse(id, false, "\"Cannot stat\"");
+            return;
+        };
+
+        var response_buf: [256]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf,
+            "{{\"isDirectory\":false,\"size\":{d}}}",
+            .{stat.size},
+        ) catch return;
+
+        try self.sendFsResponse(id, true, response);
+    }
+
+    /// Handle mkdir operation
+    fn handleFsMkDir(self: *Viewer, id: u32, path: []const u8) !void {
+        std.fs.makeDirAbsolute(path) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                try self.sendFsResponse(id, false, "\"Cannot create directory\"");
+                return;
+            }
+        };
+        try self.sendFsResponse(id, true, "true");
+    }
+
+    /// Handle remove operation
+    fn handleFsRemove(self: *Viewer, id: u32, path: []const u8, recursive: ?[]const u8) !void {
+        const is_recursive = if (recursive) |r| std.mem.eql(u8, r, "1") else false;
+
+        // Try as directory first
+        if (is_recursive) {
+            std.fs.deleteTreeAbsolute(path) catch {
+                try self.sendFsResponse(id, false, "\"Cannot remove\"");
+                return;
+            };
+        } else {
+            std.fs.deleteDirAbsolute(path) catch {
+                // Try as file
+                std.fs.deleteFileAbsolute(path) catch {
+                    try self.sendFsResponse(id, false, "\"Cannot remove\"");
+                    return;
+                };
+            };
+        }
+        try self.sendFsResponse(id, true, "true");
+    }
+
+    /// Handle createfile operation
+    fn handleFsCreateFile(self: *Viewer, id: u32, path: []const u8) !void {
+        const file = std.fs.createFileAbsolute(path, .{ .exclusive = false }) catch {
+            try self.sendFsResponse(id, false, "\"Cannot create file\"");
+            return;
+        };
+        file.close();
+        try self.sendFsResponse(id, true, "true");
+    }
+
+    /// Show JavaScript dialog (alert/confirm/prompt)
+    fn showJsDialog(self: *Viewer, payload: []const u8) !void {
+        self.log("[DIALOG] showJsDialog payload={s}\n", .{payload});
+
+        // Parse dialog type from payload
+        const dtype = parseDialogType(payload);
+        const message = parseDialogMessage(self.allocator, payload) catch "Dialog";
+        const default_text = parseDefaultPrompt(self.allocator, payload) catch "";
+
+        // Store message for later cleanup
+        if (self.dialog_message) |old_msg| {
+            self.allocator.free(old_msg);
+        }
+        self.dialog_message = message;
+
+        // Create dialog state
+        const state = try self.allocator.create(DialogState);
+        state.* = try DialogState.init(self.allocator, dtype, message, default_text);
+        self.dialog_state = state;
+
+        self.mode = .dialog;
+        self.ui_dirty = true;
+    }
+
+    /// Show file chooser (native OS picker)
+    fn showFileChooser(self: *Viewer, payload: []const u8) !void {
+        self.log("[DIALOG] showFileChooser payload={s}\n", .{payload});
+
+        // Parse file chooser mode
+        const mode = parseFileChooserMode(payload);
+
+        // Show native OS file picker (this blocks until user selects or cancels)
+        const file_path = try dialog_mod.showNativeFilePicker(self.allocator, mode);
+        defer if (file_path) |p| self.allocator.free(p);
+
+        // Send response to Chrome
+        if (file_path) |path| {
+            var params_buf: [2048]u8 = undefined;
+            const params = std.fmt.bufPrint(&params_buf, "{{\"action\":\"accept\",\"files\":[\"{s}\"]}}", .{path}) catch return;
+            _ = self.cdp_client.sendCommand("Page.handleFileChooser", params) catch {};
+        } else {
+            _ = self.cdp_client.sendCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}") catch {};
+        }
+    }
+
+    /// Handle key press in dialog mode
+    fn handleDialogMode(self: *Viewer, key: Key) !void {
+        const state = self.dialog_state orelse return;
+
+        switch (key) {
+            .char => |c| {
+                if (state.dialog_type == .prompt) {
+                    state.handleChar(c);
+                    self.ui_dirty = true;
+                }
+            },
+            .backspace => {
+                if (state.dialog_type == .prompt) {
+                    state.handleBackspace();
+                    self.ui_dirty = true;
+                }
+            },
+            .left => {
+                if (state.dialog_type == .prompt) {
+                    state.handleLeft();
+                    self.ui_dirty = true;
+                }
+            },
+            .right => {
+                if (state.dialog_type == .prompt) {
+                    state.handleRight();
+                    self.ui_dirty = true;
+                }
+            },
+            .enter => {
+                // Accept dialog
+                try self.closeDialog(true);
+            },
+            .escape => {
+                // Cancel dialog (for confirm/prompt only)
+                const can_cancel = state.dialog_type != .alert;
+                try self.closeDialog(!can_cancel);
+            },
+            else => {},
+        }
+    }
+
+    /// Close dialog and send response to Chrome
+    fn closeDialog(self: *Viewer, accepted: bool) !void {
+        const state = self.dialog_state orelse return;
+
+        // Build response JSON
+        var params_buf: [1024]u8 = undefined;
+        const params = if (state.dialog_type == .prompt)
+            std.fmt.bufPrint(&params_buf, "{{\"accept\":{},\"promptText\":\"{s}\"}}", .{ accepted, state.getText() }) catch return
+        else
+            std.fmt.bufPrint(&params_buf, "{{\"accept\":{}}}", .{accepted}) catch return;
+
+        _ = self.cdp_client.sendCommand("Page.handleJavaScriptDialog", params) catch |err| {
+            self.log("[DIALOG] closeDialog error: {}\n", .{err});
+        };
+
+        // Cleanup
+        var s = state;
+        s.deinit();
+        self.allocator.destroy(state);
+        self.dialog_state = null;
+
+        if (self.dialog_message) |msg| {
+            self.allocator.free(msg);
+            self.dialog_message = null;
+        }
+
+        self.mode = .normal;
+        self.ui_dirty = true;
+
+        // Force re-render the page
+        self.last_frame_time = 0;
+    }
+
+    /// Render dialog overlay
+    fn renderDialog(self: *Viewer, writer: anytype) !void {
+        const state = self.dialog_state orelse return;
+        const size = try self.terminal.getSize();
+        try dialog_mod.renderDialog(writer, state, size.cols, size.rows);
     }
 
     pub fn deinit(self: *Viewer) void {
@@ -1754,6 +2337,19 @@ pub const Viewer = struct {
             ctx.deinit();
             self.allocator.destroy(ctx);
         }
+        if (self.dialog_state) |state| {
+            var s = state;
+            s.deinit();
+            self.allocator.destroy(state);
+        }
+        if (self.dialog_message) |msg| {
+            self.allocator.free(msg);
+        }
+        // Free allowed file system roots
+        for (self.allowed_fs_roots.items) |root| {
+            self.allocator.free(root);
+        }
+        self.allowed_fs_roots.deinit(self.allocator);
         if (self.debug_log) |file| {
             file.close();
         }
@@ -1766,3 +2362,187 @@ pub const Viewer = struct {
         self.terminal.deinit();
     }
 };
+
+/// Parse dialog type from CDP event payload
+fn parseDialogType(payload: []const u8) DialogType {
+    // Look for "type":"alert"|"confirm"|"prompt"|"beforeunload"
+    if (std.mem.indexOf(u8, payload, "\"type\":\"alert\"") != null) return .alert;
+    if (std.mem.indexOf(u8, payload, "\"type\":\"confirm\"") != null) return .confirm;
+    if (std.mem.indexOf(u8, payload, "\"type\":\"prompt\"") != null) return .prompt;
+    if (std.mem.indexOf(u8, payload, "\"type\":\"beforeunload\"") != null) return .beforeunload;
+    return .alert; // Default
+}
+
+/// Parse dialog message from CDP event payload
+fn parseDialogMessage(allocator: std.mem.Allocator, payload: []const u8) ![]const u8 {
+    // Look for "message":"..."
+    const marker = "\"message\":\"";
+    const start = std.mem.indexOf(u8, payload, marker) orelse return error.NotFound;
+    const msg_start = start + marker.len;
+
+    // Find closing quote (handle escaped quotes)
+    var end = msg_start;
+    while (end < payload.len) : (end += 1) {
+        if (payload[end] == '"' and (end == msg_start or payload[end - 1] != '\\')) {
+            break;
+        }
+    }
+
+    if (end <= msg_start) return error.NotFound;
+
+    return try allocator.dupe(u8, payload[msg_start..end]);
+}
+
+/// Parse default prompt text from CDP event payload
+fn parseDefaultPrompt(allocator: std.mem.Allocator, payload: []const u8) ![]const u8 {
+    // Look for "defaultPrompt":"..."
+    const marker = "\"defaultPrompt\":\"";
+    const start = std.mem.indexOf(u8, payload, marker) orelse return try allocator.dupe(u8, "");
+    const text_start = start + marker.len;
+
+    // Find closing quote
+    var end = text_start;
+    while (end < payload.len) : (end += 1) {
+        if (payload[end] == '"' and (end == text_start or payload[end - 1] != '\\')) {
+            break;
+        }
+    }
+
+    if (end <= text_start) return try allocator.dupe(u8, "");
+
+    return try allocator.dupe(u8, payload[text_start..end]);
+}
+
+/// Parse file chooser mode from CDP event payload
+fn parseFileChooserMode(payload: []const u8) FilePickerMode {
+    // Look for "mode":"selectSingle"|"selectMultiple"|"uploadFolder"
+    if (std.mem.indexOf(u8, payload, "\"mode\":\"selectMultiple\"") != null) return .multiple;
+    if (std.mem.indexOf(u8, payload, "\"mode\":\"uploadFolder\"") != null) return .folder;
+    return .single; // Default
+}
+
+/// Get MIME type from file extension
+fn getMimeType(ext: []const u8) []const u8 {
+    const extensions = [_]struct { ext: []const u8, mime: []const u8 }{
+        .{ .ext = ".html", .mime = "text/html" },
+        .{ .ext = ".htm", .mime = "text/html" },
+        .{ .ext = ".css", .mime = "text/css" },
+        .{ .ext = ".js", .mime = "application/javascript" },
+        .{ .ext = ".mjs", .mime = "application/javascript" },
+        .{ .ext = ".json", .mime = "application/json" },
+        .{ .ext = ".xml", .mime = "application/xml" },
+        .{ .ext = ".txt", .mime = "text/plain" },
+        .{ .ext = ".md", .mime = "text/markdown" },
+        .{ .ext = ".png", .mime = "image/png" },
+        .{ .ext = ".jpg", .mime = "image/jpeg" },
+        .{ .ext = ".jpeg", .mime = "image/jpeg" },
+        .{ .ext = ".gif", .mime = "image/gif" },
+        .{ .ext = ".svg", .mime = "image/svg+xml" },
+        .{ .ext = ".ico", .mime = "image/x-icon" },
+        .{ .ext = ".webp", .mime = "image/webp" },
+        .{ .ext = ".pdf", .mime = "application/pdf" },
+        .{ .ext = ".zip", .mime = "application/zip" },
+        .{ .ext = ".tar", .mime = "application/x-tar" },
+        .{ .ext = ".gz", .mime = "application/gzip" },
+        .{ .ext = ".wasm", .mime = "application/wasm" },
+        .{ .ext = ".ts", .mime = "application/typescript" },
+        .{ .ext = ".tsx", .mime = "application/typescript" },
+        .{ .ext = ".jsx", .mime = "application/javascript" },
+        .{ .ext = ".py", .mime = "text/x-python" },
+        .{ .ext = ".rs", .mime = "text/x-rust" },
+        .{ .ext = ".go", .mime = "text/x-go" },
+        .{ .ext = ".zig", .mime = "text/x-zig" },
+        .{ .ext = ".c", .mime = "text/x-c" },
+        .{ .ext = ".cpp", .mime = "text/x-c++" },
+        .{ .ext = ".h", .mime = "text/x-c" },
+        .{ .ext = ".hpp", .mime = "text/x-c++" },
+    };
+
+    for (extensions) |e| {
+        if (std.mem.eql(u8, ext, e.ext)) {
+            return e.mime;
+        }
+    }
+    return "application/octet-stream";
+}
+
+/// Decode a single base64 character
+fn base64Decode(c: u8) u8 {
+    if (c >= 'A' and c <= 'Z') return c - 'A';
+    if (c >= 'a' and c <= 'z') return c - 'a' + 26;
+    if (c >= '0' and c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return 255; // Invalid or padding ('=')
+}
+
+/// Escape a string for JSON embedding (adds surrounding quotes)
+fn escapeJsonString(input: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    if (i >= buf.len) return error.OutOfMemory;
+    buf[i] = '"';
+    i += 1;
+
+    for (input) |c| {
+        switch (c) {
+            '"' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = '"';
+                i += 2;
+            },
+            '\\' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = '\\';
+                i += 2;
+            },
+            '\n' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = 'n';
+                i += 2;
+            },
+            '\r' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = 'r';
+                i += 2;
+            },
+            '\t' => {
+                if (i + 2 > buf.len) return error.OutOfMemory;
+                buf[i] = '\\';
+                buf[i + 1] = 't';
+                i += 2;
+            },
+            else => {
+                if (c < 0x20) {
+                    // Control character - escape as \uXXXX
+                    if (i + 6 > buf.len) return error.OutOfMemory;
+                    buf[i] = '\\';
+                    buf[i + 1] = 'u';
+                    buf[i + 2] = '0';
+                    buf[i + 3] = '0';
+                    buf[i + 4] = hexDigit(@truncate(c >> 4));
+                    buf[i + 5] = hexDigit(@truncate(c & 0xf));
+                    i += 6;
+                } else {
+                    if (i >= buf.len) return error.OutOfMemory;
+                    buf[i] = c;
+                    i += 1;
+                }
+            },
+        }
+    }
+
+    if (i >= buf.len) return error.OutOfMemory;
+    buf[i] = '"';
+    i += 1;
+
+    return buf[0..i];
+}
+
+fn hexDigit(n: u4) u8 {
+    const v: u8 = n;
+    return if (v < 10) '0' + v else 'a' + v - 10;
+}

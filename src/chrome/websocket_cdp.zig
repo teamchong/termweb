@@ -178,6 +178,8 @@ pub const WebSocketCdpClient = struct {
         // Get unique ID
         const id = self.next_id.fetchAdd(1, .monotonic);
 
+        logToFile("[WS] sendCommand id={} method={s}\n", .{ id, method });
+
         // Build JSON command
         const command = if (params) |p|
             try std.fmt.allocPrint(
@@ -211,6 +213,7 @@ pub const WebSocketCdpClient = struct {
 
                 // Check timeout
                 if (std.time.nanoTimestamp() - start_time > timeout_ns) {
+                    logToFile("[WS] TIMEOUT waiting for response id={}\n", .{id});
                     return error.TimeoutWaitingForResponse;
                 }
 
@@ -225,8 +228,11 @@ pub const WebSocketCdpClient = struct {
                         const response = entry.payload;
                         _ = self.response_queue.swapRemove(i);
 
+                        logToFile("[WS] got response for id={} len={}\n", .{ id, response.len });
+
                         // Check for error in response
                         if (std.mem.indexOf(u8, response, "\"error\":")) |_| {
+                            logToFile("[WS] response has error\n", .{});
                             self.allocator.free(response);
                             return WebSocketError.ProtocolError;
                         }

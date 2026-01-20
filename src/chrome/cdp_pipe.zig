@@ -365,9 +365,17 @@ pub const PipeCdpClient = struct {
 
     pub fn stopReaderThread(self: *PipeCdpClient) void {
         if (self.reader_thread) |thread| {
+            // Acquire both locks to ensure no in-flight operations
+            self.response_mutex.lock();
+            self.event_mutex.lock();
             self.running.store(false, .release);
-            // Detach thread - it will exit when pipe closes or process ends
-            thread.detach();
+            self.event_mutex.unlock();
+            self.response_mutex.unlock();
+
+            // Close read pipe to unblock the reader thread from blocking read()
+            self.read_file.close();
+            // Now we can safely wait for thread to finish
+            thread.join();
             self.reader_thread = null;
         }
     }
@@ -421,13 +429,19 @@ pub const PipeCdpClient = struct {
     }
 
     fn handleEvent(self: *PipeCdpClient, payload: []const u8) !void {
-        // Don't process if shutting down (prevents leak from race with deinit)
-        if (!self.running.load(.acquire)) return;
-
         const method_start = std.mem.indexOf(u8, payload, "\"method\":\"") orelse return;
         const method_v_start = method_start + "\"method\":\"".len;
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
+
+        // Debug: log all received events
+        logToFile("[PIPE EVENT] method={s}\n", .{method});
+
+        // Log console messages in detail
+        if (std.mem.eql(u8, method, "Runtime.consoleAPICalled")) {
+            const max_len = @min(payload.len, 500);
+            logToFile("[CONSOLE] payload={s}\n", .{payload[0..max_len]});
+        }
 
         // Set navigation flag for navigation events (event bus pattern)
         if (std.mem.eql(u8, method, "Page.frameNavigated") or
@@ -437,13 +451,13 @@ pub const PipeCdpClient = struct {
         }
 
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
-            try self.handleScreencastFrame(payload);
+            self.handleScreencastFrame(payload) catch return;
         } else {
             // Queue other events for the main thread to process
             self.event_mutex.lock();
             defer self.event_mutex.unlock();
 
-            // Double-check after acquiring lock
+            // Check running while holding lock - prevents race with deinit
             if (!self.running.load(.acquire)) return;
 
             const MAX_EVENT_QUEUE = 50;
@@ -452,11 +466,21 @@ pub const PipeCdpClient = struct {
                 old.deinit(self.allocator);
             }
 
-            try self.event_queue.append(self.allocator, .{
-                .method = try self.allocator.dupe(u8, method),
-                .payload = try self.allocator.dupe(u8, payload),
+            const method_copy = self.allocator.dupe(u8, method) catch return;
+            const payload_copy = self.allocator.dupe(u8, payload) catch {
+                self.allocator.free(method_copy);
+                return;
+            };
+
+            self.event_queue.append(self.allocator, .{
+                .method = method_copy,
+                .payload = payload_copy,
                 .allocator = self.allocator,
-            });
+            }) catch {
+                self.allocator.free(method_copy);
+                self.allocator.free(payload_copy);
+                return;
+            };
         }
     }
 
@@ -475,14 +499,12 @@ pub const PipeCdpClient = struct {
     }
 
     fn handleResponse(self: *PipeCdpClient, payload: []const u8) !void {
-        // Don't allocate if shutting down (prevents leak from race with deinit)
-        if (!self.running.load(.acquire)) return;
+        const id = self.extractMessageId(payload) catch return;
 
-        const id = try self.extractMessageId(payload);
         self.response_mutex.lock();
         defer self.response_mutex.unlock();
 
-        // Double-check after acquiring lock
+        // Check running while holding lock - prevents race with deinit
         if (!self.running.load(.acquire)) return;
 
         const MAX_QUEUE_SIZE = 50;
@@ -491,11 +513,11 @@ pub const PipeCdpClient = struct {
             old.deinit();
         }
 
-        try self.response_queue.append(self.allocator, .{
+        self.response_queue.append(self.allocator, .{
             .id = id,
-            .payload = try self.allocator.dupe(u8, payload),
+            .payload = self.allocator.dupe(u8, payload) catch return,
             .allocator = self.allocator,
-        });
+        }) catch return;
     }
 
     fn extractMessageId(_: *PipeCdpClient, payload: []const u8) !u32 {

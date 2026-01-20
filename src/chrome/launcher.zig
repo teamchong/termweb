@@ -30,6 +30,7 @@ pub const ChromePipeInstance = struct {
     read_fd: std.posix.fd_t, // FD to read from Chrome (Chrome's FD 4)
     write_fd: std.posix.fd_t, // FD to write to Chrome (Chrome's FD 3)
     user_data_dir: []const u8, // Path to temporary user data directory
+    debug_port: u16, // Random port Chrome is listening on for WebSocket connections
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ChromePipeInstance) void {
@@ -251,6 +252,9 @@ pub fn launchChromePipe(
     const pipe_to_chrome = try std.posix.pipe(); // [0]=read, [1]=write
     const pipe_from_chrome = try std.posix.pipe(); // [0]=read, [1]=write
 
+    // Stderr pipe to capture "DevTools listening on ws://..." for port discovery
+    const stderr_pipe = try std.posix.pipe(); // [0]=read (parent), [1]=write (child)
+
     // 4. Build Chrome arguments
     var args_list = try std.ArrayList([]const u8).initCapacity(allocator, 16);
     defer args_list.deinit(allocator);
@@ -262,7 +266,7 @@ pub fn launchChromePipe(
     }
 
     try args_list.append(allocator, "--remote-debugging-pipe");
-    try args_list.append(allocator, "--remote-debugging-port=9222");
+    try args_list.append(allocator, "--remote-debugging-port=0"); // Let OS pick random available port
     try args_list.append(allocator, "--remote-allow-origins=*");
 
     const user_data_arg = try std.fmt.allocPrint(allocator, "--user-data-dir={s}", .{user_data_dir});
@@ -272,6 +276,8 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--no-first-run");
     try args_list.append(allocator, "--no-default-browser-check");
     try args_list.append(allocator, "--allow-file-access-from-files");
+    try args_list.append(allocator, "--enable-features=FileSystemAccessAPI,FileSystemAccessLocal");
+    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts");
 
     if (options.disable_gpu) {
         try args_list.append(allocator, "--disable-gpu");
@@ -310,6 +316,7 @@ pub fn launchChromePipe(
         // Close parent ends of pipes
         std.posix.close(pipe_to_chrome[1]); // Parent's write end
         std.posix.close(pipe_from_chrome[0]); // Parent's read end
+        std.posix.close(stderr_pipe[0]); // Parent's read end of stderr
 
         // Set up FD 3 (Chrome reads commands from us)
         if (pipe_to_chrome[0] != 3) {
@@ -329,11 +336,14 @@ pub fn launchChromePipe(
         const fd4_flags = std.posix.fcntl(4, 1, 0) catch 0;
         _ = std.posix.fcntl(4, 2, fd4_flags & ~@as(usize, 1)) catch {};
 
-        // Redirect stdout and stderr to /dev/null
+        // Redirect stdout to /dev/null
         const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(1);
         std.posix.dup2(dev_null, 1) catch std.posix.exit(1);
-        std.posix.dup2(dev_null, 2) catch std.posix.exit(1);
         std.posix.close(dev_null);
+
+        // Redirect stderr to pipe (so parent can read "DevTools listening on...")
+        std.posix.dup2(stderr_pipe[1], 2) catch std.posix.exit(1);
+        std.posix.close(stderr_pipe[1]);
 
         // Preparation for exec - the strings are on the heap
         const path = path_z;
@@ -350,9 +360,20 @@ pub fn launchChromePipe(
     // Close child ends of pipes
     std.posix.close(pipe_to_chrome[0]); // Chrome's read end
     std.posix.close(pipe_from_chrome[1]); // Chrome's write end
+    std.posix.close(stderr_pipe[1]); // Child's write end of stderr
 
-    // Give Chrome a moment to initialize the pipe
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    // Read Chrome's stderr to find "DevTools listening on ws://127.0.0.1:PORT/..."
+    const debug_port = extractDebugPort(stderr_pipe[0]) catch |err| {
+        std.debug.print("Failed to extract debug port from Chrome: {}\n", .{err});
+        // Kill Chrome if we can't get the port
+        std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+        return LaunchError.TimeoutWaitingForDebugUrl;
+    };
+
+    // Close stderr pipe read end (we're done with it)
+    std.posix.close(stderr_pipe[0]);
+
+    std.debug.print("Chrome debugging on port {}\n", .{debug_port});
 
     // Parent uses:
     // - pipe_to_chrome[1] to WRITE to Chrome (Chrome's FD 3)
@@ -362,10 +383,63 @@ pub fn launchChromePipe(
         .write_fd = pipe_to_chrome[1],
         .read_fd = pipe_from_chrome[0],
         .user_data_dir = try allocator.dupe(u8, user_data_dir),
+        .debug_port = debug_port,
         .allocator = allocator,
     };
 }
 
+
+/// Extract debug port from Chrome stderr output (raw FD version)
+/// Reads until it finds "DevTools listening on ws://127.0.0.1:PORT/..." line
+fn extractDebugPort(stderr_fd: std.posix.fd_t) !u16 {
+    var output_buf: [8192]u8 = undefined;
+    var total_read: usize = 0;
+
+    // Wait up to 10 seconds for Chrome to print debug URL (profiles can be slow)
+    const timeout_ns = 10 * std.time.ns_per_s;
+    const start_time = std.time.nanoTimestamp();
+
+    while (std.time.nanoTimestamp() - start_time < timeout_ns) {
+        const bytes_read = std.posix.read(stderr_fd, output_buf[total_read..]) catch {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+
+        if (bytes_read == 0) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        }
+
+        total_read += bytes_read;
+
+        // Look for "DevTools listening on ws://127.0.0.1:PORT/" in accumulated output
+        const output_so_far = output_buf[0..total_read];
+        if (std.mem.indexOf(u8, output_so_far, "DevTools listening on ws://")) |idx| {
+            // Find the port number after "ws://127.0.0.1:" or "ws://localhost:"
+            const ws_start = idx + "DevTools listening on ws://".len;
+            // Skip host (127.0.0.1 or localhost)
+            const colon_pos = std.mem.indexOfPos(u8, output_so_far, ws_start, ":") orelse continue;
+            const port_start = colon_pos + 1;
+            // Find end of port (/ or newline)
+            var port_end = port_start;
+            while (port_end < output_so_far.len and output_so_far[port_end] >= '0' and output_so_far[port_end] <= '9') {
+                port_end += 1;
+            }
+            if (port_end > port_start) {
+                return std.fmt.parseInt(u16, output_so_far[port_start..port_end], 10) catch continue;
+            }
+        }
+    }
+
+    // Debug: print what we got from Chrome
+    if (total_read > 0) {
+        std.debug.print("\n[DEBUG] Chrome stderr output ({} bytes):\n{s}\n", .{ total_read, output_buf[0..total_read] });
+    } else {
+        std.debug.print("\n[DEBUG] Chrome produced no stderr output\n", .{});
+    }
+
+    return LaunchError.TimeoutWaitingForDebugUrl;
+}
 
 /// Launch Chrome with WebSocket-based CDP (legacy, for --connect compatibility)
 pub fn launchChrome(
