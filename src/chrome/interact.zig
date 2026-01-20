@@ -146,6 +146,11 @@ pub fn toggleCheckbox(
 }
 
 /// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket
+/// Click sequence (HIGH PRIORITY - never throttled):
+///   1. mouseMoved (triggers CSS :hover, JS mouseenter)
+///   2. mousePressed (sets active state)
+///   3. mouseReleased (fires click event)
+/// This bypasses viewer-level move throttling - clicks always complete immediately.
 pub fn sendMouseEvent(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -160,7 +165,9 @@ pub fn sendMouseEvent(
         event_type, x, y, button, buttons, click_count
     });
 
-    // For mousePressed, send mouseMoved first to position cursor (async is fine)
+    // CRITICAL: For mousePressed, send mouseMoved first to trigger hover states.
+    // This is part of the click sequence (HIGH PRIORITY) - not subject to move throttling.
+    // Without this, complex UIs (React/Vue/Canvas) may ignore the click.
     if (std.mem.eql(u8, event_type, "mousePressed")) {
         const move_params = try std.fmt.allocPrint(
             allocator,
@@ -168,7 +175,7 @@ pub fn sendMouseEvent(
             .{ x, y },
         );
         defer allocator.free(move_params);
-        debugLog("[MOUSE] mouseMoved: {s}\n", .{move_params});
+        debugLog("[MOUSE] mouseMoved (pre-click): {s}\n", .{move_params});
         client.sendMouseCommandAsync("Input.dispatchMouseEvent", move_params);
     }
 

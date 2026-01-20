@@ -127,10 +127,14 @@ pub const PipeCdpClient = struct {
     }
 
     pub fn deinit(self: *PipeCdpClient) void {
-        self.stopReaderThread();
+        self.stopReaderThread(); // Closes read_file
+
+        // Close write pipe (we own both fds from launcher)
+        self.write_file.close();
+
         self.frame_pool.deinit();
 
-        // Free response queue entries with lock
+        // Free response queue entries
         self.response_mutex.lock();
         for (self.response_queue.items) |*entry| {
             entry.deinit();
@@ -138,7 +142,7 @@ pub const PipeCdpClient = struct {
         self.response_queue.deinit(self.allocator);
         self.response_mutex.unlock();
 
-        // Free event queue entries with lock
+        // Free event queue entries
         self.event_mutex.lock();
         for (self.event_queue.items) |*entry| {
             entry.deinit(self.allocator);
@@ -513,11 +517,17 @@ pub const PipeCdpClient = struct {
             old.deinit();
         }
 
+        // Allocate payload copy BEFORE append to handle failure properly
+        const payload_copy = self.allocator.dupe(u8, payload) catch return;
         self.response_queue.append(self.allocator, .{
             .id = id,
-            .payload = self.allocator.dupe(u8, payload) catch return,
+            .payload = payload_copy,
             .allocator = self.allocator,
-        }) catch return;
+        }) catch {
+            // Free the duped payload if append fails
+            self.allocator.free(payload_copy);
+            return;
+        };
     }
 
     fn extractMessageId(_: *PipeCdpClient, payload: []const u8) !u32 {

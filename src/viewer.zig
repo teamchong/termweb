@@ -1032,10 +1032,11 @@ pub const Viewer = struct {
         }
     }
 
-    // Mouse event priority and rate limits:
-    // 1. Click (press/release) - HIGH PRIORITY - never dropped
-    // 2. Wheel - MEDIUM PRIORITY - 60fps (16ms)
-    // 3. Move/drag - LOW PRIORITY - 30fps (33ms)
+    // Mouse event priority and rate limits (click overrides all):
+    // 1. Click (press/release) - HIGH PRIORITY - never dropped, always immediate
+    //    Includes internal mouseMoved->mousePressed->mouseReleased sequence
+    // 2. Wheel - MEDIUM PRIORITY - 60fps (16ms) - can be dropped if too fast
+    // 3. Move/drag - LOW PRIORITY - 30fps (33ms) - most aggressive throttling
     const MOUSE_WHEEL_INTERVAL_NS = 16 * std.time.ns_per_ms; // 60fps
     const MOUSE_MOVE_INTERVAL_NS = 33 * std.time.ns_per_ms; // 30fps
 

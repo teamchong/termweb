@@ -34,9 +34,8 @@ pub const ChromePipeInstance = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ChromePipeInstance) void {
-        // Close pipes first
-        std.posix.close(self.read_fd);
-        std.posix.close(self.write_fd);
+        // NOTE: Pipe fds (read_fd, write_fd) are NOT closed here.
+        // They are owned by PipeCdpClient which closes them in deinit/stopReaderThread.
 
         // Send SIGTERM to Chrome and wait for it to exit
         std.posix.kill(self.pid, std.posix.SIG.TERM) catch {};
