@@ -326,20 +326,27 @@ pub const CdpClient = struct {
         if (self.nav_ws) |ws| {
             if (ws.running.load(.acquire)) {
                 return ws.sendCommand(method, params) catch |err| {
-                    logToFile("[CDP NAV] sendCommand failed: {}, will reconnect all\n", .{err});
-                    self.reconnectAllWebSockets() catch {};
+                    logToFile("[CDP NAV] sendCommand failed: {}, reconnecting...\n", .{err});
+                    // Reconnect and retry once
+                    self.reconnectAllWebSockets() catch |rerr| {
+                        logToFile("[CDP NAV] reconnect failed: {}\n", .{rerr});
+                        return err;
+                    };
+                    if (self.nav_ws) |new_ws| {
+                        return new_ws.sendCommand(method, params);
+                    }
                     return err;
                 };
             }
         }
 
-        // Try to reconnect all
+        // Connection not running, reconnect
         self.reconnectAllWebSockets() catch |err| {
             logToFile("[CDP NAV] reconnect failed: {}\n", .{err});
             return error.WebSocketConnectionFailed;
         };
 
-        // Retry with new connection
+        // Send with new connection
         if (self.nav_ws) |ws| {
             return ws.sendCommand(method, params);
         }

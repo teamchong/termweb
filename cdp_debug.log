@@ -4338,3 +4338,206 @@ gate via nav_ws
 [TOOLBAR] hitTest pixel_x=311 pixel_y=360 TOOLBAR_HEIGHT=40
 [TOOLBAR] hitTest pixel_x=225 pixel_y=449 TOOLBAR_HEIGHT=40
 [TOOLBAR] hitTest pixel_x=96 pixel_y=600 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=3 pixel_y=329 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=26 pixel_y=220 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=33 pixel_y=122 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=28 pixel_y=104 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=35 pixel_y=51 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=39 pixel_y=39 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=38 pixel_y=33 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=26 pixel_y=19 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=26 pixel_y=19 TOOLBAR_HEIGHT=40
+[WS] recvFrame error: error.NotOpenForReading
+[WS] connection broken, exiting reader thread
+[WS] recvFrame error: error.NotOpenForReading
+[WS] connection broken, exiting reader thread
+[WS] recvFrame error: error.NotOpenForReading
+[WS] connection broken, exiting reader thread
+[PIPE] sendSessionCommand id=3 session=245BE230AB05304C3A10519459726F5E method=Page.enable
+[PIPE] sendSessionCommand id=3 method=Page.enable response (67 bytes): {"id":3,"result":{},"sessionId":"245BE230AB05304C3A10519459726F5E"}
+[PIPE] sendSessionCommand id=4 session=245BE230AB05304C3A10519459726F5E method=Network.enable
+[PIPE] sendSessionCommand id=4 method=Network.enable response (67 bytes): {"id":4,"result":{},"sessionId":"245BE230AB05304C3A10519459726F5E"}
+[PIPE] sendSessionCommand id=5 session=245BE230AB05304C3A10519459726F5E method=Page.setInterceptFileChooserDialog
+[PIPE] sendSessionCommand id=5 method=Page.setInterceptFileChooserDialog response (67 bytes): {"id":5,"result":{},"sessionId":"245BE230AB05304C3A10519459726F5E"}
+[WS] Reader thread started
+[WS] Reader thread started
+[WS] Reader thread started
+[PIPE] sendSessionCommand id=6 session=245BE230AB05304C3A10519459726F5E method=Page.startScreencast
+[PIPE] sendSessionCommand id=6 method=Page.startScreencast response (67 bytes): {"id":6,"result":{},"sessionId":"245BE230AB05304C3A10519459726F5E"}
+[TOOLBAR] hitTest pixel_x=123 pixel_y=250 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=368 pixel_y=684 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=471 pixel_y=1210 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=482 pixel_y=1378 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=630 pixel_y=1495 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=983 pixel_y=1777 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1048 pixel_y=1823 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1055 pixel_y=1833 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1055 pixel_y=1833 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1055 pixel_y=1832 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1048 pixel_y=1821 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1036 pixel_y=1805 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=876 pixel_y=1577 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=120 pixel_y=6 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=108 pixel_y=21 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=71 pixel_y=44 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=59 pixel_y=44 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=40 pixel_y=32 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=38 pixel_y=30 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=29 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=28 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=27 pixel_y=22 TOOLBAR_HEIGHT=40
+[WS] recvFrame error: error.NotOpenForReading
+[WS] connection broken, exiting reader thread
+[WS] recvFrame error: error.NotOpenForReading
+[WS] connection broken, exiting reader thread
+[WS] recvFrame error: error.NotOpenForReading
+[WS] connection broken, exiting reader thread
+[PIPE] sendSessionCommand id=3 session=BDE32A5ED912CA0BADE9454DECC69111 method=Page.enable
+[PIPE] sendSessionCommand id=3 method=Page.enable response (67 bytes): {"id":3,"result":{},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[PIPE] sendSessionCommand id=4 session=BDE32A5ED912CA0BADE9454DECC69111 method=Network.enable
+[PIPE] sendSessionCommand id=4 method=Network.enable response (67 bytes): {"id":4,"result":{},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[PIPE] sendSessionCommand id=5 session=BDE32A5ED912CA0BADE9454DECC69111 method=Page.setInterceptFileChooserDialog
+[PIPE] sendSessionCommand id=5 method=Page.setInterceptFileChooserDialog response (67 bytes): {"id":5,"result":{},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[WS] Reader thread started
+[WS] Reader thread started
+[PIPE] sendSessionCommand id=6 session=BDE32A5ED912CA0BADE9454DECC69111 method=Page.startScreencast
+[PIPE] sendSessionCommand id=6 method=Page.startScreencast response (67 bytes): {"id":6,"result":{},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[TOOLBAR] hitTest pixel_x=70 pixel_y=168 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=868 pixel_y=639 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1222 pixel_y=1082 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1204 pixel_y=1102 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1042 pixel_y=1209 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=885 pixel_y=1649 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=889 pixel_y=1676 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=917 pixel_y=1747 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=959 pixel_y=1834 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=964 pixel_y=1846 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=964 pixel_y=1844 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1033 pixel_y=1427 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1150 pixel_y=908 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1175 pixel_y=817 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=251 pixel_y=42 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=192 pixel_y=44 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=144 pixel_y=26 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=126 pixel_y=22 TOOLBAR_HEIGHT=40
+[PIPE] sendSessionCommand id=194 session=BDE32A5ED912CA0BADE9454DECC69111 method=Runtime.evaluate
+[PIPE] sendSessionCommand id=194 method=Runtime.evaluate response (98 bytes): {"id":194,"result":{"result":{"type":"undefined"}},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[TOOLBAR] hitTest pixel_x=126 pixel_y=23 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=128 pixel_y=29 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=129 pixel_y=31 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=150 pixel_y=76 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=183 pixel_y=200 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=211 pixel_y=255 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=220 pixel_y=258 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=224 pixel_y=257 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=231 pixel_y=235 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=228 pixel_y=152 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=190 pixel_y=91 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=176 pixel_y=81 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=161 pixel_y=69 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=156 pixel_y=63 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=151 pixel_y=58 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=151 pixel_y=58 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=472 pixel_y=204 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=745 pixel_y=365 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=790 pixel_y=388 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=789 pixel_y=390 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=691 pixel_y=369 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=359 pixel_y=249 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=280 pixel_y=194 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=278 pixel_y=187 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=278 pixel_y=165 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=244 pixel_y=101 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=201 pixel_y=66 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=156 pixel_y=31 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=149 pixel_y=23 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=148 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=147 pixel_y=21 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=145 pixel_y=21 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=136 pixel_y=25 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=133 pixel_y=26 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=133 pixel_y=26 TOOLBAR_HEIGHT=40
+[PIPE] sendSessionCommand id=281 session=BDE32A5ED912CA0BADE9454DECC69111 method=Runtime.evaluate
+[PIPE] sendSessionCommand id=281 method=Runtime.evaluate response (98 bytes): {"id":281,"result":{"result":{"type":"undefined"}},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[TOOLBAR] hitTest pixel_x=133 pixel_y=26 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=135 pixel_y=29 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=135 pixel_y=30 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=135 pixel_y=41 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=137 pixel_y=51 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=139 pixel_y=61 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=140 pixel_y=65 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=150 pixel_y=67 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=517 pixel_y=204 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1133 pixel_y=674 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1290 pixel_y=922 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1285 pixel_y=919 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1199 pixel_y=840 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=727 pixel_y=411 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=573 pixel_y=232 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=548 pixel_y=225 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=511 pixel_y=221 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=395 pixel_y=202 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=200 pixel_y=72 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=183 pixel_y=58 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=178 pixel_y=50 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=173 pixel_y=42 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=168 pixel_y=36 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=155 pixel_y=29 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=148 pixel_y=27 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=143 pixel_y=26 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=143 pixel_y=26 TOOLBAR_HEIGHT=40
+[PIPE] sendSessionCommand id=288 session=BDE32A5ED912CA0BADE9454DECC69111 method=Runtime.evaluate
+[PIPE] sendSessionCommand id=288 method=Runtime.evaluate response (98 bytes): {"id":288,"result":{"result":{"type":"undefined"}},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[TOOLBAR] hitTest pixel_x=143 pixel_y=26 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=142 pixel_y=26 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=133 pixel_y=24 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=127 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=126 pixel_y=21 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=126 pixel_y=21 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=126 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=125 pixel_y=24 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=125 pixel_y=42 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=125 pixel_y=40 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=125 pixel_y=15 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=125 pixel_y=10 TOOLBAR_HEIGHT=40
+[PIPE] sendSessionCommand id=292 session=BDE32A5ED912CA0BADE9454DECC69111 method=Runtime.evaluate
+[PIPE] sendSessionCommand id=292 method=Runtime.evaluate response (98 bytes): {"id":292,"result":{"result":{"type":"undefined"}},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[TOOLBAR] hitTest pixel_x=125 pixel_y=10 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=137 pixel_y=42 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=143 pixel_y=68 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=143 pixel_y=68 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=144 pixel_y=68 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=225 pixel_y=122 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=781 pixel_y=484 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1287 pixel_y=956 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1287 pixel_y=956 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1286 pixel_y=956 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1273 pixel_y=951 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1006 pixel_y=819 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=327 pixel_y=435 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=195 pixel_y=317 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=195 pixel_y=316 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=193 pixel_y=302 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=127 pixel_y=157 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=82 pixel_y=36 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=78 pixel_y=24 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=78 pixel_y=24 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=82 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=91 pixel_y=15 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=101 pixel_y=14 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=115 pixel_y=14 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=123 pixel_y=20 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=123 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=124 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=124 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=125 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=125 pixel_y=22 TOOLBAR_HEIGHT=40
+[PIPE] sendSessionCommand id=315 session=BDE32A5ED912CA0BADE9454DECC69111 method=Runtime.evaluate
+[PIPE] sendSessionCommand id=315 method=Runtime.evaluate response (98 bytes): {"id":315,"result":{"result":{"type":"undefined"}},"sessionId":"BDE32A5ED912CA0BADE9454DECC69111"}
+[TOOLBAR] hitTest pixel_x=125 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=153 pixel_y=22 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=386 pixel_y=113 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=924 pixel_y=548 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1006 pixel_y=705 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=1005 pixel_y=705 TOOLBAR_HEIGHT=40
+[TOOLBAR] hitTest pixel_x=978 pixel_y=705 TOOLBAR_HEIGHT=40
