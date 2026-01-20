@@ -1484,8 +1484,12 @@ pub const Viewer = struct {
                 },
                 .enter => {
                     const url = renderer.getUrlText();
+                    self.log("[URL] Enter pressed, url_len={}, url='{s}'\n", .{ url.len, url });
                     if (url.len > 0) {
-                        try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url);
+                        self.log("[URL] Navigating to: {s}\n", .{url});
+                        screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url) catch |err| {
+                            self.log("[URL] Navigation failed: {}\n", .{err});
+                        };
                         self.updateNavigationState();
                     }
                     renderer.blurUrl();

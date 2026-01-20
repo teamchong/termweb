@@ -32,13 +32,27 @@ pub const ScreenshotOptions = struct {
     height: u32 = 1080,
 };
 
+fn logNav(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const file = std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write }) catch |err| blk: {
+        if (err == error.FileNotFound) {
+            break :blk std.fs.cwd().createFile("cdp_debug.log", .{ .read = true }) catch return;
+        }
+        return;
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(slice) catch return;
+}
+
 /// Navigate to URL and wait for load
 pub fn navigateToUrl(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
     url: []const u8,
 ) !void {
-    // std.debug.print("[DEBUG] navigateToUrl() starting with url: {s}\n", .{url});
+    logNav("[NAV] navigateToUrl() called with url: '{s}' (len={})\n", .{ url, url.len });
 
     // Normalize URL - add https:// if no protocol specified
     const has_protocol = std.mem.indexOf(u8, url, "://") != null;
@@ -48,18 +62,22 @@ pub fn navigateToUrl(
         try std.fmt.allocPrint(allocator, "https://{s}", .{url});
     defer if (normalized_url.ptr != url.ptr) allocator.free(normalized_url);
 
+    logNav("[NAV] normalized_url: '{s}'\n", .{normalized_url});
+
     const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{normalized_url});
     defer allocator.free(params);
+
+    logNav("[NAV] sending Page.navigate with params: {s}\n", .{params});
 
     // Use dedicated nav WebSocket for Page.navigate
     const result = try client.sendNavCommand("Page.navigate", params);
     defer allocator.free(result);
 
+    logNav("[NAV] Page.navigate result: {s}\n", .{result});
+
     // Wait for page to load (simple approach - wait fixed time)
-    // TODO M2: Use Page.loadEventFired event for proper synchronization
-    // std.debug.print("[DEBUG] Waiting 3 seconds for page load...\n", .{});
     std.Thread.sleep(3 * std.time.ns_per_s);
-    // std.debug.print("[DEBUG] navigateToUrl() complete\n", .{});
+    logNav("[NAV] navigateToUrl() complete\n", .{});
 }
 
 /// Capture screenshot and return base64-encoded PNG/JPEG data
@@ -259,6 +277,7 @@ fn isEntryAboutBlank(history: []const u8, target_index: usize) bool {
 }
 
 /// Reload current page - uses dedicated nav WebSocket
+/// Note: Scroll reset is handled by viewer after navigation event
 pub fn reload(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -273,13 +292,6 @@ pub fn reload(
 
     const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
-
-    // Scroll to top after reload (browsers preserve scroll position by default)
-    const scroll_result = client.sendCommand(
-        "Runtime.evaluate",
-        "{\"expression\":\"window.scrollTo(0, 0)\"}",
-    ) catch return; // Ignore errors - page might not be ready
-    defer allocator.free(scroll_result);
 }
 
 /// Stop page loading - uses dedicated nav WebSocket
