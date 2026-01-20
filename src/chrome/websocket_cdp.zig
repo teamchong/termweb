@@ -149,26 +149,27 @@ pub const WebSocketCdpClient = struct {
 
     /// Send command without waiting for response (fire-and-forget)
     /// Use for actions like scroll, click, mouse events
-    pub fn sendCommandAsync(self: *WebSocketCdpClient, method: []const u8, params: ?[]const u8) !void {
+    /// Silently ignores connection errors (broken pipe, etc.) - safe during shutdown
+    pub fn sendCommandAsync(self: *WebSocketCdpClient, method: []const u8, params: ?[]const u8) void {
         const id = self.next_id.fetchAdd(1, .monotonic);
 
         const command = if (params) |p|
-            try std.fmt.allocPrint(
+            std.fmt.allocPrint(
                 self.allocator,
                 "{{\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
                 .{ id, method, p },
-            )
+            ) catch return
         else
-            try std.fmt.allocPrint(
+            std.fmt.allocPrint(
                 self.allocator,
                 "{{\"id\":{d},\"method\":\"{s}\"}}",
                 .{ id, method },
-            );
+            ) catch return;
         defer self.allocator.free(command);
 
         // Use priority send for input commands to minimize latency
-        try self.sendFramePriority(0x1, command);
-        // Don't wait for response - fire and forget
+        // Fire-and-forget: ignore errors (connection may be closed during shutdown)
+        self.sendFramePriority(0x1, command) catch {};
     }
 
     pub fn sendCommand(self: *WebSocketCdpClient, method: []const u8, params: ?[]const u8) ![]u8 {
@@ -275,23 +276,13 @@ pub const WebSocketCdpClient = struct {
         if (self.reader_thread) |thread| {
             self.running.store(false, .release);
 
-            // Set a short read timeout to unblock the reader thread
-            // This allows the thread to check the running flag and exit
-            const timeout = std.posix.timeval{
-                .sec = 0,
-                .usec = 100_000, // 100ms timeout
-            };
-            std.posix.setsockopt(self.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-
-            // Wait for thread with timeout - if it doesn't exit quickly, detach it
-            // Give it a chance to exit cleanly
+            // Just wait briefly and detach - don't try to modify socket options
+            // as the socket may already be closed
             var waited: u32 = 0;
-            while (waited < 10) : (waited += 1) {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
-                // Check if thread has exited by trying a non-blocking join
-                // (Zig doesn't have tryJoin, so we just wait briefly and hope)
+            while (waited < 5) : (waited += 1) {
+                std.Thread.sleep(20 * std.time.ns_per_ms);
             }
-            thread.detach(); // Don't block forever waiting for thread
+            thread.detach();
             self.reader_thread = null;
         }
     }
@@ -340,18 +331,22 @@ pub const WebSocketCdpClient = struct {
             }
 
             var frame = self.recvFrame() catch |err| {
-                logToFile("[WS] recvFrame error: {}\n", .{err});
+                // Only log non-spam errors
+                if (err != error.WouldBlock) {
+                    logToFile("[WS] recvFrame error: {}\n", .{err});
+                }
 
-                if (err == error.ConnectionClosed or 
-                    err == error.EndOfStream or 
-                    err == error.BrokenPipe or 
+                if (err == error.ConnectionClosed or
+                    err == error.EndOfStream or
+                    err == error.BrokenPipe or
                     err == error.ConnectionResetByPeer or
-                    err == error.NotOpenForReading) {
-                     logToFile("[WS] connection broken, exiting reader thread\n", .{});
+                    err == error.NotOpenForReading or
+                    err == error.InvalidFrame) {
+                    logToFile("[WS] connection broken, exiting reader thread\n", .{});
                     self.running.store(false, .release);
                     return;
                 }
-                
+
                 // On timeout or other errors, check if we should stop
                 if (!self.running.load(.acquire)) break;
                 continue;
@@ -738,8 +733,10 @@ pub const WebSocketCdpClient = struct {
 
         // Read payload
         const payload = try self.allocator.alloc(u8, @intCast(payload_len));
-        errdefer self.allocator.free(payload);
-        const bytes_read = try self.stream.readAtLeast(payload, @intCast(payload_len));
+        const bytes_read = self.stream.readAtLeast(payload, @intCast(payload_len)) catch |err| {
+            self.allocator.free(payload);
+            return err;
+        };
 
         if (bytes_read != payload_len) {
             self.allocator.free(payload);
@@ -748,16 +745,18 @@ pub const WebSocketCdpClient = struct {
 
         // Handle control frames
         switch (opcode) {
-            0x9 => { // Ping
-                try self.sendFrame(0xA, payload); // Pong
+            0x9 => { // Ping - respond with pong, free payload, continue
+                self.sendFrame(0xA, payload) catch {
+                    // Ignore pong send errors, just free and continue
+                };
                 self.allocator.free(payload);
-                return self.recvFrame(); // Continue to next frame
+                return self.recvFrame();
             },
             0x8 => { // Close
                 self.allocator.free(payload);
                 return WebSocketError.ConnectionClosed;
             },
-            0x1, 0x2 => { // Text or Binary
+            0x1, 0x2 => { // Text or Binary - ownership transfers to Frame
                 return Frame{
                     .opcode = opcode,
                     .payload = payload,

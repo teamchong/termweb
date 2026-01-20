@@ -150,9 +150,12 @@ pub const Viewer = struct {
     last_input_time: i128,
     last_mouse_move_time: i128,  // Separate throttle for mouse move events
 
-    // Frame tracking for skip detection and throttling
+    // Frame tracking for skip detection
     last_rendered_generation: u64,
     last_content_image_id: ?u32, // Track content image ID for cleanup
+
+    // Navigation state debounce (avoid repeated CDP calls on rapid events)
+    last_nav_state_update: i128,
     frames_skipped: u32,  // Counter for monitoring
 
     // Debug flags
@@ -232,6 +235,7 @@ pub const Viewer = struct {
             .last_mouse_move_time = 0,
             .last_rendered_generation = 0,
             .last_content_image_id = null,
+            .last_nav_state_update = 0,
             .frames_skipped = 0,
             .debug_input = enable_input_debug,
             .ui_dirty = true,
@@ -408,6 +412,36 @@ pub const Viewer = struct {
             // Render new screencast frames (non-blocking) - only in normal mode
             if (self.screencast_mode and self.mode == .normal) {
                 const new_frame = self.tryRenderScreencast() catch false;
+
+                // Reset loading state when we get a new frame (page has loaded)
+                if (new_frame and self.ui_state.is_loading) {
+                    self.ui_state.is_loading = false;
+                    self.ui_dirty = true;
+                }
+
+                // Event bus pattern: Check if navigation happened and update state
+                // Debounced to avoid repeated CDP calls on rapid events (iframes, redirects)
+                if (self.cdp_client.checkNavigationHappened()) {
+                    const now = std.time.nanoTimestamp();
+                    const debounce_interval = 500 * std.time.ns_per_ms; // 500ms debounce
+
+                    if (now - self.last_nav_state_update > debounce_interval) {
+                        self.log("[NAV EVENT] Navigation detected, updating state\n", .{});
+                        const old_back = self.ui_state.can_go_back;
+                        const old_fwd = self.ui_state.can_go_forward;
+                        self.updateNavigationState();
+                        self.last_nav_state_update = now;
+
+                        if (old_back != self.ui_state.can_go_back or old_fwd != self.ui_state.can_go_forward) {
+                            self.ui_dirty = true;
+                        }
+                    }
+                    // Always reset loading state on navigation event
+                    if (self.ui_state.is_loading) {
+                        self.ui_state.is_loading = false;
+                        self.ui_dirty = true;
+                    }
+                }
 
                 // Redraw UI overlays ONLY if we got a new frame or UI is dirty (e.g. mouse moved)
                 if (new_frame or self.ui_dirty) {
@@ -1039,7 +1073,7 @@ pub const Viewer = struct {
                         } else {
                             // Ensure we call reload
                             self.log("[CLICK] Sending reload command\n", .{});
-                            _ = screenshot_api.reload(self.cdp_client, self.allocator, false) catch |err| {
+                            _ = screenshot_api.reload(self.cdp_client, self.allocator, true) catch |err| {
                                 self.log("[CLICK] Reload failed: {}\n", .{err});
                                 return; // Don't set is_loading if command failed
                             };
@@ -1570,7 +1604,7 @@ pub const Viewer = struct {
                     try interact_mod.typeText(self.cdp_client, self.allocator, text);
                 }
                 // Press Enter to submit
-                try interact_mod.pressEnter(self.cdp_client, self.allocator);
+                interact_mod.pressEnter(self.cdp_client, self.allocator);
 
                 // Cleanup prompt
                 prompt.deinit();

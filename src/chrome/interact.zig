@@ -41,7 +41,7 @@ pub fn mouseMove(
         .{ x, y },
     );
     defer allocator.free(params);
-    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
+    client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
 }
 
 /// Click at specific coordinates - uses dedicated mouse WebSocket
@@ -58,7 +58,7 @@ pub fn clickAt(
         .{ x, y },
     );
     defer allocator.free(move_params);
-    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", move_params);
+    client.sendMouseCommandAsync("Input.dispatchMouseEvent", move_params);
 
     // Mouse pressed
     // buttons: 1 = left button
@@ -68,7 +68,7 @@ pub fn clickAt(
         .{ x, y },
     );
     defer allocator.free(press_params);
-    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", press_params);
+    client.sendMouseCommandAsync("Input.dispatchMouseEvent", press_params);
 
     // Mouse released
     // buttons: 0 = none
@@ -78,7 +78,7 @@ pub fn clickAt(
         .{ x, y },
     );
     defer allocator.free(release_params);
-    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", release_params);
+    client.sendMouseCommandAsync("Input.dispatchMouseEvent", release_params);
 }
 
 /// Click on an element (center of bounding box)
@@ -122,7 +122,7 @@ pub fn typeText(
     const params = try std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{text});
     defer allocator.free(params);
 
-    try client.sendKeyboardCommandAsync("Input.insertText", params);
+    client.sendKeyboardCommandAsync("Input.insertText", params);
 }
 
 /// Toggle checkbox using JavaScript
@@ -145,7 +145,7 @@ pub fn toggleCheckbox(
     defer allocator.free(result);
 }
 
-/// Send raw mouse event - synchronous for click events to ensure proper processing
+/// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket
 pub fn sendMouseEvent(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -169,7 +169,7 @@ pub fn sendMouseEvent(
         );
         defer allocator.free(move_params);
         debugLog("[MOUSE] mouseMoved: {s}\n", .{move_params});
-        try client.sendMouseCommandAsync("Input.dispatchMouseEvent", move_params);
+        client.sendMouseCommandAsync("Input.dispatchMouseEvent", move_params);
     }
 
     // Note: clickCount is only used for mousePressed/mouseReleased
@@ -185,20 +185,20 @@ pub fn sendMouseEvent(
     debugLog("[MOUSE] Sending: {s}\n", .{params});
 
     // All mouse events go through dedicated mouse websocket (fire-and-forget for low latency)
-    try client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
+    client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
 }
 
 /// Press Enter key (fire-and-forget for low latency) - uses dedicated keyboard WS
 pub fn pressEnter(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
-) !void {
+) void {
     _ = allocator;
-    try client.sendKeyboardCommandAsync(
+    client.sendKeyboardCommandAsync(
         "Input.dispatchKeyEvent",
         "{\"type\":\"keyDown\",\"key\":\"Enter\"}",
     );
-    try client.sendKeyboardCommandAsync(
+    client.sendKeyboardCommandAsync(
         "Input.dispatchKeyEvent",
         "{\"type\":\"keyUp\",\"key\":\"Enter\"}",
     );

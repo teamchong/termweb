@@ -278,65 +278,121 @@ pub const CdpClient = struct {
     }
 
     /// Send mouse command (fire-and-forget) - uses dedicated mouse WebSocket
+    /// Silently ignores errors - safe during shutdown
     pub fn sendMouseCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
-    ) !void {
+    ) void {
         if (self.mouse_ws) |ws| {
-            return ws.sendCommandAsync(method, params);
+            ws.sendCommandAsync(method, params);
+            return;
         }
         // Fallback to pipe if websocket not connected
         if (self.session_id != null) {
-            return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
+            self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params) catch {};
+            return;
         }
-        return self.pipe_client.sendCommandAsync(method, params);
+        self.pipe_client.sendCommandAsync(method, params) catch {};
     }
 
     /// Send keyboard command (fire-and-forget) - uses dedicated keyboard WebSocket
+    /// Silently ignores errors - safe during shutdown
     pub fn sendKeyboardCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
-    ) !void {
+    ) void {
         if (self.keyboard_ws) |ws| {
-            return ws.sendCommandAsync(method, params);
+            ws.sendCommandAsync(method, params);
+            return;
         }
         // Fallback to pipe if websocket not connected
         if (self.session_id != null) {
-            return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
+            self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params) catch {};
+            return;
         }
-        return self.pipe_client.sendCommandAsync(method, params);
+        self.pipe_client.sendCommandAsync(method, params) catch {};
     }
 
-    /// Send navigation command and wait for response - uses pipe client with session
-    /// Browser-level connection stays valid across page target changes (cross-origin navigation)
+    /// Send navigation command and wait for response - uses dedicated nav WebSocket
+    /// Auto-reconnects all WebSockets if dead (cross-origin navigation creates new page target)
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        logToFile("[CDP NAV] sending {s} via pipe\n", .{method});
-        // Use pipe client with session - browser-level connection maintains navigation history
-        if (self.session_id != null) {
-            return self.pipe_client.sendSessionCommand(self.session_id.?, method, params);
+        // Try existing connection first
+        if (self.nav_ws) |ws| {
+            if (ws.running.load(.acquire)) {
+                return ws.sendCommand(method, params) catch |err| {
+                    logToFile("[CDP NAV] sendCommand failed: {}, will reconnect all\n", .{err});
+                    self.reconnectAllWebSockets() catch {};
+                    return err;
+                };
+            }
         }
-        return self.pipe_client.sendCommand(method, params);
+
+        // Try to reconnect all
+        self.reconnectAllWebSockets() catch |err| {
+            logToFile("[CDP NAV] reconnect failed: {}\n", .{err});
+            return error.WebSocketConnectionFailed;
+        };
+
+        // Retry with new connection
+        if (self.nav_ws) |ws| {
+            return ws.sendCommand(method, params);
+        }
+        return error.WebSocketConnectionFailed;
     }
 
-    /// Send navigation command (fire-and-forget) - uses pipe client with session
-    /// Browser-level connection stays valid across page target changes (cross-origin navigation)
+    /// Send navigation command (fire-and-forget) - uses dedicated nav WebSocket
     pub fn sendNavCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
-    ) !void {
-        logToFile("[CDP NAV ASYNC] sending {s} via pipe\n", .{method});
-        // Use pipe client with session - browser-level connection maintains navigation history
-        if (self.session_id != null) {
-            return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
+    ) void {
+        if (self.nav_ws) |ws| {
+            if (ws.running.load(.acquire)) {
+                ws.sendCommandAsync(method, params);
+            }
         }
-        return self.pipe_client.sendCommandAsync(method, params);
+    }
+
+    /// Reconnect all 3 WebSockets to current page target
+    /// Cross-origin navigation creates new page target, invalidating all connections
+    fn reconnectAllWebSockets(self: *CdpClient) !void {
+        logToFile("[CDP] Reconnecting all WebSockets...\n", .{});
+
+        // Close old connections
+        if (self.mouse_ws) |ws| {
+            ws.deinit();
+            self.mouse_ws = null;
+        }
+        if (self.keyboard_ws) |ws| {
+            ws.deinit();
+            self.keyboard_ws = null;
+        }
+        if (self.nav_ws) |ws| {
+            ws.deinit();
+            self.nav_ws = null;
+        }
+
+        // Discover new page WebSocket URL
+        const ws_url = try self.discoverPageWebSocketUrl(self.allocator);
+        defer self.allocator.free(ws_url);
+
+        // Connect all 3 WebSockets
+        self.mouse_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
+        self.keyboard_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
+        self.nav_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
+
+        // Start reader threads
+        try self.mouse_ws.?.startReaderThread();
+        try self.keyboard_ws.?.startReaderThread();
+        try self.nav_ws.?.startReaderThread();
+
+        logToFile("[CDP] All WebSockets reconnected successfully\n", .{});
     }
 
     /// Send CDP command and wait for response - uses session
@@ -408,5 +464,11 @@ pub const CdpClient = struct {
             .payload = raw.payload,
             .allocator = allocator,
         };
+    }
+
+    /// Check if navigation happened (event bus pattern)
+    /// Returns true if a navigation event occurred since last check, and clears the flag
+    pub fn checkNavigationHappened(self: *CdpClient) bool {
+        return self.pipe_client.checkNavigationHappened();
     }
 };

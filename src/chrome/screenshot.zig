@@ -129,6 +129,12 @@ pub fn goBack(
     const current_index = parseCurrentIndex(history) orelse return false;
     if (current_index <= 0) return false;
 
+    // Check if previous entry is about:blank (Chrome's initial page)
+    // If so, don't navigate back to it
+    if (isEntryAboutBlank(history, @intCast(current_index - 1))) {
+        return false;
+    }
+
     const target_entry_id = parseEntryIdAtIndex(history, @intCast(current_index - 1)) orelse return false;
 
     // Navigate to the previous entry
@@ -224,6 +230,34 @@ fn parseEntryIdAtIndex(history: []const u8, target_index: usize) ?i32 {
     return null;
 }
 
+/// Check if entry at index is about:blank
+fn isEntryAboutBlank(history: []const u8, target_index: usize) bool {
+    const entries_marker = "\"entries\":[";
+    const entries_start = std.mem.indexOf(u8, history, entries_marker) orelse return false;
+    var pos = entries_start + entries_marker.len;
+
+    var current_index: usize = 0;
+    while (pos < history.len) {
+        // Find next entry object start
+        const obj_start = std.mem.indexOfPos(u8, history, pos, "{\"id\":") orelse break;
+
+        if (current_index == target_index) {
+            // Find the URL in this entry
+            const url_marker = "\"url\":\"";
+            const url_start_rel = std.mem.indexOfPos(u8, history, obj_start, url_marker) orelse return false;
+            const url_start = url_start_rel + url_marker.len;
+            const url_end = std.mem.indexOfPos(u8, history, url_start, "\"") orelse return false;
+            const url = history[url_start..url_end];
+            return std.mem.eql(u8, url, "about:blank");
+        }
+
+        current_index += 1;
+        pos = obj_start + 1;
+    }
+
+    return false;
+}
+
 /// Reload current page - uses dedicated nav WebSocket
 pub fn reload(
     client: *cdp.CdpClient,
@@ -240,7 +274,12 @@ pub fn reload(
     const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
 
-    // In screencast mode, new frames arrive automatically - no need to block
+    // Scroll to top after reload (browsers preserve scroll position by default)
+    const scroll_result = client.sendCommand(
+        "Runtime.evaluate",
+        "{\"expression\":\"window.scrollTo(0, 0)\"}",
+    ) catch return; // Ignore errors - page might not be ready
+    defer allocator.free(scroll_result);
 }
 
 /// Stop page loading - uses dedicated nav WebSocket
@@ -293,8 +332,17 @@ pub fn getNavigationState(
         }
     }
 
+    // Can go back if currentIndex > 0 AND previous entry is not about:blank
+    var can_back = current_index > 0;
+    if (can_back and current_index == 1) {
+        // Check if entry[0] is about:blank
+        if (isEntryAboutBlank(result, 0)) {
+            can_back = false;
+        }
+    }
+
     return NavigationState{
-        .can_go_back = current_index > 0,
+        .can_go_back = can_back,
         .can_go_forward = current_index < entry_count - 1,
     };
 }

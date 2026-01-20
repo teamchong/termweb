@@ -86,6 +86,9 @@ pub const PipeCdpClient = struct {
     event_queue: std.ArrayList(EventQueueEntry),
     event_mutex: std.Thread.Mutex,
 
+    // Navigation event flag - set when Page.frameNavigated or similar events occur
+    navigation_happened: std.atomic.Value(bool),
+
     frame_pool: *FramePool,
     frame_count: std.atomic.Value(u32),
 
@@ -112,6 +115,7 @@ pub const PipeCdpClient = struct {
             .response_mutex = .{},
             .event_queue = try std.ArrayList(EventQueueEntry).initCapacity(allocator, 0),
             .event_mutex = .{},
+            .navigation_happened = std.atomic.Value(bool).init(false),
             .frame_pool = frame_pool,
             .frame_count = std.atomic.Value(u32).init(0),
             .write_mutex = .{},
@@ -144,6 +148,11 @@ pub const PipeCdpClient = struct {
 
         self.allocator.free(self.read_buffer);
         self.allocator.destroy(self);
+    }
+
+    /// Check if navigation happened and clear the flag (atomic swap)
+    pub fn checkNavigationHappened(self: *PipeCdpClient) bool {
+        return self.navigation_happened.swap(false, .acq_rel);
     }
 
     pub fn sendCommandAsync(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) !void {
@@ -417,13 +426,11 @@ pub const PipeCdpClient = struct {
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
 
-        // Log interesting events for debugging navigation issues
-        if (std.mem.startsWith(u8, method, "Target.") or
-            std.mem.eql(u8, method, "Page.frameNavigated") or
+        // Set navigation flag for navigation events (event bus pattern)
+        if (std.mem.eql(u8, method, "Page.frameNavigated") or
             std.mem.eql(u8, method, "Page.navigatedWithinDocument"))
         {
-            const log_len = @min(payload.len, 500);
-            logToFile("[PIPE EVENT] {s}: {s}\n", .{ method, payload[0..log_len] });
+            self.navigation_happened.store(true, .release);
         }
 
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {

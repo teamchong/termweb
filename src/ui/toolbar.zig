@@ -77,6 +77,7 @@ pub const ToolbarRenderer = struct {
 
     // Cached image IDs
     bg_image_id: ?u32 = null,
+    refresh_image_id: ?u32 = null,
 
     // Layout info
     url_bar_x: u32 = 0,
@@ -303,11 +304,13 @@ pub const ToolbarRenderer = struct {
             try self.svg_cache.getStopButton(self.refresh_hover)
         else
             try self.svg_cache.getRefreshButton(self.refresh_hover);
-        
-        // Force clear previous button to avoid overlap issues
-        try self.kitty.deletePlacement(writer, Placement.REFRESH_BTN);
-        
-        _ = try self.kitty.displayRawRGBA(writer, refresh_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
+
+        // Delete old image by ID to avoid overlap (deletePlacement doesn't remove the image data)
+        if (self.refresh_image_id) |old_id| {
+            try self.kitty.deleteImage(writer, old_id);
+        }
+
+        self.refresh_image_id = try self.kitty.displayRawRGBA(writer, refresh_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
             .placement_id = Placement.REFRESH_BTN,
             .z = 51,
             .x_offset = x_offset,
@@ -482,23 +485,34 @@ pub const ToolbarRenderer = struct {
 
     /// Get button at pixel position
     pub fn hitTest(_: *ToolbarRenderer, pixel_x: u32, pixel_y: u32) ?ButtonIcon {
+        // Debug: log to cdp_debug.log
+        {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[TOOLBAR] hitTest pixel_x={} pixel_y={} TOOLBAR_HEIGHT={}\n", .{ pixel_x, pixel_y, TOOLBAR_HEIGHT }) catch "";
+            if (std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write })) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                f.writeAll(msg) catch {};
+            } else |_| {}
+        }
+
         if (pixel_y > TOOLBAR_HEIGHT) return null;
 
         var x: u32 = BUTTON_PADDING;
 
-        // Close button
+        // Close button (8-35)
         if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .close;
         x += BUTTON_SIZE + BUTTON_PADDING;
 
-        // Back button
+        // Back button (44-71)
         if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .back;
         x += BUTTON_SIZE + BUTTON_PADDING;
 
-        // Forward button
+        // Forward button (80-107)
         if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .forward;
         x += BUTTON_SIZE + BUTTON_PADDING;
 
-        // Refresh button
+        // Refresh button (116-143)
         if (pixel_x >= x and pixel_x < x + BUTTON_SIZE) return .refresh;
 
         return null;
