@@ -8,6 +8,21 @@ const simd = @import("../simd/dispatch.zig");
 const FramePool = @import("../simd/frame_pool.zig").FramePool;
 const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
 
+fn logToFile(comptime fmt: []const u8, args: anytype) void {
+    var buf: [8192]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+
+    const file = std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write }) catch |err| blk: {
+        if (err == error.FileNotFound) {
+            break :blk std.fs.cwd().createFile("cdp_debug.log", .{ .read = true }) catch return;
+        }
+        return;
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(slice) catch return;
+}
+
 pub const PipeError = error{
     ConnectionFailed,
     SendFailed,
@@ -192,13 +207,24 @@ pub const PipeCdpClient = struct {
             );
         defer self.allocator.free(command);
 
+        logToFile("[PIPE] sendSessionCommand id={d} session={s} method={s}\n", .{ id, session_id, method });
+
         {
             self.write_mutex.lock();
             defer self.write_mutex.unlock();
             _ = try self.write_file.writeAll(command);
         }
 
-        return self.waitForResponse(id);
+        const response = self.waitForResponse(id) catch |err| {
+            logToFile("[PIPE] sendSessionCommand id={d} method={s} ERROR: {}\n", .{ id, method, err });
+            return err;
+        };
+
+        // Log first 500 chars of response
+        const log_len = @min(response.len, 500);
+        logToFile("[PIPE] sendSessionCommand id={d} method={s} response ({d} bytes): {s}\n", .{ id, method, response.len, response[0..log_len] });
+
+        return response;
     }
 
     pub fn sendCommand(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) ![]u8 {
@@ -234,6 +260,7 @@ pub const PipeCdpClient = struct {
 
             while (true) {
                 if (std.time.nanoTimestamp() - start_time > timeout_ns) {
+                    logToFile("[PIPE] waitForResponse id={d} TIMEOUT\n", .{id});
                     return PipeError.TimeoutWaitingForResponse;
                 }
 
@@ -249,6 +276,9 @@ pub const PipeCdpClient = struct {
 
                         if (std.mem.indexOf(u8, response, "\"error\":{")) |err_pos| {
                             if (err_pos < 20) {
+                                // Log the full error response before freeing
+                                const log_len = @min(response.len, 1000);
+                                logToFile("[PIPE] waitForResponse id={d} PROTOCOL_ERROR: {s}\n", .{ id, response[0..log_len] });
                                 self.allocator.free(response);
                                 return PipeError.ProtocolError;
                             }
@@ -274,6 +304,9 @@ pub const PipeCdpClient = struct {
                         }
                         if (std.mem.indexOf(u8, message, "\"error\":{")) |err_pos| {
                             if (err_pos < 20) {
+                                // Log the full error response before freeing
+                                const log_len = @min(message.len, 1000);
+                                logToFile("[PIPE] waitForResponse id={d} PROTOCOL_ERROR (sync): {s}\n", .{ id, message[0..log_len] });
                                 self.allocator.free(message);
                                 return PipeError.ProtocolError;
                             }
@@ -383,6 +416,15 @@ pub const PipeCdpClient = struct {
         const method_v_start = method_start + "\"method\":\"".len;
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
+
+        // Log interesting events for debugging navigation issues
+        if (std.mem.startsWith(u8, method, "Target.") or
+            std.mem.eql(u8, method, "Page.frameNavigated") or
+            std.mem.eql(u8, method, "Page.navigatedWithinDocument"))
+        {
+            const log_len = @min(payload.len, 500);
+            logToFile("[PIPE EVENT] {s}: {s}\n", .{ method, payload[0..log_len] });
+        }
 
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             try self.handleScreencastFrame(payload);

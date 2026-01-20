@@ -138,13 +138,13 @@ pub const ToolbarSvg = struct {
     /// Stop button (X mark for loading state)
     pub const stop_normal =
         \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-        \\  <path d="M6 6l12 12M18 6l-12 12" fill="none" stroke="#ff3b30" stroke-width="2" stroke-linecap="round"/>
+        \\  <path d="M6 6l12 12M18 6l-12 12" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
         \\</svg>
     ;
 
     pub const stop_hover =
         \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-        \\  <path d="M6 6l12 12M18 6l-12 12" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linecap="round"/>
+        \\  <path d="M6 6l12 12M18 6l-12 12" fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round"/>
         \\</svg>
     ;
 

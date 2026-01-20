@@ -1009,30 +1009,43 @@ pub const Viewer = struct {
                     .back => {
                         self.log("[CLICK] Back button (can_back={})\n", .{self.ui_state.can_go_back});
                         // Always try to go back even if state says no (state might be stale)
-                        // if (self.ui_state.can_go_back) {
-                            _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
-                            // Optimistic update
-                            self.ui_state.can_go_forward = true;
-                        // }
+                        _ = screenshot_api.goBack(self.cdp_client, self.allocator) catch |err| {
+                            self.log("[CLICK] Back failed: {}\n", .{err});
+                            return; // Don't update UI state if command failed
+                        };
+                        // Optimistic update only on success
+                        self.ui_state.can_go_forward = true;
+                        self.ui_dirty = true;
                     },
                     .forward => {
                         self.log("[CLICK] Forward button\n", .{});
                         if (self.ui_state.can_go_forward) {
-                            _ = try screenshot_api.goForward(self.cdp_client, self.allocator);
+                            _ = screenshot_api.goForward(self.cdp_client, self.allocator) catch |err| {
+                                self.log("[CLICK] Forward failed: {}\n", .{err});
+                                return; // Don't update UI state if command failed
+                            };
                             self.ui_state.can_go_back = true;
+                            self.ui_dirty = true;
                         }
                     },
                     .refresh => {
                         self.log("[CLICK] Refresh button (loading={})\n", .{self.ui_state.is_loading});
                         if (self.ui_state.is_loading) {
-                            _ = try screenshot_api.stopLoading(self.cdp_client, self.allocator);
+                            _ = screenshot_api.stopLoading(self.cdp_client, self.allocator) catch |err| {
+                                self.log("[CLICK] Stop loading failed: {}\n", .{err});
+                                return;
+                            };
                             self.ui_state.is_loading = false;
                         } else {
                             // Ensure we call reload
                             self.log("[CLICK] Sending reload command\n", .{});
-                            _ = try screenshot_api.reload(self.cdp_client, self.allocator, false);
+                            _ = screenshot_api.reload(self.cdp_client, self.allocator, false) catch |err| {
+                                self.log("[CLICK] Reload failed: {}\n", .{err});
+                                return; // Don't set is_loading if command failed
+                            };
                             self.ui_state.is_loading = true;
                         }
+                        self.ui_dirty = true;
                     },
                     .close => {
                         self.log("[CLICK] Close button\n", .{});

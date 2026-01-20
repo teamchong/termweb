@@ -303,6 +303,10 @@ pub const ToolbarRenderer = struct {
             try self.svg_cache.getStopButton(self.refresh_hover)
         else
             try self.svg_cache.getRefreshButton(self.refresh_hover);
+        
+        // Force clear previous button to avoid overlap issues
+        try self.kitty.deletePlacement(writer, Placement.REFRESH_BTN);
+        
         _ = try self.kitty.displayRawRGBA(writer, refresh_rgba, BUTTON_SIZE, BUTTON_SIZE, .{
             .placement_id = Placement.REFRESH_BTN,
             .z = 51,

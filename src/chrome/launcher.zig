@@ -263,6 +263,7 @@ pub fn launchChromePipe(
 
     try args_list.append(allocator, "--remote-debugging-pipe");
     try args_list.append(allocator, "--remote-debugging-port=9222");
+    try args_list.append(allocator, "--remote-allow-origins=*");
 
     const user_data_arg = try std.fmt.allocPrint(allocator, "--user-data-dir={s}", .{user_data_dir});
     defer allocator.free(user_data_arg);

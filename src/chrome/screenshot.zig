@@ -114,36 +114,114 @@ pub fn setViewport(
     defer allocator.free(result);
 }
 
-/// Navigate back in browser history - uses dedicated nav WebSocket
+/// Navigate back in browser history using Page.navigateToHistoryEntry
+/// (Page.goBack was removed from Chrome DevTools Protocol)
 /// Returns true if navigation happened, false if there was no history
 pub fn goBack(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !bool {
-    const result = client.sendNavCommand("Page.goBack", null) catch {
-        // No history to go back to
+    // Get current navigation history
+    const history = try client.sendNavCommand("Page.getNavigationHistory", null);
+    defer allocator.free(history);
+
+    // Parse currentIndex and find the previous entry ID
+    const current_index = parseCurrentIndex(history) orelse return false;
+    if (current_index <= 0) return false;
+
+    const target_entry_id = parseEntryIdAtIndex(history, @intCast(current_index - 1)) orelse return false;
+
+    // Navigate to the previous entry
+    const params = try std.fmt.allocPrint(allocator, "{{\"entryId\":{d}}}", .{target_entry_id});
+    defer allocator.free(params);
+
+    const result = client.sendNavCommand("Page.navigateToHistoryEntry", params) catch {
         return false;
     };
     defer allocator.free(result);
 
-    // In screencast mode, new frames arrive automatically - no need to block
     return true;
 }
 
-/// Navigate forward in browser history - uses dedicated nav WebSocket
+/// Navigate forward in browser history using Page.navigateToHistoryEntry
+/// (Page.goForward was removed from Chrome DevTools Protocol)
 /// Returns true if navigation happened, false if there was no history
 pub fn goForward(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !bool {
-    const result = client.sendNavCommand("Page.goForward", null) catch {
-        // No forward history
+    // Get current navigation history
+    const history = try client.sendNavCommand("Page.getNavigationHistory", null);
+    defer allocator.free(history);
+
+    // Parse currentIndex and entry count, find the next entry ID
+    const current_index = parseCurrentIndex(history) orelse return false;
+    const entry_count = countEntries(history);
+    if (current_index >= entry_count - 1) return false;
+
+    const target_entry_id = parseEntryIdAtIndex(history, @intCast(current_index + 1)) orelse return false;
+
+    // Navigate to the next entry
+    const params = try std.fmt.allocPrint(allocator, "{{\"entryId\":{d}}}", .{target_entry_id});
+    defer allocator.free(params);
+
+    const result = client.sendNavCommand("Page.navigateToHistoryEntry", params) catch {
         return false;
     };
     defer allocator.free(result);
 
-    // In screencast mode, new frames arrive automatically - no need to block
     return true;
+}
+
+/// Parse currentIndex from navigation history response
+fn parseCurrentIndex(history: []const u8) ?i32 {
+    const marker = "\"currentIndex\":";
+    const idx = std.mem.indexOf(u8, history, marker) orelse return null;
+    const start = idx + marker.len;
+    var end = start;
+    while (end < history.len and (history[end] >= '0' and history[end] <= '9')) : (end += 1) {}
+    if (end == start) return null;
+    return std.fmt.parseInt(i32, history[start..end], 10) catch null;
+}
+
+/// Count number of entries in navigation history
+fn countEntries(history: []const u8) i32 {
+    var count: i32 = 0;
+    const entries_start = std.mem.indexOf(u8, history, "\"entries\":[") orelse return 0;
+    var pos = entries_start;
+    while (std.mem.indexOfPos(u8, history, pos, "\"url\":")) |url_pos| {
+        count += 1;
+        pos = url_pos + 1;
+    }
+    return count;
+}
+
+/// Parse entry ID at a specific index in the entries array
+/// Format: "entries":[{"id":2,...},{"id":7,...},...]
+fn parseEntryIdAtIndex(history: []const u8, target_index: usize) ?i32 {
+    const entries_marker = "\"entries\":[";
+    const entries_start = std.mem.indexOf(u8, history, entries_marker) orelse return null;
+    var pos = entries_start + entries_marker.len;
+
+    var current_index: usize = 0;
+    while (pos < history.len) {
+        // Find next entry object start
+        const obj_start = std.mem.indexOfPos(u8, history, pos, "{\"id\":") orelse break;
+
+        if (current_index == target_index) {
+            // Parse the ID value
+            const id_start = obj_start + "{\"id\":".len;
+            var id_end = id_start;
+            while (id_end < history.len and (history[id_end] >= '0' and history[id_end] <= '9')) : (id_end += 1) {}
+            if (id_end == id_start) return null;
+            return std.fmt.parseInt(i32, history[id_start..id_end], 10) catch null;
+        }
+
+        current_index += 1;
+        pos = obj_start + 1;
+    }
+
+    return null;
 }
 
 /// Reload current page - uses dedicated nav WebSocket

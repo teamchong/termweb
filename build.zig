@@ -5,11 +5,25 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Vendor modules
+    const hashmap_shim = b.createModule(.{
+        .root_source_file = b.path("src/vendor/utils/hashmap_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const simd_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/json/simd/dispatch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const json_mod = b.createModule(.{
         .root_source_file = b.path("vendor/json/json.zig"),
         .target = target,
         .optimize = optimize,
     });
+    json_mod.addImport("utils.hashmap_helper", hashmap_shim);
+    json_mod.addImport("json_simd", simd_mod);
 
     const websocket_mod = b.createModule(.{
         .root_source_file = b.path("vendor/websocket/websocket.zig"),

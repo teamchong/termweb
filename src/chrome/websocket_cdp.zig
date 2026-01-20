@@ -64,6 +64,21 @@ const ParsedUrl = struct {
     path: []const u8,
 };
 
+fn logToFile(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+
+    const file = std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write }) catch |err| blk: {
+        if (err == error.FileNotFound) {
+             break :blk std.fs.cwd().createFile("cdp_debug.log", .{ .read = true }) catch return;
+        }
+        return;
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(slice) catch return;
+}
+
 pub const WebSocketCdpClient = struct {
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
@@ -186,6 +201,11 @@ pub const WebSocketCdpClient = struct {
             const start_time = std.time.nanoTimestamp();
 
             while (true) {
+                // Check if reader thread died (connection broken)
+                if (!self.running.load(.acquire)) {
+                    return error.ConnectionClosed;
+                }
+
                 // Check timeout
                 if (std.time.nanoTimestamp() - start_time > timeout_ns) {
                     return error.TimeoutWaitingForResponse;
@@ -297,31 +317,47 @@ pub const WebSocketCdpClient = struct {
         return self.frame_count.load(.monotonic);
     }
 
+    /// Send WebSocket ping frame to keep connection alive
+    pub fn sendPing(self: *WebSocketCdpClient) !void {
+        try self.sendFrame(0x9, "keepalive"); // opcode 0x9 = ping
+    }
+
     /// Background thread main function - continuously reads WebSocket frames
     fn readerThreadMain(self: *WebSocketCdpClient) void {
-        const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null;
-        if (log_file) |f| { f.seekFromEnd(0) catch {}; f.writeAll("[WS] Reader thread started\n") catch {}; f.close(); }
+        logToFile("[WS] Reader thread started\n", .{});
+
+        var last_activity = std.time.nanoTimestamp();
+        const keepalive_interval_ns = 15 * std.time.ns_per_s; // Send ping every 15 seconds of inactivity
 
         while (self.running.load(.acquire)) {
+            // Check if we need to send keepalive ping
+            const now = std.time.nanoTimestamp();
+            if (now - last_activity > keepalive_interval_ns) {
+                self.sendPing() catch |err| {
+                    logToFile("[WS] sendPing failed: {}\n", .{err});
+                };
+                last_activity = now;
+            }
+
             var frame = self.recvFrame() catch |err| {
-                // Safer logging:
-                 if (std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null) |f| {
-                    defer f.close();
-                    f.seekFromEnd(0) catch {};
-                    var buf: [64]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "[WS] recvFrame error: {}\n", .{err}) catch "";
-                    f.writeAll(msg) catch {};
-                }
+                logToFile("[WS] recvFrame error: {}\n", .{err});
 
                 if (err == error.ConnectionClosed or 
                     err == error.EndOfStream or 
                     err == error.BrokenPipe or 
-                    err == error.ConnectionResetByPeer) break;
+                    err == error.ConnectionResetByPeer or
+                    err == error.NotOpenForReading) {
+                     logToFile("[WS] connection broken, exiting reader thread\n", .{});
+                    self.running.store(false, .release);
+                    return;
+                }
                 
                 // On timeout or other errors, check if we should stop
                 if (!self.running.load(.acquire)) break;
                 continue;
             };
+            // Update last activity on successful frame receive
+            last_activity = std.time.nanoTimestamp();
             defer frame.deinit();
 
             // Check if we should stop before processing
@@ -334,19 +370,11 @@ pub const WebSocketCdpClient = struct {
             } else if (std.mem.indexOf(u8, frame.payload, "\"id\":")) |_| {
                 // RESPONSE (reply to our command)
                 // Log response processing
-                 if (std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null) |f| {
-                    defer f.close();
-                    f.seekFromEnd(0) catch {};
-                    f.writeAll("[WS] Processing response\n") catch {};
-                }
+                // std.debug.print("[WS] Processing response\n", .{});
                 self.handleResponse(frame.payload) catch {};
             }
         }
-        if (std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null) |f| {
-            defer f.close();
-            f.seekFromEnd(0) catch {};
-            f.writeAll("[WS] Reader thread exiting\n") catch {};
-        }
+        // std.debug.print("[WS] Reader thread exiting\n", .{});
     }
 
     /// Handle incoming CDP event

@@ -9,6 +9,22 @@
 const std = @import("std");
 const cdp_pipe = @import("cdp_pipe.zig");
 const websocket_cdp = @import("websocket_cdp.zig");
+const json = @import("json");
+
+fn logToFile(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+
+    const file = std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write }) catch |err| blk: {
+        if (err == error.FileNotFound) {
+             break :blk std.fs.cwd().createFile("cdp_debug.log", .{ .read = true }) catch return;
+        }
+        return;
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(slice) catch return;
+}
 
 pub const CdpError = error{
     ConnectionFailed,
@@ -82,22 +98,32 @@ pub const CdpClient = struct {
         // Wait for Chrome to be ready on port 9222 with retries
         var ws_url: ?[]const u8 = null;
         var retry: u32 = 0;
-        while (retry < 10) : (retry += 1) {
+        // Increase timeout to 10s (50 * 200ms) as Chrome can be slow to start listening
+        while (retry < 50) : (retry += 1) {
             std.Thread.sleep(200 * std.time.ns_per_ms);
-            ws_url = client.discoverPageWebSocketUrl(allocator) catch null;
+            ws_url = client.discoverPageWebSocketUrl(allocator) catch blk: {
+                if (retry % 5 == 0) logToFile("[CDP] Retry {}/50: Failed to get WS URL\n", .{retry});
+                break :blk null;
+            };
             if (ws_url != null) break;
+        } else {
+            // Failed to discover WebSocket URL
+            std.debug.print("[CDP] Failed to discover page WebSocket URL after 50 retries\n", .{});
+            return CdpError.WebSocketConnectionFailed;
         }
 
         if (ws_url) |url| {
             defer allocator.free(url);
-            client.mouse_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, url) catch null;
-            client.keyboard_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, url) catch null;
-            client.nav_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, url) catch null;
+            
+            // Connect strictly - failure is fatal
+            client.mouse_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
+            client.keyboard_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
+            client.nav_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
 
-            // Start reader threads for each WebSocket (enables sendCommand to work)
-            if (client.mouse_ws) |ws| ws.startReaderThread() catch {};
-            if (client.keyboard_ws) |ws| ws.startReaderThread() catch {};
-            if (client.nav_ws) |ws| ws.startReaderThread() catch {};
+            // Start reader threads strictly - failure is fatal
+            try client.mouse_ws.?.startReaderThread();
+            try client.keyboard_ws.?.startReaderThread();
+            try client.nav_ws.?.startReaderThread();
         }
 
         return client;
@@ -107,8 +133,9 @@ pub const CdpClient = struct {
     fn discoverPageWebSocketUrl(self: *CdpClient, allocator: std.mem.Allocator) ![]const u8 {
         _ = self;
         // Connect to Chrome's /json/list endpoint to get the page's WebSocket URL
-        const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", 9222) catch {
-            return CdpError.WebSocketConnectionFailed;
+        const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", 9222) catch |err| {
+            // std.debug.print("[CDP] TCP connect to 9222 failed: {}\n", .{err});
+            return err;
         };
         defer stream.close();
 
@@ -121,13 +148,41 @@ pub const CdpClient = struct {
         const n = stream.read(&buf) catch return CdpError.WebSocketConnectionFailed;
         const response = buf[0..n];
 
-        // Find webSocketDebuggerUrl in response
-        const marker = "\"webSocketDebuggerUrl\":\"";
-        const start_pos = std.mem.indexOf(u8, response, marker) orelse return CdpError.InvalidResponse;
-        const url_start = start_pos + marker.len;
-        const url_end = std.mem.indexOfPos(u8, response, url_start, "\"") orelse return CdpError.InvalidResponse;
+        // Find end of HTTP headers
+        const header_end_marker = "\r\n\r\n";
+        const body_start = std.mem.indexOf(u8, response, header_end_marker) orelse return CdpError.InvalidResponse;
+        const body = response[body_start + header_end_marker.len ..];
 
-        return try allocator.dupe(u8, response[url_start..url_end]);
+        // Parse JSON response using SIMD parser
+        var parsed = json.parse(allocator, body) catch return CdpError.InvalidResponse;
+        defer parsed.deinit(allocator);
+
+        // Iterate over targets to find one with type="page"
+        if (parsed != .array) return CdpError.InvalidResponse;
+
+        for (parsed.array.items) |target| {
+            if (target != .object) continue;
+            
+            const type_val = target.object.get("type") orelse continue;
+            if (type_val != .string or !std.mem.eql(u8, type_val.string, "page")) continue;
+
+            const url_val = target.object.get("webSocketDebuggerUrl") orelse continue;
+            if (url_val == .string) {
+                return try allocator.dupe(u8, url_val.string);
+            }
+        }
+        
+        // Return first target if no page found (fallback)
+        if (parsed.array.items.len > 0) {
+            const target = parsed.array.items[0];
+             if (target == .object) {
+                 if (target.object.get("webSocketDebuggerUrl")) |url_val| {
+                     if (url_val == .string) return try allocator.dupe(u8, url_val.string);
+                 }
+             }
+        }
+
+        return CdpError.NoPageTarget;
     }
 
     /// Attach to a page target to enable page-level commands
@@ -254,55 +309,30 @@ pub const CdpClient = struct {
         return self.pipe_client.sendCommandAsync(method, params);
     }
 
-    /// Send navigation command and wait for response - uses dedicated nav WebSocket
+    /// Send navigation command and wait for response - uses pipe client with session
+    /// Browser-level connection stays valid across page target changes (cross-origin navigation)
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // Debug logging
-        const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch null;
-        if (log_file) |f| {
-            defer f.close();
-            f.seekFromEnd(0) catch {};
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "[CDP NAV] sendNavCommand method={s} has_nav_ws={}\n", .{ method, self.nav_ws != null }) catch "";
-            f.writeAll(msg) catch {};
-        }
-
-        if (self.nav_ws) |ws| {
-            const result = ws.sendCommand(method, params) catch |err| {
-                if (log_file) |f| {
-                    var buf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "[CDP NAV] nav_ws.sendCommand failed: {}\n", .{err}) catch "";
-                    f.writeAll(msg) catch {};
-                }
-                return err;
-            };
-            return result;
-        }
-
-        if (log_file) |f| {
-            f.writeAll("[CDP NAV] Fallback to pipe (nav_ws null)\n") catch {};
-        }
-
-        // Fallback to pipe if websocket not connected
+        logToFile("[CDP NAV] sending {s} via pipe\n", .{method});
+        // Use pipe client with session - browser-level connection maintains navigation history
         if (self.session_id != null) {
             return self.pipe_client.sendSessionCommand(self.session_id.?, method, params);
         }
         return self.pipe_client.sendCommand(method, params);
     }
 
-    /// Send navigation command (fire-and-forget) - uses dedicated nav WebSocket
+    /// Send navigation command (fire-and-forget) - uses pipe client with session
+    /// Browser-level connection stays valid across page target changes (cross-origin navigation)
     pub fn sendNavCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) !void {
-        if (self.nav_ws) |ws| {
-            return ws.sendCommandAsync(method, params);
-        }
-        // Fallback to pipe if websocket not connected
+        logToFile("[CDP NAV ASYNC] sending {s} via pipe\n", .{method});
+        // Use pipe client with session - browser-level connection maintains navigation history
         if (self.session_id != null) {
             return self.pipe_client.sendSessionCommandAsync(self.session_id.?, method, params);
         }
