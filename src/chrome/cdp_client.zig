@@ -108,9 +108,8 @@ pub const CdpClient = struct {
         const polyfill_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
         allocator.free(polyfill_result);
 
-        // Enable Runtime domain to receive console messages
-        const runtime_enable = try client.sendCommand("Runtime.enable", null);
-        allocator.free(runtime_enable);
+        // NOTE: Runtime.enable is called on nav_ws after WebSocket connect (not on pipe)
+        // Pipe is ONLY for screencast frames - events come from nav_ws
 
         // Connect 3 WebSockets for input (mouse, keyboard, navigation)
         // Wait for Chrome to be ready on the discovered port with retries
@@ -148,6 +147,12 @@ pub const CdpClient = struct {
             try client.mouse_ws.?.startReaderThread();
             try client.keyboard_ws.?.startReaderThread();
             try client.nav_ws.?.startReaderThread();
+
+            // Enable Runtime domain on nav_ws to receive console events
+            // This MUST be on nav_ws, not pipe - pipe is only for screencast
+            std.debug.print("Enabling Runtime on nav_ws...\n", .{});
+            const runtime_result = try client.nav_ws.?.sendCommand("Runtime.enable", null);
+            allocator.free(runtime_result);
         }
 
         std.debug.print("CDP client ready\n", .{});
@@ -396,6 +401,10 @@ pub const CdpClient = struct {
         try self.keyboard_ws.?.startReaderThread();
         try self.nav_ws.?.startReaderThread();
 
+        // Re-enable Runtime domain on nav_ws for console events
+        const runtime_result = try self.nav_ws.?.sendCommand("Runtime.enable", null);
+        self.allocator.free(runtime_result);
+
         logToFile("[CDP] All WebSockets reconnected successfully\n", .{});
     }
 
@@ -461,12 +470,16 @@ pub const CdpClient = struct {
         return self.pipe_client.getFrameCount();
     }
 
+    /// Get next event from nav_ws (console messages, dialogs, file chooser)
+    /// Pipe is only for screencast frames - events come from WebSocket
     pub fn nextEvent(self: *CdpClient, allocator: std.mem.Allocator) !?CdpEvent {
-        const raw = try self.pipe_client.nextEvent(allocator) orelse return null;
+        _ = allocator;
+        const ws = self.nav_ws orelse return null;
+        const raw = ws.nextEvent() orelse return null;
         return CdpEvent{
             .method = raw.method,
             .payload = raw.payload,
-            .allocator = allocator,
+            .allocator = ws.allocator,
         };
     }
 

@@ -59,16 +59,8 @@ const ResponseQueueEntry = struct {
     }
 };
 
-const EventQueueEntry = struct {
-    method: []const u8,
-    payload: []u8,
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *EventQueueEntry, gpa: std.mem.Allocator) void {
-        gpa.free(self.method);
-        gpa.free(self.payload);
-    }
-};
+// NOTE: Event queue removed - pipe is ONLY for screencast frames
+// All events (console, dialogs, file chooser) go through nav_ws
 
 /// Pipe-based CDP client
 pub const PipeCdpClient = struct {
@@ -83,8 +75,8 @@ pub const PipeCdpClient = struct {
     response_queue: std.ArrayList(ResponseQueueEntry),
     response_mutex: std.Thread.Mutex,
 
-    event_queue: std.ArrayList(EventQueueEntry),
-    event_mutex: std.Thread.Mutex,
+    // NOTE: No event queue - pipe is ONLY for screencast frames
+    // Events go through nav_ws
 
     // Navigation event flag - set when Page.frameNavigated or similar events occur
     navigation_happened: std.atomic.Value(bool),
@@ -113,8 +105,6 @@ pub const PipeCdpClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .response_queue = try std.ArrayList(ResponseQueueEntry).initCapacity(allocator, 0),
             .response_mutex = .{},
-            .event_queue = try std.ArrayList(EventQueueEntry).initCapacity(allocator, 0),
-            .event_mutex = .{},
             .navigation_happened = std.atomic.Value(bool).init(false),
             .frame_pool = frame_pool,
             .frame_count = std.atomic.Value(u32).init(0),
@@ -127,28 +117,27 @@ pub const PipeCdpClient = struct {
     }
 
     pub fn deinit(self: *PipeCdpClient) void {
-        self.stopReaderThread(); // Closes read_file
+        logToFile("[PIPE deinit] Starting, response_queue.len={}\n", .{self.response_queue.items.len});
+
+        self.stopReaderThread(); // Closes read_file and joins thread
+
+        logToFile("[PIPE deinit] After stopReaderThread, response_queue.len={}\n", .{self.response_queue.items.len});
 
         // Close write pipe (we own both fds from launcher)
         self.write_file.close();
 
         self.frame_pool.deinit();
 
-        // Free response queue entries
+        // Free response queue entries - lock just in case
         self.response_mutex.lock();
+        const queue_len = self.response_queue.items.len;
         for (self.response_queue.items) |*entry| {
             entry.deinit();
         }
         self.response_queue.deinit(self.allocator);
         self.response_mutex.unlock();
 
-        // Free event queue entries
-        self.event_mutex.lock();
-        for (self.event_queue.items) |*entry| {
-            entry.deinit(self.allocator);
-        }
-        self.event_queue.deinit(self.allocator);
-        self.event_mutex.unlock();
+        logToFile("[PIPE deinit] Freed {} response queue entries\n", .{queue_len});
 
         self.allocator.free(self.read_buffer);
         self.allocator.destroy(self);
@@ -369,11 +358,9 @@ pub const PipeCdpClient = struct {
 
     pub fn stopReaderThread(self: *PipeCdpClient) void {
         if (self.reader_thread) |thread| {
-            // Acquire both locks to ensure no in-flight operations
+            // Acquire lock to ensure no in-flight operations
             self.response_mutex.lock();
-            self.event_mutex.lock();
             self.running.store(false, .release);
-            self.event_mutex.unlock();
             self.response_mutex.unlock();
 
             // Close read pipe to unblock the reader thread from blocking read()
@@ -400,20 +387,7 @@ pub const PipeCdpClient = struct {
         return self.frame_count.load(.monotonic);
     }
 
-    pub fn nextEvent(self: *PipeCdpClient, allocator: std.mem.Allocator) !?struct { method: []const u8, payload: []const u8 } {
-        self.event_mutex.lock();
-        defer self.event_mutex.unlock();
-
-        if (self.event_queue.items.len == 0) return null;
-
-        var entry = self.event_queue.orderedRemove(0);
-        defer entry.deinit(self.allocator);
-
-        return .{
-            .method = try allocator.dupe(u8, entry.method),
-            .payload = try allocator.dupe(u8, entry.payload),
-        };
-    }
+    // NOTE: nextEvent removed - events come from nav_ws, not pipe
 
     fn readerThreadMain(self: *PipeCdpClient) void {
         while (self.running.load(.acquire)) {
@@ -432,60 +406,28 @@ pub const PipeCdpClient = struct {
         }
     }
 
+    /// Handle CDP events from pipe
+    /// PIPE IS ONLY FOR SCREENCAST FRAMES - events go through nav_ws
     fn handleEvent(self: *PipeCdpClient, payload: []const u8) !void {
         const method_start = std.mem.indexOf(u8, payload, "\"method\":\"") orelse return;
         const method_v_start = method_start + "\"method\":\"".len;
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
 
-        // Debug: log all received events
-        logToFile("[PIPE EVENT] method={s}\n", .{method});
-
-        // Log console messages in detail
-        if (std.mem.eql(u8, method, "Runtime.consoleAPICalled")) {
-            const max_len = @min(payload.len, 500);
-            logToFile("[CONSOLE] payload={s}\n", .{payload[0..max_len]});
-        }
-
         // Set navigation flag for navigation events (event bus pattern)
+        // This is lightweight - just an atomic flag, no queueing
         if (std.mem.eql(u8, method, "Page.frameNavigated") or
             std.mem.eql(u8, method, "Page.navigatedWithinDocument"))
         {
             self.navigation_happened.store(true, .release);
         }
 
+        // PIPE ONLY HANDLES SCREENCAST FRAMES
+        // All other events (console, dialogs, file chooser) go through nav_ws
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             self.handleScreencastFrame(payload) catch return;
-        } else {
-            // Queue other events for the main thread to process
-            self.event_mutex.lock();
-            defer self.event_mutex.unlock();
-
-            // Check running while holding lock - prevents race with deinit
-            if (!self.running.load(.acquire)) return;
-
-            const MAX_EVENT_QUEUE = 50;
-            if (self.event_queue.items.len >= MAX_EVENT_QUEUE) {
-                var old = self.event_queue.orderedRemove(0);
-                old.deinit(self.allocator);
-            }
-
-            const method_copy = self.allocator.dupe(u8, method) catch return;
-            const payload_copy = self.allocator.dupe(u8, payload) catch {
-                self.allocator.free(method_copy);
-                return;
-            };
-
-            self.event_queue.append(self.allocator, .{
-                .method = method_copy,
-                .payload = payload_copy,
-                .allocator = self.allocator,
-            }) catch {
-                self.allocator.free(method_copy);
-                self.allocator.free(payload_copy);
-                return;
-            };
         }
+        // Ignore all other events - they're handled by nav_ws
     }
 
     fn handleScreencastFrame(self: *PipeCdpClient, payload: []const u8) !void {

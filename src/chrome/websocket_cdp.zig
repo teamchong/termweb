@@ -41,6 +41,18 @@ const ResponseQueueEntry = struct {
     }
 };
 
+// Event queue entry for CDP events (consoleAPICalled, dialogs, etc.)
+const EventQueueEntry = struct {
+    method: []u8,
+    payload: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *EventQueueEntry) void {
+        self.allocator.free(self.method);
+        self.allocator.free(self.payload);
+    }
+};
+
 const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
 
 // Screencast frame structure with zero-copy reference to pool slot
@@ -92,6 +104,10 @@ pub const WebSocketCdpClient = struct {
     response_queue: std.ArrayList(ResponseQueueEntry),
     response_mutex: std.Thread.Mutex,
 
+    // Event queue for CDP events (consoleAPICalled, dialogs, file chooser)
+    event_queue: std.ArrayList(EventQueueEntry),
+    event_mutex: std.Thread.Mutex,
+
     // Zero-copy frame pool for screencast frames (avoids per-frame allocations)
     frame_pool: *FramePool,
     frame_count: std.atomic.Value(u32),  // Debug: count received frames
@@ -119,6 +135,8 @@ pub const WebSocketCdpClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .response_queue = try std.ArrayList(ResponseQueueEntry).initCapacity(allocator, 0),
             .response_mutex = .{},
+            .event_queue = try std.ArrayList(EventQueueEntry).initCapacity(allocator, 0),
+            .event_mutex = .{},
             .frame_pool = frame_pool,
             .frame_count = std.atomic.Value(u32).init(0),
             .write_mutex = .{},
@@ -131,20 +149,32 @@ pub const WebSocketCdpClient = struct {
     }
 
     pub fn deinit(self: *WebSocketCdpClient) void {
-        // Signal thread to stop and detach it
-        self.stopReaderThread();
+        // Signal thread to stop
+        self.running.store(false, .release);
 
         // Close stream to unblock any pending reads
         self.stream.close();
 
+        // Join thread (wait for it to exit) - MUST happen before freeing queues
+        if (self.reader_thread) |thread| {
+            thread.join();
+            self.reader_thread = null;
+        }
+
         // Free frame pool
         self.frame_pool.deinit();
 
-        // Free response queue
+        // Free response queue - safe now, thread is joined
         for (self.response_queue.items) |*entry| {
             entry.deinit();
         }
         self.response_queue.deinit(self.allocator);
+
+        // Free event queue
+        for (self.event_queue.items) |*entry| {
+            entry.deinit();
+        }
+        self.event_queue.deinit(self.allocator);
 
         self.allocator.destroy(self);
     }
@@ -279,12 +309,12 @@ pub const WebSocketCdpClient = struct {
         self.reader_thread = try std.Thread.spawn(.{}, readerThreadMain, .{self});
     }
 
-    /// Stop background reader thread
-    pub fn stopReaderThread(self: *WebSocketCdpClient) void {
+    /// Stop background reader thread (internal use - deinit handles stream closing)
+    fn stopReaderThread(self: *WebSocketCdpClient) void {
         if (self.reader_thread) |thread| {
             self.running.store(false, .release);
-            // Just detach - thread will exit when socket closes or process ends
-            thread.detach();
+            // Note: caller must close stream to unblock thread, then call join
+            thread.join();
             self.reader_thread = null;
         }
     }
@@ -382,23 +412,69 @@ pub const WebSocketCdpClient = struct {
         const method_end = std.mem.indexOfPos(u8, payload, method_value_start, "\"") orelse return;
         const method = payload[method_value_start..method_end];
 
-        // Debug: log all received events
-        {
-            const log_file = std.fs.cwd().openFile("termweb_debug.log", .{ .mode = .write_only }) catch return;
-            defer log_file.close();
-            log_file.seekFromEnd(0) catch {};
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "[CDP EVENT] method={s}, payload_len={}\n", .{ method, payload.len }) catch return;
-            log_file.writeAll(msg) catch {};
-        }
-
         // Special handling for screencast frames
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             try self.handleScreencastFrame(payload);
             return;
         }
 
-        // Future: Add generic event callback here
+        // Only queue important events for main thread
+        const dominated_events = [_][]const u8{
+            "Runtime.consoleAPICalled", // Polyfill communication
+            "Page.javascriptDialogOpening", // JS dialogs
+            "Page.fileChooserOpened", // File picker
+        };
+
+        var dominated = false;
+        for (dominated_events) |de| {
+            if (std.mem.eql(u8, method, de)) {
+                dominated = true;
+                break;
+            }
+        }
+        if (!dominated) return;
+
+        // Queue event for main thread
+        self.event_mutex.lock();
+        defer self.event_mutex.unlock();
+
+        if (!self.running.load(.acquire)) return;
+
+        const MAX_EVENT_QUEUE = 100;
+        if (self.event_queue.items.len >= MAX_EVENT_QUEUE) {
+            var old = self.event_queue.orderedRemove(0);
+            old.deinit();
+        }
+
+        const method_copy = self.allocator.dupe(u8, method) catch return;
+        const payload_copy = self.allocator.dupe(u8, payload) catch {
+            self.allocator.free(method_copy);
+            return;
+        };
+
+        self.event_queue.append(self.allocator, .{
+            .method = method_copy,
+            .payload = payload_copy,
+            .allocator = self.allocator,
+        }) catch {
+            self.allocator.free(method_copy);
+            self.allocator.free(payload_copy);
+            return;
+        };
+
+        logToFile("[WS handleEvent] QUEUED method={s} queue_size={d}\n", .{ method, self.event_queue.items.len });
+    }
+
+    /// Get next event from queue (non-blocking)
+    /// Returns method and payload (caller owns both), or null if queue is empty
+    pub fn nextEvent(self: *WebSocketCdpClient) ?struct { method: []u8, payload: []u8 } {
+        self.event_mutex.lock();
+        defer self.event_mutex.unlock();
+
+        if (self.event_queue.items.len == 0) return null;
+
+        const entry = self.event_queue.orderedRemove(0);
+        return .{ .method = entry.method, .payload = entry.payload };
     }
 
     /// Handle screencast frame event (zero-copy to pool)

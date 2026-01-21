@@ -1979,9 +1979,11 @@ pub const Viewer = struct {
 
         var params_buf: [131072]u8 = undefined;
         const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{escaped}) catch return;
-        _ = self.cdp_client.sendCommand("Runtime.evaluate", params) catch |err| {
+        const result = self.cdp_client.sendCommand("Runtime.evaluate", params) catch |err| {
             self.log("[FS] evalJavaScript error: {}\n", .{err});
+            return;
         };
+        self.allocator.free(result);
     }
 
     /// Handle readdir operation
@@ -2244,9 +2246,11 @@ pub const Viewer = struct {
         if (file_path) |path| {
             var params_buf: [2048]u8 = undefined;
             const params = std.fmt.bufPrint(&params_buf, "{{\"action\":\"accept\",\"files\":[\"{s}\"]}}", .{path}) catch return;
-            _ = self.cdp_client.sendCommand("Page.handleFileChooser", params) catch {};
+            const result = self.cdp_client.sendCommand("Page.handleFileChooser", params) catch return;
+            self.allocator.free(result);
         } else {
-            _ = self.cdp_client.sendCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}") catch {};
+            const result = self.cdp_client.sendCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}") catch return;
+            self.allocator.free(result);
         }
     }
 
@@ -2303,9 +2307,11 @@ pub const Viewer = struct {
         else
             std.fmt.bufPrint(&params_buf, "{{\"accept\":{}}}", .{accepted}) catch return;
 
-        _ = self.cdp_client.sendCommand("Page.handleJavaScriptDialog", params) catch |err| {
+        const result = self.cdp_client.sendCommand("Page.handleJavaScriptDialog", params) catch |err| {
             self.log("[DIALOG] closeDialog error: {}\n", .{err});
+            return;
         };
+        self.allocator.free(result);
 
         // Cleanup
         var s = state;

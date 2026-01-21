@@ -41,9 +41,17 @@
     }
   };
 
+  // Create prototype that mimics FileSystemFileHandle
+  const FileHandleProto = {
+    [Symbol.toStringTag]: 'FileSystemFileHandle'
+  };
+
   // Create a FileSystemFileHandle with non-enumerable methods (for IndexedDB compatibility)
   function createFileHandle(path, name) {
-    const handle = { kind: 'file', name: name, _path: path };
+    const handle = Object.create(FileHandleProto);
+    handle.kind = 'file';
+    handle.name = name;
+    handle._path = path;
 
     Object.defineProperties(handle, {
       isSameEntry: { value: function(other) {
@@ -111,9 +119,18 @@
     return handle;
   }
 
+  // Create prototype that mimics FileSystemDirectoryHandle
+  const DirectoryHandleProto = {
+    [Symbol.toStringTag]: 'FileSystemDirectoryHandle'
+  };
+
   // Create a FileSystemDirectoryHandle with non-enumerable methods (for IndexedDB compatibility)
   function createDirectoryHandle(path, name) {
-    const handle = { kind: 'directory', name: name, _path: path };
+    console.log('__TERMWEB_DEBUG__:createDirectoryHandle: ' + path + ' name=' + name);
+    const handle = Object.create(DirectoryHandleProto);
+    handle.kind = 'directory';
+    handle.name = name;
+    handle._path = path;
 
     Object.defineProperties(handle, {
       isSameEntry: { value: function(other) {
@@ -127,6 +144,7 @@
         return relative.split('/').filter(p => p.length > 0);
       }},
       getFileHandle: { value: async function(entryName, options) {
+        console.log('__TERMWEB_DEBUG__:getFileHandle called: ' + entryName + ' in ' + this._path);
         const childPath = this._path + '/' + entryName;
         if (options?.create) await sendRequest('createfile', childPath);
         const stat = await sendRequest('stat', childPath);
@@ -134,6 +152,7 @@
         return createFileHandle(childPath, entryName);
       }},
       getDirectoryHandle: { value: async function(entryName, options) {
+        console.log('__TERMWEB_DEBUG__:getDirectoryHandle called: ' + entryName + ' in ' + this._path);
         const childPath = this._path + '/' + entryName;
         if (options?.create) await sendRequest('mkdir', childPath);
         const stat = await sendRequest('stat', childPath);
@@ -146,12 +165,18 @@
       }},
       entries: { value: function() {
         const dirPath = this._path;
+        console.log('__TERMWEB_DEBUG__:entries called for ' + dirPath);
         let items = null;
         let index = 0;
         return {
           [Symbol.asyncIterator]: function() { return this; },
           next: async function() {
-            if (items === null) items = await sendRequest('readdir', dirPath);
+            console.log('__TERMWEB_DEBUG__:entries.next called, index=' + index);
+            if (items === null) {
+              console.log('__TERMWEB_DEBUG__:entries.next fetching items for ' + dirPath);
+              items = await sendRequest('readdir', dirPath);
+              console.log('__TERMWEB_DEBUG__:entries.next got ' + items.length + ' items');
+            }
             if (index >= items.length) return { done: true, value: undefined };
             const item = items[index++];
             const childPath = dirPath + '/' + item.name;
@@ -163,6 +188,7 @@
         };
       }},
       values: { value: function() {
+        console.log('__TERMWEB_DEBUG__:values called for ' + this._path);
         const entries = this.entries();
         return {
           [Symbol.asyncIterator]: function() { return this; },
@@ -173,6 +199,7 @@
         };
       }},
       keys: { value: function() {
+        console.log('__TERMWEB_DEBUG__:keys called for ' + this._path);
         const entries = this.entries();
         return {
           [Symbol.asyncIterator]: function() { return this; },
@@ -182,7 +209,10 @@
           }
         };
       }},
-      [Symbol.asyncIterator]: { value: function() { return this.entries(); }}
+      [Symbol.asyncIterator]: { value: function() {
+        console.log('__TERMWEB_DEBUG__:[Symbol.asyncIterator] called for ' + this._path);
+        return this.entries();
+      }}
     });
     return handle;
   }
@@ -192,14 +222,19 @@
 
   // Called by Zig when user selects a folder/file
   window.__termwebPickerResult = function(success, path, name, isDirectory) {
+    console.log('__TERMWEB_DEBUG__:pickerResult success=' + success + ' path=' + path + ' name=' + name + ' isDir=' + isDirectory);
     const pending = window.__termwebPendingPicker;
-    if (!pending) return;
+    if (!pending) {
+      console.log('__TERMWEB_DEBUG__:pickerResult ERROR: no pending picker!');
+      return;
+    }
     window.__termwebPendingPicker = null;
 
     if (success) {
       const handle = isDirectory
         ? createDirectoryHandle(path, name)
         : createFileHandle(path, name);
+      console.log('__TERMWEB_DEBUG__:pickerResult resolving with handle:', handle.kind, handle.name);
       pending.resolve(pending.multiple ? [handle] : handle);
     } else {
       pending.reject(new DOMException('User cancelled', 'AbortError'));
