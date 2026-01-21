@@ -6,8 +6,8 @@ var debug_counter: u32 = 0;
 
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
     debug_counter += 1;
-    // Log every 30th call to avoid spam during mouse move
-    if (debug_counter % 30 != 1) return;
+    // Log every 5th call to reduce spam but still capture enough data
+    if (debug_counter % 5 != 1) return;
 
     if (debug_file == null) {
         debug_file = std.fs.createFileAbsolute("/tmp/coord_debug.log", .{ .truncate = true }) catch return;
@@ -16,6 +16,7 @@ fn debugLog(comptime fmt: []const u8, args: anytype) void {
         var buf: [1024]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "[{d}] " ++ fmt ++ "\n", .{debug_counter} ++ args) catch return;
         _ = f.write(msg) catch {};
+        f.sync() catch {}; // Flush immediately
     }
 }
 
@@ -47,10 +48,13 @@ pub const CoordinateMapper = struct {
         viewport_width: u32,
         viewport_height: u32,
     ) CoordinateMapper {
-        return initWithToolbar(terminal_width_px, terminal_height_px, terminal_cols, terminal_rows, viewport_width, viewport_height, null);
+        return initWithToolbar(terminal_width_px, terminal_height_px, terminal_cols, terminal_rows, viewport_width, viewport_height, null, null);
     }
 
-    /// Initialize coordinate mapper with explicit toolbar height
+    /// Initialize coordinate mapper with explicit toolbar height and pixel mode
+    /// pixel_mode: null = auto-detect (true if terminal reports pixel dimensions)
+    ///             true = SGR 1016h pixel coordinates
+    ///             false = SGR 1006h cell coordinates (force cell mode)
     pub fn initWithToolbar(
         terminal_width_px: u16,
         terminal_height_px: u16,
@@ -59,6 +63,7 @@ pub const CoordinateMapper = struct {
         viewport_width: u32,
         viewport_height: u32,
         toolbar_height: ?u16,
+        pixel_mode: ?bool,
     ) CoordinateMapper {
         // Calculate cell dimensions
         const cell_height: u16 = if (terminal_rows > 0)
@@ -82,8 +87,10 @@ pub const CoordinateMapper = struct {
         const content_rows: u16 = content_available / cell_height;
         const content_pixel_height: u16 = content_rows * cell_height;
 
-        // If terminal reports pixel dimensions, assume we're using SGR pixel mode (1016h)
-        const is_pixel_mode = terminal_width_px > 0;
+        // Determine pixel mode: use explicit setting, or auto-detect based on terminal size
+        // Note: Ghostty reports pixel dimensions but uses cell-based mouse coords, so
+        // callers should pass pixel_mode=false for Ghostty
+        const is_pixel_mode = pixel_mode orelse (terminal_width_px > 0);
 
         return CoordinateMapper{
             .terminal_width_px = terminal_width_px,
@@ -177,11 +184,15 @@ pub const CoordinateMapper = struct {
         var browser_x = (@as(u32, pixel_x) * self.viewport_width) / self.terminal_width_px;
         var browser_y = (@as(u32, content_y) * self.viewport_height) / self.content_pixel_height;
 
-        debugLog("in=({},{}) cy={} -> out=({},{}) term={}x{} vp={}x{}", .{
-            pixel_x_in, pixel_y_in, content_y,
+        debugLog("raw=({},{}) px=({},{}) cy={} -> browser=({},{}) term={}x{} content_h={} toolbar={} vp={}x{} pixel_mode={}", .{
+            pixel_x_in, pixel_y_in,
+            pixel_x, pixel_y,
+            content_y,
             browser_x, browser_y,
-            self.terminal_width_px, self.content_pixel_height,
+            self.terminal_width_px, self.terminal_height_px,
+            self.content_pixel_height, self.tabbar_height,
             self.viewport_width, self.viewport_height,
+            self.is_pixel_mode,
         });
 
         // Clamp to viewport bounds

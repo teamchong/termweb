@@ -195,6 +195,10 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         size.width_px / size.cols
     else
         14;
+    const cell_height: u32 = if (size.height_px > 0 and size.rows > 0)
+        size.height_px / size.rows
+    else
+        20;
     if (cell_width > 14) {
         dpr = 2;
         std.debug.print("Detected High-DPI display ({} px/col), scaling viewport by 0.5\n", .{cell_width});
@@ -203,14 +207,17 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Get actual toolbar height (accounts for DPR)
     const toolbar_height = toolbar_mod.getToolbarHeight(cell_width);
 
-    // Reserve space for toolbar at top
+    // Calculate content area height aligned to cell boundaries
+    // This MUST match the content_pixel_height calculation in CoordinateMapper
     const available_height: u32 = if (size.height_px > toolbar_height)
         size.height_px - toolbar_height
     else
         size.height_px;
+    const content_rows: u32 = available_height / cell_height;
+    const content_pixel_height: u32 = content_rows * cell_height;
 
     const viewport_width: u32 = raw_width / dpr;
-    const viewport_height: u32 = available_height / dpr;
+    const viewport_height: u32 = content_pixel_height / dpr;
 
     std.debug.print("Terminal: {}x{} px ({} cols x {} rows)\n", .{
         size.width_px,

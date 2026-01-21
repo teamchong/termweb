@@ -139,6 +139,9 @@ pub const Viewer = struct {
     // Scroll direction (true = natural scrolling inverts delta)
     natural_scroll: bool,
 
+    // Terminal type detection (Ghostty uses cell-based mouse coords, not pixel)
+    is_ghostty: bool,
+
     // Performance profiling
     perf_frame_count: u64,
     perf_total_render_ns: i128,
@@ -234,6 +237,7 @@ pub const Viewer = struct {
             .ui_dirty = true,
             .shm_buffer = shm_buffer,
             .natural_scroll = isNaturalScrollEnabled(),
+            .is_ghostty = isGhosttyTerminal(allocator),
             .perf_frame_count = 0,
             .perf_total_render_ns = 0,
             .perf_max_render_ns = 0,
@@ -276,6 +280,18 @@ pub const Viewer = struct {
     /// Main event loop
     pub fn run(self: *Viewer) !void {
         self.log("[DEBUG] Viewer.run() starting\n", .{});
+        self.log("[DEBUG] Terminal: is_ghostty={}, natural_scroll={}\n", .{ self.is_ghostty, self.natural_scroll });
+
+        // Initialize mouse debug log
+        interact_mod.initDebugLog();
+
+        // Inject mouse debug tracker if TERMWEB_DEBUG_MOUSE=1
+        if (viewer_helpers.envVarTruthy(self.allocator, "TERMWEB_DEBUG_MOUSE")) {
+            self.log("[DEBUG] Injecting mouse debug tracker\n", .{});
+            interact_mod.injectMouseDebugTracker(self.cdp_client, self.allocator) catch |err| {
+                self.log("[DEBUG] Failed to inject mouse debug tracker: {}\n", .{err});
+            };
+        }
 
         var stdout_buf: [262144]u8 = undefined; // 256KB for toolbar graphics
         const stdout_file = std.fs.File.stdout();
@@ -352,6 +368,11 @@ pub const Viewer = struct {
         if (retries >= 100) {
             return error.ScreencastTimeout;
         }
+
+        // Refresh Chrome's actual viewport - critical for coordinate mapping!
+        // Chrome may use different dimensions than what we requested (due to DPI, scrollbars, etc.)
+        self.refreshChromeViewport();
+        self.log("[DEBUG] Chrome actual viewport: {}x{}\n", .{ self.chrome_actual_width, self.chrome_actual_height });
 
         // Get initial navigation state (after page has loaded)
         self.updateNavigationState();
@@ -544,26 +565,34 @@ pub const Viewer = struct {
 
         const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
 
-        // Calculate DPR from cell width (same as cli.zig)
+        // Calculate cell dimensions
         const cell_width: u32 = if (size.cols > 0 and size.width_px > 0)
             size.width_px / size.cols
         else
             14;
+        const cell_height: u32 = if (size.rows > 0 and size.height_px > 0)
+            size.height_px / size.rows
+        else
+            20;
         const dpr: u32 = if (cell_width > 14) 2 else 1;
 
         // Get actual toolbar height (accounts for DPR)
         const toolbar = @import("ui/toolbar.zig");
         const toolbar_height: u32 = toolbar.getToolbarHeight(cell_width);
 
-        // Reserve space for toolbar at top (using actual pixel height, not row count)
+        // Calculate content area height aligned to cell boundaries
+        // This MUST match the content_pixel_height calculation in CoordinateMapper
         const available_height: u32 = if (size.height_px > toolbar_height)
             size.height_px - toolbar_height
         else
             size.height_px;
+        const content_rows: u32 = available_height / cell_height;
+        const content_pixel_height: u32 = content_rows * cell_height;
 
-        // Scale by DPR for browser viewport (matches cli.zig)
+        // Scale by DPR for browser viewport
+        // Use content_pixel_height (cell-aligned) to ensure aspect ratio matches terminal
         const new_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
-        const new_height: u32 = @max(MIN_HEIGHT, available_height / dpr);
+        const new_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
 
         self.log("[RESIZE] New size: {}x{} px, {}x{} cells, toolbar={}px, dpr={} -> viewport {}x{}\n", .{
             size.width_px, size.height_px, size.cols, size.rows, toolbar_height, dpr, new_width, new_height,
@@ -660,8 +689,9 @@ pub const Viewer = struct {
             self.chrome_actual_width,
             self.chrome_actual_height,
             toolbar_h,
+            null, // auto-detect pixel mode
         );
-        self.log("[DEBUG] Coordinate mapper initialized (chrome={}x{})\n", .{ self.chrome_actual_width, self.chrome_actual_height });
+        self.log("[DEBUG] Coordinate mapper initialized (chrome={}x{}, pixel_mode={})\n", .{ self.chrome_actual_width, self.chrome_actual_height, if (self.coord_mapper) |m| m.is_pixel_mode else false });
 
         // Capture screenshot
         self.log("[DEBUG] Capturing screenshot...\n", .{});
@@ -735,19 +765,10 @@ pub const Viewer = struct {
         const frame_width = if (frame.device_width > 0) frame.device_width else self.viewport_width;
         const frame_height = if (frame.device_height > 0) frame.device_height else self.viewport_height;
 
-        // Use screencast frame dimensions for coordinate mapping
-        // The frame is what we actually display - Chrome's viewport may be larger
-        // (e.g., download shelf takes space from viewport but screencast captures the content area)
-        if (frame.device_width > 0 and frame.device_height > 0) {
-            if (frame_width != self.chrome_actual_width or frame_height != self.chrome_actual_height) {
-                self.log("[FRAME] Coord space changed: {}x{} -> {}x{}\n", .{
-                    self.chrome_actual_width, self.chrome_actual_height,
-                    frame_width, frame_height,
-                });
-                self.chrome_actual_width = frame_width;
-                self.chrome_actual_height = frame_height;
-            }
-        }
+        // NOTE: Do NOT use frame dimensions for coordinate mapping!
+        // Screencast frames may be smaller than Chrome's actual viewport due to DPI scaling.
+        // Mouse events must map to Chrome's window.innerWidth/Height (from refreshChromeViewport).
+        // Frame: 886x980 (what we display) vs Chrome viewport: 984x1088 (where clicks go)
 
         // Debug: Log actual frame dimensions from Chrome
         if (self.perf_frame_count < 5) {
@@ -805,16 +826,14 @@ pub const Viewer = struct {
     /// Refresh Chrome's actual viewport dimensions (source of truth for coordinate mapping)
     fn refreshChromeViewport(self: *Viewer) void {
         if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |actual_vp| {
-            self.log("[VIEWPORT] Query returned: {}x{}\n", .{ actual_vp.width, actual_vp.height });
+            self.log("[VIEWPORT] Query returned: {}x{} (current: {}x{})\n", .{
+                actual_vp.width, actual_vp.height,
+                self.chrome_actual_width, self.chrome_actual_height,
+            });
             if (actual_vp.width > 0 and actual_vp.height > 0) {
-                if (actual_vp.width != self.chrome_actual_width or actual_vp.height != self.chrome_actual_height) {
-                    self.log("[VIEWPORT] Chrome actual changed: {}x{} -> {}x{}\n", .{
-                        self.chrome_actual_width, self.chrome_actual_height,
-                        actual_vp.width, actual_vp.height,
-                    });
-                    self.chrome_actual_width = actual_vp.width;
-                    self.chrome_actual_height = actual_vp.height;
-                }
+                // Always update - Chrome's actual viewport is the source of truth
+                self.chrome_actual_width = actual_vp.width;
+                self.chrome_actual_height = actual_vp.height;
             }
         } else |err| {
             self.log("[VIEWPORT] Query failed: {}\n", .{err});
@@ -860,6 +879,7 @@ pub const Viewer = struct {
             self.chrome_actual_width,   // Chrome's actual viewport, not frame size
             self.chrome_actual_height,
             @intCast(toolbar_h),
+            null, // auto-detect pixel mode
         );
 
         self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}, chrome={}x{}, y_off={}\n", .{
