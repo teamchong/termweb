@@ -404,7 +404,15 @@ pub const Viewer = struct {
             // Check for terminal resize (SIGWINCH)
             if (self.terminal.checkResize()) {
                 self.log("[RESIZE] Terminal resized, updating viewport...\n", .{});
-                try self.handleResize();
+                self.handleResize() catch |err| {
+                    // Browser may have closed during resize - exit gracefully
+                    if (err == error.NotOpenForReading or err == error.BrokenPipe) {
+                        self.log("[RESIZE] Browser disconnected, exiting...\n", .{});
+                        self.running = false;
+                        return;
+                    }
+                    return err;
+                };
             }
 
             // Drain ALL pending input to avoid backlog (process up to 100 events per iteration)

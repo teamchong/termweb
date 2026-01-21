@@ -392,7 +392,9 @@ pub const PipeCdpClient = struct {
     fn readerThreadMain(self: *PipeCdpClient) void {
         while (self.running.load(.acquire)) {
             const message = self.readMessage() catch |err| {
+                // Pipe closed (either ConnectionFailed or NotOpenForReading from stopReaderThread)
                 if (err == PipeError.ConnectionFailed) break;
+                if (err == error.NotOpenForReading) break;
                 if (!self.running.load(.acquire)) break;
                 continue;
             };
