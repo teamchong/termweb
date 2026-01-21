@@ -63,10 +63,11 @@ pub const CdpClient = struct {
     session_id: ?[]const u8, // Session ID for page-level commands
     debug_port: u16, // Chrome's debugging port for WebSocket connections
 
-    // WebSocket clients for input (separate from screencast pipe)
+    // WebSocket clients (pipe is ONLY for screencast frames)
     mouse_ws: ?*websocket_cdp.WebSocketCdpClient,
     keyboard_ws: ?*websocket_cdp.WebSocketCdpClient,
     nav_ws: ?*websocket_cdp.WebSocketCdpClient,
+    browser_ws: ?*websocket_cdp.WebSocketCdpClient, // Browser-level for downloads
 
     /// Initialize CDP client from pipe file descriptors
     /// read_fd: FD to read from Chrome (Chrome's FD 4)
@@ -82,6 +83,7 @@ pub const CdpClient = struct {
             .mouse_ws = null,
             .keyboard_ws = null,
             .nav_ws = null,
+            .browser_ws = null,
         };
 
         // Attach to page target to enable page-level commands
@@ -167,13 +169,26 @@ pub const CdpClient = struct {
             const page_result = try client.nav_ws.?.sendCommand("Page.enable", null);
             allocator.free(page_result);
 
-            // Enable downloads on nav_ws to receive download events
-            // Note: Browser.setDownloadBehavior must be called on the WebSocket that will receive events
-            std.debug.print("Enabling downloads on nav_ws...\n", .{});
-            const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
-            defer allocator.free(download_params);
-            const download_result = try client.nav_ws.?.sendCommand("Browser.setDownloadBehavior", download_params);
-            allocator.free(download_result);
+        }
+
+        // Connect browser_ws for Browser domain events (downloads)
+        std.debug.print("Connecting browser_ws...\n", .{});
+        if (client.discoverBrowserWebSocketUrl(allocator)) |browser_url| {
+            defer allocator.free(browser_url);
+            client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch |err| blk: {
+                std.debug.print("[CDP] browser_ws connect failed: {}\n", .{err});
+                break :blk null;
+            };
+            if (client.browser_ws) |bws| {
+                try bws.startReaderThread();
+                std.debug.print("Enabling downloads on browser_ws...\n", .{});
+                const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
+                defer allocator.free(download_params);
+                const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
+                allocator.free(download_result);
+            }
+        } else |_| {
+            std.debug.print("[CDP] Failed to get browser WebSocket URL\n", .{});
         }
 
         std.debug.print("CDP client ready\n", .{});
@@ -234,6 +249,35 @@ pub const CdpClient = struct {
         }
 
         return CdpError.NoPageTarget;
+    }
+
+    /// Discover browser WebSocket URL from /json/version
+    fn discoverBrowserWebSocketUrl(self: *CdpClient, allocator: std.mem.Allocator) ![]const u8 {
+        const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", self.debug_port) catch |err| {
+            return err;
+        };
+        defer stream.close();
+
+        var request_buf: [128]u8 = undefined;
+        const request = std.fmt.bufPrint(&request_buf, "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", .{self.debug_port}) catch return CdpError.OutOfMemory;
+        _ = stream.write(request) catch return CdpError.WebSocketConnectionFailed;
+
+        var buf: [4096]u8 = undefined;
+        const n = stream.read(&buf) catch return CdpError.WebSocketConnectionFailed;
+        const response = buf[0..n];
+
+        const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return CdpError.InvalidResponse;
+        const body = response[header_end + 4 ..];
+
+        var parsed = json.parse(allocator, body) catch return CdpError.InvalidResponse;
+        defer parsed.deinit(allocator);
+
+        if (parsed != .object) return CdpError.InvalidResponse;
+        const url_val = parsed.object.get("webSocketDebuggerUrl") orelse return CdpError.InvalidResponse;
+        if (url_val == .string) {
+            return try allocator.dupe(u8, url_val.string);
+        }
+        return CdpError.InvalidResponse;
     }
 
     /// Attach to a page target to enable page-level commands
@@ -301,6 +345,7 @@ pub const CdpClient = struct {
         if (self.mouse_ws) |ws| ws.deinit();
         if (self.keyboard_ws) |ws| ws.deinit();
         if (self.nav_ws) |ws| ws.deinit();
+        if (self.browser_ws) |ws| ws.deinit();
         if (self.session_id) |sid| self.allocator.free(sid);
         self.pipe_client.deinit();
         self.allocator.destroy(self);
@@ -501,10 +546,21 @@ pub const CdpClient = struct {
         return self.pipe_client.getFrameCount();
     }
 
-    /// Get next event from nav_ws (console messages, dialogs, file chooser)
-    /// Pipe is only for screencast frames - events come from WebSocket
+    /// Get next event from WebSockets
+    /// Pipe is ONLY for screencast frames - all events come from WebSockets
     pub fn nextEvent(self: *CdpClient, allocator: std.mem.Allocator) !?CdpEvent {
         _ = allocator;
+        // Check browser_ws for download events
+        if (self.browser_ws) |bws| {
+            if (bws.nextEvent()) |raw| {
+                return CdpEvent{
+                    .method = raw.method,
+                    .payload = raw.payload,
+                    .allocator = bws.allocator,
+                };
+            }
+        }
+        // Check nav_ws for page events
         const ws = self.nav_ws orelse return null;
         const raw = ws.nextEvent() orelse return null;
         return CdpEvent{
