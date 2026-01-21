@@ -121,45 +121,14 @@ pub fn typeText(
     allocator: std.mem.Allocator,
     text: []const u8,
 ) !void {
-    // Check if text contains newlines - use synthetic paste event for multi-line
-    const has_newline = std.mem.indexOf(u8, text, "\n") != null;
-
     // Escape special characters for JSON
     var escape_buf: [65536]u8 = undefined;
     const escaped = json.escapeContents(text, &escape_buf) catch return;
 
-    if (has_newline) {
-        // Dispatch synthetic paste event - editors should handle this without auto-indent
-        const js = std.fmt.allocPrint(allocator,
-            \\(function() {{
-            \\  const el = document.activeElement;
-            \\  if (!el) return false;
-            \\  const dt = new DataTransfer();
-            \\  dt.setData('text/plain', "{s}");
-            \\  const evt = new ClipboardEvent('paste', {{
-            \\    bubbles: true,
-            \\    cancelable: true,
-            \\    clipboardData: dt
-            \\  }});
-            \\  return el.dispatchEvent(evt);
-            \\}})()
-            , .{escaped}) catch return;
-        defer allocator.free(js);
-
-        var js_escape_buf: [131072]u8 = undefined;
-        const js_escaped = json.escapeString(js, &js_escape_buf) catch return;
-
-        var params_buf: [131072]u8 = undefined;
-        const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{js_escaped}) catch return;
-
-        // Use nav_ws for Runtime.evaluate (pipe is for screencast only)
-        client.sendNavCommandAsync("Runtime.evaluate", params);
-    } else {
-        // Single line: use insertText directly
-        const params = std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped}) catch return;
-        defer allocator.free(params);
-        client.sendKeyboardCommandAsync("Input.insertText", params);
-    }
+    // Use Input.insertText - works across all frames including iframes
+    const params = std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped}) catch return;
+    defer allocator.free(params);
+    client.sendKeyboardCommandAsync("Input.insertText", params);
 }
 
 /// Toggle checkbox using JavaScript
@@ -226,7 +195,6 @@ pub fn injectClipboardInterceptor(client: *cdp.CdpClient, allocator: std.mem.All
 /// Uses async command to avoid blocking/hanging on exit
 /// Also increments version counter so JS polling knows data was updated
 pub fn updateBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocator, text: []const u8) !void {
-    _ = allocator;
 
     // Limit text size to avoid buffer overflow
     const max_len = 8000;
@@ -248,9 +216,10 @@ pub fn updateBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocat
     var params_buf: [131072]u8 = undefined;
     const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{json_escaped}) catch return;
 
-    // Use nav_ws async to avoid blocking - fire and forget
+    // Use nav_ws synchronously to ensure clipboard is set before Cmd+V is sent
     // IMPORTANT: Don't use pipe for this - pipe is for screencast only
-    client.sendNavCommandAsync("Runtime.evaluate", params);
+    const result = client.sendNavCommand("Runtime.evaluate", params) catch return;
+    allocator.free(result);
 }
 
 /// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket

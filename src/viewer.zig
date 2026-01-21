@@ -1044,10 +1044,7 @@ pub const Viewer = struct {
                 defer self.allocator.free(text);
                 // Terminal sent bracketed paste (Cmd+V intercepted by terminal)
                 if (self.mode == .normal) {
-                    self.log("[PASTE] Bracketed paste: {d} bytes\n", .{text.len});
-                    // Also sync to browser clipboard for web apps that use Clipboard API
-                    interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, text) catch {};
-                    // Use typeText for reliable direct text insertion
+                    // Use typeText for reliable direct text insertion (works with Monaco)
                     interact_mod.typeText(self.cdp_client, self.allocator, text) catch {};
                 } else if (self.mode == .url_prompt) {
                     // Paste into URL bar

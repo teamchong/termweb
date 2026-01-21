@@ -41,16 +41,43 @@
     };
   }
 
+  // Helper to get clipboard data from this frame or parent frames
+  function getClipboardData() {
+    // Check local window
+    if (window._termwebClipboardData) return window._termwebClipboardData;
+    // Check parent frames (for iframes like Monaco)
+    try {
+      let w = window.parent;
+      while (w && w !== window) {
+        if (w._termwebClipboardData) return w._termwebClipboardData;
+        if (w === w.parent) break;
+        w = w.parent;
+      }
+    } catch(e) {} // Cross-origin frames will throw
+    // Check top
+    try {
+      if (window.top && window.top._termwebClipboardData) return window.top._termwebClipboardData;
+    } catch(e) {}
+    return '';
+  }
+
   // Hook navigator.clipboard.readText
   if (navigator.clipboard && navigator.clipboard.readText) {
     navigator.clipboard.readText = async function() {
+      // If data already set (from Cmd+V path), return immediately
+      const data = getClipboardData();
+      if (data) {
+        console.log('[TERMWEB] readText returning cached data, len=' + data.length);
+        return data;
+      }
+      // Otherwise request from host (for menu paste)
       const ver = window._termwebClipboardVersion;
       console.log('__TERMWEB_CLIPBOARD_REQUEST__');
       for (let i = 0; i < 20; i++) {
         await new Promise(r => setTimeout(r, 10));
         if (window._termwebClipboardVersion > ver) break;
       }
-      return window._termwebClipboardData || '';
+      return getClipboardData();
     };
   }
 
