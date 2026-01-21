@@ -544,19 +544,29 @@ pub const Viewer = struct {
 
         const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
 
-        // Reserve 1 row for tab bar at top (no status bar)
-        const row_height: u32 = if (size.height_px > 0 and size.rows > 0)
-            @as(u32, size.height_px) / size.rows
+        // Calculate DPR from cell width (same as cli.zig)
+        const cell_width: u32 = if (size.cols > 0 and size.width_px > 0)
+            size.width_px / size.cols
         else
-            20;
-        const content_rows: u32 = if (size.rows > 1) size.rows - 1 else 1;
-        const available_height = content_rows * row_height;
+            14;
+        const dpr: u32 = if (cell_width > 14) 2 else 1;
 
-        const new_width: u32 = @max(MIN_WIDTH, raw_width);
-        const new_height: u32 = @max(MIN_HEIGHT, available_height);
+        // Get actual toolbar height (accounts for DPR)
+        const toolbar = @import("ui/toolbar.zig");
+        const toolbar_height: u32 = toolbar.getToolbarHeight(cell_width);
 
-        self.log("[RESIZE] New size: {}x{} px, {}x{} cells -> viewport {}x{}\n", .{
-            size.width_px, size.height_px, size.cols, size.rows, new_width, new_height,
+        // Reserve space for toolbar at top (using actual pixel height, not row count)
+        const available_height: u32 = if (size.height_px > toolbar_height)
+            size.height_px - toolbar_height
+        else
+            size.height_px;
+
+        // Scale by DPR for browser viewport (matches cli.zig)
+        const new_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
+        const new_height: u32 = @max(MIN_HEIGHT, available_height / dpr);
+
+        self.log("[RESIZE] New size: {}x{} px, {}x{} cells, toolbar={}px, dpr={} -> viewport {}x{}\n", .{
+            size.width_px, size.height_px, size.cols, size.rows, toolbar_height, dpr, new_width, new_height,
         });
 
         // Skip if dimensions haven't changed significantly
