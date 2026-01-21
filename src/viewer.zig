@@ -1286,9 +1286,14 @@ pub const Viewer = struct {
                     // Click is in tab bar - handle button clicks
                     // We handle this on PRESS for immediate feedback (like most UI buttons)
                     const mouse_pixels = self.mouseToPixels();
-                    self.log("[CLICK] In tab bar: mouse=({},{}) pixels=({},{}) tabbar_height={}\n", .{
-                        self.mouse_x, self.mouse_y, mouse_pixels.x, mouse_pixels.y, mapper.tabbar_height,
+                    self.log("[CLICK] In tab bar: mouse=({},{}) pixels=({},{}) tabbar_height={} is_pixel_mode={}\n", .{
+                        self.mouse_x, self.mouse_y, mouse_pixels.x, mouse_pixels.y, mapper.tabbar_height, mapper.is_pixel_mode,
                     });
+                    if (self.toolbar_renderer) |*tr| {
+                        self.log("[CLICK] Toolbar: btn_size={} btn_pad={} toolbar_h={}\n", .{
+                            tr.button_size, tr.button_padding, tr.toolbar_height,
+                        });
+                    }
                     try self.handleTabBarClick(mouse_pixels.x, mouse_pixels.y, mapper);
                 }
             },
