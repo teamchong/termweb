@@ -1114,19 +1114,6 @@ pub const Viewer = struct {
                     return;
                 }
 
-                // Normal mode: ESC quits the app
-                if (self.mode == .normal) {
-                    const should_quit = switch (key) {
-                        .escape => true,
-                        else => false,
-                    };
-
-                    if (should_quit) {
-                        self.running = false;
-                        return;
-                    }
-                }
-
                 try self.handleKey(key_input);
             },
             .mouse => |mouse| try self.handleMouse(mouse),
@@ -1782,7 +1769,7 @@ pub const Viewer = struct {
                 try writer.print(" | [Enter] submit [Esc] cancel", .{});
             },
             .help => {
-                try writer.print("HELP | [?] or [q] to close | [Ctrl+Q/W/C] or [ESC] to quit", .{});
+                try writer.print("HELP | [?] or [q] to close | [Ctrl+Q/W/C] to quit", .{});
             },
             .dialog => {
                 // Dialog mode - status shown in dialog overlay
