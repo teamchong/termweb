@@ -1,6 +1,7 @@
 /// Toolbar rendering using Kitty graphics protocol
 /// Renders macOS-style SVG button images with proper font rendering
 const std = @import("std");
+const builtin = @import("builtin");
 const kitty_mod = @import("../terminal/kitty_graphics.zig");
 const svg_mod = @import("svg.zig");
 const font_mod = @import("font.zig");
@@ -229,6 +230,153 @@ pub const ToolbarRenderer = struct {
     pub fn handleEnd(self: *ToolbarRenderer) void {
         self.clearSelection();
         self.url_cursor = self.url_len;
+    }
+
+    /// Handle Shift+Left - extend selection left
+    pub fn handleSelectLeft(self: *ToolbarRenderer) void {
+        if (self.url_cursor == 0) return;
+
+        // Start selection at current cursor if no selection exists
+        if (self.url_select_start == null) {
+            self.url_select_start = self.url_cursor;
+        }
+
+        self.url_cursor -= 1;
+        self.url_select_end = self.url_cursor;
+    }
+
+    /// Handle Shift+Right - extend selection right
+    pub fn handleSelectRight(self: *ToolbarRenderer) void {
+        if (self.url_cursor >= self.url_len) return;
+
+        // Start selection at current cursor if no selection exists
+        if (self.url_select_start == null) {
+            self.url_select_start = self.url_cursor;
+        }
+
+        self.url_cursor += 1;
+        self.url_select_end = self.url_cursor;
+    }
+
+    /// Handle Shift+Home - select from cursor to beginning
+    pub fn handleSelectHome(self: *ToolbarRenderer) void {
+        if (self.url_cursor == 0) return;
+
+        if (self.url_select_start == null) {
+            self.url_select_start = self.url_cursor;
+        }
+
+        self.url_cursor = 0;
+        self.url_select_end = 0;
+    }
+
+    /// Handle Shift+End - select from cursor to end
+    pub fn handleSelectEnd(self: *ToolbarRenderer) void {
+        if (self.url_cursor >= self.url_len) return;
+
+        if (self.url_select_start == null) {
+            self.url_select_start = self.url_cursor;
+        }
+
+        self.url_cursor = self.url_len;
+        self.url_select_end = self.url_len;
+    }
+
+    /// Handle Ctrl+A - select all
+    pub fn handleSelectAll(self: *ToolbarRenderer) void {
+        self.url_select_start = 0;
+        self.url_select_end = self.url_len;
+        self.url_cursor = self.url_len;
+    }
+
+    /// Handle Delete key - forward delete
+    pub fn handleDelete(self: *ToolbarRenderer) void {
+        if (!self.url_focused) return;
+
+        // If there's a selection, delete it
+        if (self.hasSelection()) {
+            self.deleteSelection();
+            return;
+        }
+
+        // Delete character at cursor (forward delete)
+        if (self.url_cursor < self.url_len) {
+            var i = self.url_cursor;
+            while (i < self.url_len - 1) : (i += 1) {
+                self.url_buffer[i] = self.url_buffer[i + 1];
+            }
+            self.url_len -= 1;
+        }
+    }
+
+    /// Handle Ctrl+Left - move cursor to previous word boundary
+    pub fn handleWordLeft(self: *ToolbarRenderer) void {
+        self.clearSelection();
+        if (self.url_cursor == 0) return;
+
+        // Skip any trailing spaces
+        while (self.url_cursor > 0 and self.url_buffer[self.url_cursor - 1] == ' ') {
+            self.url_cursor -= 1;
+        }
+
+        // Skip to beginning of word
+        while (self.url_cursor > 0 and self.url_buffer[self.url_cursor - 1] != ' ') {
+            self.url_cursor -= 1;
+        }
+    }
+
+    /// Handle Ctrl+Right - move cursor to next word boundary
+    pub fn handleWordRight(self: *ToolbarRenderer) void {
+        self.clearSelection();
+        if (self.url_cursor >= self.url_len) return;
+
+        // Skip current word
+        while (self.url_cursor < self.url_len and self.url_buffer[self.url_cursor] != ' ') {
+            self.url_cursor += 1;
+        }
+
+        // Skip spaces after word
+        while (self.url_cursor < self.url_len and self.url_buffer[self.url_cursor] == ' ') {
+            self.url_cursor += 1;
+        }
+    }
+
+    /// Handle Ctrl+X - cut selected text to clipboard
+    pub fn handleCut(self: *ToolbarRenderer, allocator: std.mem.Allocator) void {
+        if (!self.hasSelection()) return;
+
+        // Copy first
+        self.handleCopy(allocator);
+
+        // Then delete
+        self.deleteSelection();
+    }
+
+    /// Handle Ctrl+C - copy selected text to clipboard
+    pub fn handleCopy(self: *ToolbarRenderer, allocator: std.mem.Allocator) void {
+        const bounds = self.getSelectionBounds() orelse return;
+        const text = self.url_buffer[bounds.start..bounds.end];
+        if (text.len == 0) return;
+
+        copyToClipboard(allocator, text);
+    }
+
+    /// Handle Ctrl+V - paste text from clipboard
+    pub fn handlePaste(self: *ToolbarRenderer, allocator: std.mem.Allocator) void {
+        const text = pasteFromClipboard(allocator) orelse return;
+        defer allocator.free(text);
+
+        // If there's a selection, delete it first
+        if (self.hasSelection()) {
+            self.deleteSelection();
+        }
+
+        // Insert pasted text at cursor
+        for (text) |c| {
+            if (c >= 32 and c <= 126 and c != '\n' and c != '\r') {
+                self.handleChar(c);
+            }
+        }
     }
 
     /// Check if there's an active selection
@@ -585,4 +733,63 @@ fn generateToolbarBg(allocator: std.mem.Allocator, width: u32, height: u32) ![]u
     }
 
     return data;
+}
+
+/// Copy text to system clipboard (macOS: pbcopy, Linux: xclip)
+fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) void {
+    const argv = if (builtin.os.tag == .macos)
+        &[_][]const u8{"pbcopy"}
+    else
+        &[_][]const u8{ "xclip", "-selection", "clipboard" };
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return;
+
+    if (child.stdin) |stdin| {
+        stdin.writeAll(text) catch {};
+        stdin.close();
+        child.stdin = null;
+    }
+
+    _ = child.wait() catch {};
+}
+
+/// Paste text from system clipboard (macOS: pbpaste, Linux: xclip -o)
+fn pasteFromClipboard(allocator: std.mem.Allocator) ?[]u8 {
+    const argv = if (builtin.os.tag == .macos)
+        &[_][]const u8{"pbpaste"}
+    else
+        &[_][]const u8{ "xclip", "-selection", "clipboard", "-o" };
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return null;
+
+    const stdout = child.stdout orelse return null;
+
+    // Read all output from the pipe
+    var result = std.ArrayList(u8).initCapacity(allocator, 0) catch return null;
+    defer result.deinit(allocator);
+
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        const n = stdout.read(&buf) catch break;
+        if (n == 0) break;
+        result.appendSlice(allocator, buf[0..n]) catch break;
+    }
+
+    _ = child.wait() catch {};
+
+    if (result.items.len == 0) {
+        return null;
+    }
+
+    return result.toOwnedSlice(allocator) catch null;
 }

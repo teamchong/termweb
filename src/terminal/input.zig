@@ -174,6 +174,69 @@ pub const InputReader = struct {
             };
         }
 
+        // xterm-style modified cursor keys: ESC [ 1 ; mod A/B/C/D/H/F
+        // Also handles: ESC [ 1 ; mod : event A/B/C/D/H/F (Kitty extended)
+        // H = Home, F = End (in application cursor mode)
+        const last_char = self.escape_buffer[self.escape_len - 1];
+        if (last_char == 'A' or last_char == 'B' or last_char == 'C' or last_char == 'D' or
+            last_char == 'H' or last_char == 'F')
+        {
+            // Parse the key
+            const key: Key = switch (last_char) {
+                'A' => .up,
+                'B' => .down,
+                'C' => .right,
+                'D' => .left,
+                'H' => .home,
+                'F' => .end,
+                else => unreachable,
+            };
+
+            // Try to extract modifiers from the sequence
+            // Format: ESC [ 1 ; mod A  or  ESC [ 1 ; mod : event A
+            var cdp_mods: u8 = 0;
+            if (self.escape_len > 3) {
+                // Find semicolon position
+                var semi_pos: ?usize = null;
+                var colon_pos: ?usize = null;
+                for (self.escape_buffer[2 .. self.escape_len - 1], 0..) |byte, i| {
+                    if (byte == ';' and semi_pos == null) {
+                        semi_pos = i + 2;
+                    } else if (byte == ':' and colon_pos == null) {
+                        colon_pos = i + 2;
+                    }
+                }
+
+                if (semi_pos) |sp| {
+                    // Parse modifier number after semicolon
+                    const mod_end = colon_pos orelse (self.escape_len - 1);
+                    if (mod_end > sp + 1) {
+                        const mod_str = self.escape_buffer[sp + 1 .. mod_end];
+                        const raw_mod = std.fmt.parseInt(u16, mod_str, 10) catch 1;
+
+                        // Kitty protocol: modifier bits are (raw_mod - 1)
+                        // Kitty bits: 1=shift, 2=alt, 4=ctrl, 8=super, 16=hyper, 32=meta, 64=caps_lock
+                        // xterm style: 2=shift, 3=alt, 5=ctrl, etc (value = 1 + sum of bits)
+                        // Both use offset-by-1 encoding, so we subtract 1 to get the actual bits
+                        const mod_bits = if (raw_mod > 0) raw_mod - 1 else 0;
+
+                        // Extract modifier flags (Kitty-style bit positions)
+                        const shift = (mod_bits & 1) != 0;
+                        const alt = (mod_bits & 2) != 0;
+                        const ctrl = (mod_bits & 4) != 0;
+                        // Note: super(8), hyper(16), meta(32), caps_lock(64) are ignored
+
+                        // Convert to CDP: 8=shift, 2=ctrl, 1=alt, 4=meta
+                        cdp_mods = (if (shift) @as(u8, 8) else 0) |
+                            (if (ctrl) @as(u8, 2) else 0) |
+                            (if (alt) @as(u8, 1) else 0);
+                    }
+                }
+            }
+
+            return .{ .key = .{ .key = key, .modifiers = cdp_mods } };
+        }
+
         // Mouse: ESC [ < ... M/m
         // Always try to parse mouse sequences to consume them properly
         // (even when disabled, we need to find the terminator)
@@ -209,35 +272,62 @@ pub const InputReader = struct {
             }
         }
 
-        // Function/nav keys: ESC [ N ~
+        // Function/nav keys: ESC [ N ~ or ESC [ N ; mod ~
         // Look for terminating ~
         if (self.escape_buffer[self.escape_len - 1] == '~') {
-            const num_start = 2;
-            const num_end = self.escape_len - 1;
-            const num_str = self.escape_buffer[num_start..num_end];
+            // Find semicolon to separate key code from modifiers
+            var semi_pos: ?usize = null;
+            for (self.escape_buffer[2 .. self.escape_len - 1], 0..) |byte, i| {
+                if (byte == ';') {
+                    semi_pos = i + 2;
+                    break;
+                }
+            }
+
+            const num_end = semi_pos orelse (self.escape_len - 1);
+            const num_str = self.escape_buffer[2..num_end];
             const num = std.fmt.parseInt(u8, num_str, 10) catch return null;
 
-            return switch (num) {
-                1 => .{ .key = .{ .key = .home } },
-                2 => .{ .key = .{ .key = .insert } },
-                3 => .{ .key = .{ .key = .delete } },
-                4 => .{ .key = .{ .key = .end } },
-                5 => .{ .key = .{ .key = .page_up } },
-                6 => .{ .key = .{ .key = .page_down } },
-                11 => .{ .key = .{ .key = .f1 } },
-                12 => .{ .key = .{ .key = .f2 } },
-                13 => .{ .key = .{ .key = .f3 } },
-                14 => .{ .key = .{ .key = .f4 } },
-                15 => .{ .key = .{ .key = .f5 } },
-                17 => .{ .key = .{ .key = .f6 } },
-                18 => .{ .key = .{ .key = .f7 } },
-                19 => .{ .key = .{ .key = .f8 } },
-                20 => .{ .key = .{ .key = .f9 } },
-                21 => .{ .key = .{ .key = .f10 } },
-                23 => .{ .key = .{ .key = .f11 } },
-                24 => .{ .key = .{ .key = .f12 } },
+            // Parse modifiers if present
+            var cdp_mods: u8 = 0;
+            if (semi_pos) |sp| {
+                const mod_str = self.escape_buffer[sp + 1 .. self.escape_len - 1];
+                const raw_mod = std.fmt.parseInt(u16, mod_str, 10) catch 1;
+                const mod_bits = if (raw_mod > 0) raw_mod - 1 else 0;
+                const shift = (mod_bits & 1) != 0;
+                const alt = (mod_bits & 2) != 0;
+                const ctrl = (mod_bits & 4) != 0;
+                cdp_mods = (if (shift) @as(u8, 8) else 0) |
+                    (if (ctrl) @as(u8, 2) else 0) |
+                    (if (alt) @as(u8, 1) else 0);
+            }
+
+            const key: ?Key = switch (num) {
+                1 => .home,
+                2 => .insert,
+                3 => .delete,
+                4 => .end,
+                5 => .page_up,
+                6 => .page_down,
+                11 => .f1,
+                12 => .f2,
+                13 => .f3,
+                14 => .f4,
+                15 => .f5,
+                17 => .f6,
+                18 => .f7,
+                19 => .f8,
+                20 => .f9,
+                21 => .f10,
+                23 => .f11,
+                24 => .f12,
                 else => null,
             };
+
+            if (key) |k| {
+                return .{ .key = .{ .key = k, .modifiers = cdp_mods } };
+            }
+            return null;
         }
 
         // Kitty keyboard protocol: ESC [ code u or ESC [ code ; modifiers u

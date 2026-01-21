@@ -13,6 +13,7 @@ const coordinates_mod = @import("terminal/coordinates.zig");
 const cdp = @import("chrome/cdp_client.zig");
 const screenshot_api = @import("chrome/screenshot.zig");
 const scroll_api = @import("chrome/scroll.zig");
+const mouse_event_bus = @import("mouse_event_bus.zig");
 const dom_mod = @import("chrome/dom.zig");
 const interact_mod = @import("chrome/interact.zig");
 const download_mod = @import("chrome/download.zig");
@@ -157,7 +158,10 @@ pub const Viewer = struct {
     mouse_buttons: u32, // Bitmask of currently pressed buttons
     cursor_image_id: ?u32,  // Track cursor image ID for cleanup
 
-    // Input throttling
+    // Mouse event bus (decouples recording from dispatch)
+    event_bus: mouse_event_bus.MouseEventBus,
+
+    // Input throttling (deprecated - event bus handles mouse throttling)
     last_input_time: i128,
     last_mouse_move_time: i128,  // Separate throttle for mouse move events
 
@@ -264,6 +268,7 @@ pub const Viewer = struct {
             .mouse_visible = false,
             .mouse_buttons = 0,
             .cursor_image_id = null,
+            .event_bus = mouse_event_bus.MouseEventBus.init(cdp_client, allocator, isNaturalScrollEnabled()),
             .last_input_time = 0,
             .last_mouse_move_time = 0,
             .last_rendered_generation = 0,
@@ -454,6 +459,9 @@ pub const Viewer = struct {
                 }
                 try self.handleInput(input);
             }
+
+            // Tick mouse event bus (dispatch pending events at 30fps)
+            self.event_bus.maybeTick();
 
             // Render new screencast frames (non-blocking) - only in normal mode
             if (self.screencast_mode and self.mode == .normal) {
@@ -1125,37 +1133,9 @@ pub const Viewer = struct {
         }
     }
 
-    // Mouse event priority and rate limits (click overrides all):
-    // 1. Click (press/release) - HIGH PRIORITY - never dropped, always immediate
-    //    Includes internal mouseMoved->mousePressed->mouseReleased sequence
-    // 2. Wheel - MEDIUM PRIORITY - 60fps (16ms) - can be dropped if too fast
-    // 3. Move/drag - LOW PRIORITY - 30fps (33ms) - most aggressive throttling
-    const MOUSE_WHEEL_INTERVAL_NS = 16 * std.time.ns_per_ms; // 60fps
-    const MOUSE_MOVE_INTERVAL_NS = 33 * std.time.ns_per_ms; // 30fps
-
-    /// Handle mouse event - dispatches to mode-specific handlers
+    /// Handle mouse event - records to event bus and dispatches to mode-specific handlers
+    /// Throttling/prioritization is handled by the event bus (30fps tick)
     fn handleMouse(self: *Viewer, mouse: MouseEvent) !void {
-        const now = std.time.nanoTimestamp();
-
-        // Priority-based rate limiting: click > wheel > move
-        switch (mouse.type) {
-            .press, .release => {}, // HIGH PRIORITY - always process clicks
-            .wheel => {
-                // MEDIUM PRIORITY - throttle wheel to 60fps
-                if (now - self.last_input_time < MOUSE_WHEEL_INTERVAL_NS) {
-                    return;
-                }
-                self.last_input_time = now;
-            },
-            .move, .drag => {
-                // LOW PRIORITY - throttle moves to 30fps
-                if (now - self.last_mouse_move_time < MOUSE_MOVE_INTERVAL_NS) {
-                    return;
-                }
-                self.last_mouse_move_time = now;
-            },
-        }
-
         // Normalize mouse coordinates:
         // - SGR 1006 (cell mode): 1-indexed, need to subtract 1
         // - SGR 1016 (pixel mode): 0-indexed, no adjustment needed
@@ -1182,7 +1162,22 @@ pub const Viewer = struct {
             });
         }
 
-        // Dispatch to mode-specific handlers
+        // Get viewport size for event bus
+        const term_size = self.terminal.getSize() catch terminal_mod.TerminalSize{
+            .cols = 80,
+            .rows = 24,
+            .width_px = 800,
+            .height_px = 600,
+        };
+
+        // Update event bus coord mapper reference and record the event
+        // The bus handles all throttling/prioritization and dispatches at 30fps
+        if (self.coord_mapper) |*mapper| {
+            self.event_bus.setCoordMapper(mapper);
+        }
+        self.mouse_buttons = self.event_bus.record(mouse, norm_x, norm_y, term_size.width_px, term_size.height_px);
+
+        // Dispatch to mode-specific handlers (for local UI interactions only)
         switch (self.mode) {
             .normal => try self.handleMouseNormal(mouse),
             .url_prompt => {
@@ -1300,54 +1295,16 @@ pub const Viewer = struct {
         }
     }
 
-    /// Handle mouse event in normal mode
+    /// Handle mouse event in normal mode - local UI interactions only
+    /// CDP dispatch is handled by the event bus (30fps tick)
     fn handleMouseNormal(self: *Viewer, mouse: MouseEvent) !void {
         const mapper = self.coord_mapper orelse return;
 
-        // Determine button mask and name
-        var button_mask: u32 = 0;
-        var button_name: []const u8 = "none";
-        
-        switch (mouse.button) {
-            .left => { button_mask = 1; button_name = "left"; },
-            .right => { button_mask = 2; button_name = "right"; },
-            .middle => { button_mask = 4; button_name = "middle"; },
-            else => {},
-        }
-
         switch (mouse.type) {
             .press => {
-                // Update button state (add pressed button)
-                self.mouse_buttons |= button_mask;
-
-                // Log mapper details for debugging (if enabled)
-                if (self.debug_input) {
-                    self.log("[MOUSE] Press: {} ({s}) mask={} total={}\n", .{
-                        mouse.button, button_name, button_mask, self.mouse_buttons
-                    });
-                }
-
+                // Check if click is in browser area or tab bar
                 if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
-                    self.log("[COORD] -> browser=({},{})\n", .{ coords.x, coords.y });
-
-                    self.log("[INPUT] Sending mousePressed: ({},{}) button={s} buttons={} clickCount=1\n", .{
-                        coords.x, coords.y, button_name, self.mouse_buttons
-                    });
-
-                    // WORKAROUND: Try both mousePressed and click
-                    try interact_mod.sendMouseEvent(
-                        self.cdp_client,
-                        self.allocator,
-                        "mousePressed",
-                        coords.x,
-                        coords.y,
-                        button_name,
-                        self.mouse_buttons,
-                        1
-                    );
-
                     // Store click info for status line display
-                    // Note: This is now just "last interaction position" effectively
                     if (mouse.button == .left) {
                         self.last_click = .{
                             .term_x = self.mouse_x,
@@ -1359,42 +1316,20 @@ pub const Viewer = struct {
                         self.updateNavigationState();
                     }
                 } else {
-                    // Click is in tab bar - handle button clicks
+                    // Click is in tab bar - handle button clicks locally
                     // We handle this on PRESS for immediate feedback (like most UI buttons)
                     const mouse_pixels = self.mouseToPixels();
                     self.log("[CLICK] In tab bar: mouse=({},{}) pixels=({},{}) tabbar_height={} is_pixel_mode={}\n", .{
                         self.mouse_x, self.mouse_y, mouse_pixels.x, mouse_pixels.y, mapper.tabbar_height, mapper.is_pixel_mode,
                     });
-                    if (self.toolbar_renderer) |*tr| {
-                        self.log("[CLICK] Toolbar: btn_size={} btn_pad={} toolbar_h={}\n", .{
-                            tr.button_size, tr.button_padding, tr.toolbar_height,
-                        });
-                    }
                     try self.handleTabBarClick(mouse_pixels.x, mouse_pixels.y, mapper);
                 }
             },
             .release => {
-                // Update button state (remove released button)
-                self.mouse_buttons &= ~button_mask;
-
-                if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
-                    self.log("[INPUT] Sending mouseReleased: ({},{}) button={s} buttons={} clickCount=1\n", .{
-                        coords.x, coords.y, button_name, self.mouse_buttons
-                    });
-                    try interact_mod.sendMouseEvent(
-                        self.cdp_client,
-                        self.allocator,
-                        "mouseReleased",
-                        coords.x,
-                        coords.y,
-                        button_name, // Release event needs the button that changed state
-                        self.mouse_buttons,
-                        1
-                    );
-                }
+                // No local UI handling needed for release
             },
             .move, .drag => {
-                // Check if mouse is hovering over toolbar buttons
+                // Check if mouse is hovering over toolbar buttons (local UI)
                 if (self.toolbar_renderer) |*renderer| {
                     // Track previous hover states
                     const old_close = renderer.close_hover;
@@ -1411,7 +1346,6 @@ pub const Viewer = struct {
                     renderer.url_bar_hover = false;
 
                     // Set hover for the button under cursor
-                    // Convert mouse coordinates to pixels for toolbar hit testing
                     const mouse_pixels = self.mouseToPixels();
                     if (renderer.hitTest(mouse_pixels.x, mouse_pixels.y)) |button| {
                         switch (button) {
@@ -1439,51 +1373,10 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 }
-
-                // Forward mouse move to Chrome for hover and drag effects
-                if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
-                    try interact_mod.sendMouseEvent(
-                        self.cdp_client, 
-                        self.allocator, 
-                        "mouseMoved", 
-                        coords.x, 
-                        coords.y, 
-                        "none", // Move events don't have a "changed" button
-                        self.mouse_buttons, 
-                        0
-                    );
-                }
             },
             .wheel => {
-                // Throttling already handled in handleMouse (60fps)
-                // Get viewport size for scroll calculations
-                const size = try self.terminal.getSize();
-                const vw = size.width_px;
-                const vh = size.height_px;
-
-                // Scroll based on delta_y direction
-                // Natural scroll: swipe up = scroll down (content moves up)
-                // Traditional: swipe up = scroll up (content moves down)
-                const scroll_down = if (self.natural_scroll)
-                    mouse.delta_y < 0  // Natural: negative delta = scroll down
-                else
-                    mouse.delta_y > 0; // Traditional: positive delta = scroll down
-
-                if (mouse.delta_y != 0) {
-                    if (scroll_down) {
-                        if (self.debug_input) {
-                            self.log("[MOUSE] Wheel scroll down (natural={})\n", .{self.natural_scroll});
-                        }
-                        try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
-                    } else {
-                        if (self.debug_input) {
-                            self.log("[MOUSE] Wheel scroll up (natural={})\n", .{self.natural_scroll});
-                        }
-                        try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
-                    }
-                }
+                // Wheel events are fully handled by the event bus
             },
-
         }
     }
 
@@ -1491,7 +1384,7 @@ pub const Viewer = struct {
     fn handleKey(self: *Viewer, key_input: KeyInput) !void {
         switch (self.mode) {
             .normal => try self.handleNormalMode(key_input),
-            .url_prompt => try self.handleUrlPromptMode(key_input.key),
+            .url_prompt => try self.handleUrlPromptMode(key_input),
             .form_mode => try self.handleFormMode(key_input.key),
             .text_input => try self.handleTextInputMode(key_input.key),
             .help => {}, // Help mode only responds to Esc (handled in handleInput)
@@ -1549,7 +1442,12 @@ pub const Viewer = struct {
     }
 
     /// Handle key press in URL prompt mode
-    fn handleUrlPromptMode(self: *Viewer, key: Key) !void {
+    fn handleUrlPromptMode(self: *Viewer, key_input: KeyInput) !void {
+        const key = key_input.key;
+        const mods = key_input.modifiers; // CDP modifiers: 1=alt, 2=ctrl, 4=meta, 8=shift
+        const shift = (mods & 8) != 0;
+        const ctrl = (mods & 2) != 0;
+
         // Use toolbar renderer for URL editing if available
         if (self.toolbar_renderer) |*renderer| {
             switch (key) {
@@ -1562,19 +1460,59 @@ pub const Viewer = struct {
                     self.ui_dirty = true;
                 },
                 .left => {
-                    renderer.handleLeft();
+                    if (shift) {
+                        renderer.handleSelectLeft();
+                    } else if (ctrl) {
+                        renderer.handleWordLeft();
+                    } else {
+                        renderer.handleLeft();
+                    }
                     self.ui_dirty = true;
                 },
                 .right => {
-                    renderer.handleRight();
+                    if (shift) {
+                        renderer.handleSelectRight();
+                    } else if (ctrl) {
+                        renderer.handleWordRight();
+                    } else {
+                        renderer.handleRight();
+                    }
                     self.ui_dirty = true;
                 },
                 .home => {
-                    renderer.handleHome();
+                    if (shift) {
+                        renderer.handleSelectHome();
+                    } else {
+                        renderer.handleHome();
+                    }
                     self.ui_dirty = true;
                 },
                 .end => {
-                    renderer.handleEnd();
+                    if (shift) {
+                        renderer.handleSelectEnd();
+                    } else {
+                        renderer.handleEnd();
+                    }
+                    self.ui_dirty = true;
+                },
+                .delete => {
+                    renderer.handleDelete();
+                    self.ui_dirty = true;
+                },
+                .ctrl_a => {
+                    renderer.handleSelectAll();
+                    self.ui_dirty = true;
+                },
+                .ctrl_x => {
+                    renderer.handleCut(self.allocator);
+                    self.ui_dirty = true;
+                },
+                .ctrl_c => {
+                    renderer.handleCopy(self.allocator);
+                    // Don't exit URL mode on Ctrl+C when we have text selected
+                },
+                .ctrl_v => {
+                    renderer.handlePaste(self.allocator);
                     self.ui_dirty = true;
                 },
                 .enter => {
