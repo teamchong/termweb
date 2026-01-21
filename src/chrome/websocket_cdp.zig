@@ -425,6 +425,8 @@ pub const WebSocketCdpClient = struct {
             "Page.fileChooserOpened", // File picker
             "Browser.downloadWillBegin", // Download started
             "Browser.downloadProgress", // Download progress/completion
+            "Page.frameNavigated", // Navigation completed - update URL
+            "Page.navigatedWithinDocument", // SPA navigation - update URL
         };
 
         var dominated = false;

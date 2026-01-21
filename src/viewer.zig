@@ -1786,6 +1786,31 @@ pub const Viewer = struct {
             try self.handleDownloadWillBegin(event.payload);
         } else if (std.mem.eql(u8, event.method, "Browser.downloadProgress")) {
             try self.handleDownloadProgress(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Page.frameNavigated") or
+                   std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
+            self.handleNavigationEvent(event.payload);
+        }
+    }
+
+    /// Handle navigation events - extract URL and update address bar
+    fn handleNavigationEvent(self: *Viewer, payload: []const u8) void {
+        // Extract URL from event payload
+        // Page.frameNavigated: {"frame":{"url":"https://...",...}}
+        // Page.navigatedWithinDocument: {"frameId":"...","url":"https://..."}
+        const url = extractUrlFromNavEvent(payload) orelse return;
+
+        self.log("[NAV EVENT] URL: {s}\n", .{url});
+
+        // Update current_url if different
+        if (!std.mem.eql(u8, self.current_url, url)) {
+            const new_url = self.allocator.dupe(u8, url) catch return;
+            self.current_url = new_url;
+
+            // Update toolbar display
+            if (self.toolbar_renderer) |*renderer| {
+                renderer.setUrl(new_url);
+                self.ui_dirty = true;
+            }
         }
     }
 
@@ -2368,6 +2393,26 @@ pub const Viewer = struct {
         self.terminal.deinit();
     }
 };
+
+/// Extract URL from navigation event payload
+/// Page.frameNavigated: {"frame":{"id":"...","url":"https://example.com",...}}
+/// Page.navigatedWithinDocument: {"frameId":"...","url":"https://example.com"}
+fn extractUrlFromNavEvent(payload: []const u8) ?[]const u8 {
+    // Try to find "url":" pattern
+    const url_marker = "\"url\":\"";
+    const url_start_idx = std.mem.indexOf(u8, payload, url_marker) orelse return null;
+    const url_value_start = url_start_idx + url_marker.len;
+
+    // Find the closing quote
+    const url_end_idx = std.mem.indexOfPos(u8, payload, url_value_start, "\"") orelse return null;
+
+    const url = payload[url_value_start..url_end_idx];
+
+    // Skip about:blank and empty URLs
+    if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return null;
+
+    return url;
+}
 
 /// Parse dialog type from CDP event payload
 fn parseDialogType(payload: []const u8) DialogType {
