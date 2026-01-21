@@ -118,6 +118,17 @@ pub const CdpClient = struct {
         const polyfill_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
         allocator.free(polyfill_result);
 
+        // Inject Clipboard interceptor polyfill - runs in all frames (including iframes)
+        // This enables bidirectional clipboard sync between browser and host
+        const clipboard_script = @embedFile("clipboard_polyfill.js");
+        var clipboard_json_buf: [8192]u8 = undefined;
+        const clipboard_json = json_utils.escapeString(clipboard_script, &clipboard_json_buf) catch return error.OutOfMemory;
+
+        var clipboard_params_buf: [16384]u8 = undefined;
+        const clipboard_params = std.fmt.bufPrint(&clipboard_params_buf, "{{\"source\":{s}}}", .{clipboard_json}) catch return error.OutOfMemory;
+        const clipboard_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
+        allocator.free(clipboard_result);
+
         // NOTE: Runtime.enable is called on nav_ws after WebSocket connect (not on pipe)
         // Pipe is ONLY for screencast frames - events come from nav_ws
 

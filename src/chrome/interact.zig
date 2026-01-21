@@ -212,71 +212,14 @@ pub fn injectMouseDebugTracker(client: *cdp.CdpClient, allocator: std.mem.Alloca
     defer allocator.free(result);
 }
 
-/// Inject clipboard interceptor - captures clipboard.writeText and provides readText
-/// This allows us to sync browser clipboard to system clipboard bidirectionally
-/// readText() requests clipboard from host and waits for response
+/// Inject clipboard interceptor - NO-OP, now handled by clipboard_polyfill.js
+/// The polyfill is injected via Page.addScriptToEvaluateOnNewDocument in cdp_client.zig
+/// and runs automatically in all frames (including iframes)
 pub fn injectClipboardInterceptor(client: *cdp.CdpClient, allocator: std.mem.Allocator) !void {
-    const js =
-        \\(function() {
-        \\  if (window._termwebClipboardHook) return;
-        \\  window._termwebClipboardHook = true;
-        \\  window._termwebClipboardData = '';
-        \\  window._termwebClipboardVersion = 0;
-        \\  const origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
-        \\  const origReadText = navigator.clipboard.readText.bind(navigator.clipboard);
-        \\  navigator.clipboard.writeText = async function(text) {
-        \\    console.log('[TERMWEB] writeText called, len=' + text.length);
-        \\    window._termwebClipboardData = text;
-        \\    console.log('__TERMWEB_CLIPBOARD__:' + text);
-        \\    return origWriteText(text).catch(() => {});
-        \\  };
-        \\  navigator.clipboard.readText = async function() {
-        \\    console.log('[TERMWEB] readText called, requesting from host...');
-        \\    const ver = window._termwebClipboardVersion;
-        \\    console.log('__TERMWEB_CLIPBOARD_REQUEST__');
-        \\    for (let i = 0; i < 20; i++) {
-        \\      await new Promise(r => setTimeout(r, 10));
-        \\      if (window._termwebClipboardVersion > ver) break;
-        \\    }
-        \\    console.log('[TERMWEB] readText returning, len=' + (window._termwebClipboardData?.length || 0));
-        \\    return window._termwebClipboardData || '';
-        \\  };
-        \\  document.addEventListener('copy', function(e) {
-        \\    const sel = window.getSelection();
-        \\    if (sel && sel.toString()) {
-        \\      window._termwebClipboardData = sel.toString();
-        \\      console.log('__TERMWEB_CLIPBOARD__:' + sel.toString());
-        \\    }
-        \\  });
-        \\  document.addEventListener('paste', function(e) {
-        \\    console.log('[TERMWEB] paste event fired, data=' + (window._termwebClipboardData?.length || 0));
-        \\    if (window._termwebClipboardData) {
-        \\      e.preventDefault();
-        \\      e.stopPropagation();
-        \\      const el = document.activeElement;
-        \\      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
-        \\        document.execCommand('insertText', false, window._termwebClipboardData);
-        \\        console.log('[TERMWEB] paste injected via execCommand');
-        \\      }
-        \\    }
-        \\  }, true);
-        \\  let lastFocusSync = 0;
-        \\  document.addEventListener('focusin', function(e) {
-        \\    const now = Date.now();
-        \\    if (now - lastFocusSync > 500) {
-        \\      lastFocusSync = now;
-        \\      console.log('__TERMWEB_CLIPBOARD_REQUEST__');
-        \\    }
-        \\  }, true);
-        \\  console.log('[TERMWEB] Clipboard interceptor installed v3');
-        \\})()
-    ;
-
-    const params = try std.fmt.allocPrint(allocator, "{{\"expression\":\"{s}\"}}", .{js});
-    defer allocator.free(params);
-
-    const result = try client.sendNavCommand("Runtime.evaluate", params);
-    defer allocator.free(result);
+    _ = client;
+    _ = allocator;
+    // No-op - clipboard interception is now handled by clipboard_polyfill.js
+    // which is injected on all new documents via Page.addScriptToEvaluateOnNewDocument
 }
 
 /// Update browser's clipboard data (called in response to __TERMWEB_CLIPBOARD_REQUEST__)

@@ -97,10 +97,7 @@ pub fn navigateToUrl(
         };
     }
 
-    // Inject clipboard interceptor - always enabled
-    interact.injectClipboardInterceptor(client, allocator) catch |err| {
-        logNav("[NAV] Failed to inject clipboard interceptor: {}\n", .{err});
-    };
+    // Clipboard interceptor is now injected globally via clipboard_polyfill.js
 
     logNav("[NAV] navigateToUrl() complete\n", .{});
 }
@@ -233,12 +230,11 @@ pub fn goBack(
     };
     defer allocator.free(result);
 
-    // Re-inject after back navigation
+    // Re-inject mouse tracker after back navigation (clipboard is global)
     std.Thread.sleep(2 * std.time.ns_per_s);
     if (isMouseDebugEnabled()) {
         interact.injectMouseDebugTracker(client, allocator) catch {};
     }
-    interact.injectClipboardInterceptor(client, allocator) catch {};
 
     return true;
 }
@@ -270,12 +266,11 @@ pub fn goForward(
     };
     defer allocator.free(result);
 
-    // Re-inject after forward navigation
+    // Re-inject mouse tracker after forward navigation (clipboard is global)
     std.Thread.sleep(2 * std.time.ns_per_s);
     if (isMouseDebugEnabled()) {
         interact.injectMouseDebugTracker(client, allocator) catch {};
     }
-    interact.injectClipboardInterceptor(client, allocator) catch {};
 
     return true;
 }
@@ -376,12 +371,11 @@ pub fn reload(
     const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
 
-    // Wait for page to reload then re-inject
+    // Wait for page to reload then re-inject mouse tracker (clipboard is global)
     std.Thread.sleep(2 * std.time.ns_per_s);
     if (isMouseDebugEnabled()) {
         interact.injectMouseDebugTracker(client, allocator) catch {};
     }
-    interact.injectClipboardInterceptor(client, allocator) catch {};
 }
 
 /// Stop page loading - uses dedicated nav WebSocket

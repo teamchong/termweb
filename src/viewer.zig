@@ -300,10 +300,8 @@ pub const Viewer = struct {
         }
 
         // Inject clipboard interceptor - syncs browser clipboard to system clipboard
-        self.log("[DEBUG] Injecting clipboard interceptor\n", .{});
-        interact_mod.injectClipboardInterceptor(self.cdp_client, self.allocator) catch |err| {
-            self.log("[DEBUG] Failed to inject clipboard interceptor: {}\n", .{err});
-        };
+        // Clipboard interceptor is now injected globally via clipboard_polyfill.js
+        // in Page.addScriptToEvaluateOnNewDocument (see cdp_client.zig)
 
         var stdout_buf: [262144]u8 = undefined; // 256KB for toolbar graphics
         const stdout_file = std.fs.File.stdout();
@@ -1687,7 +1685,6 @@ pub const Viewer = struct {
         const clipboard_request = "__TERMWEB_CLIPBOARD_REQUEST__";
         if (std.mem.indexOf(u8, payload, clipboard_request) != null) {
             self.log("[CONSOLE MSG] Clipboard read request - syncing from host\n", .{});
-            std.debug.print("[CLIPBOARD] Request received, syncing from host\n", .{});
             self.handleClipboardReadRequest();
             return;
         }
