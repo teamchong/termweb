@@ -665,13 +665,15 @@ pub const Viewer = struct {
         });
 
         // Update coordinate mapper (for handling terminal resize)
-        self.coord_mapper = CoordinateMapper.init(
+        const toolbar_h: ?u16 = if (self.toolbar_renderer) |tr| @intCast(tr.toolbar_height) else null;
+        self.coord_mapper = CoordinateMapper.initWithToolbar(
             size.width_px,
             size.height_px,
             size.cols,
             size.rows,
             self.viewport_width,
             self.viewport_height,
+            toolbar_h,
         );
         self.log("[DEBUG] Coordinate mapper initialized\n", .{});
 
@@ -810,13 +812,15 @@ pub const Viewer = struct {
 
         // Update coordinate mapper with ACTUAL frame dimensions from CDP
         // This ensures click coordinates match what Chrome is rendering
-        self.coord_mapper = CoordinateMapper.init(
+        const toolbar_h: ?u16 = if (self.toolbar_renderer) |tr| @intCast(tr.toolbar_height) else null;
+        self.coord_mapper = CoordinateMapper.initWithToolbar(
             size.width_px,
             size.height_px,
             size.cols,
             size.rows,
             frame_width,   // Use actual frame width, not viewport
             frame_height,  // Use actual frame height, not viewport
+            toolbar_h,
         );
 
         self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}\n", .{

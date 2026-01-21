@@ -27,18 +27,33 @@ pub const CoordinateMapper = struct {
         viewport_width: u32,
         viewport_height: u32,
     ) CoordinateMapper {
+        return initWithToolbar(terminal_width_px, terminal_height_px, terminal_cols, terminal_rows, viewport_width, viewport_height, null);
+    }
+
+    /// Initialize coordinate mapper with explicit toolbar height
+    pub fn initWithToolbar(
+        terminal_width_px: u16,
+        terminal_height_px: u16,
+        terminal_cols: u16,
+        terminal_rows: u16,
+        viewport_width: u32,
+        viewport_height: u32,
+        toolbar_height: ?u16,
+    ) CoordinateMapper {
         // Calculate cell dimensions
         const cell_height: u16 = if (terminal_rows > 0)
             @divTrunc(terminal_height_px, terminal_rows)
         else
             20; // fallback
-        // Content starts at row 2 (after 1 row reserved for tab bar)
-        // The actual content offset is 1 row = cell_height pixels, not the toolbar's visual height
-        const content_offset: u16 = cell_height; // 1 row for toolbar
-        const content_pixel_height = if (terminal_height_px > content_offset)
-            terminal_height_px - content_offset
-        else
-            terminal_height_px;
+
+        // Use explicit toolbar height if provided, otherwise default to 1 row
+        // This is used for HIT DETECTION only
+        const tabbar_h: u16 = toolbar_height orelse cell_height;
+
+        // Content area: rows 2 to (rows-1), i.e., (rows-2) rows
+        // This is where the Kitty graphic is displayed, regardless of toolbar pixel height
+        const content_rows = if (terminal_rows > 2) terminal_rows - 2 else 1;
+        const content_pixel_height = content_rows * cell_height;
 
         // If terminal reports pixel dimensions, assume we're using SGR pixel mode (1016h)
         const is_pixel_mode = terminal_width_px > 0;
@@ -51,7 +66,7 @@ pub const CoordinateMapper = struct {
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .cell_height = cell_height,
-            .tabbar_height = content_offset, // 1 row for toolbar (matches rendering in viewer.zig)
+            .tabbar_height = tabbar_h,
             .content_pixel_height = content_pixel_height,
             .is_pixel_mode = is_pixel_mode,
         };
@@ -112,18 +127,19 @@ pub const CoordinateMapper = struct {
             pixel_y = pixel_y_in * self.cell_height + self.cell_height / 2;
         }
 
-        // Check if click is in tab bar (top)
+        // Check if click is in tab bar (top) - use actual toolbar pixel height for hit detection
         if (pixel_y < self.tabbar_height) return null;
 
-        // Content area starts after tab bar
-        const content_top = self.tabbar_height;
+        // Content graphic starts at row 2 (cell_height pixels from top)
+        // This is where coordinate mapping happens, independent of toolbar visual height
+        const content_top = self.cell_height;
         const content_bottom = content_top + self.content_pixel_height;
 
         // Check if click is in status bar (bottom)
         if (pixel_y >= content_bottom) return null;
 
-        // Adjust Y coordinate to content space (subtract tab bar)
-        const content_y = pixel_y - content_top;
+        // Adjust Y coordinate to content space (subtract content top, not toolbar height)
+        const content_y = if (pixel_y >= content_top) pixel_y - content_top else 0;
 
         // Prevent division by zero
         if (self.terminal_width_px == 0 or self.content_pixel_height == 0) return null;
