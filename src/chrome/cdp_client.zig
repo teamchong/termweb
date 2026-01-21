@@ -97,17 +97,12 @@ pub const CdpClient = struct {
         const intercept_file = try client.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
         allocator.free(intercept_file);
 
-        // Enable downloads with events (files go to temp dir, we'll prompt user and move)
-        const download_path = "/tmp/termweb-downloads";
-        std.fs.makeDirAbsolute(download_path) catch |err| {
+        // Create downloads directory (actual download setup happens on nav_ws later)
+        std.fs.makeDirAbsolute("/tmp/termweb-downloads") catch |err| {
             if (err != error.PathAlreadyExists) {
                 logToFile("[CDP] Failed to create download dir: {}\n", .{err});
             }
         };
-        const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"{s}\",\"eventsEnabled\":true}}", .{download_path});
-        defer allocator.free(download_params);
-        const download_result = try client.sendCommand("Browser.setDownloadBehavior", download_params);
-        allocator.free(download_result);
 
         // Inject File System Access API polyfill with full file system bridge
         // Security: Only allows access to directories user explicitly selected via picker
@@ -165,6 +160,14 @@ pub const CdpClient = struct {
             std.debug.print("Enabling Runtime on nav_ws...\n", .{});
             const runtime_result = try client.nav_ws.?.sendCommand("Runtime.enable", null);
             allocator.free(runtime_result);
+
+            // Enable downloads on nav_ws to receive download events
+            // Note: Browser.setDownloadBehavior must be called on the WebSocket that will receive events
+            std.debug.print("Enabling downloads on nav_ws...\n", .{});
+            const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
+            defer allocator.free(download_params);
+            const download_result = try client.nav_ws.?.sendCommand("Browser.setDownloadBehavior", download_params);
+            allocator.free(download_result);
         }
 
         std.debug.print("CDP client ready\n", .{});

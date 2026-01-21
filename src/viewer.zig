@@ -1501,6 +1501,15 @@ pub const Viewer = struct {
                         screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url) catch |err| {
                             self.log("[URL] Navigation failed: {}\n", .{err});
                         };
+                        // Update current_url to match the new URL
+                        const new_url = self.allocator.dupe(u8, url) catch url;
+                        if (!std.mem.eql(u8, self.current_url, url)) {
+                            // Don't free the original URL from init, but free if we allocated it later
+                            if (self.current_url.len > 0) {
+                                // Note: can't easily track if current_url was allocated, so we just update
+                            }
+                            self.current_url = new_url;
+                        }
                         self.updateNavigationState();
                     }
                     renderer.blurUrl();
