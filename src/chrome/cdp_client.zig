@@ -501,10 +501,20 @@ pub const CdpClient = struct {
         return self.pipe_client.getFrameCount();
     }
 
-    /// Get next event from nav_ws (console messages, dialogs, file chooser)
-    /// Pipe is only for screencast frames - events come from WebSocket
+    /// Get next event from pipe (download events) or nav_ws (console, dialogs, etc)
     pub fn nextEvent(self: *CdpClient, allocator: std.mem.Allocator) !?CdpEvent {
         _ = allocator;
+
+        // Check pipe for download events first
+        if (self.pipe_client.pollEvent()) |pipe_event| {
+            return CdpEvent{
+                .method = pipe_event.method,
+                .payload = pipe_event.payload,
+                .allocator = self.pipe_client.allocator,
+            };
+        }
+
+        // Then check nav_ws for other events
         const ws = self.nav_ws orelse return null;
         const raw = ws.nextEvent() orelse return null;
         return CdpEvent{
