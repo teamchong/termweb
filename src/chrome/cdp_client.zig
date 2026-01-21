@@ -161,6 +161,12 @@ pub const CdpClient = struct {
             const runtime_result = try client.nav_ws.?.sendCommand("Runtime.enable", null);
             allocator.free(runtime_result);
 
+            // Enable Page domain on nav_ws to receive navigation events
+            // This duplicates pipe's Page.enable but ensures events come through nav_ws
+            std.debug.print("Enabling Page on nav_ws...\n", .{});
+            const page_result = try client.nav_ws.?.sendCommand("Page.enable", null);
+            allocator.free(page_result);
+
             // Enable downloads on nav_ws to receive download events
             // Note: Browser.setDownloadBehavior must be called on the WebSocket that will receive events
             std.debug.print("Enabling downloads on nav_ws...\n", .{});
@@ -419,6 +425,10 @@ pub const CdpClient = struct {
         // Re-enable Runtime domain on nav_ws for console events
         const runtime_result = try self.nav_ws.?.sendCommand("Runtime.enable", null);
         self.allocator.free(runtime_result);
+
+        // Re-enable Page domain on nav_ws for navigation events
+        const page_result = try self.nav_ws.?.sendCommand("Page.enable", null);
+        self.allocator.free(page_result);
 
         // Re-enable downloads on nav_ws for download events
         const download_params = try std.fmt.allocPrint(self.allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
