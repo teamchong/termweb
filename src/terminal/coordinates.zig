@@ -32,16 +32,11 @@ pub const CoordinateMapper = struct {
             @divTrunc(terminal_height_px, terminal_rows)
         else
             20; // fallback
-        const cell_width: u16 = if (terminal_cols > 0)
-            @divTrunc(terminal_width_px, terminal_cols)
-        else
-            10; // fallback
-
-        // Detect High-DPI and scale toolbar height accordingly
-        const dpr: u16 = if (cell_width > 14) 2 else 1;
-        const toolbar_height: u16 = 40 * dpr;
-        const content_pixel_height = if (terminal_height_px > toolbar_height)
-            terminal_height_px - toolbar_height
+        // Content starts at row 2 (after 1 row reserved for tab bar)
+        // The actual content offset is 1 row = cell_height pixels, not the toolbar's visual height
+        const content_offset: u16 = cell_height; // 1 row for toolbar
+        const content_pixel_height = if (terminal_height_px > content_offset)
+            terminal_height_px - content_offset
         else
             terminal_height_px;
 
@@ -56,7 +51,7 @@ pub const CoordinateMapper = struct {
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .cell_height = cell_height,
-            .tabbar_height = toolbar_height, // Scaled for High-DPI (matches toolbar.zig)
+            .tabbar_height = content_offset, // 1 row for toolbar (matches rendering in viewer.zig)
             .content_pixel_height = content_pixel_height,
             .is_pixel_mode = is_pixel_mode,
         };
