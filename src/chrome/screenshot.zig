@@ -1,6 +1,7 @@
 const std = @import("std");
 const cdp = @import("cdp_client.zig");
 const interact = @import("interact.zig");
+const json = @import("../utils/json.zig");
 
 /// Check if mouse debug overlay is enabled (via TERMWEB_DEBUG_MOUSE=1)
 fn isMouseDebugEnabled() bool {
@@ -72,7 +73,10 @@ pub fn navigateToUrl(
 
     logNav("[NAV] normalized_url: '{s}'\n", .{normalized_url});
 
-    const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{normalized_url});
+    // Escape URL for JSON (handles quotes, backslashes in URLs)
+    var escape_buf: [8192]u8 = undefined;
+    const escaped_url = json.escapeContents(normalized_url, &escape_buf) catch return error.NavigationFailed;
+    const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{escaped_url});
     defer allocator.free(params);
 
     logNav("[NAV] sending Page.navigate with params: {s}\n", .{params});

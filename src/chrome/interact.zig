@@ -1,6 +1,7 @@
 const std = @import("std");
 const cdp = @import("cdp_client.zig");
 const dom = @import("dom.zig");
+const json = @import("../utils/json.zig");
 
 /// Debug log file for CDP interactions
 var debug_log_file: ?std.fs.File = null;
@@ -119,7 +120,11 @@ pub fn typeText(
     allocator: std.mem.Allocator,
     text: []const u8,
 ) !void {
-    const params = try std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{text});
+    // Escape special characters for JSON
+    var escape_buf: [16384]u8 = undefined;
+    const escaped = json.escapeContents(text, &escape_buf) catch return;
+
+    const params = try std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped});
     defer allocator.free(params);
 
     client.sendKeyboardCommandAsync("Input.insertText", params);
@@ -283,8 +288,9 @@ pub fn sendCharWithModifiers(
     var text_buf: [2]u8 = .{ text_char, 0 };
     const text: []const u8 = text_buf[0..1];
 
-    var unmod_buf: [2]u8 = .{ char, 0 };
-    const unmodified_text: []const u8 = unmod_buf[0..1];
+    // Escape the text for JSON (handles quotes, backslashes)
+    var escape_buf: [16]u8 = undefined;
+    const escaped_text = json.escapeContents(text, &escape_buf) catch return;
 
     // windowsVirtualKeyCode (uppercase for A-Z, ASCII otherwise)
     const vk_code: u8 = if (char >= 'a' and char <= 'z') char - 32 else char;
@@ -294,31 +300,22 @@ pub fn sendCharWithModifiers(
         var down_buf: [512]u8 = undefined;
         const down_params = std.fmt.bufPrint(&down_buf,
             "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
-            .{ text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
+            .{ escaped_text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
 
         var up_buf: [512]u8 = undefined;
         const up_params = std.fmt.bufPrint(&up_buf,
             "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
-            .{ text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
+            .{ escaped_text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
 
         client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
         client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
         return;
     }
 
-    // Normal text input - include all required fields
-    var down_buf: [512]u8 = undefined;
-    const down_params = std.fmt.bufPrint(&down_buf,
-        "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"text\":\"{s}\",\"unmodifiedText\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
-        .{ text, std.ascii.toUpper(char), text, unmodified_text, vk_code, modifiers }) catch return;
-
-    var up_buf: [512]u8 = undefined;
-    const up_params = std.fmt.bufPrint(&up_buf,
-        "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
-        .{ text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
-
-    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
-    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
+    // Normal text input - use insertText to avoid auto-indent issues with paste
+    var text_param_buf: [64]u8 = undefined;
+    const text_params = std.fmt.bufPrint(&text_param_buf, "{{\"text\":\"{s}\"}}", .{escaped_text}) catch return;
+    client.sendKeyboardCommandAsync("Input.insertText", text_params);
 }
 
 /// Send Enter key with text property (needed for text editors like Monaco/VSCode)
@@ -359,11 +356,15 @@ pub fn sendSpecialKeyWithModifiers(
     key_code: u16,
     modifiers: u8,
 ) void {
+    // Escape key_name for JSON (handles any special chars)
+    var escape_buf: [64]u8 = undefined;
+    const escaped_key = json.escapeContents(key_name, &escape_buf) catch return;
+
     var down_buf: [256]u8 = undefined;
-    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key_name, key_name, key_code, modifiers }) catch return;
+    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ escaped_key, escaped_key, key_code, modifiers }) catch return;
 
     var up_buf: [256]u8 = undefined;
-    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key_name, key_name, key_code, modifiers }) catch return;
+    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ escaped_key, escaped_key, key_code, modifiers }) catch return;
 
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
@@ -382,11 +383,13 @@ pub fn handleFileChooser(
     var files_json = std.ArrayList(u8).initCapacity(allocator, 0) catch return error.OutOfMemory;
     defer files_json.deinit(allocator);
     try files_json.append(allocator, '[');
+
+    var escape_buf: [4096]u8 = undefined;
     for (files, 0..) |file, i| {
         if (i > 0) try files_json.append(allocator, ',');
-        try files_json.append(allocator, '"');
-        try files_json.appendSlice(allocator, file);
-        try files_json.append(allocator, '"');
+        // Use escapeString which includes quotes and handles special chars
+        const escaped = json.escapeString(file, &escape_buf) catch continue;
+        try files_json.appendSlice(allocator, escaped);
     }
     try files_json.append(allocator, ']');
 

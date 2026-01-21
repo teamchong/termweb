@@ -19,6 +19,7 @@ const dom_mod = @import("chrome/dom.zig");
 const interact_mod = @import("chrome/interact.zig");
 const download_mod = @import("chrome/download.zig");
 const ui_mod = @import("ui/mod.zig");
+const json = @import("utils/json.zig");
 
 const Terminal = terminal_mod.Terminal;
 const KittyGraphics = kitty_mod.KittyGraphics;
@@ -1367,11 +1368,20 @@ pub const Viewer = struct {
         const mods = key_input.modifiers; // CDP: 1=alt, 2=ctrl, 4=meta, 8=shift
         switch (key) {
             .char => |c| {
-                // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
-                // CDP: ctrl=2, shift=8, meta=4
+                const meta = (mods & 4) != 0; // Cmd on macOS
                 const ctrl_shift: u8 = 2 | 8; // ctrl + shift = 10
+
+                // Handle Cmd+V: paste from clipboard (Ghostty may pass this through)
+                if ((c == 'v' or c == 'V') and meta) {
+                    const toolbar = @import("ui/toolbar.zig");
+                    const clipboard = toolbar.pasteFromClipboard(self.allocator) orelse return;
+                    defer self.allocator.free(clipboard);
+                    interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
+                    return;
+                }
+
+                // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
                 if ((c == 'p' or c == 'P') and (mods & ctrl_shift) == ctrl_shift) {
-                    // Replace ctrl with meta, keep shift
                     const new_mods = (mods & ~@as(u8, 2)) | 4; // remove ctrl, add meta
                     interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', new_mods);
                 } else {
@@ -1382,6 +1392,13 @@ pub const Viewer = struct {
             .escape => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Escape", 27, mods),
             // Translate Ctrl+A to Cmd+A (meta) for browser select-all (Ghostty intercepts Cmd+A)
             .ctrl_a => interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'a', 4), // 4 = meta
+            // Handle Ctrl+V: read system clipboard and insert text (headless Chrome can't access clipboard)
+            .ctrl_v => {
+                const toolbar = @import("ui/toolbar.zig");
+                const clipboard = toolbar.pasteFromClipboard(self.allocator) orelse return;
+                defer self.allocator.free(clipboard);
+                interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
+            },
             // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
             .ctrl_p => {
                 const shift = (mods & 8) != 0;
@@ -1888,9 +1905,9 @@ pub const Viewer = struct {
 
     /// Execute JavaScript in the browser
     fn evalJavaScript(self: *Viewer, script: []const u8) !void {
-        // Escape the script for JSON
+        // Escape the script for JSON (escapeString includes quotes)
         var escaped_buf: [131072]u8 = undefined;
-        const escaped = escapeJsonString(script, &escaped_buf) catch return;
+        const escaped = json.escapeString(script, &escaped_buf) catch return;
 
         var params_buf: [131072]u8 = undefined;
         const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{escaped}) catch return;
@@ -1917,13 +1934,16 @@ pub const Viewer = struct {
         try writer.writeAll("[");
         var first = true;
         var iter = dir.iterate();
+        var escape_buf: [1024]u8 = undefined;
         while (try iter.next()) |entry| {
             if (!first) try writer.writeAll(",");
             first = false;
 
             const is_dir = entry.kind == .directory;
+            // Escape entry name for JSON (handles quotes, backslashes in filenames)
+            const escaped_name = json.escapeContents(entry.name, &escape_buf) catch continue;
             try writer.print("{{\"name\":\"{s}\",\"isDirectory\":{s}}}", .{
-                entry.name,
+                escaped_name,
                 if (is_dir) "true" else "false",
             });
         }
@@ -2159,8 +2179,11 @@ pub const Viewer = struct {
 
         // Send response to Chrome
         if (file_path) |path| {
-            var params_buf: [2048]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"action\":\"accept\",\"files\":[\"{s}\"]}}", .{path}) catch return;
+            // Escape file path for JSON (handles quotes, backslashes)
+            var escape_buf: [4096]u8 = undefined;
+            const escaped_path = json.escapeContents(path, &escape_buf) catch return;
+            var params_buf: [8192]u8 = undefined;
+            const params = std.fmt.bufPrint(&params_buf, "{{\"action\":\"accept\",\"files\":[\"{s}\"]}}", .{escaped_path}) catch return;
             const result = self.cdp_client.sendCommand("Page.handleFileChooser", params) catch return;
             self.allocator.free(result);
         } else {
@@ -2216,10 +2239,13 @@ pub const Viewer = struct {
         const state = self.dialog_state orelse return;
 
         // Build response JSON
-        var params_buf: [1024]u8 = undefined;
-        const params = if (state.dialog_type == .prompt)
-            std.fmt.bufPrint(&params_buf, "{{\"accept\":{},\"promptText\":\"{s}\"}}", .{ accepted, state.getText() }) catch return
-        else
+        var params_buf: [4096]u8 = undefined;
+        const params = if (state.dialog_type == .prompt) blk: {
+            // Escape prompt text for JSON (handles quotes, newlines, etc.)
+            var escape_buf: [2048]u8 = undefined;
+            const escaped_text = json.escapeContents(state.getText(), &escape_buf) catch return;
+            break :blk std.fmt.bufPrint(&params_buf, "{{\"accept\":{},\"promptText\":\"{s}\"}}", .{ accepted, escaped_text }) catch return;
+        } else
             std.fmt.bufPrint(&params_buf, "{{\"accept\":{}}}", .{accepted}) catch return;
 
         const result = self.cdp_client.sendCommand("Page.handleJavaScriptDialog", params) catch |err| {
@@ -2440,75 +2466,4 @@ fn base64Decode(c: u8) u8 {
     if (c == '+') return 62;
     if (c == '/') return 63;
     return 255; // Invalid or padding ('=')
-}
-
-/// Escape a string for JSON embedding (adds surrounding quotes)
-fn escapeJsonString(input: []const u8, buf: []u8) ![]const u8 {
-    var i: usize = 0;
-    if (i >= buf.len) return error.OutOfMemory;
-    buf[i] = '"';
-    i += 1;
-
-    for (input) |c| {
-        switch (c) {
-            '"' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = '"';
-                i += 2;
-            },
-            '\\' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = '\\';
-                i += 2;
-            },
-            '\n' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = 'n';
-                i += 2;
-            },
-            '\r' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = 'r';
-                i += 2;
-            },
-            '\t' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = 't';
-                i += 2;
-            },
-            else => {
-                if (c < 0x20) {
-                    // Control character - escape as \uXXXX
-                    if (i + 6 > buf.len) return error.OutOfMemory;
-                    buf[i] = '\\';
-                    buf[i + 1] = 'u';
-                    buf[i + 2] = '0';
-                    buf[i + 3] = '0';
-                    buf[i + 4] = hexDigit(@truncate(c >> 4));
-                    buf[i + 5] = hexDigit(@truncate(c & 0xf));
-                    i += 6;
-                } else {
-                    if (i >= buf.len) return error.OutOfMemory;
-                    buf[i] = c;
-                    i += 1;
-                }
-            },
-        }
-    }
-
-    if (i >= buf.len) return error.OutOfMemory;
-    buf[i] = '"';
-    i += 1;
-
-    return buf[0..i];
-}
-
-fn hexDigit(n: u4) u8 {
-    const v: u8 = n;
-    return if (v < 10) '0' + v else 'a' + v - 10;
 }

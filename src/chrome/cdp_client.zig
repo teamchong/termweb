@@ -10,6 +10,7 @@ const std = @import("std");
 const cdp_pipe = @import("cdp_pipe.zig");
 const websocket_cdp = @import("websocket_cdp.zig");
 const json = @import("json");
+const json_utils = @import("../utils/json.zig");
 
 fn logToFile(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
@@ -110,7 +111,7 @@ pub const CdpClient = struct {
         // Security: Only allows access to directories user explicitly selected via picker
         const polyfill_script = @embedFile("fs_polyfill.js");
         var polyfill_json_buf: [65536]u8 = undefined;
-        const polyfill_json = escapeJsonString(polyfill_script, &polyfill_json_buf) catch return error.OutOfMemory;
+        const polyfill_json = json_utils.escapeString(polyfill_script, &polyfill_json_buf) catch return error.OutOfMemory;
 
         var polyfill_params_buf: [65536]u8 = undefined;
         const polyfill_params = std.fmt.bufPrint(&polyfill_params_buf, "{{\"source\":{s}}}", .{polyfill_json}) catch return error.OutOfMemory;
@@ -292,10 +293,13 @@ pub const CdpClient = struct {
         defer self.allocator.free(target_id);
 
         // Step 2: Attach to the page target with flatten mode
+        // Escape target_id for JSON (handles any special chars)
+        var escape_buf: [512]u8 = undefined;
+        const escaped_id = json_utils.escapeContents(target_id, &escape_buf) catch return error.OutOfMemory;
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"targetId\":\"{s}\",\"flatten\":true}}",
-            .{target_id},
+            .{escaped_id},
         );
         defer self.allocator.free(params);
 
@@ -576,74 +580,3 @@ pub const CdpClient = struct {
         return self.pipe_client.checkNavigationHappened();
     }
 };
-
-/// Escape a string for JSON embedding (adds surrounding quotes)
-fn escapeJsonString(input: []const u8, buf: []u8) ![]const u8 {
-    var i: usize = 0;
-    if (i >= buf.len) return error.OutOfMemory;
-    buf[i] = '"';
-    i += 1;
-
-    for (input) |c| {
-        switch (c) {
-            '"' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = '"';
-                i += 2;
-            },
-            '\\' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = '\\';
-                i += 2;
-            },
-            '\n' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = 'n';
-                i += 2;
-            },
-            '\r' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = 'r';
-                i += 2;
-            },
-            '\t' => {
-                if (i + 2 > buf.len) return error.OutOfMemory;
-                buf[i] = '\\';
-                buf[i + 1] = 't';
-                i += 2;
-            },
-            else => {
-                if (c < 0x20) {
-                    // Control character - escape as \uXXXX
-                    if (i + 6 > buf.len) return error.OutOfMemory;
-                    buf[i] = '\\';
-                    buf[i + 1] = 'u';
-                    buf[i + 2] = '0';
-                    buf[i + 3] = '0';
-                    buf[i + 4] = hexDigit(@truncate(c >> 4));
-                    buf[i + 5] = hexDigit(@truncate(c & 0xf));
-                    i += 6;
-                } else {
-                    if (i >= buf.len) return error.OutOfMemory;
-                    buf[i] = c;
-                    i += 1;
-                }
-            },
-        }
-    }
-
-    if (i >= buf.len) return error.OutOfMemory;
-    buf[i] = '"';
-    i += 1;
-
-    return buf[0..i];
-}
-
-fn hexDigit(n: u4) u8 {
-    const v: u8 = n;
-    return if (v < 10) '0' + v else 'a' + v - 10;
-}

@@ -7,6 +7,7 @@ const std = @import("std");
 const simd = @import("../simd/dispatch.zig");
 const FramePool = @import("../simd/frame_pool.zig").FramePool;
 const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
+const json = @import("../utils/json.zig");
 
 fn logToFile(comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
@@ -534,9 +535,12 @@ pub const PipeCdpClient = struct {
 
     fn acknowledgeFrame(self: *PipeCdpClient, r_sid: ?[]const u8, f_sid: u32) !void {
         const id = self.next_id.fetchAdd(1, .monotonic);
-        const command = if (r_sid) |rsid|
-            try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"sessionId\":\"{s}\",\"method\":\"Page.screencastFrameAck\",\"params\":{{\"sessionId\":{d}}}}}\x00", .{ id, rsid, f_sid })
-        else
+        const command = if (r_sid) |rsid| blk: {
+            // Escape session ID for JSON (handles any special chars)
+            var escape_buf: [256]u8 = undefined;
+            const escaped_sid = json.escapeContents(rsid, &escape_buf) catch return error.OutOfMemory;
+            break :blk try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"sessionId\":\"{s}\",\"method\":\"Page.screencastFrameAck\",\"params\":{{\"sessionId\":{d}}}}}\x00", .{ id, escaped_sid, f_sid });
+        } else
             try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"method\":\"Page.screencastFrameAck\",\"params\":{{\"sessionId\":{d}}}}}\x00", .{ id, f_sid });
         defer self.allocator.free(command);
         self.write_mutex.lock();
