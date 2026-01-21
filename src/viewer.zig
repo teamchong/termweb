@@ -235,7 +235,7 @@ pub const Viewer = struct {
             .terminal = Terminal.init(),
             .kitty = KittyGraphics.init(allocator),
             .cdp_client = cdp_client,
-            .input = InputReader.init(std.posix.STDIN_FILENO, enable_input_debug),
+            .input = InputReader.init(std.posix.STDIN_FILENO, enable_input_debug, allocator),
             .current_url = try allocator.dupe(u8, url),
             .running = true,
             .mode = .normal,
@@ -444,6 +444,7 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     },
                     .mouse => |m| self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y }),
+                    .paste => |text| self.log("[INPUT] Paste: {d} bytes\n", .{text.len}),
                     .none => {},
                 }
                 try self.handleInput(input);
@@ -1080,6 +1081,25 @@ pub const Viewer = struct {
                 try self.handleKey(key_input);
             },
             .mouse => |mouse| try self.handleMouse(mouse),
+            .paste => |text| {
+                defer self.allocator.free(text);
+                // Use Input.insertText for proper paste handling (avoids auto-indent issues)
+                if (self.mode == .normal) {
+                    // Paste directly into browser using CDP insertText
+                    interact_mod.typeText(self.cdp_client, self.allocator, text) catch {};
+                } else if (self.mode == .url_prompt) {
+                    // Paste into URL bar
+                    if (self.toolbar_renderer) |*renderer| {
+                        // Insert text at cursor (filter non-printable chars)
+                        for (text) |c| {
+                            if (c >= 32 and c <= 126 and c != '\n' and c != '\r') {
+                                renderer.handleChar(c);
+                            }
+                        }
+                        self.ui_dirty = true;
+                    }
+                }
+            },
             .none => {},
         }
     }
@@ -2214,6 +2234,7 @@ pub const Viewer = struct {
     }
 
     pub fn deinit(self: *Viewer) void {
+        self.input.deinit();
         if (self.prompt_buffer) |*p| p.deinit();
         if (self.dialog_state) |state| {
             var s = state;

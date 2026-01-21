@@ -78,6 +78,7 @@ pub const MouseEvent = struct {
 pub const Input = union(enum) {
     key: KeyInput,
     mouse: MouseEvent,
+    paste: []const u8, // Bracketed paste content (caller must free)
     none,
 };
 
@@ -92,23 +93,35 @@ pub const InputReader = struct {
     buffer_len: usize,  // Track accumulated bytes
     mouse_enabled: bool,
     debug_input: bool,
+    allocator: std.mem.Allocator,
 
     // State for multi-byte sequences
     in_escape: bool,
     escape_buffer: [64]u8,
     escape_len: usize,
 
-    pub fn init(fd: std.posix.fd_t, debug_input: bool) InputReader {
+    // State for bracketed paste
+    in_paste: bool,
+    paste_buffer: std.ArrayList(u8),
+
+    pub fn init(fd: std.posix.fd_t, debug_input: bool, allocator: std.mem.Allocator) InputReader {
         return .{
             .fd = fd,
             .buffer = undefined,
             .buffer_len = 0,
             .mouse_enabled = false,
             .debug_input = debug_input,
+            .allocator = allocator,
             .in_escape = false,
             .escape_buffer = undefined,
             .escape_len = 0,
+            .in_paste = false,
+            .paste_buffer = .{},
         };
+    }
+
+    pub fn deinit(self: *InputReader) void {
+        self.paste_buffer.deinit(self.allocator);
     }
 
     fn debugLog(self: *InputReader, comptime fmt: []const u8, args: anytype) void {
@@ -274,6 +287,7 @@ pub const InputReader = struct {
         }
 
         // Function/nav keys: ESC [ N ~ or ESC [ N ; mod ~
+        // Also handles bracketed paste: ESC [ 200 ~ (start) and ESC [ 201 ~ (end)
         // Look for terminating ~
         if (self.escape_buffer[self.escape_len - 1] == '~') {
             // Find semicolon to separate key code from modifiers
@@ -287,7 +301,25 @@ pub const InputReader = struct {
 
             const num_end = semi_pos orelse (self.escape_len - 1);
             const num_str = self.escape_buffer[2..num_end];
-            const num = std.fmt.parseInt(u8, num_str, 10) catch return null;
+            const num = std.fmt.parseInt(u16, num_str, 10) catch return null;
+
+            // Handle bracketed paste sequences
+            if (num == 200) {
+                // Start of bracketed paste
+                self.in_paste = true;
+                self.paste_buffer.clearRetainingCapacity();
+                return .none; // Signal handled, continue reading
+            } else if (num == 201) {
+                // End of bracketed paste - return accumulated content
+                self.in_paste = false;
+                if (self.paste_buffer.items.len > 0) {
+                    // Clone the content for the caller (they own it)
+                    const content = self.allocator.dupe(u8, self.paste_buffer.items) catch return .none;
+                    self.paste_buffer.clearRetainingCapacity();
+                    return .{ .paste = content };
+                }
+                return .none;
+            }
 
             // Parse modifiers if present
             var cdp_mods: u8 = 0;
@@ -343,6 +375,9 @@ pub const InputReader = struct {
 
     /// Parse Kitty keyboard protocol sequence (ESC [ code u or ESC [ code ; modifiers u)
     fn parseKittyKeyboard(self: *InputReader) !?Input {
+        // Log the raw escape sequence for debugging
+        inputDebugLog("[KITTY] Parsing: len={d} buf='{s}'", .{ self.escape_len, self.escape_buffer[0..self.escape_len] });
+
         // Format: ESC [ code u  or  ESC [ code ; modifiers u  or  ESC [ code ; modifiers : event-type u
         // Find semicolons and colons
         var semi_idx: ?usize = null;
@@ -393,6 +428,15 @@ pub const InputReader = struct {
             (if (ctrl) @as(u8, 2) else 0) |
             (if (alt) @as(u8, 1) else 0) |
             (if (super) @as(u8, 4) else 0);
+
+        inputDebugLog("[KITTY] Parsed: code={d} char='{c}' raw_mod={d} mod_bits={d} cdp_mods={d} super={}", .{
+            code,
+            if (code >= 32 and code < 127) @as(u8, @intCast(code)) else '.',
+            modifiers,
+            mod_bits,
+            cdp_mods,
+            super,
+        });
         return .{ .key = .{ .key = self.unicodeToKey(code, mod_bits), .modifiers = cdp_mods } };
     }
 
@@ -793,7 +837,19 @@ pub const InputReader = struct {
                 continue;
             }
 
+            // If in paste mode, accumulate bytes instead of processing them
+            if (self.in_paste) {
+                self.paste_buffer.append(self.allocator, c) catch {};
+                // Remove from main buffer
+                if (self.buffer_len > 1) {
+                    std.mem.copyForwards(u8, self.buffer[0..self.buffer_len - 1], self.buffer[1..self.buffer_len]);
+                }
+                self.buffer_len -= 1;
+                continue; // Keep accumulating
+            }
+
             // Regular character or control code
+            inputDebugLog("[KEY] Single byte: 0x{x} ('{c}')", .{ c, if (c >= 32 and c < 127) c else '.' });
             const key = try self.parseSingleByte(c);
             self.debugLog("[INPUT] Parsed single byte to key, returning\n", .{});
             // Log any printable chars being output (potential mouse leak)

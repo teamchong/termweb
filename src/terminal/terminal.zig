@@ -141,6 +141,9 @@ pub const Terminal = struct {
         // Enable Kitty keyboard protocol (level 1 - disambiguate escape codes)
         try writer.writeAll("\x1b[>1u");
 
+        // Enable bracketed paste mode (for proper paste handling)
+        try writer.writeAll("\x1b[?2004h");
+
         try writer.flush();
         self.mouse_enabled = true;
     }
@@ -156,6 +159,9 @@ pub const Terminal = struct {
 
         // Disable Kitty keyboard protocol
         try writer.writeAll("\x1b[<u");
+
+        // Disable bracketed paste mode
+        try writer.writeAll("\x1b[?2004l");
 
         // Disable SGR pixel mouse mode
         try writer.writeAll("\x1b[?1016l");
