@@ -247,6 +247,16 @@ pub fn sendChar(
     allocator: std.mem.Allocator,
     char: u8,
 ) void {
+    sendCharWithModifiers(client, allocator, char, 0);
+}
+
+/// Send a character to the browser with modifiers (for Cmd+A, Ctrl+C, etc.)
+pub fn sendCharWithModifiers(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    char: u8,
+    modifiers: u8,
+) void {
     var key_buf: [2]u8 = .{ char, 0 };
     const key: []const u8 = key_buf[0..1];
 
@@ -256,7 +266,22 @@ pub fn sendChar(
     else
         char;
 
-    // Format keyDown event (no text - char event handles text insertion)
+    _ = allocator;
+
+    // If modifiers are present (Cmd+A, Ctrl+C, etc.), send without text to trigger shortcuts
+    if (modifiers != 0) {
+        var down_buf: [256]u8 = undefined;
+        const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key, std.ascii.toUpper(char), code, modifiers }) catch return;
+
+        var up_buf: [256]u8 = undefined;
+        const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key, std.ascii.toUpper(char), code, modifiers }) catch return;
+
+        client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
+        client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
+        return;
+    }
+
+    // No modifiers - send normal character input
     var down_buf: [256]u8 = undefined;
     const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, code }) catch return;
 
@@ -268,7 +293,6 @@ pub fn sendChar(
     var up_buf: [256]u8 = undefined;
     const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, code }) catch return;
 
-    _ = allocator;
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", char_params);
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);

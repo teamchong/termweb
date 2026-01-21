@@ -31,7 +31,6 @@ const Input = input_mod.Input;
 const MouseEvent = input_mod.MouseEvent;
 const CoordinateMapper = coordinates_mod.CoordinateMapper;
 const PromptBuffer = prompt_mod.PromptBuffer;
-const FormContext = dom_mod.FormContext;
 const UIState = ui_mod.UIState;
 const Placement = ui_mod.Placement;
 const ZIndex = ui_mod.ZIndex;
@@ -98,27 +97,18 @@ fn isNaturalScrollEnabled() bool {
 
 /// ViewerMode represents the current interaction mode of the viewer.
 ///
-/// The viewer operates as a state machine with six distinct modes:
-/// - normal: Default browsing mode (scroll, navigate, refresh)
+/// The viewer operates as a state machine with three modes:
+/// - normal: Default browsing mode - all input goes to the browser
 /// - url_prompt: URL entry mode activated by Ctrl+L
-/// - form_mode: Form element selection mode activated by 'f' key
-/// - text_input: Text entry mode for filling form fields
-/// - help: Help overlay showing key bindings
 /// - dialog: Modal dialog mode for JavaScript alerts/confirms/prompts
 ///
 /// Mode transitions:
 ///   Normal → URL Prompt (press Ctrl+L)
-///   Normal → Form Mode (press 'f')
-///   Normal → Help (press '?')
 ///   Normal → Dialog (JavaScript dialog event)
-///   Form Mode → Text Input (press Enter on text field)
-///   Any mode → Normal (press Esc or complete action)
+///   URL Prompt/Dialog → Normal (press Esc or complete action)
 pub const ViewerMode = enum {
-    normal,       // Scroll, navigate, refresh
+    normal,       // Main browsing mode - all input goes to browser
     url_prompt,   // Entering URL (Ctrl+L)
-    form_mode,    // Selecting form elements (f key, Tab navigation)
-    text_input,   // Typing into form field
-    help,         // Help overlay (? key)
     dialog,       // JavaScript dialog (alert/confirm/prompt)
 };
 
@@ -132,7 +122,6 @@ pub const Viewer = struct {
     running: bool,
     mode: ViewerMode,
     prompt_buffer: ?PromptBuffer,
-    form_context: ?*FormContext,
     debug_log: ?std.fs.File,
     viewport_width: u32,  // Requested viewport (for screencast)
     viewport_height: u32,
@@ -251,7 +240,6 @@ pub const Viewer = struct {
             .running = true,
             .mode = .normal,
             .prompt_buffer = null,
-            .form_context = null,
             .debug_log = debug_log,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
@@ -1089,32 +1077,6 @@ pub const Viewer = struct {
                     return;
                 }
 
-                // Help mode: ESC, ?, q close help (NOT quit app)
-                if (self.mode == .help) {
-                    const should_close = switch (key) {
-                        .escape => true,  // ESC closes help
-                        .char => |c| c == '?' or c == 'q' or c == 'Q',
-                        else => false,
-                    };
-
-                    if (should_close) {
-                        self.mode = .normal;
-                        // Clear screen and force re-render after help overlay
-                        var stdout_buf: [8192]u8 = undefined;
-                        const stdout_file = std.fs.File.stdout();
-                        var stdout_writer = stdout_file.writer(&stdout_buf);
-                        const writer = &stdout_writer.interface;
-                        try Screen.clear(writer);
-                        try self.kitty.clearAll(writer);
-                        try writer.flush();
-                        // Reset frame time to force immediate render
-                        self.last_frame_time = 0;
-                        return;
-                    }
-                    // Ignore other keys in help mode
-                    return;
-                }
-
                 try self.handleKey(key_input);
             },
             .mouse => |mouse| try self.handleMouse(mouse),
@@ -1185,9 +1147,6 @@ pub const Viewer = struct {
                     }
                 }
             },
-            .form_mode => {}, // TODO: Phase 6 - form mode mouse support
-            .text_input => {}, // Ignore mouse in text input mode
-            .help => {}, // Ignore mouse in help mode
             .dialog => {}, // Ignore mouse in dialog mode (keyboard only)
         }
     }
@@ -1374,9 +1333,6 @@ pub const Viewer = struct {
         switch (self.mode) {
             .normal => try self.handleNormalMode(key_input),
             .url_prompt => try self.handleUrlPromptMode(key_input),
-            .form_mode => try self.handleFormMode(key_input.key),
-            .text_input => try self.handleTextInputMode(key_input.key),
-            .help => {}, // Help mode only responds to Esc (handled in handleInput)
             .dialog => try self.handleDialogMode(key_input.key),
         }
     }
@@ -1391,9 +1347,8 @@ pub const Viewer = struct {
         const mods = key_input.modifiers; // CDP: 1=alt, 2=ctrl, 4=meta, 8=shift
         switch (key) {
             .char => |c| {
-                // Pass all characters to browser (with modifiers via sendSpecialKeyWithModifiers)
-                // For regular chars, use sendChar which doesn't support modifiers for now
-                interact_mod.sendChar(self.cdp_client, self.allocator, c);
+                // Pass all characters to browser with modifiers (for Cmd+A, Ctrl+C, etc.)
+                interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, c, mods);
             },
             .escape => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Escape", 27, mods),
             // Ctrl+W, Ctrl+Q, Ctrl+C handled globally (see handleInput)
@@ -1618,112 +1573,6 @@ pub const Viewer = struct {
         }
     }
 
-    /// Handle key press in form mode
-    fn handleFormMode(self: *Viewer, key: Key) !void {
-        var ctx = self.form_context orelse return;
-
-        switch (key) {
-            .tab => {
-                ctx.next();
-                try self.drawStatus();
-            },
-            .enter => {
-                if (ctx.current()) |elem| {
-                    if (std.mem.eql(u8, elem.tag, "a")) {
-                        // Click link
-                        try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
-                        try self.refresh();
-                    } else if (std.mem.eql(u8, elem.tag, "input")) {
-                        if (elem.type) |t| {
-                            if (std.mem.eql(u8, t, "text") or std.mem.eql(u8, t, "password")) {
-                                // Enter text input mode
-                                try interact_mod.focusElement(self.cdp_client, self.allocator, elem.selector);
-                                self.mode = .text_input;
-                                self.prompt_buffer = try PromptBuffer.init(self.allocator);
-                                try self.drawStatus();
-                            } else if (std.mem.eql(u8, t, "checkbox") or std.mem.eql(u8, t, "radio")) {
-                                // Toggle checkbox or select radio button
-                                try interact_mod.toggleCheckbox(self.cdp_client, self.allocator, elem.selector);
-                                try self.refresh();
-                            } else if (std.mem.eql(u8, t, "submit")) {
-                                // Submit button - click it
-                                try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
-                                try self.refresh();
-                            }
-                        }
-                    } else if (std.mem.eql(u8, elem.tag, "textarea")) {
-                        // Treat textarea like text input
-                        try interact_mod.focusElement(self.cdp_client, self.allocator, elem.selector);
-                        self.mode = .text_input;
-                        self.prompt_buffer = try PromptBuffer.init(self.allocator);
-                        try self.drawStatus();
-                    } else if (std.mem.eql(u8, elem.tag, "select")) {
-                        // Click select to activate dropdown
-                        try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
-                        try self.refresh();
-                    } else if (std.mem.eql(u8, elem.tag, "button")) {
-                        // Click button
-                        try interact_mod.clickElement(self.cdp_client, self.allocator, elem);
-                        try self.refresh();
-                    }
-                }
-            },
-            .escape => {
-                // Exit form mode
-                ctx.deinit();
-                self.allocator.destroy(ctx);
-                self.form_context = null;
-                self.mode = .normal;
-                try self.drawStatus();
-            },
-            else => {},
-        }
-    }
-
-    /// Handle key press in text input mode
-    fn handleTextInputMode(self: *Viewer, key: Key) !void {
-        var prompt = &self.prompt_buffer.?;
-
-        switch (key) {
-            .char => |c| {
-                if (c >= 32 and c <= 126) { // Printable characters
-                    try prompt.insertChar(c);
-                }
-                try self.drawStatus();
-            },
-            .backspace => {
-                prompt.backspace();
-                try self.drawStatus();
-            },
-            .enter => {
-                const text = prompt.getString();
-                if (text.len > 0) {
-                    // Type the text into the focused element
-                    try interact_mod.typeText(self.cdp_client, self.allocator, text);
-                }
-                // Press Enter to submit
-                interact_mod.pressEnter(self.cdp_client, self.allocator);
-
-                // Cleanup prompt
-                prompt.deinit();
-                self.prompt_buffer = null;
-
-                // Return to form mode (not normal mode)
-                self.mode = .form_mode;
-                try self.refresh();
-                try self.drawStatus();
-            },
-            .escape => {
-                // Cancel text input
-                prompt.deinit();
-                self.prompt_buffer = null;
-                self.mode = .form_mode;
-                try self.drawStatus();
-            },
-            else => {},
-        }
-    }
-
     /// Draw status line (only for non-normal modes that need user input)
     fn drawStatus(self: *Viewer) !void {
         // Don't show status bar in normal mode - use tab bar instead
@@ -1751,27 +1600,6 @@ pub const Viewer = struct {
                 }
                 try writer.print(" | [Enter] navigate [Esc] cancel", .{});
             },
-            .form_mode => {
-                if (self.form_context) |ctx| {
-                    if (ctx.current()) |elem| {
-                        var desc_buf: [200]u8 = undefined;
-                        const desc = try elem.describe(&desc_buf);
-                        try writer.print("FORM [{d}/{d}]: {s} | [Tab] next [Enter] activate [Esc] exit", .{ ctx.current_index + 1, ctx.elements.len, desc });
-                    } else {
-                        try writer.print("FORM: No elements | [Esc] exit", .{});
-                    }
-                }
-            },
-            .text_input => {
-                try writer.print("Type text: ", .{});
-                if (self.prompt_buffer) |*p| {
-                    try p.render(writer, "");
-                }
-                try writer.print(" | [Enter] submit [Esc] cancel", .{});
-            },
-            .help => {
-                try writer.print("HELP | [?] or [q] to close | [Ctrl+Q/W] to quit", .{});
-            },
             .dialog => {
                 // Dialog mode - status shown in dialog overlay
                 try writer.print("DIALOG | [Enter] OK [Esc] Cancel", .{});
@@ -1779,54 +1607,6 @@ pub const Viewer = struct {
         }
         try writer.writeAll("\x1b[0m"); // Reset colors
         try writer.flush();
-    }
-
-    /// Draw help overlay
-    fn drawHelp(self: *Viewer) !void {
-        var stdout_buf: [8192]u8 = undefined;
-        const stdout_file = std.fs.File.stdout();
-        var stdout_writer = stdout_file.writer(&stdout_buf);
-        const writer = &stdout_writer.interface;
-
-        try Screen.clear(writer);
-        try Screen.moveCursor(writer, 1, 1);
-
-        // Title
-        try writer.writeAll("\x1b[1;37m"); // Bold white
-        try writer.writeAll("┌─────────────────────────────────────────────────────────────┐" ++ CRLF);
-        try writer.writeAll("│              TERMWEB - KEYBOARD & MOUSE HELP                │" ++ CRLF);
-        try writer.writeAll("└─────────────────────────────────────────────────────────────┘\x1b[0m" ++ CRLF ++ CRLF);
-
-        // Chrome key bindings
-        try writer.writeAll("\x1b[1;36mCHROME-STYLE KEYS:\x1b[0m" ++ CRLF);
-        try writer.writeAll("  Ctrl+L        Focus address bar" ++ CRLF);
-        try writer.writeAll("  Ctrl+R        Reload page from server" ++ CRLF);
-        try writer.writeAll("  Ctrl+F        Enter form mode (find/forms)" ++ CRLF);
-        try writer.writeAll("  Ctrl+Q/W      Quit termweb" ++ CRLF ++ CRLF);
-
-        // Navigation
-        try writer.writeAll("\x1b[1;36mNAVIGATION:\x1b[0m" ++ CRLF);
-        try writer.writeAll("  j, ↓          Scroll down one line" ++ CRLF);
-        try writer.writeAll("  k, ↑          Scroll up one line" ++ CRLF);
-        try writer.writeAll("  d             Scroll down half page" ++ CRLF);
-        try writer.writeAll("  u             Scroll up half page" ++ CRLF);
-        try writer.writeAll("  b, ←          Navigate back in history" ++ CRLF);
-        try writer.writeAll("  →             Navigate forward in history" ++ CRLF);
-        try writer.writeAll("  r             Refresh screenshot" ++ CRLF ++ CRLF);
-
-        // Mouse
-        try writer.writeAll("\x1b[1;36mMOUSE:\x1b[0m" ++ CRLF);
-        try writer.writeAll("  Left Click    Click links and buttons" ++ CRLF);
-        try writer.writeAll("  Wheel Up/Down Scroll page up/down" ++ CRLF ++ CRLF);
-
-        // Other
-        try writer.writeAll("\x1b[1;36mOTHER:\x1b[0m" ++ CRLF);
-        try writer.writeAll("  ?             Toggle this help" ++ CRLF ++ CRLF);
-
-        try writer.writeAll("\x1b[2m(Press ? or q to close help. Ctrl+Q quits anytime)\x1b[0m" ++ CRLF);
-
-        try writer.flush();
-        try self.drawStatus();
     }
 
     /// Handle CDP events (JavaScript dialogs, file chooser, console messages)
@@ -2435,10 +2215,6 @@ pub const Viewer = struct {
 
     pub fn deinit(self: *Viewer) void {
         if (self.prompt_buffer) |*p| p.deinit();
-        if (self.form_context) |ctx| {
-            ctx.deinit();
-            self.allocator.destroy(ctx);
-        }
         if (self.dialog_state) |state| {
             var s = state;
             s.deinit();
