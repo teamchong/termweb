@@ -412,6 +412,11 @@ pub const WebSocketCdpClient = struct {
         const method_end = std.mem.indexOfPos(u8, payload, method_value_start, "\"") orelse return;
         const method = payload[method_value_start..method_end];
 
+        // Debug: Log all Browser.* events
+        if (std.mem.startsWith(u8, method, "Browser.")) {
+            logToFile("[WS] Browser event: {s}\n", .{method});
+        }
+
         // Special handling for screencast frames
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             try self.handleScreencastFrame(payload);
