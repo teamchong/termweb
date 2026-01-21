@@ -23,6 +23,7 @@ const ShmBuffer = shm_mod.ShmBuffer;
 const InputReader = input_mod.InputReader;
 const Screen = screen_mod.Screen;
 const Key = input_mod.Key;
+const KeyInput = input_mod.KeyInput;
 const Input = input_mod.Input;
 const MouseEvent = input_mod.MouseEvent;
 const CoordinateMapper = coordinates_mod.CoordinateMapper;
@@ -913,13 +914,19 @@ pub const Viewer = struct {
     /// Handle input event - dispatches to key or mouse handlers
     fn handleInput(self: *Viewer, input: Input) !void {
         switch (input) {
-            .key => |key| {
+            .key => |key_input| {
+                const key = key_input.key;
+                const modifiers = key_input.modifiers;
                 // Debug log all key presses (if enabled)
                 if (self.debug_input) {
+                    if (modifiers != 0) {
+                        self.log("[KEY] modifiers: {d}\n", .{modifiers});
+                    }
                     switch (key) {
                         .char => |c| self.log("[KEY] char: {d} ('{c}')\n", .{ c, if (c >= 32 and c <= 126) c else '.' }),
                         .escape => self.log("[KEY] escape\n", .{}),
                         .tab => self.log("[KEY] tab\n", .{}),
+                        .shift_tab => self.log("[KEY] shift_tab\n", .{}),
                         .backspace => self.log("[KEY] backspace\n", .{}),
                         .enter => self.log("[KEY] enter\n", .{}),
                         .ctrl_a => self.log("[KEY] ctrl_a\n", .{}),
@@ -1025,7 +1032,7 @@ pub const Viewer = struct {
                     }
                 }
 
-                try self.handleKey(key);
+                try self.handleKey(key_input);
             },
             .mouse => |mouse| try self.handleMouse(mouse),
             .none => {},
@@ -1384,14 +1391,14 @@ pub const Viewer = struct {
     }
 
     /// Handle key press - dispatches to mode-specific handlers
-    fn handleKey(self: *Viewer, key: Key) !void {
+    fn handleKey(self: *Viewer, key_input: KeyInput) !void {
         switch (self.mode) {
-            .normal => try self.handleNormalMode(key),
-            .url_prompt => try self.handleUrlPromptMode(key),
-            .form_mode => try self.handleFormMode(key),
-            .text_input => try self.handleTextInputMode(key),
+            .normal => try self.handleNormalMode(key_input),
+            .url_prompt => try self.handleUrlPromptMode(key_input.key),
+            .form_mode => try self.handleFormMode(key_input.key),
+            .text_input => try self.handleTextInputMode(key_input.key),
             .help => {}, // Help mode only responds to Esc (handled in handleInput)
-            .dialog => try self.handleDialogMode(key),
+            .dialog => try self.handleDialogMode(key_input.key),
         }
     }
 
@@ -1400,13 +1407,16 @@ pub const Viewer = struct {
     /// - Ctrl+Q/W/C: quit (handled globally)
     /// - Ctrl+L: address bar
     /// - Ctrl+R: reload
-    fn handleNormalMode(self: *Viewer, key: Key) !void {
+    fn handleNormalMode(self: *Viewer, key_input: KeyInput) !void {
+        const key = key_input.key;
+        const mods = key_input.modifiers; // CDP: 1=alt, 2=ctrl, 4=meta, 8=shift
         switch (key) {
             .char => |c| {
-                // Pass all characters to browser
+                // Pass all characters to browser (with modifiers via sendSpecialKeyWithModifiers)
+                // For regular chars, use sendChar which doesn't support modifiers for now
                 interact_mod.sendChar(self.cdp_client, self.allocator, c);
             },
-            .escape => interact_mod.sendSpecialKey(self.cdp_client, "Escape", 27),
+            .escape => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Escape", 27, mods),
             // Ctrl+W, Ctrl+Q, Ctrl+C handled globally (see handleInput)
             .ctrl_r => { // Chrome-style reload
                 try screenshot_api.reload(self.cdp_client, self.allocator, false);
@@ -1422,20 +1432,21 @@ pub const Viewer = struct {
                 }
                 self.ui_dirty = true;
             },
-            // Arrow keys - pass to browser
-            .left => interact_mod.sendSpecialKey(self.cdp_client, "ArrowLeft", 37),
-            .right => interact_mod.sendSpecialKey(self.cdp_client, "ArrowRight", 39),
-            .up => interact_mod.sendSpecialKey(self.cdp_client, "ArrowUp", 38),
-            .down => interact_mod.sendSpecialKey(self.cdp_client, "ArrowDown", 40),
-            // Special keys - pass to browser
-            .enter => interact_mod.sendSpecialKey(self.cdp_client, "Enter", 13),
-            .backspace => interact_mod.sendSpecialKey(self.cdp_client, "Backspace", 8),
-            .tab => interact_mod.sendSpecialKey(self.cdp_client, "Tab", 9),
-            .delete => interact_mod.sendSpecialKey(self.cdp_client, "Delete", 46),
-            .home => interact_mod.sendSpecialKey(self.cdp_client, "Home", 36),
-            .end => interact_mod.sendSpecialKey(self.cdp_client, "End", 35),
-            .page_up => interact_mod.sendSpecialKey(self.cdp_client, "PageUp", 33),
-            .page_down => interact_mod.sendSpecialKey(self.cdp_client, "PageDown", 34),
+            // Arrow keys - pass to browser with modifiers
+            .left => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowLeft", 37, mods),
+            .right => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowRight", 39, mods),
+            .up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowUp", 38, mods),
+            .down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowDown", 40, mods),
+            // Special keys - pass to browser with modifiers
+            .enter => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Enter", 13, mods),
+            .backspace => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Backspace", 8, mods),
+            .tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods),
+            .shift_tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods | 8), // Ensure shift is set
+            .delete => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Delete", 46, mods),
+            .home => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Home", 36, mods),
+            .end => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "End", 35, mods),
+            .page_up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageUp", 33, mods),
+            .page_down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageDown", 34, mods),
             else => {},
         }
     }

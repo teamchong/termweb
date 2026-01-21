@@ -250,11 +250,21 @@ pub fn sendSpecialKey(
     key_name: []const u8,
     key_code: u16,
 ) void {
+    sendSpecialKeyWithModifiers(client, key_name, key_code, 0);
+}
+
+/// Send a special key with modifiers (shift=8, ctrl=4, alt=2, meta=1 in CDP)
+pub fn sendSpecialKeyWithModifiers(
+    client: *cdp.CdpClient,
+    key_name: []const u8,
+    key_code: u16,
+    modifiers: u8,
+) void {
     var down_buf: [256]u8 = undefined;
-    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key_name, key_name, key_code }) catch return;
+    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key_name, key_name, key_code, modifiers }) catch return;
 
     var up_buf: [256]u8 = undefined;
-    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key_name, key_name, key_code }) catch return;
+    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key_name, key_name, key_code, modifiers }) catch return;
 
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);

@@ -6,6 +6,7 @@ pub const Key = union(enum) {
     // Control keys
     escape,
     tab,
+    shift_tab,
     backspace,
     enter,
 
@@ -61,9 +62,14 @@ pub const MouseEvent = struct {
 };
 
 pub const Input = union(enum) {
-    key: Key,
+    key: KeyInput,
     mouse: MouseEvent,
     none,
+};
+
+pub const KeyInput = struct {
+    key: Key,
+    modifiers: u8 = 0, // CDP modifiers: 1=alt, 2=ctrl, 4=meta, 8=shift
 };
 
 pub const InputReader = struct {
@@ -138,10 +144,10 @@ pub const InputReader = struct {
         // Simple cursor keys: ESC [ A/B/C/D
         if (self.escape_len == 3) {
             return switch (self.escape_buffer[2]) {
-                'A' => .{ .key = .up },
-                'B' => .{ .key = .down },
-                'C' => .{ .key = .right },
-                'D' => .{ .key = .left },
+                'A' => .{ .key = .{ .key = .up } },
+                'B' => .{ .key = .{ .key = .down } },
+                'C' => .{ .key = .{ .key = .right } },
+                'D' => .{ .key = .{ .key = .left } },
                 else => null,
             };
         }
@@ -163,24 +169,24 @@ pub const InputReader = struct {
             const num = std.fmt.parseInt(u8, num_str, 10) catch return null;
 
             return switch (num) {
-                1 => .{ .key = .home },
-                2 => .{ .key = .insert },
-                3 => .{ .key = .delete },
-                4 => .{ .key = .end },
-                5 => .{ .key = .page_up },
-                6 => .{ .key = .page_down },
-                11 => .{ .key = .f1 },
-                12 => .{ .key = .f2 },
-                13 => .{ .key = .f3 },
-                14 => .{ .key = .f4 },
-                15 => .{ .key = .f5 },
-                17 => .{ .key = .f6 },
-                18 => .{ .key = .f7 },
-                19 => .{ .key = .f8 },
-                20 => .{ .key = .f9 },
-                21 => .{ .key = .f10 },
-                23 => .{ .key = .f11 },
-                24 => .{ .key = .f12 },
+                1 => .{ .key = .{ .key = .home } },
+                2 => .{ .key = .{ .key = .insert } },
+                3 => .{ .key = .{ .key = .delete } },
+                4 => .{ .key = .{ .key = .end } },
+                5 => .{ .key = .{ .key = .page_up } },
+                6 => .{ .key = .{ .key = .page_down } },
+                11 => .{ .key = .{ .key = .f1 } },
+                12 => .{ .key = .{ .key = .f2 } },
+                13 => .{ .key = .{ .key = .f3 } },
+                14 => .{ .key = .{ .key = .f4 } },
+                15 => .{ .key = .{ .key = .f5 } },
+                17 => .{ .key = .{ .key = .f6 } },
+                18 => .{ .key = .{ .key = .f7 } },
+                19 => .{ .key = .{ .key = .f8 } },
+                20 => .{ .key = .{ .key = .f9 } },
+                21 => .{ .key = .{ .key = .f10 } },
+                23 => .{ .key = .{ .key = .f11 } },
+                24 => .{ .key = .{ .key = .f12 } },
                 else => null,
             };
         }
@@ -230,10 +236,18 @@ pub const InputReader = struct {
         }
 
         // Only handle key press events (event_type 1) and repeat (event_type 2)
-        if (event_type == 3) return .{ .key = .none }; // Ignore release events
+        if (event_type == 3) return .{ .key = .{ .key = .none } }; // Ignore release events
 
-        // Map unicode codepoint to Key
-        return .{ .key = self.unicodeToKey(code, modifiers) };
+        // Parse terminal modifiers (2=shift, 4=ctrl, 8=alt in Kitty protocol)
+        const shift = (modifiers & 2) != 0;
+        const ctrl = (modifiers & 4) != 0;
+        const alt = (modifiers & 8) != 0;
+
+        // Convert to CDP modifiers (8=shift, 2=ctrl, 1=alt, 4=meta)
+        const cdp_mods: u8 = (if (shift) @as(u8, 8) else 0) |
+            (if (ctrl) @as(u8, 2) else 0) |
+            (if (alt) @as(u8, 1) else 0);
+        return .{ .key = .{ .key = self.unicodeToKey(code, modifiers), .modifiers = cdp_mods } };
     }
 
     /// Convert unicode codepoint and modifiers to Key enum
@@ -242,7 +256,11 @@ pub const InputReader = struct {
         const shift = (modifiers & 2) != 0;
         const ctrl = (modifiers & 4) != 0;
         const alt = (modifiers & 8) != 0;
-        _ = shift;
+
+        // Handle shift+tab specifically
+        if (shift and code == 9) {
+            return .shift_tab;
+        }
 
         // Handle ctrl+key combinations
         if (ctrl and !alt) {
@@ -333,10 +351,10 @@ pub const InputReader = struct {
 
         if (self.escape_len == 3) {
             return switch (self.escape_buffer[2]) {
-                'P' => .{ .key = .f1 },
-                'Q' => .{ .key = .f2 },
-                'R' => .{ .key = .f3 },
-                'S' => .{ .key = .f4 },
+                'P' => .{ .key = .{ .key = .f1 } },
+                'Q' => .{ .key = .{ .key = .f2 } },
+                'R' => .{ .key = .{ .key = .f3 } },
+                'S' => .{ .key = .{ .key = .f4 } },
                 else => null,
             };
         }
@@ -441,10 +459,10 @@ pub const InputReader = struct {
         if (self.escape_len == 2) {
             const c = self.escape_buffer[1];
             if (c >= 'a' and c <= 'z') {
-                return .{ .key = .{ .alt_char = c } };
+                return .{ .key = .{ .key = .{ .alt_char = c } } };
             }
             if (c >= 'A' and c <= 'Z') {
-                return .{ .key = .{ .alt_char = c } };
+                return .{ .key = .{ .key = .{ .alt_char = c } } };
             }
         }
 
@@ -460,7 +478,7 @@ pub const InputReader = struct {
 
         // Plain ESC key (timeout waiting for rest of sequence)
         if (self.escape_len == 1) {
-            return .{ .key = .escape };
+            return .{ .key = .{ .key = .escape } };
         }
 
         return null; // Incomplete or unknown
@@ -527,7 +545,7 @@ pub const InputReader = struct {
                         // Timeout waiting for rest of sequence - treat as ESC key
                         self.in_escape = false;
                         self.escape_len = 0;
-                        return .{ .key = .escape };
+                        return .{ .key = .{ .key = .escape } };
                     }
                     return .none;
                 }
@@ -613,7 +631,7 @@ pub const InputReader = struct {
             self.buffer_len -= 1;
             self.debugLog("[INPUT] After return, buffer_len={d}\n", .{self.buffer_len});
 
-            return .{ .key = key };
+            return .{ .key = .{ .key = key } };
         }
 
         // Processed all bytes but no complete input (accumulating escape)
