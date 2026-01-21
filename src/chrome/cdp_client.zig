@@ -420,6 +420,12 @@ pub const CdpClient = struct {
         const runtime_result = try self.nav_ws.?.sendCommand("Runtime.enable", null);
         self.allocator.free(runtime_result);
 
+        // Re-enable downloads on nav_ws for download events
+        const download_params = try std.fmt.allocPrint(self.allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
+        defer self.allocator.free(download_params);
+        const download_result = try self.nav_ws.?.sendCommand("Browser.setDownloadBehavior", download_params);
+        self.allocator.free(download_result);
+
         logToFile("[CDP] All WebSockets reconnected successfully\n", .{});
     }
 
