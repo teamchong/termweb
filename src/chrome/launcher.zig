@@ -276,7 +276,8 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--no-default-browser-check");
     try args_list.append(allocator, "--allow-file-access-from-files");
     try args_list.append(allocator, "--enable-features=FileSystemAccessAPI,FileSystemAccessLocal");
-    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts");
+    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts,DownloadBubble,DownloadBubbleV2");
+    try args_list.append(allocator, "--disable-infobars"); // Disable download shelf/bar
 
     if (options.disable_gpu) {
         try args_list.append(allocator, "--disable-gpu");

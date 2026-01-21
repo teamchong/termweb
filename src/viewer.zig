@@ -132,8 +132,10 @@ pub const Viewer = struct {
     prompt_buffer: ?PromptBuffer,
     form_context: ?*FormContext,
     debug_log: ?std.fs.File,
-    viewport_width: u32,
+    viewport_width: u32,  // Requested viewport (for screencast)
     viewport_height: u32,
+    chrome_actual_width: u32,  // Chrome's actual window.innerWidth (for coordinate mapping)
+    chrome_actual_height: u32, // Chrome's actual window.innerHeight
     coord_mapper: ?CoordinateMapper,
     last_click: ?struct { term_x: u16, term_y: u16, browser_x: u32, browser_y: u32 },
 
@@ -225,6 +227,15 @@ pub const Viewer = struct {
         const shm_buffer = if (disable_shm) null else ShmBuffer.init(shm_size) catch null;
         const screencast_format: screenshot_api.ScreenshotFormat = if (shm_buffer == null) .png else .jpeg;
 
+        // Query Chrome's ACTUAL viewport (may differ from requested due to DPI scaling)
+        // This is the source of truth for coordinate mapping
+        var chrome_actual_w = viewport_width;
+        var chrome_actual_h = viewport_height;
+        if (screenshot_api.getActualViewport(cdp_client, allocator)) |actual_vp| {
+            if (actual_vp.width > 0) chrome_actual_w = actual_vp.width;
+            if (actual_vp.height > 0) chrome_actual_h = actual_vp.height;
+        } else |_| {}
+
         return Viewer{
             .allocator = allocator,
             .terminal = Terminal.init(),
@@ -239,6 +250,8 @@ pub const Viewer = struct {
             .debug_log = debug_log,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
+            .chrome_actual_width = chrome_actual_w,
+            .chrome_actual_height = chrome_actual_h,
             .coord_mapper = null,
             .last_click = null,
             .screencast_mode = false,
@@ -664,18 +677,18 @@ pub const Viewer = struct {
             size.height_px,
         });
 
-        // Update coordinate mapper (for handling terminal resize)
+        // Update coordinate mapper using Chrome's actual viewport (source of truth)
         const toolbar_h: ?u16 = if (self.toolbar_renderer) |tr| @intCast(tr.toolbar_height) else null;
         self.coord_mapper = CoordinateMapper.initWithToolbar(
             size.width_px,
             size.height_px,
             size.cols,
             size.rows,
-            self.viewport_width,
-            self.viewport_height,
+            self.chrome_actual_width,
+            self.chrome_actual_height,
             toolbar_h,
         );
-        self.log("[DEBUG] Coordinate mapper initialized\n", .{});
+        self.log("[DEBUG] Coordinate mapper initialized (chrome={}x{})\n", .{ self.chrome_actual_width, self.chrome_actual_height });
 
         // Capture screenshot
         self.log("[DEBUG] Capturing screenshot...\n", .{});
@@ -749,6 +762,28 @@ pub const Viewer = struct {
         const frame_width = if (frame.device_width > 0) frame.device_width else self.viewport_width;
         const frame_height = if (frame.device_height > 0) frame.device_height else self.viewport_height;
 
+        // Use screencast frame dimensions for coordinate mapping
+        // The frame is what we actually display - Chrome's viewport may be larger
+        // (e.g., download shelf takes space from viewport but screencast captures the content area)
+        if (frame.device_width > 0 and frame.device_height > 0) {
+            if (frame_width != self.chrome_actual_width or frame_height != self.chrome_actual_height) {
+                self.log("[FRAME] Coord space changed: {}x{} -> {}x{}\n", .{
+                    self.chrome_actual_width, self.chrome_actual_height,
+                    frame_width, frame_height,
+                });
+                self.chrome_actual_width = frame_width;
+                self.chrome_actual_height = frame_height;
+            }
+        }
+
+        // Debug: Log actual frame dimensions from Chrome
+        if (self.perf_frame_count < 5) {
+            self.log("[FRAME] device={}x{} (raw={}x{}), chrome={}x{}\n", .{
+                frame_width, frame_height, frame.device_width, frame.device_height,
+                self.chrome_actual_width, self.chrome_actual_height,
+            });
+        }
+
         // Profile render time
         const render_start = std.time.nanoTimestamp();
 
@@ -790,6 +825,27 @@ pub const Viewer = struct {
         const nav_state = screenshot_api.getNavigationState(self.cdp_client, self.allocator) catch return;
         self.ui_state.can_go_back = nav_state.can_go_back;
         self.ui_state.can_go_forward = nav_state.can_go_forward;
+        // Refresh Chrome's actual viewport (may change after navigation/zoom)
+        self.refreshChromeViewport();
+    }
+
+    /// Refresh Chrome's actual viewport dimensions (source of truth for coordinate mapping)
+    fn refreshChromeViewport(self: *Viewer) void {
+        if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |actual_vp| {
+            self.log("[VIEWPORT] Query returned: {}x{}\n", .{ actual_vp.width, actual_vp.height });
+            if (actual_vp.width > 0 and actual_vp.height > 0) {
+                if (actual_vp.width != self.chrome_actual_width or actual_vp.height != self.chrome_actual_height) {
+                    self.log("[VIEWPORT] Chrome actual changed: {}x{} -> {}x{}\n", .{
+                        self.chrome_actual_width, self.chrome_actual_height,
+                        actual_vp.width, actual_vp.height,
+                    });
+                    self.chrome_actual_width = actual_vp.width;
+                    self.chrome_actual_height = actual_vp.height;
+                }
+            }
+        } else |err| {
+            self.log("[VIEWPORT] Query failed: {}\n", .{err});
+        }
     }
 
     /// Display a base64 PNG frame with specific dimensions for coordinate mapping
@@ -821,20 +877,21 @@ pub const Viewer = struct {
             size.height_px;
         const content_rows: u32 = content_pixel_height / cell_height;
 
-        // Update coordinate mapper with ACTUAL frame dimensions from CDP
-        // This ensures click coordinates match what Chrome is rendering
+        // Update coordinate mapper with Chrome's ACTUAL viewport (source of truth)
+        // Chrome's window.innerWidth/Height is where mouse events are dispatched
         self.coord_mapper = CoordinateMapper.initWithToolbar(
             size.width_px,
             size.height_px,
             size.cols,
             size.rows,
-            frame_width,   // Use actual frame width, not viewport
-            frame_height,  // Use actual frame height, not viewport
+            self.chrome_actual_width,   // Chrome's actual viewport, not frame size
+            self.chrome_actual_height,
             @intCast(toolbar_h),
         );
 
-        self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}, y_off={}\n", .{
-            base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height, y_offset,
+        self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}, chrome={}x{}, y_off={}\n", .{
+            base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
+            self.chrome_actual_width, self.chrome_actual_height, y_offset,
         });
 
         // Move cursor to row 2

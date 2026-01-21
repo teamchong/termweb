@@ -155,10 +155,15 @@ pub fn injectMouseDebugTracker(client: *cdp.CdpClient, allocator: std.mem.Alloca
         \\  dot.style.cssText = 'position:fixed;width:10px;height:10px;background:red;border-radius:50%;pointer-events:none;z-index:999999;transform:translate(-50%,-50%)';
         \\  document.body.appendChild(dot);
         \\  window._mouseDebugDot = dot;
+        \\  var info = document.createElement('div');
+        \\  info.id = '_mouseDebugInfo';
+        \\  info.style.cssText = 'position:fixed;top:0;left:0;background:rgba(0,0,0,0.8);color:lime;font:12px monospace;padding:4px 8px;z-index:999999;pointer-events:none';
+        \\  info.textContent = 'VP:' + window.innerWidth + 'x' + window.innerHeight;
+        \\  document.body.appendChild(info);
         \\  document.addEventListener('mousemove', function(e) {
         \\    dot.style.left = e.clientX + 'px';
         \\    dot.style.top = e.clientY + 'px';
-        \\    console.log('MOUSE_DEBUG: x=' + e.clientX + ' y=' + e.clientY);
+        \\    info.textContent = 'VP:' + window.innerWidth + 'x' + window.innerHeight + ' M:' + e.clientX + ',' + e.clientY;
         \\  });
         \\})()
     ;

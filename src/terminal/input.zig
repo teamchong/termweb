@@ -1,5 +1,19 @@
 const std = @import("std");
 
+// File-based debug logging (always on for debugging)
+var input_debug_file: ?std.fs.File = null;
+
+fn inputDebugLog(comptime fmt: []const u8, args: anytype) void {
+    if (input_debug_file == null) {
+        input_debug_file = std.fs.cwd().createFile("/tmp/input_debug.log", .{ .truncate = true }) catch return;
+    }
+    if (input_debug_file) |f| {
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+        _ = f.write(msg) catch {};
+    }
+}
+
 pub const Key = union(enum) {
     char: u8,
 
@@ -141,6 +155,14 @@ pub const InputReader = struct {
         // Need at least ESC [ X (3 bytes)
         if (self.escape_len < 3) return null;
 
+        // DEBUG: Log escape buffer contents
+        self.debugLog("[CSI] escape_len={d} buf[2]='{c}'(0x{x}) mouse_enabled={}\n", .{
+            self.escape_len,
+            if (self.escape_buffer[2] >= 32 and self.escape_buffer[2] < 127) self.escape_buffer[2] else '.',
+            self.escape_buffer[2],
+            self.mouse_enabled,
+        });
+
         // Simple cursor keys: ESC [ A/B/C/D
         if (self.escape_len == 3) {
             return switch (self.escape_buffer[2]) {
@@ -156,23 +178,32 @@ pub const InputReader = struct {
         // Always try to parse mouse sequences to consume them properly
         // (even when disabled, we need to find the terminator)
         if (self.escape_buffer[2] == '<') {
+            inputDebugLog("[MOUSE] Detected mouse CSI, escape_len={d}, mouse_enabled={}", .{ self.escape_len, self.mouse_enabled });
+
             // Check if sequence is complete by looking for M/m terminator
             var has_terminator = false;
-            for (self.escape_buffer[0..self.escape_len]) |byte| {
+            var term_pos: usize = 0;
+            for (self.escape_buffer[0..self.escape_len], 0..) |byte, i| {
                 if (byte == 'M' or byte == 'm') {
                     has_terminator = true;
+                    term_pos = i;
                     break;
                 }
             }
 
             if (!has_terminator) {
+                inputDebugLog("[MOUSE] No terminator yet, returning null", .{});
                 return null; // Incomplete - need more bytes
             }
 
+            inputDebugLog("[MOUSE] Found terminator at pos {d}", .{term_pos});
+
             // Sequence is complete - parse it
             if (self.mouse_enabled) {
+                inputDebugLog("[MOUSE] Parsing mouse event (enabled)", .{});
                 return try self.parseMouseCSI();
             } else {
+                inputDebugLog("[MOUSE] Discarding mouse event (disabled)", .{});
                 // Mouse disabled - discard the sequence by returning none
                 return .none;
             }
@@ -382,6 +413,8 @@ pub const InputReader = struct {
 
     /// Parse mouse CSI sequence (ESC [ < button ; x ; y M/m)
     fn parseMouseCSI(self: *InputReader) !?Input {
+        inputDebugLog("[PARSE_MOUSE] Start, escape_len={d}", .{self.escape_len});
+
         // Look for terminator M or m
         var term_idx: ?usize = null;
         var terminator: u8 = 0;
@@ -393,7 +426,12 @@ pub const InputReader = struct {
             }
         }
 
-        if (term_idx == null) return null; // Incomplete
+        if (term_idx == null) {
+            inputDebugLog("[PARSE_MOUSE] No terminator, returning null", .{});
+            return null; // Incomplete
+        }
+
+        inputDebugLog("[PARSE_MOUSE] terminator at {d}", .{term_idx.?});
 
         // Find semicolons
         var first_semi: ?usize = null;
@@ -409,18 +447,35 @@ pub const InputReader = struct {
             }
         }
 
-        const semi1 = first_semi orelse return null;
-        const semi2 = second_semi orelse return null;
+        if (first_semi == null or second_semi == null) {
+            inputDebugLog("[PARSE_MOUSE] Missing semicolons: semi1={?}, semi2={?}", .{ first_semi, second_semi });
+            return null;
+        }
+        const semi1 = first_semi.?;
+        const semi2 = second_semi.?;
 
-        // Parse button;x;y
+        // Parse button;x;y (use i32 to handle negative coords near window edges)
         const button_str = self.escape_buffer[3..semi1];
-        const button_code = std.fmt.parseInt(u16, button_str, 10) catch return null;
+        const button_code = std.fmt.parseInt(u16, button_str, 10) catch {
+            inputDebugLog("[PARSE_MOUSE] Failed to parse button_code from '{s}'", .{button_str});
+            return null;
+        };
 
         const x_str = self.escape_buffer[semi1 + 1 .. semi2];
-        const x = std.fmt.parseInt(u16, x_str, 10) catch return null;
+        const x_signed = std.fmt.parseInt(i32, x_str, 10) catch {
+            inputDebugLog("[PARSE_MOUSE] Failed to parse x from '{s}'", .{x_str});
+            return null;
+        };
+        // Clamp negative coordinates to 0
+        const x: u16 = if (x_signed < 0) 0 else @intCast(@min(x_signed, 65535));
 
         const y_str = self.escape_buffer[semi2 + 1 .. term_idx.?];
-        const y = std.fmt.parseInt(u16, y_str, 10) catch return null;
+        const y_signed = std.fmt.parseInt(i32, y_str, 10) catch {
+            inputDebugLog("[PARSE_MOUSE] Failed to parse y from '{s}'", .{y_str});
+            return null;
+        };
+        // Clamp negative coordinates to 0
+        const y: u16 = if (y_signed < 0) 0 else @intCast(@min(y_signed, 65535));
 
         // Determine button and event type
         // SGR mouse protocol button_code:
@@ -614,6 +669,7 @@ pub const InputReader = struct {
                 // Try to parse what we have
                 if (try self.parseEscapeSequence()) |input| {
                     // Complete sequence parsed
+                    inputDebugLog("[RESET] Parsed input, resetting escape_len from {d} to 0", .{self.escape_len});
                     self.in_escape = false;
                     self.escape_len = 0;
                     return input;
@@ -641,6 +697,14 @@ pub const InputReader = struct {
             // Regular character or control code
             const key = try self.parseSingleByte(c);
             self.debugLog("[INPUT] Parsed single byte to key, returning\n", .{});
+            // Log any printable chars being output (potential mouse leak)
+            if (c >= '0' and c <= '9') {
+                inputDebugLog("[LEAK?] Digit char: '{c}' (0x{x})", .{ c, c });
+            } else if (c == ';') {
+                inputDebugLog("[LEAK?] Semicolon char", .{});
+            } else if (c == 'M' or c == 'm') {
+                inputDebugLog("[LEAK?] M/m char", .{});
+            }
 
             // Remove from buffer
             if (self.buffer_len > 1) {

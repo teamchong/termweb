@@ -139,6 +139,48 @@ pub fn setViewport(
     defer allocator.free(result);
 }
 
+/// Get Chrome's actual viewport dimensions via JavaScript
+pub fn getActualViewport(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+) !struct { width: u32, height: u32 } {
+    const result = try client.sendCommand(
+        "Runtime.evaluate",
+        "{\"expression\":\"JSON.stringify({w:window.innerWidth,h:window.innerHeight})\",\"returnByValue\":true}",
+    );
+    defer allocator.free(result);
+
+    // Debug: log raw response
+    if (std.fs.cwd().openFile("/tmp/viewport_debug.log", .{ .mode = .write_only })) |f| {
+        f.seekFromEnd(0) catch {};
+        _ = f.write(result) catch {};
+        _ = f.write("\n") catch {};
+        f.close();
+    } else |_| {}
+
+    // Parse result: {"id":N,"result":{"result":{"type":"string","value":"{\"w\":984,\"h\":1107}"}}}
+    // Find the value field and extract w/h directly from result (avoid escaped quote issues)
+    var width: u32 = 0;
+    var height: u32 = 0;
+
+    // Look for \"w\": pattern (escaped quotes in JSON string value)
+    if (std.mem.indexOf(u8, result, "\\\"w\\\":")) |w_start| {
+        const num_start = w_start + 6; // skip \"w\":
+        var num_end = num_start;
+        while (num_end < result.len and result[num_end] >= '0' and result[num_end] <= '9') : (num_end += 1) {}
+        width = std.fmt.parseInt(u32, result[num_start..num_end], 10) catch 0;
+    }
+
+    if (std.mem.indexOf(u8, result, "\\\"h\\\":")) |h_start| {
+        const num_start = h_start + 6; // skip \"h\":
+        var num_end = num_start;
+        while (num_end < result.len and result[num_end] >= '0' and result[num_end] <= '9') : (num_end += 1) {}
+        height = std.fmt.parseInt(u32, result[num_start..num_end], 10) catch 0;
+    }
+
+    return .{ .width = width, .height = height };
+}
+
 /// Navigate back in browser history using Page.navigateToHistoryEntry
 /// (Page.goBack was removed from Chrome DevTools Protocol)
 /// Returns true if navigation happened, false if there was no history

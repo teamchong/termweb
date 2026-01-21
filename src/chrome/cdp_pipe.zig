@@ -439,6 +439,18 @@ pub const PipeCdpClient = struct {
         const width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
         const height = self.extractMetadataInt(payload, "deviceHeight") catch 0;
 
+        // Debug: log first few frames' metadata dimensions
+        const frame_count = self.frame_count.load(.monotonic);
+        if (frame_count < 3) {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[PIPE] Frame {}: device={}x{}\n", .{ frame_count, width, height }) catch "";
+            if (std.fs.cwd().openFile("/tmp/pipe_debug.log", .{ .mode = .write_only })) |f| {
+                f.seekFromEnd(0) catch {};
+                _ = f.write(msg) catch {};
+                f.close();
+            } else |_| {}
+        }
+
         if (try self.frame_pool.writeFrame(data, frame_sid, width, height)) |_| {
             _ = self.frame_count.fetchAdd(1, .monotonic);
         }

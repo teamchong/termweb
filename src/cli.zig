@@ -288,8 +288,20 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     std.debug.print("Page loaded\n", .{});
 
-    // Run viewer
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url, viewport_width, viewport_height);
+    // Query Chrome's ACTUAL viewport dimensions for coordinate mapping
+    // (setDeviceMetricsOverride may not take effect exactly as specified)
+    var actual_viewport_width = viewport_width;
+    var actual_viewport_height = viewport_height;
+    if (screenshot_api.getActualViewport(client, allocator)) |actual_vp| {
+        if (actual_vp.width > 0) actual_viewport_width = actual_vp.width;
+        if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
+        std.debug.print("Chrome actual viewport: {}x{}\n", .{ actual_viewport_width, actual_viewport_height });
+    } else |err| {
+        std.debug.print("Warning: Could not get actual viewport ({}), using requested size\n", .{err});
+    }
+
+    // Run viewer with Chrome's actual viewport for accurate coordinate mapping
+    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height);
     defer viewer.deinit();
 
     try viewer.run();
