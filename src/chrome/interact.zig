@@ -250,51 +250,74 @@ pub fn sendChar(
     sendCharWithModifiers(client, allocator, char, 0);
 }
 
+/// Apply shift mapping for US keyboard layout
+fn applyShiftMapping(char: u8) u8 {
+    if (char >= 'a' and char <= 'z') return char - 32; // A-Z
+    return switch (char) {
+        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%',
+        '6' => '^', '7' => '&', '8' => '*', '9' => '(', '0' => ')',
+        '-' => '_', '=' => '+', '[' => '{', ']' => '}', '\\' => '|',
+        ';' => ':', '\'' => '"', ',' => '<', '.' => '>', '/' => '?', '`' => '~',
+        else => char,
+    };
+}
+
 /// Send a character to the browser with modifiers (for Cmd+A, Ctrl+C, etc.)
+/// CDP requires: type, key, code, text, unmodifiedText, windowsVirtualKeyCode, modifiers
 pub fn sendCharWithModifiers(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
     char: u8,
     modifiers: u8,
 ) void {
-    var key_buf: [2]u8 = .{ char, 0 };
-    const key: []const u8 = key_buf[0..1];
-
-    // Get key code (uppercase for A-Z)
-    const code: u8 = if (char >= 'a' and char <= 'z')
-        char - 32 // Convert to uppercase for keyCode
-    else
-        char;
-
     _ = allocator;
 
-    // If modifiers are present (Cmd+A, Ctrl+C, etc.), send without text to trigger shortcuts
-    if (modifiers != 0) {
-        var down_buf: [256]u8 = undefined;
-        const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key, std.ascii.toUpper(char), code, modifiers }) catch return;
+    // CDP modifiers: 1=alt, 2=ctrl, 4=meta, 8=shift
+    const has_shift = (modifiers & 8) != 0;
+    const has_shortcut_mod = (modifiers & (1 | 2 | 4)) != 0; // alt, ctrl, or meta
 
-        var up_buf: [256]u8 = undefined;
-        const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}", .{ key, std.ascii.toUpper(char), code, modifiers }) catch return;
+    // text = what should appear (with shift applied)
+    // unmodifiedText = what would appear without modifiers (except shift for letters)
+    const text_char: u8 = if (has_shift) applyShiftMapping(char) else char;
+
+    var text_buf: [2]u8 = .{ text_char, 0 };
+    const text: []const u8 = text_buf[0..1];
+
+    var unmod_buf: [2]u8 = .{ char, 0 };
+    const unmodified_text: []const u8 = unmod_buf[0..1];
+
+    // windowsVirtualKeyCode (uppercase for A-Z, ASCII otherwise)
+    const vk_code: u8 = if (char >= 'a' and char <= 'z') char - 32 else char;
+
+    // If shortcut modifiers (Ctrl, Alt, Meta), send without text field to trigger shortcuts
+    if (has_shortcut_mod) {
+        var down_buf: [512]u8 = undefined;
+        const down_params = std.fmt.bufPrint(&down_buf,
+            "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
+            .{ text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
+
+        var up_buf: [512]u8 = undefined;
+        const up_params = std.fmt.bufPrint(&up_buf,
+            "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
+            .{ text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
 
         client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
         client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
         return;
     }
 
-    // No modifiers - send normal character input
-    var down_buf: [256]u8 = undefined;
-    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, code }) catch return;
+    // Normal text input - include all required fields
+    var down_buf: [512]u8 = undefined;
+    const down_params = std.fmt.bufPrint(&down_buf,
+        "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"text\":\"{s}\",\"unmodifiedText\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
+        .{ text, std.ascii.toUpper(char), text, unmodified_text, vk_code, modifiers }) catch return;
 
-    // Format char event (for text input)
-    var char_buf: [256]u8 = undefined;
-    const char_params = std.fmt.bufPrint(&char_buf, "{{\"type\":\"char\",\"key\":\"{s}\",\"text\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, key, code }) catch return;
-
-    // Format keyUp event
-    var up_buf: [256]u8 = undefined;
-    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, code }) catch return;
+    var up_buf: [512]u8 = undefined;
+    const up_params = std.fmt.bufPrint(&up_buf,
+        "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"Key{c}\",\"windowsVirtualKeyCode\":{d},\"modifiers\":{d}}}",
+        .{ text, std.ascii.toUpper(char), vk_code, modifiers }) catch return;
 
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
-    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", char_params);
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
 }
 

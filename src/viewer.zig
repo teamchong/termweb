@@ -1367,11 +1367,31 @@ pub const Viewer = struct {
         const mods = key_input.modifiers; // CDP: 1=alt, 2=ctrl, 4=meta, 8=shift
         switch (key) {
             .char => |c| {
-                // Pass all characters to browser with modifiers (for Cmd+A, Ctrl+C, etc.)
-                interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, c, mods);
+                // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
+                // CDP: ctrl=2, shift=8, meta=4
+                const ctrl_shift: u8 = 2 | 8; // ctrl + shift = 10
+                if ((c == 'p' or c == 'P') and (mods & ctrl_shift) == ctrl_shift) {
+                    // Replace ctrl with meta, keep shift
+                    const new_mods = (mods & ~@as(u8, 2)) | 4; // remove ctrl, add meta
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', new_mods);
+                } else {
+                    // Pass all other characters to browser with original modifiers
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, c, mods);
+                }
             },
             .escape => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Escape", 27, mods),
-            // Ctrl+W, Ctrl+Q, Ctrl+C handled globally (see handleInput)
+            // Translate Ctrl+A to Cmd+A (meta) for browser select-all (Ghostty intercepts Cmd+A)
+            .ctrl_a => interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'a', 4), // 4 = meta
+            // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
+            .ctrl_p => {
+                const shift = (mods & 8) != 0;
+                if (shift) {
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', 4 | 8); // meta + shift
+                } else {
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', 2); // just ctrl
+                }
+            },
+            // Ctrl+W, Ctrl+Q handled globally (see handleInput)
             .ctrl_r => { // Chrome-style reload
                 try screenshot_api.reload(self.cdp_client, self.allocator, false);
                 try self.refresh();
