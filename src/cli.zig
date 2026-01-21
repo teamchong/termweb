@@ -260,7 +260,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     std.debug.print("Chrome launched\n", .{});
 
     // Connect CDP client via Pipe
-    var client = cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd) catch |err| {
+    var client = cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port) catch |err| {
         std.debug.print("Error connecting to Chrome DevTools Protocol: {}\n", .{err});
         std.process.exit(1);
     };

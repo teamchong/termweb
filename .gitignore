@@ -6,6 +6,15 @@ vendor/node_modules/
 *.swo
 *~
 .zig-cache/
+
+# Log files
+*.log
 debug.log
 termweb_debug.log
 full_output.log
+build.log
+cdp_debug.log
+termweb_input.log
+
+# Test files
+test_*

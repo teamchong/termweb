@@ -1,0 +1,377 @@
+/// Browser dialog handling for JavaScript dialogs and file chooser
+///
+/// Provides:
+/// - DialogState for managing alert/confirm/prompt dialogs
+/// - renderDialog for terminal overlay rendering
+/// - Native file picker integration for macOS and Linux
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub const DialogType = enum {
+    alert,
+    confirm,
+    prompt,
+    beforeunload,
+    file_chooser,
+};
+
+pub const FilePickerMode = enum {
+    single,
+    multiple,
+    folder,
+};
+
+pub const DialogState = struct {
+    allocator: std.mem.Allocator,
+    dialog_type: DialogType,
+    message: []const u8,
+    default_text: []const u8,
+    input_buffer: std.ArrayList(u8),
+    cursor_pos: usize,
+
+    pub fn init(allocator: std.mem.Allocator, dtype: DialogType, msg: []const u8, default: []const u8) !DialogState {
+        var input_buffer = try std.ArrayList(u8).initCapacity(allocator, 256);
+
+        // Pre-fill with default text for prompt dialogs
+        if (dtype == .prompt and default.len > 0) {
+            try input_buffer.appendSlice(allocator, default);
+        }
+
+        return DialogState{
+            .allocator = allocator,
+            .dialog_type = dtype,
+            .message = msg,
+            .default_text = default,
+            .input_buffer = input_buffer,
+            .cursor_pos = if (dtype == .prompt) default.len else 0,
+        };
+    }
+
+    pub fn deinit(self: *DialogState) void {
+        self.input_buffer.deinit(self.allocator);
+    }
+
+    pub fn handleChar(self: *DialogState, c: u8) void {
+        if (c < 32 or c > 126) return; // Only printable ASCII
+
+        // Insert at cursor position
+        if (self.cursor_pos >= self.input_buffer.items.len) {
+            self.input_buffer.append(self.allocator, c) catch return;
+        } else {
+            self.input_buffer.insert(self.allocator, self.cursor_pos, c) catch return;
+        }
+        self.cursor_pos += 1;
+    }
+
+    pub fn handleBackspace(self: *DialogState) void {
+        if (self.cursor_pos > 0 and self.input_buffer.items.len > 0) {
+            _ = self.input_buffer.orderedRemove(self.cursor_pos - 1);
+            self.cursor_pos -= 1;
+        }
+    }
+
+    pub fn handleLeft(self: *DialogState) void {
+        if (self.cursor_pos > 0) self.cursor_pos -= 1;
+    }
+
+    pub fn handleRight(self: *DialogState) void {
+        if (self.cursor_pos < self.input_buffer.items.len) self.cursor_pos += 1;
+    }
+
+    pub fn getText(self: *DialogState) []const u8 {
+        return self.input_buffer.items;
+    }
+};
+
+/// Render dialog box overlay in the terminal
+pub fn renderDialog(
+    writer: anytype,
+    state: *const DialogState,
+    terminal_width: u16,
+    terminal_height: u16,
+) !void {
+    // Dialog dimensions
+    const dialog_width: u16 = @min(60, terminal_width - 4);
+    const dialog_height: u16 = if (state.dialog_type == .prompt) 9 else 7;
+
+    // Center the dialog
+    const start_col = (terminal_width - dialog_width) / 2;
+    const start_row = (terminal_height - dialog_height) / 2;
+
+    // Colors
+    const bg_color = "\x1b[48;2;45;45;48m";      // Dark gray background
+    const border_color = "\x1b[38;2;100;100;105m"; // Gray border
+    const text_color = "\x1b[38;2;220;220;220m";   // Light text
+    const button_color = "\x1b[48;2;59;130;246m\x1b[38;2;255;255;255m"; // Blue button
+    const button_dim = "\x1b[48;2;70;70;75m\x1b[38;2;180;180;180m"; // Dim button
+    const input_bg = "\x1b[48;2;30;30;32m";       // Input background
+    const reset = "\x1b[0m";
+
+    // Draw dialog box
+    var row: u16 = 0;
+    while (row < dialog_height) : (row += 1) {
+        try writer.print("\x1b[{d};{d}H", .{ start_row + row, start_col });
+
+        if (row == 0) {
+            // Top border
+            try writer.print("{s}{s}╭", .{ bg_color, border_color });
+            var i: u16 = 0;
+            while (i < dialog_width - 2) : (i += 1) {
+                try writer.writeAll("─");
+            }
+            try writer.print("╮{s}", .{reset});
+        } else if (row == dialog_height - 1) {
+            // Bottom border
+            try writer.print("{s}{s}╰", .{ bg_color, border_color });
+            var i: u16 = 0;
+            while (i < dialog_width - 2) : (i += 1) {
+                try writer.writeAll("─");
+            }
+            try writer.print("╯{s}", .{reset});
+        } else {
+            // Content rows
+            try writer.print("{s}{s}│{s}", .{ bg_color, border_color, text_color });
+
+            const content_width = dialog_width - 4;
+
+            if (row == 1) {
+                // Title based on dialog type
+                const title = switch (state.dialog_type) {
+                    .alert => "Alert",
+                    .confirm => "Confirm",
+                    .prompt => "Prompt",
+                    .beforeunload => "Leave Page?",
+                    .file_chooser => "Select File",
+                };
+                const padding = (content_width - title.len) / 2;
+                var i: usize = 0;
+                while (i < padding) : (i += 1) {
+                    try writer.writeAll(" ");
+                }
+                try writer.writeAll(title);
+                i = title.len + padding;
+                while (i < content_width) : (i += 1) {
+                    try writer.writeAll(" ");
+                }
+            } else if (row == 3) {
+                // Message (truncated if too long)
+                const msg = state.message;
+                const display_len = @min(msg.len, content_width);
+                try writer.writeAll(" ");
+                try writer.writeAll(msg[0..display_len]);
+                var i: usize = display_len + 1;
+                while (i < content_width) : (i += 1) {
+                    try writer.writeAll(" ");
+                }
+            } else if (row == 5 and state.dialog_type == .prompt) {
+                // Input field for prompt
+                try writer.print(" {s}", .{input_bg});
+                const text = state.input_buffer.items;
+                const field_width = content_width - 4;
+                const display_len = @min(text.len, field_width);
+                try writer.writeAll(text[0..display_len]);
+
+                // Show cursor
+                if (state.cursor_pos == text.len) {
+                    try writer.writeAll("▏");
+                }
+
+                var i: usize = display_len + 1;
+                while (i < field_width) : (i += 1) {
+                    try writer.writeAll(" ");
+                }
+                try writer.print("{s}{s} ", .{ reset, bg_color });
+            } else if ((row == 5 and state.dialog_type != .prompt) or
+                      (row == 7 and state.dialog_type == .prompt)) {
+                // Buttons
+                const buttons = switch (state.dialog_type) {
+                    .alert => " [Enter] OK ",
+                    .confirm, .beforeunload => " [Enter] OK  [Esc] Cancel ",
+                    .prompt => " [Enter] OK  [Esc] Cancel ",
+                    .file_chooser => " [Enter] Select  [Esc] Cancel ",
+                };
+                const btn_len = buttons.len;
+                const padding = (content_width - btn_len) / 2;
+
+                var i: usize = 0;
+                while (i < padding) : (i += 1) {
+                    try writer.writeAll(" ");
+                }
+
+                // Render OK button highlighted, Cancel dim
+                if (state.dialog_type == .alert) {
+                    try writer.print("{s} OK {s}{s}", .{ button_color, reset, bg_color });
+                } else {
+                    try writer.print("{s} OK {s}{s}  {s} Cancel {s}{s}", .{
+                        button_color, reset, bg_color,
+                        button_dim, reset, bg_color,
+                    });
+                }
+
+                i = btn_len + padding;
+                while (i < content_width) : (i += 1) {
+                    try writer.writeAll(" ");
+                }
+            } else {
+                // Empty row
+                var i: usize = 0;
+                while (i < content_width) : (i += 1) {
+                    try writer.writeAll(" ");
+                }
+            }
+
+            try writer.print(" {s}│{s}", .{ border_color, reset });
+        }
+    }
+}
+
+/// Show native OS file picker dialog
+/// Returns the selected file path(s) or null if cancelled
+pub fn showNativeFilePicker(
+    allocator: std.mem.Allocator,
+    mode: FilePickerMode,
+) !?[]const u8 {
+    if (builtin.os.tag == .macos) {
+        return showMacOSFilePicker(allocator, mode);
+    } else if (builtin.os.tag == .linux) {
+        return showLinuxFilePicker(allocator, mode);
+    }
+    return null;
+}
+
+fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
+    const script = switch (mode) {
+        .single => "POSIX path of (choose file)",
+        .folder => "POSIX path of (choose folder)",
+        .multiple =>
+            \\set f to (choose file with multiple selections allowed)
+            \\set out to ""
+            \\repeat with i in f
+            \\set out to out & POSIX path of i & "\n"
+            \\end repeat
+            \\out
+        ,
+    };
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "osascript", "-e", script },
+    }) catch return null;
+    defer allocator.free(result.stderr);
+
+    // Check if cancelled (non-zero exit)
+    if (result.term.Exited != 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    if (result.stdout.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    // Trim trailing newlines
+    var end: usize = result.stdout.len;
+    while (end > 0 and (result.stdout[end - 1] == '\n' or result.stdout[end - 1] == '\r')) {
+        end -= 1;
+    }
+
+    if (end == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    // Return trimmed result (caller must free)
+    if (end < result.stdout.len) {
+        const trimmed = try allocator.dupe(u8, result.stdout[0..end]);
+        allocator.free(result.stdout);
+        return trimmed;
+    }
+
+    return result.stdout;
+}
+
+fn showLinuxFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
+    // Try zenity first
+    const zenity_result = tryZenity(allocator, mode) catch null;
+    if (zenity_result) |path| return path;
+
+    // Fallback to kdialog
+    return tryKdialog(allocator, mode);
+}
+
+fn tryZenity(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
+    const argv: []const []const u8 = switch (mode) {
+        .single => &.{ "zenity", "--file-selection" },
+        .folder => &.{ "zenity", "--file-selection", "--directory" },
+        .multiple => &.{ "zenity", "--file-selection", "--multiple" },
+    };
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+    }) catch return null;
+    defer allocator.free(result.stderr);
+
+    if (result.term.Exited != 0 or result.stdout.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    // Trim newlines
+    var end: usize = result.stdout.len;
+    while (end > 0 and (result.stdout[end - 1] == '\n' or result.stdout[end - 1] == '\r')) {
+        end -= 1;
+    }
+
+    if (end == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    if (end < result.stdout.len) {
+        const trimmed = try allocator.dupe(u8, result.stdout[0..end]);
+        allocator.free(result.stdout);
+        return trimmed;
+    }
+
+    return result.stdout;
+}
+
+fn tryKdialog(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
+    const argv: []const []const u8 = switch (mode) {
+        .single => &.{ "kdialog", "--getopenfilename" },
+        .folder => &.{ "kdialog", "--getexistingdirectory" },
+        .multiple => &.{ "kdialog", "--getopenfilename", "--multiple" },
+    };
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+    }) catch return null;
+    defer allocator.free(result.stderr);
+
+    if (result.term.Exited != 0 or result.stdout.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    // Trim newlines
+    var end: usize = result.stdout.len;
+    while (end > 0 and (result.stdout[end - 1] == '\n' or result.stdout[end - 1] == '\r')) {
+        end -= 1;
+    }
+
+    if (end == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    if (end < result.stdout.len) {
+        const trimmed = try allocator.dupe(u8, result.stdout[0..end]);
+        allocator.free(result.stdout);
+        return trimmed;
+    }
+
+    return result.stdout;
+}
