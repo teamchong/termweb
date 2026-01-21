@@ -256,9 +256,9 @@ pub fn sendChar(
     else
         char;
 
-    // Format keyDown event
+    // Format keyDown event (no text - char event handles text insertion)
     var down_buf: [256]u8 = undefined;
-    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"text\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, key, code }) catch return;
+    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, code }) catch return;
 
     // Format char event (for text input)
     var char_buf: [256]u8 = undefined;
@@ -279,11 +279,11 @@ pub fn sendEnterKey(
     client: *cdp.CdpClient,
     modifiers: u8,
 ) void {
-    // keyDown with text property
+    // keyDown (no text - char event handles text insertion)
     var down_buf: [256]u8 = undefined;
-    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"text\":\"\\r\",\"windowsVirtualKeyCode\":13,\"modifiers\":{d}}}", .{modifiers}) catch return;
+    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"modifiers\":{d}}}", .{modifiers}) catch return;
 
-    // char event for text input
+    // char event for text input (this inserts the newline)
     var char_buf: [256]u8 = undefined;
     const char_params = std.fmt.bufPrint(&char_buf, "{{\"type\":\"char\",\"key\":\"Enter\",\"text\":\"\\r\",\"windowsVirtualKeyCode\":13,\"modifiers\":{d}}}", .{modifiers}) catch return;
 
