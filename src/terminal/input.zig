@@ -153,11 +153,29 @@ pub const InputReader = struct {
         }
 
         // Mouse: ESC [ < ... M/m
+        // Always try to parse mouse sequences to consume them properly
+        // (even when disabled, we need to find the terminator)
         if (self.escape_buffer[2] == '<') {
+            // Check if sequence is complete by looking for M/m terminator
+            var has_terminator = false;
+            for (self.escape_buffer[0..self.escape_len]) |byte| {
+                if (byte == 'M' or byte == 'm') {
+                    has_terminator = true;
+                    break;
+                }
+            }
+
+            if (!has_terminator) {
+                return null; // Incomplete - need more bytes
+            }
+
+            // Sequence is complete - parse it
             if (self.mouse_enabled) {
                 return try self.parseMouseCSI();
+            } else {
+                // Mouse disabled - discard the sequence by returning none
+                return .none;
             }
-            return null;
         }
 
         // Function/nav keys: ESC [ N ~

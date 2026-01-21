@@ -1,5 +1,6 @@
 const std = @import("std");
 const cdp = @import("cdp_client.zig");
+const interact = @import("interact.zig");
 
 /// Re-export ScreencastFrame for caller use
 pub const ScreencastFrame = cdp.ScreencastFrame;
@@ -77,6 +78,12 @@ pub fn navigateToUrl(
 
     // Wait for page to load (simple approach - wait fixed time)
     std.Thread.sleep(3 * std.time.ns_per_s);
+
+    // Inject mouse debug tracker to visualize where Chrome sees mouse events
+    interact.injectMouseDebugTracker(client, allocator) catch |err| {
+        logNav("[NAV] Failed to inject mouse debug tracker: {}\n", .{err});
+    };
+
     logNav("[NAV] navigateToUrl() complete\n", .{});
 }
 
@@ -164,6 +171,10 @@ pub fn goBack(
     };
     defer allocator.free(result);
 
+    // Re-inject mouse debug tracker after back navigation
+    std.Thread.sleep(2 * std.time.ns_per_s);
+    interact.injectMouseDebugTracker(client, allocator) catch {};
+
     return true;
 }
 
@@ -193,6 +204,10 @@ pub fn goForward(
         return false;
     };
     defer allocator.free(result);
+
+    // Re-inject mouse debug tracker after forward navigation
+    std.Thread.sleep(2 * std.time.ns_per_s);
+    interact.injectMouseDebugTracker(client, allocator) catch {};
 
     return true;
 }
@@ -292,6 +307,10 @@ pub fn reload(
 
     const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
+
+    // Wait for page to reload then re-inject mouse debug tracker
+    std.Thread.sleep(2 * std.time.ns_per_s);
+    interact.injectMouseDebugTracker(client, allocator) catch {};
 }
 
 /// Stop page loading - uses dedicated nav WebSocket

@@ -6,6 +6,7 @@ const cdp = @import("chrome/cdp_client.zig");
 const screenshot_api = @import("chrome/screenshot.zig");
 const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
+const toolbar_mod = @import("ui/toolbar.zig");
 
 const VERSION = "0.7.0";
 
@@ -188,23 +189,25 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Calculate viewport size
     const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
 
-    // Reserve 1 row for tab bar at top
-    const row_height: u32 = if (size.height_px > 0 and size.rows > 0)
-        @as(u32, size.height_px) / size.rows
-    else
-        20;
-    const content_rows: u32 = if (size.rows > 1) size.rows - 1 else 1;
-    const available_height = content_rows * row_height;
-
     // Detect High-DPI (Retina) displays
     var dpr: u32 = 1;
-    if (size.width_px > 0 and size.cols > 0) {
-        const px_per_col = size.width_px / size.cols;
-        if (px_per_col > 14) {
-            dpr = 2;
-            std.debug.print("Detected High-DPI display ({} px/col), scaling viewport by 0.5\n", .{px_per_col});
-        }
+    const cell_width: u32 = if (size.width_px > 0 and size.cols > 0)
+        size.width_px / size.cols
+    else
+        14;
+    if (cell_width > 14) {
+        dpr = 2;
+        std.debug.print("Detected High-DPI display ({} px/col), scaling viewport by 0.5\n", .{cell_width});
     }
+
+    // Get actual toolbar height (accounts for DPR)
+    const toolbar_height = toolbar_mod.getToolbarHeight(cell_width);
+
+    // Reserve space for toolbar at top
+    const available_height: u32 = if (size.height_px > toolbar_height)
+        size.height_px - toolbar_height
+    else
+        size.height_px;
 
     const viewport_width: u32 = raw_width / dpr;
     const viewport_height: u32 = available_height / dpr;
@@ -267,6 +270,14 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer client.deinit();
 
     std.debug.print("Connected to Chrome via Pipe\n", .{});
+
+    // Set viewport size explicitly (ensures Chrome uses exact dimensions for coordinate mapping)
+    screenshot_api.setViewport(client, allocator, viewport_width, viewport_height) catch |err| {
+        std.debug.print("Error setting viewport: {}\n", .{err});
+        std.process.exit(1);
+    };
+    std.debug.print("Viewport set to: {}x{}\n", .{ viewport_width, viewport_height });
+
     std.debug.print("Navigating to: {s}\n", .{url});
 
     // Navigate to URL

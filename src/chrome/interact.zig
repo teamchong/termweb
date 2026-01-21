@@ -145,6 +145,31 @@ pub fn toggleCheckbox(
     defer allocator.free(result);
 }
 
+/// Inject mouse debug tracker - shows red dot where Chrome thinks mouse is
+pub fn injectMouseDebugTracker(client: *cdp.CdpClient, allocator: std.mem.Allocator) !void {
+    const js =
+        \\(function() {
+        \\  if (window._mouseDebugDot) return;
+        \\  var dot = document.createElement('div');
+        \\  dot.id = '_mouseDebugDot';
+        \\  dot.style.cssText = 'position:fixed;width:10px;height:10px;background:red;border-radius:50%;pointer-events:none;z-index:999999;transform:translate(-50%,-50%)';
+        \\  document.body.appendChild(dot);
+        \\  window._mouseDebugDot = dot;
+        \\  document.addEventListener('mousemove', function(e) {
+        \\    dot.style.left = e.clientX + 'px';
+        \\    dot.style.top = e.clientY + 'px';
+        \\    console.log('MOUSE_DEBUG: x=' + e.clientX + ' y=' + e.clientY);
+        \\  });
+        \\})()
+    ;
+
+    const params = try std.fmt.allocPrint(allocator, "{{\"expression\":\"{s}\"}}", .{js});
+    defer allocator.free(params);
+
+    const result = try client.sendCommand("Runtime.evaluate", params);
+    defer allocator.free(result);
+}
+
 /// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket
 /// Click sequence (HIGH PRIORITY - never throttled):
 ///   1. mouseMoved (triggers CSS :hover, JS mouseenter)

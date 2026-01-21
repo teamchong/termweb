@@ -800,19 +800,29 @@ pub const Viewer = struct {
         var stdout_writer = stdout_file.writer(&stdout_buf);
         const writer = &stdout_writer.interface;
 
-        // Get terminal size - reserve 1 row for tab bar at top
+        // Get terminal size
         const size = try self.terminal.getSize();
-        const tabbar_rows: u32 = 1;
-        const content_rows = if (size.rows > tabbar_rows) size.rows - tabbar_rows else 1;
         const display_cols: u16 = if (size.cols > 0) size.cols else 80;
 
-        // Note: We use the full column count from ioctl
-        // The image will be scaled to fill all columns (2x scaling on Retina)
-        // This is correct because cli.zig already halved the viewport width
+        // Calculate cell height and toolbar rows
+        const cell_height: u32 = if (size.rows > 0) size.height_px / size.rows else 20;
+        const toolbar_h: u32 = if (self.toolbar_renderer) |tr| tr.toolbar_height else cell_height;
+
+        // Content starts at row 2, with y_offset to align with toolbar bottom
+        // This avoids gaps between toolbar and content
+        const row_start_pixel = cell_height; // Row 2 starts at 1 * cell_height
+        const y_offset: u32 = if (toolbar_h > row_start_pixel) toolbar_h - row_start_pixel else 0;
+
+        // Calculate content rows (account for toolbar pixel height, not row count)
+        const content_pixel_start = row_start_pixel + y_offset; // = toolbar_h
+        const content_pixel_height = if (size.height_px > content_pixel_start)
+            size.height_px - content_pixel_start
+        else
+            size.height_px;
+        const content_rows: u32 = content_pixel_height / cell_height;
 
         // Update coordinate mapper with ACTUAL frame dimensions from CDP
         // This ensures click coordinates match what Chrome is rendering
-        const toolbar_h: ?u16 = if (self.toolbar_renderer) |tr| @intCast(tr.toolbar_height) else null;
         self.coord_mapper = CoordinateMapper.initWithToolbar(
             size.width_px,
             size.height_px,
@@ -820,22 +830,24 @@ pub const Viewer = struct {
             size.rows,
             frame_width,   // Use actual frame width, not viewport
             frame_height,  // Use actual frame height, not viewport
-            toolbar_h,
+            @intCast(toolbar_h),
         );
 
-        self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}\n", .{
-            base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
+        self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}, y_off={}\n", .{
+            base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height, y_offset,
         });
 
-        // Move cursor to row 2 (after tab bar)
+        // Move cursor to row 2
         try writer.writeAll("\x1b[2;1H");
 
         // Use placement ID and Z-index to ensure correct layering and replacement
+        // y_offset shifts content down to start right after toolbar
         const display_opts = kitty_mod.DisplayOptions{
             .rows = content_rows,
             .columns = display_cols,
             .placement_id = Placement.CONTENT,
             .z = ZIndex.CONTENT,
+            .y_offset = @intCast(y_offset),
         };
 
         // Track old image ID for cleanup

@@ -1,5 +1,24 @@
 const std = @import("std");
 
+/// Debug logging for coordinate mapping - writes to file
+var debug_file: ?std.fs.File = null;
+var debug_counter: u32 = 0;
+
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    debug_counter += 1;
+    // Log every 30th call to avoid spam during mouse move
+    if (debug_counter % 30 != 1) return;
+
+    if (debug_file == null) {
+        debug_file = std.fs.createFileAbsolute("/tmp/coord_debug.log", .{ .truncate = true }) catch return;
+    }
+    if (debug_file) |f| {
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "[{d}] " ++ fmt ++ "\n", .{debug_counter} ++ args) catch return;
+        _ = f.write(msg) catch {};
+    }
+}
+
 /// Coordinate mapping between terminal pixel space and browser viewport space.
 ///
 /// Terminal space: (0,0) to (width_px, height_px) - from TIOCGWINSZ
@@ -14,6 +33,7 @@ pub const CoordinateMapper = struct {
     viewport_height: u32,
     cell_height: u16,
     tabbar_height: u16,
+    tabbar_rows: u16, // Number of rows toolbar occupies
     content_pixel_height: u16, // Actual rendered content height
 
     is_pixel_mode: bool,
@@ -47,13 +67,20 @@ pub const CoordinateMapper = struct {
             20; // fallback
 
         // Use explicit toolbar height if provided, otherwise default to 1 row
-        // This is used for HIT DETECTION only
         const tabbar_h: u16 = toolbar_height orelse cell_height;
 
-        // Content area: rows 2 to end, i.e., (rows-1) rows
-        // Only toolbar row is reserved at top
-        const content_rows = if (terminal_rows > 1) terminal_rows - 1 else 1;
-        const content_pixel_height = content_rows * cell_height;
+        // Calculate how many rows the toolbar occupies (round up)
+        const tabbar_rows: u16 = (tabbar_h + cell_height - 1) / cell_height;
+
+        // Content area: match viewer.zig calculation exactly
+        // viewer.zig: content_rows = (height_px - toolbar_h) / cell_height
+        // Kitty displays content_rows rows, so displayed_height = content_rows * cell_height
+        const content_available: u16 = if (terminal_height_px > tabbar_h)
+            terminal_height_px - tabbar_h
+        else
+            terminal_height_px;
+        const content_rows: u16 = content_available / cell_height;
+        const content_pixel_height: u16 = content_rows * cell_height;
 
         // If terminal reports pixel dimensions, assume we're using SGR pixel mode (1016h)
         const is_pixel_mode = terminal_width_px > 0;
@@ -67,6 +94,7 @@ pub const CoordinateMapper = struct {
             .viewport_height = viewport_height,
             .cell_height = cell_height,
             .tabbar_height = tabbar_h,
+            .tabbar_rows = tabbar_rows,
             .content_pixel_height = content_pixel_height,
             .is_pixel_mode = is_pixel_mode,
         };
@@ -122,7 +150,7 @@ pub const CoordinateMapper = struct {
                 @divTrunc(self.terminal_width_px, self.terminal_cols)
             else
                 14;
-            
+
             pixel_x = pixel_x_in * cell_width + cell_width / 2;
             pixel_y = pixel_y_in * self.cell_height + self.cell_height / 2;
         }
@@ -130,9 +158,8 @@ pub const CoordinateMapper = struct {
         // Check if click is in tab bar (top) - use actual toolbar pixel height for hit detection
         if (pixel_y < self.tabbar_height) return null;
 
-        // Content graphic starts at row 2 (cell_height pixels from top)
-        // This is where coordinate mapping happens, independent of toolbar visual height
-        const content_top = self.cell_height;
+        // Content graphic starts right after toolbar (using actual pixel height)
+        const content_top = self.tabbar_height;
         const content_bottom = content_top + self.content_pixel_height;
 
         // Check if click is in status bar (bottom)
@@ -143,11 +170,19 @@ pub const CoordinateMapper = struct {
 
         // Prevent division by zero
         if (self.terminal_width_px == 0 or self.content_pixel_height == 0) return null;
+        if (self.viewport_width == 0 or self.viewport_height == 0) return null;
 
-        // Kitty stretches image to fit content area (content_rows * cell_height)
-        // Scale from terminal content pixels to browser viewport
+        // Kitty STRETCHES the image to fill the specified rows/columns (no aspect ratio preservation)
+        // Map terminal content pixels to browser viewport pixels using linear scaling
         var browser_x = (@as(u32, pixel_x) * self.viewport_width) / self.terminal_width_px;
         var browser_y = (@as(u32, content_y) * self.viewport_height) / self.content_pixel_height;
+
+        debugLog("in=({},{}) cy={} -> out=({},{}) term={}x{} vp={}x{}", .{
+            pixel_x_in, pixel_y_in, content_y,
+            browser_x, browser_y,
+            self.terminal_width_px, self.content_pixel_height,
+            self.viewport_width, self.viewport_height,
+        });
 
         // Clamp to viewport bounds
         browser_x = @min(browser_x, self.viewport_width -| 1);
