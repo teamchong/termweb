@@ -736,7 +736,7 @@ fn generateToolbarBg(allocator: std.mem.Allocator, width: u32, height: u32) ![]u
 }
 
 /// Copy text to system clipboard (macOS: pbcopy, Linux: xclip)
-fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) void {
+pub fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) void {
     const argv = if (builtin.os.tag == .macos)
         &[_][]const u8{"pbcopy"}
     else
@@ -759,7 +759,7 @@ fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) void {
 }
 
 /// Paste text from system clipboard (macOS: pbpaste, Linux: xclip -o)
-fn pasteFromClipboard(allocator: std.mem.Allocator) ?[]u8 {
+pub fn pasteFromClipboard(allocator: std.mem.Allocator) ?[]u8 {
     const argv = if (builtin.os.tag == .macos)
         &[_][]const u8{"pbpaste"}
     else

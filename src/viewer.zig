@@ -26,6 +26,12 @@ const viewer_mod = @import("viewer/mod.zig");
 const viewer_helpers = viewer_mod.helpers;
 const fs_handler = viewer_mod.fs_handler;
 
+// Import keyboard handling
+const key_normalizer = @import("terminal/key_normalizer.zig");
+const app_shortcuts = @import("app_shortcuts.zig");
+const NormalizedKeyEvent = key_normalizer.NormalizedKeyEvent;
+const AppAction = app_shortcuts.AppAction;
+
 const Terminal = terminal_mod.Terminal;
 const KittyGraphics = kitty_mod.KittyGraphics;
 const ShmBuffer = shm_mod.ShmBuffer;
@@ -958,86 +964,34 @@ pub const Viewer = struct {
     fn handleInput(self: *Viewer, input: Input) !void {
         switch (input) {
             .key => |key_input| {
-                const key = key_input.key;
-                const modifiers = key_input.modifiers;
-                // Debug log all key presses (if enabled)
+                // 1. Normalize the key input to unified representation
+                const event = key_normalizer.normalize(key_input);
+
+                // Debug log (if enabled)
                 if (self.debug_input) {
-                    if (modifiers != 0) {
-                        self.log("[KEY] modifiers: {d}\n", .{modifiers});
-                    }
-                    switch (key) {
-                        .char => |c| self.log("[KEY] char: {d} ('{c}')\n", .{ c, if (c >= 32 and c <= 126) c else '.' }),
-                        .escape => self.log("[KEY] escape\n", .{}),
-                        .tab => self.log("[KEY] tab\n", .{}),
-                        .shift_tab => self.log("[KEY] shift_tab\n", .{}),
-                        .backspace => self.log("[KEY] backspace\n", .{}),
-                        .enter => self.log("[KEY] enter\n", .{}),
-                        .ctrl_a => self.log("[KEY] ctrl_a\n", .{}),
-                        .ctrl_b => self.log("[KEY] ctrl_b\n", .{}),
-                        .ctrl_c => self.log("[KEY] ctrl_c\n", .{}),
-                        .ctrl_d => self.log("[KEY] ctrl_d\n", .{}),
-                        .ctrl_e => self.log("[KEY] ctrl_e\n", .{}),
-                        .ctrl_f => self.log("[KEY] ctrl_f\n", .{}),
-                        .ctrl_g => self.log("[KEY] ctrl_g\n", .{}),
-                        .ctrl_h => self.log("[KEY] ctrl_h\n", .{}),
-                        .ctrl_i => self.log("[KEY] ctrl_i\n", .{}),
-                        .ctrl_j => self.log("[KEY] ctrl_j\n", .{}),
-                        .ctrl_k => self.log("[KEY] ctrl_k\n", .{}),
-                        .ctrl_l => self.log("[KEY] ctrl_l\n", .{}),
-                        .ctrl_m => self.log("[KEY] ctrl_m\n", .{}),
-                        .ctrl_n => self.log("[KEY] ctrl_n\n", .{}),
-                        .ctrl_o => self.log("[KEY] ctrl_o\n", .{}),
-                        .ctrl_p => self.log("[KEY] ctrl_p\n", .{}),
-                        .ctrl_q => self.log("[KEY] ctrl_q\n", .{}),
-                        .ctrl_r => self.log("[KEY] ctrl_r\n", .{}),
-                        .ctrl_s => self.log("[KEY] ctrl_s\n", .{}),
-                        .ctrl_t => self.log("[KEY] ctrl_t\n", .{}),
-                        .ctrl_u => self.log("[KEY] ctrl_u\n", .{}),
-                        .ctrl_v => self.log("[KEY] ctrl_v\n", .{}),
-                        .ctrl_w => self.log("[KEY] ctrl_w\n", .{}),
-                        .ctrl_x => self.log("[KEY] ctrl_x\n", .{}),
-                        .ctrl_y => self.log("[KEY] ctrl_y\n", .{}),
-                        .ctrl_z => self.log("[KEY] ctrl_z\n", .{}),
-                        .alt_char => |c| self.log("[KEY] alt+{c}\n", .{c}),
-                        .up => self.log("[KEY] up\n", .{}),
-                        .down => self.log("[KEY] down\n", .{}),
-                        .left => self.log("[KEY] left\n", .{}),
-                        .right => self.log("[KEY] right\n", .{}),
-                        .home => self.log("[KEY] home\n", .{}),
-                        .end => self.log("[KEY] end\n", .{}),
-                        .insert => self.log("[KEY] insert\n", .{}),
-                        .delete => self.log("[KEY] delete\n", .{}),
-                        .page_up => self.log("[KEY] page_up\n", .{}),
-                        .page_down => self.log("[KEY] page_down\n", .{}),
-                        .f1 => self.log("[KEY] f1\n", .{}),
-                        .f2 => self.log("[KEY] f2\n", .{}),
-                        .f3 => self.log("[KEY] f3\n", .{}),
-                        .f4 => self.log("[KEY] f4\n", .{}),
-                        .f5 => self.log("[KEY] f5\n", .{}),
-                        .f6 => self.log("[KEY] f6\n", .{}),
-                        .f7 => self.log("[KEY] f7\n", .{}),
-                        .f8 => self.log("[KEY] f8\n", .{}),
-                        .f9 => self.log("[KEY] f9\n", .{}),
-                        .f10 => self.log("[KEY] f10\n", .{}),
-                        .f11 => self.log("[KEY] f11\n", .{}),
-                        .f12 => self.log("[KEY] f12\n", .{}),
-                        .none => {},
+                    if (event.base_key.getChar()) |c| {
+                        self.log("[KEY] char='{c}' shift={} ctrl={} alt={} meta={} shortcut={} cdp={d}\n", .{
+                            c, event.shift, event.ctrl, event.alt, event.meta, event.shortcut_mod, event.cdp_modifiers,
+                        });
+                    } else {
+                        self.log("[KEY] special={} shift={} ctrl={} alt={} meta={} shortcut={} cdp={d}\n", .{
+                            event.base_key, event.shift, event.ctrl, event.alt, event.meta, event.shortcut_mod, event.cdp_modifiers,
+                        });
                     }
                 }
 
-                // GLOBAL quit keys - Ctrl+Q/W only (work from ANY mode)
-                // Note: Ctrl+C is NOT a quit key - it's used for copy
-                const is_global_quit = switch (key) {
-                    .ctrl_q, .ctrl_w => true,
-                    else => false,
-                };
-
-                if (is_global_quit) {
-                    self.running = false;
+                // 2. Check for global app shortcuts (work from ANY mode)
+                if (app_shortcuts.findAppAction(event)) |action| {
+                    try self.executeAppAction(action, event);
                     return;
                 }
 
-                try self.handleKey(key_input);
+                // 3. Mode-specific handling
+                switch (self.mode) {
+                    .normal => try self.handleNormalModeKey(event),
+                    .url_prompt => try self.handleUrlPromptKey(event),
+                    .dialog => try self.handleDialogKey(event),
+                }
             },
             .mouse => |mouse| try self.handleMouse(mouse),
             .paste => |text| {
@@ -1060,6 +1014,255 @@ pub const Viewer = struct {
                 }
             },
             .none => {},
+        }
+    }
+
+    /// Execute an app-level action (shortcuts intercepted by termweb)
+    fn executeAppAction(self: *Viewer, action: AppAction, event: NormalizedKeyEvent) !void {
+        _ = event;
+        switch (action) {
+            .quit => {
+                self.running = false;
+            },
+            .address_bar => {
+                self.mode = .url_prompt;
+                if (self.toolbar_renderer) |*renderer| {
+                    renderer.setUrl(self.current_url);
+                    renderer.focusUrl();
+                } else {
+                    self.prompt_buffer = try PromptBuffer.init(self.allocator);
+                }
+                self.ui_dirty = true;
+            },
+            .reload => {
+                try screenshot_api.reload(self.cdp_client, self.allocator, false);
+                try self.refresh();
+            },
+            .copy => {
+                if (self.mode == .url_prompt) {
+                    if (self.toolbar_renderer) |*renderer| {
+                        renderer.handleCopy(self.allocator);
+                    }
+                } else {
+                    try self.copySelectionToClipboard(false);
+                }
+            },
+            .cut => {
+                if (self.mode == .url_prompt) {
+                    if (self.toolbar_renderer) |*renderer| {
+                        renderer.handleCut(self.allocator);
+                        self.ui_dirty = true;
+                    }
+                } else {
+                    try self.copySelectionToClipboard(true);
+                }
+            },
+            .paste => {
+                if (self.mode == .url_prompt) {
+                    if (self.toolbar_renderer) |*renderer| {
+                        renderer.handlePaste(self.allocator);
+                        self.ui_dirty = true;
+                    }
+                } else {
+                    const toolbar = @import("ui/toolbar.zig");
+                    const clipboard = toolbar.pasteFromClipboard(self.allocator) orelse return;
+                    defer self.allocator.free(clipboard);
+                    interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
+                }
+            },
+            .select_all => {
+                if (self.mode == .url_prompt) {
+                    if (self.toolbar_renderer) |*renderer| {
+                        renderer.handleSelectAll();
+                        self.ui_dirty = true;
+                    }
+                } else {
+                    // Send Cmd+A to browser for select-all
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'a', 4); // 4 = meta
+                }
+            },
+        }
+    }
+
+    /// Handle key in normal mode - pass to browser with correct modifiers
+    fn handleNormalModeKey(self: *Viewer, event: NormalizedKeyEvent) !void {
+        const mods = event.cdp_modifiers;
+
+        switch (event.base_key) {
+            .char => |c| {
+                // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
+                if (event.ctrl and event.shift and (c == 'p' or c == 'P')) {
+                    const new_mods = (mods & ~@as(u8, 2)) | 4; // remove ctrl, add meta
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', new_mods);
+                } else {
+                    // Pass to browser with original modifiers
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, c, mods);
+                }
+            },
+            .escape => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Escape", 27, mods),
+            .enter => interact_mod.sendEnterKey(self.cdp_client, mods),
+            .backspace => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Backspace", 8, mods),
+            .tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods),
+            .delete => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Delete", 46, mods),
+            .left => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowLeft", 37, mods),
+            .right => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowRight", 39, mods),
+            .up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowUp", 38, mods),
+            .down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowDown", 40, mods),
+            .home => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Home", 36, mods),
+            .end => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "End", 35, mods),
+            .page_up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageUp", 33, mods),
+            .page_down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageDown", 34, mods),
+            .insert => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Insert", 45, mods),
+            .f1 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F1", 112, mods),
+            .f2 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F2", 113, mods),
+            .f3 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F3", 114, mods),
+            .f4 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F4", 115, mods),
+            .f5 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F5", 116, mods),
+            .f6 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F6", 117, mods),
+            .f7 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F7", 118, mods),
+            .f8 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F8", 119, mods),
+            .f9 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F9", 120, mods),
+            .f10 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F10", 121, mods),
+            .f11 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F11", 122, mods),
+            .f12 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F12", 123, mods),
+            .none => {},
+        }
+    }
+
+    /// Handle key in URL prompt mode - text editing
+    fn handleUrlPromptKey(self: *Viewer, event: NormalizedKeyEvent) !void {
+        const renderer = if (self.toolbar_renderer) |*r| r else return;
+
+        // Platform-specific navigation modifiers
+        const is_macos = comptime builtin.os.tag == .macos;
+        const word_nav = if (is_macos) event.alt else event.ctrl;
+        const line_nav = if (is_macos) event.meta else false;
+
+        switch (event.base_key) {
+            .char => |c| {
+                renderer.handleChar(c);
+                self.ui_dirty = true;
+            },
+            .backspace => {
+                renderer.handleBackspace();
+                self.ui_dirty = true;
+            },
+            .delete => {
+                renderer.handleDelete();
+                self.ui_dirty = true;
+            },
+            .left => {
+                if (event.shift) {
+                    renderer.handleSelectLeft();
+                } else if (line_nav) {
+                    renderer.handleHome();
+                } else if (word_nav) {
+                    renderer.handleWordLeft();
+                } else {
+                    renderer.handleLeft();
+                }
+                self.ui_dirty = true;
+            },
+            .right => {
+                if (event.shift) {
+                    renderer.handleSelectRight();
+                } else if (line_nav) {
+                    renderer.handleEnd();
+                } else if (word_nav) {
+                    renderer.handleWordRight();
+                } else {
+                    renderer.handleRight();
+                }
+                self.ui_dirty = true;
+            },
+            .home => {
+                if (event.shift) {
+                    renderer.handleSelectHome();
+                } else {
+                    renderer.handleHome();
+                }
+                self.ui_dirty = true;
+            },
+            .end => {
+                if (event.shift) {
+                    renderer.handleSelectEnd();
+                } else {
+                    renderer.handleEnd();
+                }
+                self.ui_dirty = true;
+            },
+            .enter => {
+                const url = renderer.getUrlText();
+                self.log("[URL] Enter pressed, url_len={}, url='{s}'\n", .{ url.len, url });
+                if (url.len > 0) {
+                    self.log("[URL] Navigating to: {s}\n", .{url});
+                    screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url) catch |err| {
+                        self.log("[URL] Navigation failed: {}\n", .{err});
+                    };
+                    if (!std.mem.eql(u8, self.current_url, url)) {
+                        const new_url = self.allocator.dupe(u8, url) catch {
+                            self.log("[URL] Failed to allocate new URL\n", .{});
+                            self.updateNavigationState();
+                            renderer.blurUrl();
+                            self.mode = .normal;
+                            self.ui_dirty = true;
+                            return;
+                        };
+                        self.allocator.free(self.current_url);
+                        self.current_url = new_url;
+                    }
+                    self.updateNavigationState();
+                }
+                renderer.blurUrl();
+                self.mode = .normal;
+                self.ui_dirty = true;
+            },
+            .escape => {
+                renderer.blurUrl();
+                self.mode = .normal;
+                self.ui_dirty = true;
+            },
+            else => {},
+        }
+    }
+
+    /// Handle key in dialog mode
+    fn handleDialogKey(self: *Viewer, event: NormalizedKeyEvent) !void {
+        const state = self.dialog_state orelse return;
+
+        switch (event.base_key) {
+            .char => |c| {
+                if (state.dialog_type == .prompt) {
+                    state.handleChar(c);
+                    self.ui_dirty = true;
+                }
+            },
+            .backspace => {
+                if (state.dialog_type == .prompt) {
+                    state.handleBackspace();
+                    self.ui_dirty = true;
+                }
+            },
+            .left => {
+                if (state.dialog_type == .prompt) {
+                    state.handleLeft();
+                    self.ui_dirty = true;
+                }
+            },
+            .right => {
+                if (state.dialog_type == .prompt) {
+                    state.handleRight();
+                    self.ui_dirty = true;
+                }
+            },
+            .enter => {
+                try self.closeDialog(true);
+            },
+            .escape => {
+                const can_cancel = state.dialog_type != .alert;
+                try self.closeDialog(!can_cancel);
+            },
+            else => {},
         }
     }
 
@@ -1305,332 +1508,6 @@ pub const Viewer = struct {
                 // Wheel events are fully handled by the event bus
             },
         }
-    }
-
-    /// Handle key press - dispatches to mode-specific handlers
-    fn handleKey(self: *Viewer, key_input: KeyInput) !void {
-        switch (self.mode) {
-            .normal => try self.handleNormalMode(key_input),
-            .url_prompt => try self.handleUrlPromptMode(key_input),
-            .dialog => try self.handleDialogMode(key_input.key),
-        }
-    }
-
-    /// Handle key press in normal mode
-    /// All keys pass to browser except termweb hotkeys:
-    /// - Ctrl+Q/W/C: quit (handled globally)
-    /// - Ctrl+L: address bar
-    /// - Ctrl+R: reload
-    fn handleNormalMode(self: *Viewer, key_input: KeyInput) !void {
-        const key = key_input.key;
-        const mods = key_input.modifiers; // CDP: 1=alt, 2=ctrl, 4=meta, 8=shift
-        switch (key) {
-            .char => |c| {
-                const meta = (mods & 4) != 0; // Cmd on macOS
-                const ctrl_shift: u8 = 2 | 8; // ctrl + shift = 10
-
-                // Handle Cmd+V: paste from clipboard (Ghostty may pass this through)
-                if ((c == 'v' or c == 'V') and meta) {
-                    const toolbar = @import("ui/toolbar.zig");
-                    const clipboard = toolbar.pasteFromClipboard(self.allocator) orelse return;
-                    defer self.allocator.free(clipboard);
-                    interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
-                    return;
-                }
-
-                // Handle Cmd+C / Cmd+X: copy/cut selection to system clipboard
-                if ((c == 'c' or c == 'C' or c == 'x' or c == 'X') and meta) {
-                    try self.copySelectionToClipboard(c == 'x' or c == 'X');
-                    return;
-                }
-
-                // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
-                if ((c == 'p' or c == 'P') and (mods & ctrl_shift) == ctrl_shift) {
-                    const new_mods = (mods & ~@as(u8, 2)) | 4; // remove ctrl, add meta
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', new_mods);
-                } else {
-                    // Pass all other characters to browser with original modifiers
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, c, mods);
-                }
-            },
-            .escape => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Escape", 27, mods),
-            // Translate Ctrl+A to Cmd+A (meta) for browser select-all (Ghostty intercepts Cmd+A)
-            .ctrl_a => interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'a', 4), // 4 = meta
-            // Handle Ctrl+V: read system clipboard and insert text (headless Chrome can't access clipboard)
-            .ctrl_v => {
-                const toolbar = @import("ui/toolbar.zig");
-                const clipboard = toolbar.pasteFromClipboard(self.allocator) orelse return;
-                defer self.allocator.free(clipboard);
-                interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
-            },
-            // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
-            .ctrl_p => {
-                const shift = (mods & 8) != 0;
-                if (shift) {
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', 4 | 8); // meta + shift
-                } else {
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', 2); // just ctrl
-                }
-            },
-            // Ctrl+W, Ctrl+Q handled globally (see handleInput)
-            .ctrl_r => { // Chrome-style reload
-                try screenshot_api.reload(self.cdp_client, self.allocator, false);
-                try self.refresh();
-            },
-            .ctrl_l => { // Chrome-style address bar focus
-                self.mode = .url_prompt;
-                if (self.toolbar_renderer) |*renderer| {
-                    renderer.setUrl(self.current_url);
-                    renderer.focusUrl();
-                } else {
-                    self.prompt_buffer = try PromptBuffer.init(self.allocator);
-                }
-                self.ui_dirty = true;
-            },
-            // Ctrl+C / Ctrl+X: copy/cut selection to system clipboard (terminals send Cmd as Ctrl)
-            .ctrl_c => try self.copySelectionToClipboard(false),
-            .ctrl_x => try self.copySelectionToClipboard(true),
-            // Arrow keys - pass to browser with modifiers
-            .left => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowLeft", 37, mods),
-            .right => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowRight", 39, mods),
-            .up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowUp", 38, mods),
-            .down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowDown", 40, mods),
-            // Special keys - pass to browser with modifiers
-            .enter => interact_mod.sendEnterKey(self.cdp_client, mods),
-            .backspace => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Backspace", 8, mods),
-            .tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods),
-            .shift_tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods | 8), // Ensure shift is set
-            .delete => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Delete", 46, mods),
-            .home => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Home", 36, mods),
-            .end => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "End", 35, mods),
-            .page_up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageUp", 33, mods),
-            .page_down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageDown", 34, mods),
-            else => {},
-        }
-    }
-
-    /// Handle key press in URL prompt mode
-    fn handleUrlPromptMode(self: *Viewer, key_input: KeyInput) !void {
-        const key = key_input.key;
-        const mods = key_input.modifiers; // CDP modifiers: 1=alt, 2=ctrl, 4=meta, 8=shift
-        const shift = (mods & 8) != 0;
-        const ctrl = (mods & 2) != 0;
-        const alt = (mods & 1) != 0; // Option on macOS
-        const meta = (mods & 4) != 0; // Cmd on macOS
-
-        // Platform-specific modifier for shortcuts
-        const is_macos = comptime builtin.os.tag == .macos;
-        const cmd_or_ctrl = if (is_macos) meta else ctrl; // Cmd on macOS, Ctrl on Linux
-        const word_nav_mod = if (is_macos) alt else ctrl; // Option on macOS, Ctrl on Linux
-        const line_nav_mod = if (is_macos) meta else false; // Cmd+arrow = Home/End on macOS only
-
-        // Use toolbar renderer for URL editing if available
-        if (self.toolbar_renderer) |*renderer| {
-            switch (key) {
-                .char => |c| {
-                    // Handle Cmd+key (macOS) or Ctrl+key (Linux) shortcuts
-                    if (cmd_or_ctrl) {
-                        switch (c) {
-                            'a', 'A' => {
-                                renderer.handleSelectAll();
-                                self.ui_dirty = true;
-                                return;
-                            },
-                            'x', 'X' => {
-                                renderer.handleCut(self.allocator);
-                                self.ui_dirty = true;
-                                return;
-                            },
-                            'c', 'C' => {
-                                renderer.handleCopy(self.allocator);
-                                return;
-                            },
-                            'v', 'V' => {
-                                renderer.handlePaste(self.allocator);
-                                self.ui_dirty = true;
-                                return;
-                            },
-                            else => {},
-                        }
-                    }
-                    renderer.handleChar(c);
-                    self.ui_dirty = true;
-                },
-                .backspace => {
-                    renderer.handleBackspace();
-                    self.ui_dirty = true;
-                },
-                .left => {
-                    if (shift) {
-                        renderer.handleSelectLeft();
-                    } else if (line_nav_mod) {
-                        // Cmd+Left on macOS = Home
-                        renderer.handleHome();
-                    } else if (word_nav_mod) {
-                        // Option+Left on macOS, Ctrl+Left on Linux = word left
-                        renderer.handleWordLeft();
-                    } else {
-                        renderer.handleLeft();
-                    }
-                    self.ui_dirty = true;
-                },
-                .right => {
-                    if (shift) {
-                        renderer.handleSelectRight();
-                    } else if (line_nav_mod) {
-                        // Cmd+Right on macOS = End
-                        renderer.handleEnd();
-                    } else if (word_nav_mod) {
-                        // Option+Right on macOS, Ctrl+Right on Linux = word right
-                        renderer.handleWordRight();
-                    } else {
-                        renderer.handleRight();
-                    }
-                    self.ui_dirty = true;
-                },
-                .home => {
-                    if (shift) {
-                        renderer.handleSelectHome();
-                    } else {
-                        renderer.handleHome();
-                    }
-                    self.ui_dirty = true;
-                },
-                .end => {
-                    if (shift) {
-                        renderer.handleSelectEnd();
-                    } else {
-                        renderer.handleEnd();
-                    }
-                    self.ui_dirty = true;
-                },
-                .delete => {
-                    renderer.handleDelete();
-                    self.ui_dirty = true;
-                },
-                .ctrl_a => {
-                    renderer.handleSelectAll();
-                    self.ui_dirty = true;
-                },
-                .ctrl_x => {
-                    renderer.handleCut(self.allocator);
-                    self.ui_dirty = true;
-                },
-                .ctrl_c => {
-                    renderer.handleCopy(self.allocator);
-                    // Don't exit URL mode on Ctrl+C when we have text selected
-                },
-                .ctrl_v => {
-                    renderer.handlePaste(self.allocator);
-                    self.ui_dirty = true;
-                },
-                .enter => {
-                    const url = renderer.getUrlText();
-                    self.log("[URL] Enter pressed, url_len={}, url='{s}'\n", .{ url.len, url });
-                    if (url.len > 0) {
-                        self.log("[URL] Navigating to: {s}\n", .{url});
-                        screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url) catch |err| {
-                            self.log("[URL] Navigation failed: {}\n", .{err});
-                        };
-                        // Update current_url to match the new URL (only if different)
-                        if (!std.mem.eql(u8, self.current_url, url)) {
-                            const new_url = self.allocator.dupe(u8, url) catch {
-                                self.log("[URL] Failed to allocate new URL\n", .{});
-                                self.updateNavigationState();
-                                renderer.blurUrl();
-                                self.mode = .normal;
-                                self.ui_dirty = true;
-                                return;
-                            };
-                            // Free old URL and replace
-                            self.allocator.free(self.current_url);
-                            self.current_url = new_url;
-                        }
-                        self.updateNavigationState();
-                    }
-                    renderer.blurUrl();
-                    self.mode = .normal;
-                    self.ui_dirty = true;
-                },
-                .escape => {
-                    renderer.blurUrl();
-                    self.mode = .normal;
-                    self.ui_dirty = true;
-                },
-                else => {},
-            }
-            return;
-        }
-
-        // Fallback to old prompt buffer
-        if (self.prompt_buffer) |*prompt| {
-            switch (key) {
-                .char => |c| {
-                    if (c >= 32 and c <= 126) {
-                        try prompt.insertChar(c);
-                    }
-                    try self.drawStatus();
-                },
-                .backspace => {
-                    prompt.backspace();
-                    try self.drawStatus();
-                },
-                .enter => {
-                    const url = prompt.getString();
-                    if (url.len > 0) {
-                        try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url);
-                        try self.refresh();
-                    }
-                    prompt.deinit();
-                    self.prompt_buffer = null;
-                    self.mode = .normal;
-                    try self.drawStatus();
-                },
-                .escape => {
-                    prompt.deinit();
-                    self.prompt_buffer = null;
-                    self.mode = .normal;
-                    try self.drawStatus();
-                },
-                else => {},
-            }
-        }
-    }
-
-    /// Draw status line (only for non-normal modes that need user input)
-    fn drawStatus(self: *Viewer) !void {
-        // Don't show status bar in normal mode - use tab bar instead
-        if (self.mode == .normal) return;
-
-        var stdout_buf: [8192]u8 = undefined;
-        const stdout_file = std.fs.File.stdout();
-        var stdout_writer = stdout_file.writer(&stdout_buf);
-        const writer = &stdout_writer.interface;
-
-        const size = try self.terminal.getSize();
-
-        // Move to last row and show dark background
-        try Screen.moveCursor(writer, size.rows, 1);
-        try Screen.clearLine(writer);
-        try writer.writeAll("\x1b[48;2;40;40;40m\x1b[38;2;220;220;220m"); // Dark bg, light text
-
-        // Status text based on mode
-        switch (self.mode) {
-            .normal => unreachable, // Already returned above
-            .url_prompt => {
-                try writer.print("Go to URL: ", .{});
-                if (self.prompt_buffer) |*p| {
-                    try p.render(writer, "");
-                }
-                try writer.print(" | [Enter] navigate [Esc] cancel", .{});
-            },
-            .dialog => {
-                // Dialog mode - status shown in dialog overlay
-                try writer.print("DIALOG | [Enter] OK [Esc] Cancel", .{});
-            },
-        }
-        try writer.writeAll("\x1b[0m"); // Reset colors
-        try writer.flush();
     }
 
     /// Handle CDP events (JavaScript dialogs, file chooser, console messages)
@@ -2209,48 +2086,6 @@ pub const Viewer = struct {
         } else {
             const result = self.cdp_client.sendCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}") catch return;
             self.allocator.free(result);
-        }
-    }
-
-    /// Handle key press in dialog mode
-    fn handleDialogMode(self: *Viewer, key: Key) !void {
-        const state = self.dialog_state orelse return;
-
-        switch (key) {
-            .char => |c| {
-                if (state.dialog_type == .prompt) {
-                    state.handleChar(c);
-                    self.ui_dirty = true;
-                }
-            },
-            .backspace => {
-                if (state.dialog_type == .prompt) {
-                    state.handleBackspace();
-                    self.ui_dirty = true;
-                }
-            },
-            .left => {
-                if (state.dialog_type == .prompt) {
-                    state.handleLeft();
-                    self.ui_dirty = true;
-                }
-            },
-            .right => {
-                if (state.dialog_type == .prompt) {
-                    state.handleRight();
-                    self.ui_dirty = true;
-                }
-            },
-            .enter => {
-                // Accept dialog
-                try self.closeDialog(true);
-            },
-            .escape => {
-                // Cancel dialog (for confirm/prompt only)
-                const can_cancel = state.dialog_type != .alert;
-                try self.closeDialog(!can_cancel);
-            },
-            else => {},
         }
     }
 

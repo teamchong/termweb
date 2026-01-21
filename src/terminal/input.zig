@@ -306,11 +306,13 @@ pub const InputReader = struct {
             // Handle bracketed paste sequences
             if (num == 200) {
                 // Start of bracketed paste
+                inputDebugLog("[PASTE] Start bracketed paste (ESC[200~)", .{});
                 self.in_paste = true;
                 self.paste_buffer.clearRetainingCapacity();
                 return .none; // Signal handled, continue reading
             } else if (num == 201) {
                 // End of bracketed paste - return accumulated content
+                inputDebugLog("[PASTE] End bracketed paste (ESC[201~), len={d}", .{self.paste_buffer.items.len});
                 self.in_paste = false;
                 if (self.paste_buffer.items.len > 0) {
                     // Clone the content for the caller (they own it)
