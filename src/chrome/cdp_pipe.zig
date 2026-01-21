@@ -59,17 +59,8 @@ const ResponseQueueEntry = struct {
     }
 };
 
-/// Event queue entry for download events
-const EventQueueEntry = struct {
-    method: []u8,
-    payload: []u8,
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *EventQueueEntry) void {
-        self.allocator.free(self.method);
-        self.allocator.free(self.payload);
-    }
-};
+// NOTE: Event queue removed - pipe is ONLY for screencast frames
+// All events (console, dialogs, file chooser) go through nav_ws
 
 /// Pipe-based CDP client
 pub const PipeCdpClient = struct {
@@ -84,9 +75,8 @@ pub const PipeCdpClient = struct {
     response_queue: std.ArrayList(ResponseQueueEntry),
     response_mutex: std.Thread.Mutex,
 
-    // Event queue for download events (download events come through pipe, not nav_ws)
-    event_queue: std.ArrayList(EventQueueEntry),
-    event_mutex: std.Thread.Mutex,
+    // NOTE: No event queue - pipe is ONLY for screencast frames
+    // Events go through nav_ws
 
     // Navigation event flag - set when Page.frameNavigated or similar events occur
     navigation_happened: std.atomic.Value(bool),
@@ -115,8 +105,6 @@ pub const PipeCdpClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .response_queue = try std.ArrayList(ResponseQueueEntry).initCapacity(allocator, 0),
             .response_mutex = .{},
-            .event_queue = try std.ArrayList(EventQueueEntry).initCapacity(allocator, 0),
-            .event_mutex = .{},
             .navigation_happened = std.atomic.Value(bool).init(false),
             .frame_pool = frame_pool,
             .frame_count = std.atomic.Value(u32).init(0),
@@ -150,14 +138,6 @@ pub const PipeCdpClient = struct {
         self.response_mutex.unlock();
 
         logToFile("[PIPE deinit] Freed {} response queue entries\n", .{queue_len});
-
-        // Free event queue entries
-        self.event_mutex.lock();
-        for (self.event_queue.items) |*entry| {
-            entry.deinit();
-        }
-        self.event_queue.deinit(self.allocator);
-        self.event_mutex.unlock();
 
         self.allocator.free(self.read_buffer);
         self.allocator.destroy(self);
@@ -429,16 +409,12 @@ pub const PipeCdpClient = struct {
     }
 
     /// Handle CDP events from pipe
+    /// PIPE IS ONLY FOR SCREENCAST FRAMES - events go through nav_ws
     fn handleEvent(self: *PipeCdpClient, payload: []const u8) !void {
         const method_start = std.mem.indexOf(u8, payload, "\"method\":\"") orelse return;
         const method_v_start = method_start + "\"method\":\"".len;
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
-
-        // Debug: Log download-related events
-        if (std.mem.startsWith(u8, method, "Browser.download") or std.mem.startsWith(u8, method, "Page.download")) {
-            logToFile("[PIPE EVENT] {s}\n", .{method});
-        }
 
         // Set navigation flag for navigation events (event bus pattern)
         // This is lightweight - just an atomic flag, no queueing
@@ -448,70 +424,12 @@ pub const PipeCdpClient = struct {
             self.navigation_happened.store(true, .release);
         }
 
-        // Handle screencast frames directly
+        // PIPE ONLY HANDLES SCREENCAST FRAMES
+        // All other events (console, dialogs, file chooser) go through nav_ws
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             self.handleScreencastFrame(payload) catch return;
-            return;
         }
-
-        // Queue download events for main thread processing
-        if (std.mem.eql(u8, method, "Browser.downloadWillBegin") or
-            std.mem.eql(u8, method, "Browser.downloadProgress"))
-        {
-            logToFile("[PIPE] Queueing download event: {s}\n", .{method});
-            self.queueEvent(method, payload) catch |err| {
-                logToFile("[PIPE] Failed to queue download event: {}\n", .{err});
-            };
-        }
-        // Other events go through nav_ws
-    }
-
-    /// Queue an event for main thread processing
-    fn queueEvent(self: *PipeCdpClient, method: []const u8, payload: []const u8) !void {
-        self.event_mutex.lock();
-        defer self.event_mutex.unlock();
-
-        if (!self.running.load(.acquire)) return;
-
-        // Limit queue size
-        const MAX_EVENT_QUEUE = 50;
-        if (self.event_queue.items.len >= MAX_EVENT_QUEUE) {
-            var old = self.event_queue.orderedRemove(0);
-            old.deinit();
-        }
-
-        // Copy method and payload
-        const method_copy = try self.allocator.dupe(u8, method);
-        errdefer self.allocator.free(method_copy);
-        const payload_copy = try self.allocator.dupe(u8, payload);
-
-        try self.event_queue.append(self.allocator, .{
-            .method = method_copy,
-            .payload = payload_copy,
-            .allocator = self.allocator,
-        });
-    }
-
-    /// Get next event from queue (called by main thread)
-    pub fn pollEvent(self: *PipeCdpClient) ?struct { method: []const u8, payload: []const u8 } {
-        self.event_mutex.lock();
-        defer self.event_mutex.unlock();
-
-        if (self.event_queue.items.len == 0) return null;
-
-        const entry = self.event_queue.orderedRemove(0);
-        // Note: caller must NOT free - we return slices into entry which will be freed later
-        // Actually, let's return owned copies that caller can manage
-        return .{
-            .method = entry.method,
-            .payload = entry.payload,
-        };
-    }
-
-    /// Free event data returned by pollEvent
-    pub fn freeEventData(self: *PipeCdpClient, method: []const u8, payload: []const u8) void {
-        self.allocator.free(method);
-        self.allocator.free(payload);
+        // Ignore all other events - they're handled by nav_ws
     }
 
     fn handleScreencastFrame(self: *PipeCdpClient, payload: []const u8) !void {
