@@ -1934,6 +1934,16 @@ pub const Viewer = struct {
                 info.received_bytes,
                 info.total_bytes,
             );
+
+            // Reset viewport after download completes to fix Chrome's layout
+            if (std.mem.eql(u8, info.state, "completed")) {
+                self.log("[DOWNLOAD] Complete - resetting viewport to fix layout\n", .{});
+                screenshot_api.setViewport(self.cdp_client, self.allocator, self.viewport_width, self.viewport_height) catch |err| {
+                    self.log("[DOWNLOAD] Viewport reset failed: {}\n", .{err});
+                };
+                // Re-query actual viewport after reset
+                self.refreshChromeViewport();
+            }
         }
     }
 
