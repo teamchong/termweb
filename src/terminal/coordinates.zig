@@ -50,9 +50,9 @@ pub const CoordinateMapper = struct {
         // This is used for HIT DETECTION only
         const tabbar_h: u16 = toolbar_height orelse cell_height;
 
-        // Content area: rows 2 to (rows-1), i.e., (rows-2) rows
-        // This is where the Kitty graphic is displayed, regardless of toolbar pixel height
-        const content_rows = if (terminal_rows > 2) terminal_rows - 2 else 1;
+        // Content area: rows 2 to end, i.e., (rows-1) rows
+        // Only toolbar row is reserved at top
+        const content_rows = if (terminal_rows > 1) terminal_rows - 1 else 1;
         const content_pixel_height = content_rows * cell_height;
 
         // If terminal reports pixel dimensions, assume we're using SGR pixel mode (1016h)
