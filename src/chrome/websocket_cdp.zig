@@ -423,6 +423,8 @@ pub const WebSocketCdpClient = struct {
             "Runtime.consoleAPICalled", // Polyfill communication
             "Page.javascriptDialogOpening", // JS dialogs
             "Page.fileChooserOpened", // File picker
+            "Browser.downloadWillBegin", // Download started
+            "Browser.downloadProgress", // Download progress/completion
         };
 
         var dominated = false;

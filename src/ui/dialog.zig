@@ -19,6 +19,7 @@ pub const FilePickerMode = enum {
     single,
     multiple,
     folder,
+    save, // Save file dialog
 };
 
 pub const DialogState = struct {
@@ -231,16 +232,28 @@ pub fn showNativeFilePicker(
     allocator: std.mem.Allocator,
     mode: FilePickerMode,
 ) !?[]const u8 {
+    return showNativeFilePickerWithName(allocator, mode, null);
+}
+
+/// Show native OS file picker dialog with optional default filename (for save dialogs)
+/// Returns the selected file path(s) or null if cancelled
+pub fn showNativeFilePickerWithName(
+    allocator: std.mem.Allocator,
+    mode: FilePickerMode,
+    default_name: ?[]const u8,
+) !?[]const u8 {
     if (builtin.os.tag == .macos) {
-        return showMacOSFilePicker(allocator, mode);
+        return showMacOSFilePicker(allocator, mode, default_name);
     } else if (builtin.os.tag == .linux) {
-        return showLinuxFilePicker(allocator, mode);
+        return showLinuxFilePicker(allocator, mode, default_name);
     }
     return null;
 }
 
-fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
-    const script = switch (mode) {
+fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: ?[]const u8) !?[]const u8 {
+    // Build script based on mode
+    var script_buf: [512]u8 = undefined;
+    const script: []const u8 = switch (mode) {
         .single => "POSIX path of (choose file)",
         .folder => "POSIX path of (choose folder)",
         .multiple =>
@@ -251,6 +264,13 @@ fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]c
             \\end repeat
             \\out
         ,
+        .save => blk: {
+            if (default_name) |name| {
+                break :blk std.fmt.bufPrint(&script_buf, "POSIX path of (choose file name with prompt \"Save As\" default name \"{s}\")", .{name}) catch "POSIX path of (choose file name with prompt \"Save As\")";
+            } else {
+                break :blk "POSIX path of (choose file name with prompt \"Save As\")";
+            }
+        },
     };
 
     const result = std.process.Child.run(.{
@@ -291,21 +311,48 @@ fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]c
     return result.stdout;
 }
 
-fn showLinuxFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
+fn showLinuxFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: ?[]const u8) !?[]const u8 {
     // Try zenity first
-    const zenity_result = tryZenity(allocator, mode) catch null;
+    const zenity_result = tryZenity(allocator, mode, default_name) catch null;
     if (zenity_result) |path| return path;
 
     // Fallback to kdialog
-    return tryKdialog(allocator, mode);
+    return tryKdialog(allocator, mode, default_name);
 }
 
-fn tryZenity(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
-    const argv: []const []const u8 = switch (mode) {
-        .single => &.{ "zenity", "--file-selection" },
-        .folder => &.{ "zenity", "--file-selection", "--directory" },
-        .multiple => &.{ "zenity", "--file-selection", "--multiple" },
-    };
+fn tryZenity(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: ?[]const u8) !?[]const u8 {
+    // Build argv based on mode
+    var argv_buf: [6][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "zenity";
+    argc += 1;
+    argv_buf[argc] = "--file-selection";
+    argc += 1;
+
+    switch (mode) {
+        .single => {},
+        .folder => {
+            argv_buf[argc] = "--directory";
+            argc += 1;
+        },
+        .multiple => {
+            argv_buf[argc] = "--multiple";
+            argc += 1;
+        },
+        .save => {
+            argv_buf[argc] = "--save";
+            argc += 1;
+            if (default_name) |name| {
+                argv_buf[argc] = "--filename";
+                argc += 1;
+                argv_buf[argc] = name;
+                argc += 1;
+            }
+        },
+    }
+
+    const argv = argv_buf[0..argc];
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
@@ -338,12 +385,40 @@ fn tryZenity(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
     return result.stdout;
 }
 
-fn tryKdialog(allocator: std.mem.Allocator, mode: FilePickerMode) !?[]const u8 {
-    const argv: []const []const u8 = switch (mode) {
-        .single => &.{ "kdialog", "--getopenfilename" },
-        .folder => &.{ "kdialog", "--getexistingdirectory" },
-        .multiple => &.{ "kdialog", "--getopenfilename", "--multiple" },
-    };
+fn tryKdialog(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: ?[]const u8) !?[]const u8 {
+    // Build argv based on mode
+    var argv_buf: [4][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "kdialog";
+    argc += 1;
+
+    switch (mode) {
+        .single => {
+            argv_buf[argc] = "--getopenfilename";
+            argc += 1;
+        },
+        .folder => {
+            argv_buf[argc] = "--getexistingdirectory";
+            argc += 1;
+        },
+        .multiple => {
+            argv_buf[argc] = "--getopenfilename";
+            argc += 1;
+            argv_buf[argc] = "--multiple";
+            argc += 1;
+        },
+        .save => {
+            argv_buf[argc] = "--getsavefilename";
+            argc += 1;
+            if (default_name) |name| {
+                argv_buf[argc] = name;
+                argc += 1;
+            }
+        },
+    }
+
+    const argv = argv_buf[0..argc];
 
     const result = std.process.Child.run(.{
         .allocator = allocator,

@@ -15,6 +15,7 @@ const screenshot_api = @import("chrome/screenshot.zig");
 const scroll_api = @import("chrome/scroll.zig");
 const dom_mod = @import("chrome/dom.zig");
 const interact_mod = @import("chrome/interact.zig");
+const download_mod = @import("chrome/download.zig");
 const ui_mod = @import("ui/mod.zig");
 
 const Terminal = terminal_mod.Terminal;
@@ -190,6 +191,9 @@ pub const Viewer = struct {
     // File System Access API - allowed roots (security: only allow access to user-selected directories)
     allowed_fs_roots: std.ArrayList([]const u8),
 
+    // Download manager for file downloads
+    download_manager: download_mod.DownloadManager,
+
     pub fn init(
         allocator: std.mem.Allocator,
         cdp_client: *cdp.CdpClient,
@@ -265,6 +269,7 @@ pub const Viewer = struct {
             .dialog_state = null,
             .dialog_message = null,
             .allowed_fs_roots = try std.ArrayList([]const u8).initCapacity(allocator, 0),
+            .download_manager = download_mod.DownloadManager.init(allocator, "/tmp/termweb-downloads"),
         };
     }
 
@@ -1768,6 +1773,39 @@ pub const Viewer = struct {
             try self.showFileChooser(event.payload);
         } else if (std.mem.eql(u8, event.method, "Runtime.consoleAPICalled")) {
             try self.handleConsoleMessage(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Browser.downloadWillBegin")) {
+            try self.handleDownloadWillBegin(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Browser.downloadProgress")) {
+            try self.handleDownloadProgress(event.payload);
+        }
+    }
+
+    /// Handle Browser.downloadWillBegin event - prompt user for save location
+    fn handleDownloadWillBegin(self: *Viewer, payload: []const u8) !void {
+        self.log("[DOWNLOAD] downloadWillBegin: {s}\n", .{payload[0..@min(payload.len, 500)]});
+
+        if (download_mod.parseDownloadWillBegin(payload)) |info| {
+            self.log("[DOWNLOAD] guid={s} filename={s}\n", .{ info.guid, info.suggested_filename });
+            try self.download_manager.handleDownloadWillBegin(
+                info.guid,
+                info.url,
+                info.suggested_filename,
+            );
+        }
+    }
+
+    /// Handle Browser.downloadProgress event - track progress and move file when complete
+    fn handleDownloadProgress(self: *Viewer, payload: []const u8) !void {
+        if (download_mod.parseDownloadProgress(payload)) |info| {
+            self.log("[DOWNLOAD] progress: guid={s} state={s} {d}/{d} bytes\n", .{
+                info.guid, info.state, info.received_bytes, info.total_bytes,
+            });
+            try self.download_manager.handleDownloadProgress(
+                info.guid,
+                info.state,
+                info.received_bytes,
+                info.total_bytes,
+            );
         }
     }
 
@@ -2308,6 +2346,7 @@ pub const Viewer = struct {
             self.allocator.free(root);
         }
         self.allowed_fs_roots.deinit(self.allocator);
+        self.download_manager.deinit();
         if (self.debug_log) |file| {
             file.close();
         }

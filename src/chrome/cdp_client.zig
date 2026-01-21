@@ -97,6 +97,18 @@ pub const CdpClient = struct {
         const intercept_file = try client.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
         allocator.free(intercept_file);
 
+        // Enable downloads with events (files go to temp dir, we'll prompt user and move)
+        const download_path = "/tmp/termweb-downloads";
+        std.fs.makeDirAbsolute(download_path) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                logToFile("[CDP] Failed to create download dir: {}\n", .{err});
+            }
+        };
+        const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"{s}\",\"eventsEnabled\":true}}", .{download_path});
+        defer allocator.free(download_params);
+        const download_result = try client.sendCommand("Browser.setDownloadBehavior", download_params);
+        allocator.free(download_result);
+
         // Inject File System Access API polyfill with full file system bridge
         // Security: Only allows access to directories user explicitly selected via picker
         const polyfill_script = @embedFile("fs_polyfill.js");
