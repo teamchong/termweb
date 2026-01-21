@@ -231,7 +231,7 @@ pub const Viewer = struct {
             .kitty = KittyGraphics.init(allocator),
             .cdp_client = cdp_client,
             .input = InputReader.init(std.posix.STDIN_FILENO, enable_input_debug),
-            .current_url = url,
+            .current_url = try allocator.dupe(u8, url),
             .running = true,
             .mode = .normal,
             .prompt_buffer = null,
@@ -1501,13 +1501,18 @@ pub const Viewer = struct {
                         screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url) catch |err| {
                             self.log("[URL] Navigation failed: {}\n", .{err});
                         };
-                        // Update current_url to match the new URL
-                        const new_url = self.allocator.dupe(u8, url) catch url;
+                        // Update current_url to match the new URL (only if different)
                         if (!std.mem.eql(u8, self.current_url, url)) {
-                            // Don't free the original URL from init, but free if we allocated it later
-                            if (self.current_url.len > 0) {
-                                // Note: can't easily track if current_url was allocated, so we just update
-                            }
+                            const new_url = self.allocator.dupe(u8, url) catch {
+                                self.log("[URL] Failed to allocate new URL\n", .{});
+                                self.updateNavigationState();
+                                renderer.blurUrl();
+                                self.mode = .normal;
+                                self.ui_dirty = true;
+                                return;
+                            };
+                            // Free old URL and replace
+                            self.allocator.free(self.current_url);
                             self.current_url = new_url;
                         }
                         self.updateNavigationState();
@@ -1804,6 +1809,8 @@ pub const Viewer = struct {
         // Update current_url if different
         if (!std.mem.eql(u8, self.current_url, url)) {
             const new_url = self.allocator.dupe(u8, url) catch return;
+            // Free old URL and replace
+            self.allocator.free(self.current_url);
             self.current_url = new_url;
 
             // Update toolbar display
@@ -2393,6 +2400,8 @@ pub const Viewer = struct {
         if (self.toolbar_renderer) |*renderer| {
             renderer.deinit();
         }
+        // Free the URL we own
+        self.allocator.free(self.current_url);
         self.terminal.deinit();
     }
 };
