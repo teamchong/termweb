@@ -1,0 +1,39 @@
+{
+  "name": "termweb",
+  "version": "0.1.0",
+  "description": "Web browser in your terminal using Kitty graphics protocol",
+  "bin": {
+    "termweb": "./bin/termweb.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "keywords": [
+    "terminal",
+    "browser",
+    "kitty",
+    "graphics",
+    "cli",
+    "web"
+  ],
+  "author": "teamch",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teamch/termweb"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

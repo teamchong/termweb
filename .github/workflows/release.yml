@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            arch: aarch64
+            name: termweb-macos-aarch64
+          - os: macos-13
+            arch: x86_64
+            name: termweb-macos-x86_64
+          - os: ubuntu-latest
+            arch: x86_64
+            name: termweb-linux-x86_64
+          - os: ubuntu-latest
+            arch: aarch64
+            name: termweb-linux-aarch64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build (native)
+        if: matrix.arch == 'x86_64' || (matrix.os == 'macos-latest' && matrix.arch == 'aarch64')
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build (cross-compile Linux aarch64)
+        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'aarch64'
+        run: zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+
+      - name: Rename binary
+        run: mv zig-out/bin/termweb ${{ matrix.name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            termweb-macos-aarch64/termweb-macos-aarch64
+            termweb-macos-x86_64/termweb-macos-x86_64
+            termweb-linux-x86_64/termweb-linux-x86_64
+            termweb-linux-aarch64/termweb-linux-aarch64

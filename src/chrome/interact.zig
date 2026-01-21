@@ -203,12 +203,61 @@ pub fn pressEnter(
     _ = allocator;
     client.sendKeyboardCommandAsync(
         "Input.dispatchKeyEvent",
-        "{\"type\":\"keyDown\",\"key\":\"Enter\"}",
+        "{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13}",
     );
     client.sendKeyboardCommandAsync(
         "Input.dispatchKeyEvent",
-        "{\"type\":\"keyUp\",\"key\":\"Enter\"}",
+        "{\"type\":\"keyUp\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13}",
     );
+}
+
+/// Send a character key to the browser (keyDown + char + keyUp)
+pub fn sendChar(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    char: u8,
+) void {
+    var key_buf: [2]u8 = .{ char, 0 };
+    const key: []const u8 = key_buf[0..1];
+
+    // Get key code (uppercase for A-Z)
+    const code: u8 = if (char >= 'a' and char <= 'z')
+        char - 32 // Convert to uppercase for keyCode
+    else
+        char;
+
+    // Format keyDown event
+    var down_buf: [256]u8 = undefined;
+    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"text\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, key, code }) catch return;
+
+    // Format char event (for text input)
+    var char_buf: [256]u8 = undefined;
+    const char_params = std.fmt.bufPrint(&char_buf, "{{\"type\":\"char\",\"key\":\"{s}\",\"text\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, key, code }) catch return;
+
+    // Format keyUp event
+    var up_buf: [256]u8 = undefined;
+    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key, code }) catch return;
+
+    _ = allocator;
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", char_params);
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
+}
+
+/// Send a special key to the browser (Escape, Backspace, Tab, Arrow keys, etc.)
+pub fn sendSpecialKey(
+    client: *cdp.CdpClient,
+    key_name: []const u8,
+    key_code: u16,
+) void {
+    var down_buf: [256]u8 = undefined;
+    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key_name, key_name, key_code }) catch return;
+
+    var up_buf: [256]u8 = undefined;
+    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d}}}", .{ key_name, key_name, key_code }) catch return;
+
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
 }
 
 /// Handle intercepted file chooser dialog

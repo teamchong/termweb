@@ -1396,61 +1396,17 @@ pub const Viewer = struct {
     }
 
     /// Handle key press in normal mode
+    /// All keys pass to browser except termweb hotkeys:
+    /// - Ctrl+Q/W/C: quit (handled globally)
+    /// - Ctrl+L: address bar
+    /// - Ctrl+R: reload
     fn handleNormalMode(self: *Viewer, key: Key) !void {
-        // Get viewport size for scroll calculations
-        const size = try self.terminal.getSize();
-        const vw = size.width_px;
-        const vh = size.height_px;
-
         switch (key) {
             .char => |c| {
-                switch (c) {
-                    'r' => try self.refresh(), // lowercase = refresh screenshot only (also Ctrl+R)
-                    'b' => { // back
-                        const navigated = try screenshot_api.goBack(self.cdp_client, self.allocator);
-                        if (navigated) {
-                            try self.refresh();
-                        }
-                    },
-                    // Vim-style scrolling
-                    'j' => {
-                        try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
-                        try self.refresh();
-                    },
-                    'k' => {
-                        try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
-                        try self.refresh();
-                    },
-                    'd' => {
-                        try scroll_api.scrollHalfPageDown(self.cdp_client, self.allocator, vw, vh);
-                        try self.refresh();
-                    },
-                    'u' => {
-                        try scroll_api.scrollHalfPageUp(self.cdp_client, self.allocator, vw, vh);
-                        try self.refresh();
-                    },
-                    // 'g', 'G' removed - use Ctrl+L for address bar (Chrome-style)
-                    'f' => {
-                        // Enter form mode
-                        self.mode = .form_mode;
-
-                        // Query elements
-                        const ctx = try self.allocator.create(FormContext);
-                        ctx.* = FormContext.init(self.allocator);
-                        ctx.elements = try dom_mod.queryElements(self.cdp_client, self.allocator);
-                        self.form_context = ctx;
-
-                        try self.drawStatus();
-                    },
-                    '?' => {
-                        // Enter help mode
-                        self.mode = .help;
-                        try self.drawHelp();
-                    },
-                    else => {},
-                }
+                // Pass all characters to browser
+                interact_mod.sendChar(self.cdp_client, self.allocator, c);
             },
-            .escape => self.running = false,
+            .escape => interact_mod.sendSpecialKey(self.cdp_client, "Escape", 27),
             // Ctrl+W, Ctrl+Q, Ctrl+C handled globally (see handleInput)
             .ctrl_r => { // Chrome-style reload
                 try screenshot_api.reload(self.cdp_client, self.allocator, false);
@@ -1466,44 +1422,20 @@ pub const Viewer = struct {
                 }
                 self.ui_dirty = true;
             },
-            .ctrl_f => { // Chrome-style find (use for forms)
-                self.mode = .form_mode;
-                const ctx = try self.allocator.create(FormContext);
-                ctx.* = FormContext.init(self.allocator);
-                ctx.elements = try dom_mod.queryElements(self.cdp_client, self.allocator);
-                self.form_context = ctx;
-                try self.drawStatus();
-            },
-            .left => { // Arrow key navigation
-                const navigated = try screenshot_api.goBack(self.cdp_client, self.allocator);
-                if (navigated) {
-                    try self.refresh();
-                }
-            },
-            .right => {
-                const navigated = try screenshot_api.goForward(self.cdp_client, self.allocator);
-                if (navigated) {
-                    try self.refresh();
-                }
-            },
-            // Arrow key scrolling
-            .up => {
-                try scroll_api.scrollLineUp(self.cdp_client, self.allocator, vw, vh);
-                try self.refresh();
-            },
-            .down => {
-                try scroll_api.scrollLineDown(self.cdp_client, self.allocator, vw, vh);
-                try self.refresh();
-            },
-            // Page key scrolling
-            .page_up => {
-                try scroll_api.scrollPageUp(self.cdp_client, self.allocator, vw, vh);
-                try self.refresh();
-            },
-            .page_down => {
-                try scroll_api.scrollPageDown(self.cdp_client, self.allocator, vw, vh);
-                try self.refresh();
-            },
+            // Arrow keys - pass to browser
+            .left => interact_mod.sendSpecialKey(self.cdp_client, "ArrowLeft", 37),
+            .right => interact_mod.sendSpecialKey(self.cdp_client, "ArrowRight", 39),
+            .up => interact_mod.sendSpecialKey(self.cdp_client, "ArrowUp", 38),
+            .down => interact_mod.sendSpecialKey(self.cdp_client, "ArrowDown", 40),
+            // Special keys - pass to browser
+            .enter => interact_mod.sendSpecialKey(self.cdp_client, "Enter", 13),
+            .backspace => interact_mod.sendSpecialKey(self.cdp_client, "Backspace", 8),
+            .tab => interact_mod.sendSpecialKey(self.cdp_client, "Tab", 9),
+            .delete => interact_mod.sendSpecialKey(self.cdp_client, "Delete", 46),
+            .home => interact_mod.sendSpecialKey(self.cdp_client, "Home", 36),
+            .end => interact_mod.sendSpecialKey(self.cdp_client, "End", 35),
+            .page_up => interact_mod.sendSpecialKey(self.cdp_client, "PageUp", 33),
+            .page_down => interact_mod.sendSpecialKey(self.cdp_client, "PageDown", 34),
             else => {},
         }
     }

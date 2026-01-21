@@ -18,3 +18,7 @@ termweb_input.log
 
 # Test files
 test_*
+
+# npm binaries (downloaded during install)
+binaries/
+node_modules/
