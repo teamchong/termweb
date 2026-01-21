@@ -1812,6 +1812,9 @@ pub const Viewer = struct {
                 self.ui_dirty = true;
             }
         }
+
+        // Update back/forward button state
+        self.updateNavigationState();
     }
 
     /// Handle Browser.downloadWillBegin event - prompt user for save location
