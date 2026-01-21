@@ -1077,9 +1077,10 @@ pub const Viewer = struct {
                     }
                 }
 
-                // GLOBAL quit keys - Ctrl+Q/W/C only (work from ANY mode)
+                // GLOBAL quit keys - Ctrl+Q/W only (work from ANY mode)
+                // Note: Ctrl+C is NOT a quit key - it's used for copy
                 const is_global_quit = switch (key) {
-                    .ctrl_q, .ctrl_w, .ctrl_c => true,
+                    .ctrl_q, .ctrl_w => true,
                     else => false,
                 };
 
@@ -1416,7 +1417,7 @@ pub const Viewer = struct {
             .up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowUp", 38, mods),
             .down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowDown", 40, mods),
             // Special keys - pass to browser with modifiers
-            .enter => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Enter", 13, mods),
+            .enter => interact_mod.sendEnterKey(self.cdp_client, mods),
             .backspace => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Backspace", 8, mods),
             .tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods),
             .shift_tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods | 8), // Ensure shift is set
@@ -1769,7 +1770,7 @@ pub const Viewer = struct {
                 try writer.print(" | [Enter] submit [Esc] cancel", .{});
             },
             .help => {
-                try writer.print("HELP | [?] or [q] to close | [Ctrl+Q/W/C] to quit", .{});
+                try writer.print("HELP | [?] or [q] to close | [Ctrl+Q/W] to quit", .{});
             },
             .dialog => {
                 // Dialog mode - status shown in dialog overlay

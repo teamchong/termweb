@@ -274,6 +274,28 @@ pub fn sendChar(
     client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
 }
 
+/// Send Enter key with text property (needed for text editors like Monaco/VSCode)
+pub fn sendEnterKey(
+    client: *cdp.CdpClient,
+    modifiers: u8,
+) void {
+    // keyDown with text property
+    var down_buf: [256]u8 = undefined;
+    const down_params = std.fmt.bufPrint(&down_buf, "{{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"text\":\"\\r\",\"windowsVirtualKeyCode\":13,\"modifiers\":{d}}}", .{modifiers}) catch return;
+
+    // char event for text input
+    var char_buf: [256]u8 = undefined;
+    const char_params = std.fmt.bufPrint(&char_buf, "{{\"type\":\"char\",\"key\":\"Enter\",\"text\":\"\\r\",\"windowsVirtualKeyCode\":13,\"modifiers\":{d}}}", .{modifiers}) catch return;
+
+    // keyUp
+    var up_buf: [256]u8 = undefined;
+    const up_params = std.fmt.bufPrint(&up_buf, "{{\"type\":\"keyUp\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"modifiers\":{d}}}", .{modifiers}) catch return;
+
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down_params);
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", char_params);
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up_params);
+}
+
 /// Send a special key to the browser (Escape, Backspace, Tab, Arrow keys, etc.)
 pub fn sendSpecialKey(
     client: *cdp.CdpClient,
