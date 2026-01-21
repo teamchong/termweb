@@ -1113,10 +1113,10 @@ pub const Viewer = struct {
                 // Click outside URL bar cancels prompt and returns to normal mode
                 if (mouse.type == .press) {
                     if (self.toolbar_renderer) |*renderer| {
-                        const pixel_x = self.mouse_x;
-                        const in_url_bar = pixel_x >= renderer.url_bar_x and
-                            pixel_x < renderer.url_bar_x + renderer.url_bar_width and
-                            self.mouse_y <= renderer.toolbar_height;
+                        const mouse_pixels = self.mouseToPixels();
+                        const in_url_bar = mouse_pixels.x >= renderer.url_bar_x and
+                            mouse_pixels.x < renderer.url_bar_x + renderer.url_bar_width and
+                            mouse_pixels.y <= renderer.toolbar_height;
                         if (!in_url_bar) {
                             renderer.blurUrl();
                             self.mode = .normal;
@@ -1133,7 +1133,7 @@ pub const Viewer = struct {
     }
 
     /// Handle click on tab bar buttons
-    fn handleTabBarClick(self: *Viewer, pixel_x: u16, pixel_y: u16, mapper: CoordinateMapper) !void {
+    fn handleTabBarClick(self: *Viewer, pixel_x: u32, pixel_y: u32, mapper: CoordinateMapper) !void {
         if (self.toolbar_renderer) |*renderer| {
             self.log("[CLICK] handleTabBarClick x={} y={}\n", .{ pixel_x, pixel_y });
             
@@ -1285,10 +1285,11 @@ pub const Viewer = struct {
                 } else {
                     // Click is in tab bar - handle button clicks
                     // We handle this on PRESS for immediate feedback (like most UI buttons)
-                    self.log("[CLICK] In tab bar: mouse=({},{}) tabbar_height={}\n", .{
-                        self.mouse_x, self.mouse_y, mapper.tabbar_height,
+                    const mouse_pixels = self.mouseToPixels();
+                    self.log("[CLICK] In tab bar: mouse=({},{}) pixels=({},{}) tabbar_height={}\n", .{
+                        self.mouse_x, self.mouse_y, mouse_pixels.x, mouse_pixels.y, mapper.tabbar_height,
                     });
-                    try self.handleTabBarClick(self.mouse_x, self.mouse_y, mapper);
+                    try self.handleTabBarClick(mouse_pixels.x, mouse_pixels.y, mapper);
                 }
             },
             .release => {
@@ -1329,17 +1330,19 @@ pub const Viewer = struct {
                     renderer.url_bar_hover = false;
 
                     // Set hover for the button under cursor
-                    if (renderer.hitTest(self.mouse_x, self.mouse_y)) |button| {
+                    // Convert mouse coordinates to pixels for toolbar hit testing
+                    const mouse_pixels = self.mouseToPixels();
+                    if (renderer.hitTest(mouse_pixels.x, mouse_pixels.y)) |button| {
                         switch (button) {
                             .close => renderer.close_hover = true,
                             .back => renderer.back_hover = true,
                             .forward => renderer.forward_hover = true,
                             .refresh => renderer.refresh_hover = true,
                         }
-                    } else if (self.mouse_y < 40) {
+                    } else if (mouse_pixels.y < renderer.toolbar_height) {
                         // Check URL bar hover (within toolbar area)
-                        if (self.mouse_x >= renderer.url_bar_x and
-                            self.mouse_x < renderer.url_bar_x + renderer.url_bar_width)
+                        if (mouse_pixels.x >= renderer.url_bar_x and
+                            mouse_pixels.x < renderer.url_bar_x + renderer.url_bar_width)
                         {
                             renderer.url_bar_hover = true;
                         }
@@ -2403,6 +2406,30 @@ pub const Viewer = struct {
         // Free the URL we own
         self.allocator.free(self.current_url);
         self.terminal.deinit();
+    }
+
+    /// Convert mouse coordinates to pixel coordinates for toolbar hit testing.
+    /// When terminal is in cell mode (not pixel mode), converts cell coordinates to pixels.
+    fn mouseToPixels(self: *const Viewer) struct { x: u32, y: u32 } {
+        const mapper = self.coord_mapper orelse return .{ .x = self.mouse_x, .y = self.mouse_y };
+
+        if (mapper.is_pixel_mode) {
+            // Already in pixel coordinates
+            return .{ .x = self.mouse_x, .y = self.mouse_y };
+        }
+
+        // Convert cell coordinates to pixel coordinates
+        const cell_width: u32 = if (mapper.terminal_cols > 0)
+            mapper.terminal_width_px / mapper.terminal_cols
+        else
+            14;
+        const cell_height: u32 = mapper.cell_height;
+
+        // Convert cell to pixel (top-left of cell)
+        const pixel_x: u32 = @as(u32, self.mouse_x) * cell_width;
+        const pixel_y: u32 = @as(u32, self.mouse_y) * cell_height;
+
+        return .{ .x = pixel_x, .y = pixel_y };
     }
 };
 
