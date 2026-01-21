@@ -115,13 +115,14 @@ pub fn focusElement(
 
 /// Type text into focused element (fire-and-forget for low latency)
 /// Type text into focused element - uses dedicated keyboard WS
+/// Note: For multi-line text in code editors, auto-indent may occur per line
 pub fn typeText(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
     text: []const u8,
 ) !void {
     // Escape special characters for JSON
-    var escape_buf: [16384]u8 = undefined;
+    var escape_buf: [65536]u8 = undefined;
     const escaped = json.escapeContents(text, &escape_buf) catch return;
 
     const params = try std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped});

@@ -29,6 +29,7 @@ pub const ClickEvent = struct {
     button: MouseButton,
     is_press: bool, // true = press, false = release
     buttons_state: u32, // bitmask after this event
+    click_count: u32, // 1 for single-click, 2 for double-click, 3 for triple-click
 };
 
 /// Wheel event (keep latest only)
@@ -88,6 +89,13 @@ pub const MouseEventBus = struct {
     // Mouse button state tracking
     buttons_state: u32,
 
+    // Double-click detection
+    last_click_time: i64, // nanoseconds
+    last_click_x: u32,
+    last_click_y: u32,
+    last_click_button: MouseButton,
+    current_click_count: u32, // tracks consecutive clicks at same position
+
     // Timing
     last_tick_time: i128,
     tick_interval_ns: i128,
@@ -106,6 +114,8 @@ pub const MouseEventBus = struct {
     debug_enabled: bool,
 
     const TICK_INTERVAL_NS = 66 * std.time.ns_per_ms; // ~15fps
+    const DOUBLE_CLICK_TIME_MS = 400; // max time between clicks for double-click
+    const DOUBLE_CLICK_DISTANCE = 5; // max pixel distance for double-click
 
     pub fn init(
         cdp_client: *CdpClient,
@@ -117,6 +127,11 @@ pub const MouseEventBus = struct {
             .pending_wheel = null,
             .pending_move = null,
             .buttons_state = 0,
+            .last_click_time = 0,
+            .last_click_x = 0,
+            .last_click_y = 0,
+            .last_click_button = .none,
+            .current_click_count = 0,
             .last_tick_time = 0,
             .tick_interval_ns = TICK_INTERVAL_NS,
             .cdp_client = cdp_client,
@@ -152,17 +167,43 @@ pub const MouseEventBus = struct {
 
                 // Convert to browser coords and queue
                 if (mapper.terminalToBrowser(term_x, term_y)) |coords| {
+                    // Detect double/triple click
+                    const now = std.time.milliTimestamp();
+                    const time_diff = now - self.last_click_time;
+                    const dx = if (coords.x >= self.last_click_x) coords.x - self.last_click_x else self.last_click_x - coords.x;
+                    const dy = if (coords.y >= self.last_click_y) coords.y - self.last_click_y else self.last_click_y - coords.y;
+                    const same_position = dx <= DOUBLE_CLICK_DISTANCE and dy <= DOUBLE_CLICK_DISTANCE;
+                    const same_button = mouse.button == self.last_click_button;
+
+                    var click_count: u32 = 1;
+                    if (time_diff <= DOUBLE_CLICK_TIME_MS and same_position and same_button) {
+                        // Consecutive click at same position - increment count (max 3)
+                        self.current_click_count = @min(self.current_click_count + 1, 3);
+                        click_count = self.current_click_count;
+                    } else {
+                        // New click sequence
+                        self.current_click_count = 1;
+                        click_count = 1;
+                    }
+
+                    // Update tracking
+                    self.last_click_time = now;
+                    self.last_click_x = coords.x;
+                    self.last_click_y = coords.y;
+                    self.last_click_button = mouse.button;
+
                     const click = ClickEvent{
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                         .button = mouse.button,
                         .is_press = true,
                         .buttons_state = self.buttons_state,
+                        .click_count = click_count,
                     };
                     _ = self.pending_clicks.push(click);
                     if (self.debug_enabled) {
-                        std.debug.print("[BUS] Queued press: ({},{}) btn={s} state={}\n", .{
-                            coords.x, coords.y, @tagName(mouse.button), self.buttons_state,
+                        std.debug.print("[BUS] Queued press: ({},{}) btn={s} state={} clickCount={}\n", .{
+                            coords.x, coords.y, @tagName(mouse.button), self.buttons_state, click_count,
                         });
                     }
                 }
@@ -174,17 +215,19 @@ pub const MouseEventBus = struct {
 
                 // Convert to browser coords and queue
                 if (mapper.terminalToBrowser(term_x, term_y)) |coords| {
+                    // Use same click_count as the corresponding press
                     const click = ClickEvent{
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                         .button = mouse.button,
                         .is_press = false,
                         .buttons_state = self.buttons_state,
+                        .click_count = self.current_click_count,
                     };
                     _ = self.pending_clicks.push(click);
                     if (self.debug_enabled) {
-                        std.debug.print("[BUS] Queued release: ({},{}) btn={s} state={}\n", .{
-                            coords.x, coords.y, @tagName(mouse.button), self.buttons_state,
+                        std.debug.print("[BUS] Queued release: ({},{}) btn={s} state={} clickCount={}\n", .{
+                            coords.x, coords.y, @tagName(mouse.button), self.buttons_state, self.current_click_count,
                         });
                     }
                 }
@@ -250,8 +293,8 @@ pub const MouseEventBus = struct {
         const button_name = buttonName(click.button);
 
         if (self.debug_enabled) {
-            std.debug.print("[BUS] Sending {s}: ({},{}) btn={s}\n", .{
-                event_type, click.browser_x, click.browser_y, button_name,
+            std.debug.print("[BUS] Sending {s}: ({},{}) btn={s} clickCount={}\n", .{
+                event_type, click.browser_x, click.browser_y, button_name, click.click_count,
             });
         }
 
@@ -263,7 +306,7 @@ pub const MouseEventBus = struct {
             click.browser_y,
             button_name,
             click.buttons_state,
-            1, // clickCount
+            click.click_count,
         ) catch {};
     }
 
