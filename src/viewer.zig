@@ -148,6 +148,10 @@ pub const Viewer = struct {
     perf_max_render_ns: i128,
     perf_last_report_time: i128,
 
+    // Clipboard sync - periodically sync host clipboard to browser
+    last_clipboard_sync: i128,
+    last_clipboard_hash: u64,
+
     // Dialog state for JavaScript dialogs (alert/confirm/prompt)
     dialog_state: ?*DialogState,
     dialog_message: ?[]const u8,
@@ -242,6 +246,8 @@ pub const Viewer = struct {
             .perf_total_render_ns = 0,
             .perf_max_render_ns = 0,
             .perf_last_report_time = 0,
+            .last_clipboard_sync = 0,
+            .last_clipboard_hash = 0,
             .dialog_state = null,
             .dialog_message = null,
             .allowed_fs_roots = try std.ArrayList([]const u8).initCapacity(allocator, 0),
@@ -292,6 +298,12 @@ pub const Viewer = struct {
                 self.log("[DEBUG] Failed to inject mouse debug tracker: {}\n", .{err});
             };
         }
+
+        // Inject clipboard interceptor - syncs browser clipboard to system clipboard
+        self.log("[DEBUG] Injecting clipboard interceptor\n", .{});
+        interact_mod.injectClipboardInterceptor(self.cdp_client, self.allocator) catch |err| {
+            self.log("[DEBUG] Failed to inject clipboard interceptor: {}\n", .{err});
+        };
 
         var stdout_buf: [262144]u8 = undefined; // 256KB for toolbar graphics
         const stdout_file = std.fs.File.stdout();
@@ -1012,8 +1024,14 @@ pub const Viewer = struct {
 
                 // 2. Check for global app shortcuts (work from ANY mode)
                 if (app_shortcuts.findAppAction(event)) |action| {
+                    self.log("[SHORTCUT] Matched action: {s}\n", .{@tagName(action)});
                     try self.executeAppAction(action, event);
                     return;
+                } else if (event.shortcut_mod) {
+                    // Log unmatched shortcut keys for debugging
+                    if (event.base_key.getChar()) |c| {
+                        self.log("[SHORTCUT] Unmatched: char='{c}' shift={} alt={}\n", .{ c, event.shift, event.alt });
+                    }
                 }
 
                 // 3. Mode-specific handling
@@ -1026,9 +1044,12 @@ pub const Viewer = struct {
             .mouse => |mouse| try self.handleMouse(mouse),
             .paste => |text| {
                 defer self.allocator.free(text);
-                // Use Input.insertText for proper paste handling (avoids auto-indent issues)
+                // Terminal sent bracketed paste (Cmd+V intercepted by terminal)
                 if (self.mode == .normal) {
-                    // Paste directly into browser using CDP insertText
+                    self.log("[PASTE] Bracketed paste: {d} bytes\n", .{text.len});
+                    // Also sync to browser clipboard for web apps that use Clipboard API
+                    interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, text) catch {};
+                    // Use typeText for reliable direct text insertion
                     interact_mod.typeText(self.cdp_client, self.allocator, text) catch {};
                 } else if (self.mode == .url_prompt) {
                     // Paste into URL bar
@@ -1069,12 +1090,17 @@ pub const Viewer = struct {
                 try self.refresh();
             },
             .copy => {
+                self.log("[ACTION] Copy triggered, mode={s}\n", .{@tagName(self.mode)});
                 if (self.mode == .url_prompt) {
                     if (self.toolbar_renderer) |*renderer| {
                         renderer.handleCopy(self.allocator);
                     }
                 } else {
-                    try self.copySelectionToClipboard(false);
+                    // Try to copy selection to system clipboard with timeout/recovery
+                    self.copySelectionToClipboard(false) catch |err| {
+                        self.log("[COPY] Failed: {}, falling back to browser\n", .{err});
+                        interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'c', 4);
+                    };
                 }
             },
             .cut => {
@@ -1084,7 +1110,11 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
-                    try self.copySelectionToClipboard(true);
+                    // Try to cut selection to system clipboard with timeout/recovery
+                    self.copySelectionToClipboard(true) catch |err| {
+                        self.log("[CUT] Failed: {}, falling back to browser\n", .{err});
+                        interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'x', 4);
+                    };
                 }
             },
             .paste => {
@@ -1094,10 +1124,17 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
+                    // Get system clipboard and sync to browser, then send Cmd+V
+                    // This allows web apps like VSCode to read from our clipboard
                     const toolbar = @import("ui/toolbar.zig");
-                    const clipboard = toolbar.pasteFromClipboard(self.allocator) orelse return;
-                    defer self.allocator.free(clipboard);
-                    interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
+                    if (toolbar.pasteFromClipboard(self.allocator)) |clipboard| {
+                        defer self.allocator.free(clipboard);
+                        self.log("[PASTE] Syncing system clipboard to browser: {d} bytes\n", .{clipboard.len});
+                        // Update browser's clipboard data so readText() returns our content
+                        interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, clipboard) catch {};
+                        // Send Cmd+V so web app can handle paste
+                        interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'v', 4);
+                    }
                 }
             },
             .select_all => {
@@ -1108,6 +1145,7 @@ pub const Viewer = struct {
                     }
                 } else {
                     // Send Cmd+A to browser for select-all
+                    self.log("[SELECT_ALL] Sending Cmd+A to browser\n", .{});
                     interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'a', 4); // 4 = meta
                 }
             },
@@ -1632,6 +1670,28 @@ pub const Viewer = struct {
         const debug_len = @min(payload.len, 200);
         self.log("[CONSOLE MSG] payload={s}\n", .{payload[0..debug_len]});
 
+        // Debug: print to stderr if clipboard-related
+        if (std.mem.indexOf(u8, payload, "TERMWEB") != null or std.mem.indexOf(u8, payload, "clipboard") != null) {
+            std.debug.print("[CONSOLE] {s}\n", .{payload[0..debug_len]});
+        }
+
+        // Check for clipboard marker - sync browser clipboard to system clipboard
+        const clipboard_marker = "__TERMWEB_CLIPBOARD__:";
+        if (std.mem.indexOf(u8, payload, clipboard_marker)) |clip_pos| {
+            self.log("[CONSOLE MSG] Found clipboard marker\n", .{});
+            try self.handleClipboardSync(payload, clip_pos + clipboard_marker.len);
+            return;
+        }
+
+        // Check for clipboard read request - browser wants host clipboard
+        const clipboard_request = "__TERMWEB_CLIPBOARD_REQUEST__";
+        if (std.mem.indexOf(u8, payload, clipboard_request) != null) {
+            self.log("[CONSOLE MSG] Clipboard read request - syncing from host\n", .{});
+            std.debug.print("[CLIPBOARD] Request received, syncing from host\n", .{});
+            self.handleClipboardReadRequest();
+            return;
+        }
+
         // Check for file system operation marker
         const fs_marker = "__TERMWEB_FS__:";
         if (std.mem.indexOf(u8, payload, fs_marker)) |fs_pos| {
@@ -1706,6 +1766,53 @@ pub const Viewer = struct {
         }
     }
 
+    /// Handle clipboard sync - copy browser clipboard to system clipboard
+    fn handleClipboardSync(self: *Viewer, payload: []const u8, start: usize) !void {
+        // Find the end of the clipboard text (look for closing quote in JSON)
+        var end = start;
+        while (end < payload.len and payload[end] != '"') : (end += 1) {}
+
+        if (end <= start) {
+            self.log("[CLIPBOARD] Empty clipboard text\n", .{});
+            return;
+        }
+
+        const clipboard_text = payload[start..end];
+        self.log("[CLIPBOARD] Syncing to system: '{s}' (len={d})\n", .{ clipboard_text[0..@min(clipboard_text.len, 50)], clipboard_text.len });
+
+        // Copy to system clipboard via pbcopy
+        const toolbar = @import("ui/toolbar.zig");
+        toolbar.copyToClipboard(self.allocator, clipboard_text);
+        self.log("[CLIPBOARD] Copied to system clipboard\n", .{});
+    }
+
+    /// Handle clipboard read request - browser wants host clipboard
+    /// Called when browser's navigator.clipboard.readText() is invoked
+    fn handleClipboardReadRequest(self: *Viewer) void {
+        const toolbar = @import("ui/toolbar.zig");
+
+        std.debug.print("[CLIPBOARD] handleClipboardReadRequest called\n", .{});
+
+        // Read from system clipboard (pbpaste on macOS, xclip on Linux)
+        const clipboard_text = toolbar.pasteFromClipboard(self.allocator) orelse {
+            self.log("[CLIPBOARD] No content in system clipboard\n", .{});
+            std.debug.print("[CLIPBOARD] No content in system clipboard\n", .{});
+            // Still update browser with empty string to unblock the JS polling
+            interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, "") catch {};
+            return;
+        };
+        defer self.allocator.free(clipboard_text);
+
+        self.log("[CLIPBOARD] Sending to browser: len={d}\n", .{clipboard_text.len});
+        std.debug.print("[CLIPBOARD] Sending to browser: len={d}\n", .{clipboard_text.len});
+
+        // Send to browser - this updates window._termwebClipboardData and increments version
+        interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, clipboard_text) catch |err| {
+            self.log("[CLIPBOARD] Failed to update browser: {}\n", .{err});
+            std.debug.print("[CLIPBOARD] Failed to update browser: {}\n", .{err});
+        };
+    }
+
     /// Handle file system operation request
     fn handleFsRequest(self: *Viewer, payload: []const u8, start: usize) !void {
         // Format: __TERMWEB_FS__:id:type:path[:data]
@@ -1757,23 +1864,22 @@ pub const Viewer = struct {
         return fs_handler.isPathAllowed(self.allowed_fs_roots.items, path);
     }
 
-    /// Copy current browser selection to system clipboard
-    /// If is_cut is true, also sends Cmd+X to delete the selection
+    /// Copy current browser selection to system clipboard.
+    /// Returns error on timeout/failure so caller can fallback to browser.
+    /// If is_cut is true, also sends Cmd+X to delete the selection after copying.
     fn copySelectionToClipboard(self: *Viewer, is_cut: bool) !void {
         // Get selection via JavaScript
         const js = "window.getSelection().toString()";
         var escaped_buf: [256]u8 = undefined;
-        const escaped = json.escapeString(js, &escaped_buf) catch return;
+        const escaped = try json.escapeString(js, &escaped_buf);
 
         var params_buf: [512]u8 = undefined;
-        const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s},\"returnByValue\":true}}", .{escaped}) catch return;
+        const params = try std.fmt.bufPrint(&params_buf, "{{\"expression\":{s},\"returnByValue\":true}}", .{escaped});
 
-        self.log("[COPY] Sending: {s}\n", .{params});
+        self.log("[COPY] Evaluating: {s}\n", .{js});
 
-        const result = self.cdp_client.sendCommand("Runtime.evaluate", params) catch |err| {
-            self.log("[COPY] evalJavaScript error: {}\n", .{err});
-            return;
-        };
+        // This can timeout (5s) - error propagates to caller for fallback
+        const result = try self.cdp_client.sendNavCommand("Runtime.evaluate", params);
         defer self.allocator.free(result);
 
         self.log("[COPY] Result: {s}\n", .{result});
@@ -1781,22 +1887,29 @@ pub const Viewer = struct {
         // Parse the selection text from result
         // Format: {"id":N,"result":{"result":{"type":"string","value":"selected text"}}}
         const selection = self.extractSelectionFromResult(result) orelse {
-            self.log("[COPY] No selection found in result\n", .{});
+            self.log("[COPY] No text selection, passing to browser\n", .{});
+            // No text selection - let the web app handle Cmd+C/X
+            const key: u8 = if (is_cut) 'x' else 'c';
+            interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, key, 4);
             return;
         };
 
-        self.log("[COPY] Selection: '{s}' (len={d})\n", .{ selection, selection.len });
-
         if (selection.len > 0) {
+            self.log("[COPY] Selection: '{s}' (len={d})\n", .{ selection, selection.len });
             // Write to system clipboard via pbcopy
             const toolbar = @import("ui/toolbar.zig");
             toolbar.copyToClipboard(self.allocator, selection);
-            self.log("[COPY] Copied to clipboard\n", .{});
+            self.log("[COPY] Copied to system clipboard\n", .{});
 
-            // For cut, send the key to browser to delete selection
+            // For cut, send Cmd+X to browser to delete selection
             if (is_cut) {
-                interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'x', 4); // meta + x
+                interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'x', 4);
             }
+        } else {
+            // Empty selection - let the web app handle Cmd+C/X
+            self.log("[COPY] Empty selection, passing to browser\n", .{});
+            const key: u8 = if (is_cut) 'x' else 'c';
+            interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, key, 4);
         }
     }
 
@@ -1838,7 +1951,7 @@ pub const Viewer = struct {
 
         var params_buf: [131072]u8 = undefined;
         const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{escaped}) catch return;
-        const result = self.cdp_client.sendCommand("Runtime.evaluate", params) catch |err| {
+        const result = self.cdp_client.sendNavCommand("Runtime.evaluate", params) catch |err| {
             self.log("[FS] evalJavaScript error: {}\n", .{err});
             return;
         };
@@ -2111,10 +2224,10 @@ pub const Viewer = struct {
             const escaped_path = json.escapeContents(path, &escape_buf) catch return;
             var params_buf: [8192]u8 = undefined;
             const params = std.fmt.bufPrint(&params_buf, "{{\"action\":\"accept\",\"files\":[\"{s}\"]}}", .{escaped_path}) catch return;
-            const result = self.cdp_client.sendCommand("Page.handleFileChooser", params) catch return;
+            const result = self.cdp_client.sendNavCommand("Page.handleFileChooser", params) catch return;
             self.allocator.free(result);
         } else {
-            const result = self.cdp_client.sendCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}") catch return;
+            const result = self.cdp_client.sendNavCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}") catch return;
             self.allocator.free(result);
         }
     }
@@ -2133,7 +2246,7 @@ pub const Viewer = struct {
         } else
             std.fmt.bufPrint(&params_buf, "{{\"accept\":{}}}", .{accepted}) catch return;
 
-        const result = self.cdp_client.sendCommand("Page.handleJavaScriptDialog", params) catch |err| {
+        const result = self.cdp_client.sendNavCommand("Page.handleJavaScriptDialog", params) catch |err| {
             self.log("[DIALOG] closeDialog error: {}\n", .{err});
             return;
         };

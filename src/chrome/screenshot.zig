@@ -97,6 +97,11 @@ pub fn navigateToUrl(
         };
     }
 
+    // Inject clipboard interceptor - always enabled
+    interact.injectClipboardInterceptor(client, allocator) catch |err| {
+        logNav("[NAV] Failed to inject clipboard interceptor: {}\n", .{err});
+    };
+
     logNav("[NAV] navigateToUrl() complete\n", .{});
 }
 
@@ -106,9 +111,9 @@ pub fn captureScreenshot(
     allocator: std.mem.Allocator,
     options: ScreenshotOptions,
 ) ![]const u8 {
-    // Inject JavaScript to force white background
+    // Inject JavaScript to force white background - use nav_ws (pipe is for screencast only)
     const js_params = "{\"expression\":\"document.body.style.backgroundColor = 'white'; document.documentElement.style.backgroundColor = 'white';\"}";
-    const js_result = try client.sendCommand("Runtime.evaluate", js_params);
+    const js_result = try client.sendNavCommand("Runtime.evaluate", js_params);
     defer allocator.free(js_result);
 
     const params = try std.fmt.allocPrint(
@@ -148,7 +153,8 @@ pub fn setViewport(
     );
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Emulation.setDeviceMetricsOverride", params);
+    // Use nav_ws for viewport configuration (pipe is for screencast only)
+    const result = try client.sendNavCommand("Emulation.setDeviceMetricsOverride", params);
     defer allocator.free(result);
 }
 
@@ -157,7 +163,8 @@ pub fn getActualViewport(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !struct { width: u32, height: u32 } {
-    const result = try client.sendCommand(
+    // Use nav_ws for Runtime.evaluate (pipe is for screencast only)
+    const result = try client.sendNavCommand(
         "Runtime.evaluate",
         "{\"expression\":\"JSON.stringify({w:window.innerWidth,h:window.innerHeight})\",\"returnByValue\":true}",
     );
@@ -226,11 +233,12 @@ pub fn goBack(
     };
     defer allocator.free(result);
 
-    // Re-inject mouse debug tracker after back navigation (only if enabled)
+    // Re-inject after back navigation
     std.Thread.sleep(2 * std.time.ns_per_s);
     if (isMouseDebugEnabled()) {
         interact.injectMouseDebugTracker(client, allocator) catch {};
     }
+    interact.injectClipboardInterceptor(client, allocator) catch {};
 
     return true;
 }
@@ -262,11 +270,12 @@ pub fn goForward(
     };
     defer allocator.free(result);
 
-    // Re-inject mouse debug tracker after forward navigation (only if enabled)
+    // Re-inject after forward navigation
     std.Thread.sleep(2 * std.time.ns_per_s);
     if (isMouseDebugEnabled()) {
         interact.injectMouseDebugTracker(client, allocator) catch {};
     }
+    interact.injectClipboardInterceptor(client, allocator) catch {};
 
     return true;
 }
@@ -367,11 +376,12 @@ pub fn reload(
     const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
 
-    // Wait for page to reload then re-inject mouse debug tracker (only if enabled)
+    // Wait for page to reload then re-inject
     std.Thread.sleep(2 * std.time.ns_per_s);
     if (isMouseDebugEnabled()) {
         interact.injectMouseDebugTracker(client, allocator) catch {};
     }
+    interact.injectClipboardInterceptor(client, allocator) catch {};
 }
 
 /// Stop page loading - uses dedicated nav WebSocket

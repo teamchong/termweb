@@ -18,8 +18,8 @@ fn scrollByDelta(
     );
     defer allocator.free(params);
 
-    // Fire-and-forget: don't wait for response
-    try client.sendCommandAsync("Input.dispatchMouseEvent", params);
+    // Fire-and-forget via mouse_ws - pipe is for screencast only
+    client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
 }
 
 /// Scroll down by one line (~20px)

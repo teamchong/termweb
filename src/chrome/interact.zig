@@ -109,7 +109,8 @@ pub fn focusElement(
     const params = try std.fmt.allocPrint(allocator, "{{\"expression\":\"{s}\"}}", .{js});
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Runtime.evaluate", params);
+    // Use nav_ws - pipe is for screencast only
+    const result = try client.sendNavCommand("Runtime.evaluate", params);
     defer allocator.free(result);
 }
 
@@ -151,7 +152,8 @@ pub fn typeText(
         var params_buf: [131072]u8 = undefined;
         const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{js_escaped}) catch return;
 
-        client.sendCommandAsync("Runtime.evaluate", params) catch {};
+        // Use nav_ws for Runtime.evaluate (pipe is for screencast only)
+        client.sendNavCommandAsync("Runtime.evaluate", params);
     } else {
         // Single line: use insertText directly
         const params = std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped}) catch return;
@@ -176,7 +178,7 @@ pub fn toggleCheckbox(
     const params = try std.fmt.allocPrint(allocator, "{{\"expression\":\"{s}\"}}", .{js});
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Runtime.evaluate", params);
+    const result = try client.sendNavCommand("Runtime.evaluate", params);
     defer allocator.free(result);
 }
 
@@ -206,8 +208,106 @@ pub fn injectMouseDebugTracker(client: *cdp.CdpClient, allocator: std.mem.Alloca
     const params = try std.fmt.allocPrint(allocator, "{{\"expression\":\"{s}\"}}", .{js});
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Runtime.evaluate", params);
+    const result = try client.sendNavCommand("Runtime.evaluate", params);
     defer allocator.free(result);
+}
+
+/// Inject clipboard interceptor - captures clipboard.writeText and provides readText
+/// This allows us to sync browser clipboard to system clipboard bidirectionally
+/// readText() requests clipboard from host and waits for response
+pub fn injectClipboardInterceptor(client: *cdp.CdpClient, allocator: std.mem.Allocator) !void {
+    const js =
+        \\(function() {
+        \\  if (window._termwebClipboardHook) return;
+        \\  window._termwebClipboardHook = true;
+        \\  window._termwebClipboardData = '';
+        \\  window._termwebClipboardVersion = 0;
+        \\  const origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+        \\  const origReadText = navigator.clipboard.readText.bind(navigator.clipboard);
+        \\  navigator.clipboard.writeText = async function(text) {
+        \\    console.log('[TERMWEB] writeText called, len=' + text.length);
+        \\    window._termwebClipboardData = text;
+        \\    console.log('__TERMWEB_CLIPBOARD__:' + text);
+        \\    return origWriteText(text).catch(() => {});
+        \\  };
+        \\  navigator.clipboard.readText = async function() {
+        \\    console.log('[TERMWEB] readText called, requesting from host...');
+        \\    const ver = window._termwebClipboardVersion;
+        \\    console.log('__TERMWEB_CLIPBOARD_REQUEST__');
+        \\    for (let i = 0; i < 20; i++) {
+        \\      await new Promise(r => setTimeout(r, 10));
+        \\      if (window._termwebClipboardVersion > ver) break;
+        \\    }
+        \\    console.log('[TERMWEB] readText returning, len=' + (window._termwebClipboardData?.length || 0));
+        \\    return window._termwebClipboardData || '';
+        \\  };
+        \\  document.addEventListener('copy', function(e) {
+        \\    const sel = window.getSelection();
+        \\    if (sel && sel.toString()) {
+        \\      window._termwebClipboardData = sel.toString();
+        \\      console.log('__TERMWEB_CLIPBOARD__:' + sel.toString());
+        \\    }
+        \\  });
+        \\  document.addEventListener('paste', function(e) {
+        \\    console.log('[TERMWEB] paste event fired, data=' + (window._termwebClipboardData?.length || 0));
+        \\    if (window._termwebClipboardData) {
+        \\      e.preventDefault();
+        \\      e.stopPropagation();
+        \\      const el = document.activeElement;
+        \\      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
+        \\        document.execCommand('insertText', false, window._termwebClipboardData);
+        \\        console.log('[TERMWEB] paste injected via execCommand');
+        \\      }
+        \\    }
+        \\  }, true);
+        \\  let lastFocusSync = 0;
+        \\  document.addEventListener('focusin', function(e) {
+        \\    const now = Date.now();
+        \\    if (now - lastFocusSync > 500) {
+        \\      lastFocusSync = now;
+        \\      console.log('__TERMWEB_CLIPBOARD_REQUEST__');
+        \\    }
+        \\  }, true);
+        \\  console.log('[TERMWEB] Clipboard interceptor installed v3');
+        \\})()
+    ;
+
+    const params = try std.fmt.allocPrint(allocator, "{{\"expression\":\"{s}\"}}", .{js});
+    defer allocator.free(params);
+
+    const result = try client.sendNavCommand("Runtime.evaluate", params);
+    defer allocator.free(result);
+}
+
+/// Update browser's clipboard data (called in response to __TERMWEB_CLIPBOARD_REQUEST__)
+/// Uses async command to avoid blocking/hanging on exit
+/// Also increments version counter so JS polling knows data was updated
+pub fn updateBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocator, text: []const u8) !void {
+    _ = allocator;
+
+    // Limit text size to avoid buffer overflow
+    const max_len = 8000;
+    const safe_text = if (text.len > max_len) text[0..max_len] else text;
+
+    // Double-escape: first for JS string, then for JSON
+    var js_escaped_buf: [16384]u8 = undefined;
+    const js_escaped = json.escapeContents(safe_text, &js_escaped_buf) catch return;
+
+    // Build JS: set data AND increment version so JS polling loop exits
+    var js_buf: [32768]u8 = undefined;
+    const js = std.fmt.bufPrint(&js_buf, "window._termwebClipboardData = \"{s}\"; window._termwebClipboardVersion++", .{js_escaped}) catch return;
+
+    // Escape the entire JS for JSON expression field
+    var json_escaped_buf: [65536]u8 = undefined;
+    const json_escaped = json.escapeContents(js, &json_escaped_buf) catch return;
+
+    // Build final params
+    var params_buf: [131072]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{json_escaped}) catch return;
+
+    // Use nav_ws async to avoid blocking - fire and forget
+    // IMPORTANT: Don't use pipe for this - pipe is for screencast only
+    client.sendNavCommandAsync("Runtime.evaluate", params);
 }
 
 /// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket
@@ -430,7 +530,7 @@ pub fn handleFileChooser(
     );
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Page.handleFileChooser", params);
+    const result = try client.sendNavCommand("Page.handleFileChooser", params);
     defer allocator.free(result);
 }
 
@@ -439,6 +539,6 @@ pub fn cancelFileChooser(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
 ) !void {
-    const result = try client.sendCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}");
+    const result = try client.sendNavCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}");
     defer allocator.free(result);
 }

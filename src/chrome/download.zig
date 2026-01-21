@@ -176,7 +176,8 @@ pub fn enableDownloads(client: *cdp.CdpClient, allocator: std.mem.Allocator, dow
     );
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Browser.setDownloadBehavior", params);
+    // Use nav_ws - pipe is for screencast only
+    const result = try client.sendNavCommand("Browser.setDownloadBehavior", params);
     defer allocator.free(result);
 }
 

@@ -133,7 +133,8 @@ pub fn queryElements(
     );
     defer allocator.free(params);
 
-    const result = try client.sendCommand("Runtime.evaluate", params);
+    // Use nav_ws - pipe is for screencast only
+    const result = try client.sendNavCommand("Runtime.evaluate", params);
     defer allocator.free(result);
 
     return try parseElementsFromJson(allocator, result);
