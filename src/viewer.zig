@@ -3,6 +3,7 @@
 /// Implements the interactive browser session with a mode-based state machine.
 /// Handles keyboard input, screenshot rendering, and user interaction modes.
 const std = @import("std");
+const builtin = @import("builtin");
 const terminal_mod = @import("terminal/terminal.zig");
 const kitty_mod = @import("terminal/kitty_graphics.zig");
 const shm_mod = @import("terminal/shm.zig");
@@ -1447,11 +1448,44 @@ pub const Viewer = struct {
         const mods = key_input.modifiers; // CDP modifiers: 1=alt, 2=ctrl, 4=meta, 8=shift
         const shift = (mods & 8) != 0;
         const ctrl = (mods & 2) != 0;
+        const alt = (mods & 1) != 0; // Option on macOS
+        const meta = (mods & 4) != 0; // Cmd on macOS
+
+        // Platform-specific modifier for shortcuts
+        const is_macos = comptime builtin.os.tag == .macos;
+        const cmd_or_ctrl = if (is_macos) meta else ctrl; // Cmd on macOS, Ctrl on Linux
+        const word_nav_mod = if (is_macos) alt else ctrl; // Option on macOS, Ctrl on Linux
+        const line_nav_mod = if (is_macos) meta else false; // Cmd+arrow = Home/End on macOS only
 
         // Use toolbar renderer for URL editing if available
         if (self.toolbar_renderer) |*renderer| {
             switch (key) {
                 .char => |c| {
+                    // Handle Cmd+key (macOS) or Ctrl+key (Linux) shortcuts
+                    if (cmd_or_ctrl) {
+                        switch (c) {
+                            'a', 'A' => {
+                                renderer.handleSelectAll();
+                                self.ui_dirty = true;
+                                return;
+                            },
+                            'x', 'X' => {
+                                renderer.handleCut(self.allocator);
+                                self.ui_dirty = true;
+                                return;
+                            },
+                            'c', 'C' => {
+                                renderer.handleCopy(self.allocator);
+                                return;
+                            },
+                            'v', 'V' => {
+                                renderer.handlePaste(self.allocator);
+                                self.ui_dirty = true;
+                                return;
+                            },
+                            else => {},
+                        }
+                    }
                     renderer.handleChar(c);
                     self.ui_dirty = true;
                 },
@@ -1462,7 +1496,11 @@ pub const Viewer = struct {
                 .left => {
                     if (shift) {
                         renderer.handleSelectLeft();
-                    } else if (ctrl) {
+                    } else if (line_nav_mod) {
+                        // Cmd+Left on macOS = Home
+                        renderer.handleHome();
+                    } else if (word_nav_mod) {
+                        // Option+Left on macOS, Ctrl+Left on Linux = word left
                         renderer.handleWordLeft();
                     } else {
                         renderer.handleLeft();
@@ -1472,7 +1510,11 @@ pub const Viewer = struct {
                 .right => {
                     if (shift) {
                         renderer.handleSelectRight();
-                    } else if (ctrl) {
+                    } else if (line_nav_mod) {
+                        // Cmd+Right on macOS = End
+                        renderer.handleEnd();
+                    } else if (word_nav_mod) {
+                        // Option+Right on macOS, Ctrl+Right on Linux = word right
                         renderer.handleWordRight();
                     } else {
                         renderer.handleRight();

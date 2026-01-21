@@ -224,12 +224,13 @@ pub const InputReader = struct {
                         const shift = (mod_bits & 1) != 0;
                         const alt = (mod_bits & 2) != 0;
                         const ctrl = (mod_bits & 4) != 0;
-                        // Note: super(8), hyper(16), meta(32), caps_lock(64) are ignored
+                        const super = (mod_bits & 8) != 0; // Cmd on macOS
 
                         // Convert to CDP: 8=shift, 2=ctrl, 1=alt, 4=meta
                         cdp_mods = (if (shift) @as(u8, 8) else 0) |
                             (if (ctrl) @as(u8, 2) else 0) |
-                            (if (alt) @as(u8, 1) else 0);
+                            (if (alt) @as(u8, 1) else 0) |
+                            (if (super) @as(u8, 4) else 0);
                     }
                 }
             }
@@ -297,9 +298,11 @@ pub const InputReader = struct {
                 const shift = (mod_bits & 1) != 0;
                 const alt = (mod_bits & 2) != 0;
                 const ctrl = (mod_bits & 4) != 0;
+                const super = (mod_bits & 8) != 0; // Cmd on macOS
                 cdp_mods = (if (shift) @as(u8, 8) else 0) |
                     (if (ctrl) @as(u8, 2) else 0) |
-                    (if (alt) @as(u8, 1) else 0);
+                    (if (alt) @as(u8, 1) else 0) |
+                    (if (super) @as(u8, 4) else 0);
             }
 
             const key: ?Key = switch (num) {
@@ -377,24 +380,30 @@ pub const InputReader = struct {
         // Only handle key press events (event_type 1) and repeat (event_type 2)
         if (event_type == 3) return .{ .key = .{ .key = .none } }; // Ignore release events
 
-        // Parse terminal modifiers (2=shift, 4=ctrl, 8=alt in Kitty protocol)
-        const shift = (modifiers & 2) != 0;
-        const ctrl = (modifiers & 4) != 0;
-        const alt = (modifiers & 8) != 0;
+        // Kitty protocol: raw modifier value = 1 + modifier_bits
+        // Bits: 1=shift, 2=alt, 4=ctrl, 8=super (Cmd on macOS)
+        const mod_bits = if (modifiers > 0) modifiers - 1 else 0;
+        const shift = (mod_bits & 1) != 0;
+        const alt = (mod_bits & 2) != 0;
+        const ctrl = (mod_bits & 4) != 0;
+        const super = (mod_bits & 8) != 0; // Cmd on macOS
 
         // Convert to CDP modifiers (8=shift, 2=ctrl, 1=alt, 4=meta)
         const cdp_mods: u8 = (if (shift) @as(u8, 8) else 0) |
             (if (ctrl) @as(u8, 2) else 0) |
-            (if (alt) @as(u8, 1) else 0);
-        return .{ .key = .{ .key = self.unicodeToKey(code, modifiers), .modifiers = cdp_mods } };
+            (if (alt) @as(u8, 1) else 0) |
+            (if (super) @as(u8, 4) else 0);
+        return .{ .key = .{ .key = self.unicodeToKey(code, mod_bits), .modifiers = cdp_mods } };
     }
 
     /// Convert unicode codepoint and modifiers to Key enum
-    fn unicodeToKey(self: *InputReader, code: u32, modifiers: u8) Key {
+    /// modifiers should be the already-adjusted bits (raw value - 1)
+    fn unicodeToKey(self: *InputReader, code: u32, mod_bits: u8) Key {
         _ = self;
-        const shift = (modifiers & 2) != 0;
-        const ctrl = (modifiers & 4) != 0;
-        const alt = (modifiers & 8) != 0;
+        // Kitty bits: 1=shift, 2=alt, 4=ctrl, 8=super
+        const shift = (mod_bits & 1) != 0;
+        const alt = (mod_bits & 2) != 0;
+        const ctrl = (mod_bits & 4) != 0;
 
         // Handle shift+tab specifically
         if (shift and code == 9) {
