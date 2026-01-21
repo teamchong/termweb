@@ -1087,9 +1087,12 @@ pub const Viewer = struct {
             },
         }
 
-        // ANSI mouse coordinates are 1-indexed. Normalize to 0-indexed for internal use.
-        const norm_x = if (mouse.x > 0) mouse.x - 1 else 0;
-        const norm_y = if (mouse.y > 0) mouse.y - 1 else 0;
+        // Normalize mouse coordinates:
+        // - SGR 1006 (cell mode): 1-indexed, need to subtract 1
+        // - SGR 1016 (pixel mode): 0-indexed, no adjustment needed
+        const is_pixel = if (self.coord_mapper) |m| m.is_pixel_mode else false;
+        const norm_x = if (is_pixel) mouse.x else if (mouse.x > 0) mouse.x - 1 else 0;
+        const norm_y = if (is_pixel) mouse.y else if (mouse.y > 0) mouse.y - 1 else 0;
 
         // Track mouse position for cursor rendering
         self.mouse_x = norm_x;

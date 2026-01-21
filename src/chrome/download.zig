@@ -126,11 +126,19 @@ pub const DownloadManager = struct {
                     self.pending_save_path = null;
                 }
 
-                // Remove from tracking
-                _ = self.downloads.remove(guid);
+                // Remove from tracking (free allocated strings first)
+                if (self.downloads.fetchRemove(guid)) |entry| {
+                    self.allocator.free(entry.key);
+                    self.allocator.free(entry.value.url);
+                    self.allocator.free(entry.value.suggested_filename);
+                }
             } else if (std.mem.eql(u8, state, "canceled")) {
                 download.state = .canceled;
-                _ = self.downloads.remove(guid);
+                if (self.downloads.fetchRemove(guid)) |entry| {
+                    self.allocator.free(entry.key);
+                    self.allocator.free(entry.value.url);
+                    self.allocator.free(entry.value.suggested_filename);
+                }
 
                 if (self.pending_save_path) |path| {
                     self.allocator.free(path);
