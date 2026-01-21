@@ -115,20 +115,49 @@ pub fn focusElement(
 
 /// Type text into focused element (fire-and-forget for low latency)
 /// Type text into focused element - uses dedicated keyboard WS
-/// Note: For multi-line text in code editors, auto-indent may occur per line
 pub fn typeText(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
     text: []const u8,
 ) !void {
+    // Check if text contains newlines - use synthetic paste event for multi-line
+    const has_newline = std.mem.indexOf(u8, text, "\n") != null;
+
     // Escape special characters for JSON
     var escape_buf: [65536]u8 = undefined;
     const escaped = json.escapeContents(text, &escape_buf) catch return;
 
-    const params = try std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped});
-    defer allocator.free(params);
+    if (has_newline) {
+        // Dispatch synthetic paste event - editors should handle this without auto-indent
+        const js = std.fmt.allocPrint(allocator,
+            \\(function() {{
+            \\  const el = document.activeElement;
+            \\  if (!el) return false;
+            \\  const dt = new DataTransfer();
+            \\  dt.setData('text/plain', "{s}");
+            \\  const evt = new ClipboardEvent('paste', {{
+            \\    bubbles: true,
+            \\    cancelable: true,
+            \\    clipboardData: dt
+            \\  }});
+            \\  return el.dispatchEvent(evt);
+            \\}})()
+            , .{escaped}) catch return;
+        defer allocator.free(js);
 
-    client.sendKeyboardCommandAsync("Input.insertText", params);
+        var js_escape_buf: [131072]u8 = undefined;
+        const js_escaped = json.escapeString(js, &js_escape_buf) catch return;
+
+        var params_buf: [131072]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{js_escaped}) catch return;
+
+        client.sendCommandAsync("Runtime.evaluate", params) catch {};
+    } else {
+        // Single line: use insertText directly
+        const params = std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped}) catch return;
+        defer allocator.free(params);
+        client.sendKeyboardCommandAsync("Input.insertText", params);
+    }
 }
 
 /// Toggle checkbox using JavaScript

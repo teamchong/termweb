@@ -114,8 +114,8 @@ pub const MouseEventBus = struct {
     debug_enabled: bool,
 
     const TICK_INTERVAL_NS = 66 * std.time.ns_per_ms; // ~15fps
-    const DOUBLE_CLICK_TIME_MS = 400; // max time between clicks for double-click
-    const DOUBLE_CLICK_DISTANCE = 5; // max pixel distance for double-click
+    const DOUBLE_CLICK_TIME_MS = 1000; // max time between clicks for double-click (generous for latency)
+    const DOUBLE_CLICK_DISTANCE = 15; // max pixel distance for double-click
 
     pub fn init(
         cdp_client: *CdpClient,
