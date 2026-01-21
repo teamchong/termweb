@@ -2,6 +2,13 @@ const std = @import("std");
 const cdp = @import("cdp_client.zig");
 const interact = @import("interact.zig");
 
+/// Check if mouse debug overlay is enabled (via TERMWEB_DEBUG_MOUSE=1)
+fn isMouseDebugEnabled() bool {
+    const val = std.process.getEnvVarOwned(std.heap.page_allocator, "TERMWEB_DEBUG_MOUSE") catch return false;
+    defer std.heap.page_allocator.free(val);
+    return std.mem.eql(u8, val, "1");
+}
+
 /// Re-export ScreencastFrame for caller use
 pub const ScreencastFrame = cdp.ScreencastFrame;
 
@@ -79,10 +86,12 @@ pub fn navigateToUrl(
     // Wait for page to load (simple approach - wait fixed time)
     std.Thread.sleep(3 * std.time.ns_per_s);
 
-    // Inject mouse debug tracker to visualize where Chrome sees mouse events
-    interact.injectMouseDebugTracker(client, allocator) catch |err| {
-        logNav("[NAV] Failed to inject mouse debug tracker: {}\n", .{err});
-    };
+    // Inject mouse debug tracker (only if TERMWEB_DEBUG_MOUSE=1)
+    if (isMouseDebugEnabled()) {
+        interact.injectMouseDebugTracker(client, allocator) catch |err| {
+            logNav("[NAV] Failed to inject mouse debug tracker: {}\n", .{err});
+        };
+    }
 
     logNav("[NAV] navigateToUrl() complete\n", .{});
 }
@@ -213,9 +222,11 @@ pub fn goBack(
     };
     defer allocator.free(result);
 
-    // Re-inject mouse debug tracker after back navigation
+    // Re-inject mouse debug tracker after back navigation (only if enabled)
     std.Thread.sleep(2 * std.time.ns_per_s);
-    interact.injectMouseDebugTracker(client, allocator) catch {};
+    if (isMouseDebugEnabled()) {
+        interact.injectMouseDebugTracker(client, allocator) catch {};
+    }
 
     return true;
 }
@@ -247,9 +258,11 @@ pub fn goForward(
     };
     defer allocator.free(result);
 
-    // Re-inject mouse debug tracker after forward navigation
+    // Re-inject mouse debug tracker after forward navigation (only if enabled)
     std.Thread.sleep(2 * std.time.ns_per_s);
-    interact.injectMouseDebugTracker(client, allocator) catch {};
+    if (isMouseDebugEnabled()) {
+        interact.injectMouseDebugTracker(client, allocator) catch {};
+    }
 
     return true;
 }
@@ -350,9 +363,11 @@ pub fn reload(
     const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
 
-    // Wait for page to reload then re-inject mouse debug tracker
+    // Wait for page to reload then re-inject mouse debug tracker (only if enabled)
     std.Thread.sleep(2 * std.time.ns_per_s);
-    interact.injectMouseDebugTracker(client, allocator) catch {};
+    if (isMouseDebugEnabled()) {
+        interact.injectMouseDebugTracker(client, allocator) catch {};
+    }
 }
 
 /// Stop page loading - uses dedicated nav WebSocket
