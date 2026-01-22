@@ -1725,7 +1725,7 @@ pub const Viewer = struct {
         self.closeBrowserTarget(target_id);
     }
 
-    /// Launch termweb in a new terminal tab/window
+    /// Launch termweb in a new terminal window
     fn launchInNewTerminal(self: *Viewer, url: []const u8) void {
         // Get full path to current executable
         var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1734,35 +1734,45 @@ pub const Viewer = struct {
             return;
         };
 
-        // Detect terminal type
-        const term_program = std.posix.getenv("TERM_PROGRAM") orelse "";
-        const term = std.posix.getenv("TERM") orelse "";
-        self.log("[NEW TAB] TERM_PROGRAM={s} TERM={s}\n", .{ term_program, term });
+        // Create temp script to launch termweb
+        const tmp_dir = std.posix.getenv("TMPDIR") orelse "/tmp";
+        var script_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const script_path = std.fmt.bufPrint(&script_path_buf, "{s}/termweb_launch_{d}.command", .{ tmp_dir, std.time.milliTimestamp() }) catch return;
 
-        // Try terminal-specific launch methods
-        if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
-            // Ghostty - use ghostty -e to launch new window with command
-            const argv = [_][]const u8{ term_program, "-e", exe_path, "open", url };
-            var child = std.process.Child.init(&argv, self.allocator);
-            child.spawn() catch |err| {
-                self.log("[NEW TAB] Ghostty launch failed: {}\n", .{err});
-                return;
-            };
-            self.log("[NEW TAB] Launched in {s}: {s}\n", .{ term_program, url });
-        } else if (std.posix.getenv("KITTY_LISTEN_ON") != null or std.mem.eql(u8, term, "xterm-kitty")) {
-            // Kitty - use remote control protocol
-            const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", exe_path, "open", url };
-            var child = std.process.Child.init(&argv, self.allocator);
-            child.spawn() catch |err| {
-                self.log("[NEW TAB] Kitty launch failed: {}\n", .{err});
-                return;
-            };
-            _ = child.wait() catch {};
-            self.log("[NEW TAB] Launched in Kitty: {s}\n", .{url});
-        } else {
-            // Fallback - just log
-            self.log("[NEW TAB] No supported terminal. URL: {s}\n", .{url});
-        }
+        // Get current working directory
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch ".";
+
+        // Write script content
+        var script_buf: [2048]u8 = undefined;
+        const script = std.fmt.bufPrint(&script_buf,
+            \\#!/bin/bash
+            \\cd "{s}"
+            \\exec "{s}" open "{s}"
+        , .{ cwd, exe_path, url }) catch return;
+
+        const file = std.fs.createFileAbsolute(script_path, .{}) catch |err| {
+            self.log("[NEW TAB] Failed to create script: {}\n", .{err});
+            return;
+        };
+        defer file.close();
+        file.writeAll(script) catch return;
+
+        // Make executable
+        std.fs.chdirAbsolute(tmp_dir) catch {};
+        const chmod_argv = [_][]const u8{ "chmod", "+x", script_path };
+        var chmod_child = std.process.Child.init(&chmod_argv, self.allocator);
+        _ = chmod_child.spawnAndWait() catch {};
+
+        // Use 'open' which launches in user's default terminal
+        self.log("[NEW TAB] Launching via open: {s}\n", .{url});
+        const argv = [_][]const u8{ "open", script_path };
+        var child = std.process.Child.init(&argv, self.allocator);
+        child.spawn() catch |err| {
+            self.log("[NEW TAB] Launch failed: {}\n", .{err});
+            return;
+        };
+        self.log("[NEW TAB] Launched: {s}\n", .{url});
     }
 
     /// Close a browser target
