@@ -92,13 +92,14 @@ zig build test 2>&1 | less
 
 ### Code Organization
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed module descriptions. Quick overview:
+Quick overview of the codebase:
 
 - `src/main.zig` - Entry point
 - `src/cli.zig` - Command-line interface
-- `src/viewer.zig` - Main event loop
-- `src/chrome/` - Browser automation (CDP, WebSocket, screenshots, etc.)
+- `src/viewer.zig` - Main event loop and mode management
+- `src/chrome/` - Browser automation (CDP, WebSocket, screencast, etc.)
 - `src/terminal/` - Terminal I/O (Kitty graphics, input, screen control)
+- `src/ui/` - UI components (toolbar, tabs, native dialogs)
 - `vendor/` - Third-party dependencies
 
 ## Development Workflow
@@ -518,10 +519,9 @@ PRs are merged when:
 
 ### Resources
 
-- [Architecture Guide](ARCHITECTURE.md) - Understand the codebase
-- [Usage Guide](USAGE.md) - Learn how features work
 - [Troubleshooting](TROUBLESHOOTING.md) - Debug common issues
 - [Zig Documentation](https://ziglang.org/documentation/) - Learn Zig
+- [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) - CDP reference
 
 ### Finding Issues to Work On
 

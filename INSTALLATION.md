@@ -317,8 +317,8 @@ pkill -f "chrome.*--remote-debugging-port"
 
 Once installation is complete:
 
-1. Read the [Keyboard Controls](KEYBINDINGS.md) to learn navigation shortcuts
-2. Check out the [Usage Guide](USAGE.md) for detailed examples
+1. Try `termweb open https://example.com` to test
+2. Use mouse to click links and toolbar buttons
 3. If you encounter issues, see [Troubleshooting](TROUBLESHOOTING.md)
 
 ## Updating termweb

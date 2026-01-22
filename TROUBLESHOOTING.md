@@ -430,51 +430,6 @@ TERMWEB_DISABLE_SHM=1 termweb open https://example.com
 # To override auto-disable: TERMWEB_FORCE_SHM=1
 ```
 
-### Forms Not Working
-
-**Error:** Pressing 'f' shows "No elements"
-
-**Cause 1:** Page has no interactive elements
-
-**Fix:**
-This is expected. Try a different page:
-```bash
-termweb open https://google.com  # Has search form
-```
-
-**Cause 2:** Elements are dynamically loaded
-
-**Fix:**
-```bash
-# Wait for page to fully load
-# Press 'r' to refresh screenshot
-# Press 'f' again to re-query elements
-```
-
-**Cause 3:** Custom form widgets not detected
-
-**Fix:**
-termweb only detects standard HTML elements:
-- `<a>`, `<button>`, `<input>`, `<select>`, `<textarea>`
-
-Custom React/Vue components may not be detected. No workaround currently.
-
----
-
-**Error:** Form submission doesn't work
-
-**Cause:** Some forms use JavaScript instead of standard submission
-
-**Fix:**
-```bash
-# After typing and pressing Enter:
-# 1. Press 'r' to refresh and see if form submitted
-# 2. If not, try clicking submit button manually:
-#    - Press 'f' to enter form mode
-#    - Tab to submit button
-#    - Press Enter
-```
-
 ## Performance Issues
 
 ### Slow Screenshot Capture
@@ -693,22 +648,14 @@ Crash with error: ...
 - **GitHub Discussions** - Questions and help
 - **Documentation** - Check all docs first:
   - [Installation](INSTALLATION.md)
-  - [Usage](USAGE.md)
-  - [Keybindings](KEYBINDINGS.md)
-  - [Architecture](ARCHITECTURE.md)
   - [Contributing](CONTRIBUTING.md)
 
 ### Known Limitations
 
 Some issues are known limitations (not bugs):
 
-- No mouse support
 - No horizontal scrolling
-- Can't interact with JavaScript-rendered custom widgets
-- 3-second page load delay (hard-coded)
-- No clipboard support
-
-See [USAGE.md - Limitations](USAGE.md#limitations-and-known-issues) for full list.
+- Page load wait time is hard-coded
 
 ---
 

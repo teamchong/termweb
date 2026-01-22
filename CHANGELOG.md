@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Real-time Screencast** - Live page rendering via CDP screencast
+- **Mouse Support** - Click interactions with page elements
+- **Clickable Toolbar UI** - Navigation buttons rendered via Kitty graphics
+  - Back, forward, reload buttons
+  - Tab button showing tab count
+- **Tab Management** - Multiple tabs with native OS dialog picker
+  - AppleScript dialog on macOS
+  - Zenity dialog on Linux
+  - Links opening new windows captured as tabs
+- **Clipboard Integration** - System clipboard support
+  - Cmd+C to copy selection
+  - Cmd+V to paste
+  - Cmd+X to cut
+  - Cmd+A to select all
+- **New UI Modules**
+  - `src/ui/toolbar.zig` - Toolbar rendering and hit testing
+  - `src/ui/state.zig` - Tab state management
+  - `src/ui/dialog.zig` - Native OS dialog integration
+
+### Changed
+- Simplified viewer modes from 4 to 2 (normal, url_prompt)
+- Removed form mode and text input mode (mouse interaction replaces keyboard-only navigation)
+- Chrome native dialogs (alert, confirm, prompt) now render in screencast instead of TUI overlay
+
+### Removed
+- Form mode (`f` key no longer enters form mode)
+- Text input mode (direct mouse interaction instead)
+- TUI dialog overlay system
+- Outdated documentation (KEYBINDINGS.md, USAGE.md, ARCHITECTURE.md)
+
 ## [0.6.0] - 2024-01-02 - M5 Packaging + Documentation
 
 ### Added
