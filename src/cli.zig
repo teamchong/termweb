@@ -8,7 +8,7 @@ const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 const toolbar_mod = @import("ui/toolbar.zig");
 
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 
 const Command = enum {
     open,

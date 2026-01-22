@@ -30,14 +30,30 @@ https://github.com/user-attachments/assets/192411f7-ac5e-44b1-a09c-1d070ef85c3f
 - [WezTerm](https://wezfurlong.org/wezterm/)
 
 ### System Requirements
-- Zig 0.15.2+
 - Chrome or Chromium browser
 - macOS or Linux
 
-## Building
+## Installation
+
+### Using npm (recommended)
 
 ```bash
+# Run directly with npx
+npx termweb open https://example.com
+
+# Or install globally
+npm install -g termweb
+termweb open https://example.com
+```
+
+### Building from source
+
+```bash
+# Requires Zig 0.15.2+
+git clone https://github.com/teamchong/termweb
+cd termweb
 zig build
+./zig-out/bin/termweb open https://example.com
 ```
 
 ## Usage
