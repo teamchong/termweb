@@ -6,7 +6,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 const VERSION = require('../package.json').version;
-const REPO = 'teamch/termweb';
+const REPO = 'teamchong/termweb';
 
 const platform = process.platform;
 const arch = process.arch;

@@ -12,7 +12,6 @@ const VERSION = "0.7.0";
 
 const Command = enum {
     open,
-    doctor,
     help,
     version,
     unknown,
@@ -31,7 +30,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     switch (command) {
         .open => try cmdOpen(allocator, args[2..]),
-        .doctor => try cmdDoctor(allocator),
         .version => try cmdVersion(),
         .help => printHelp(),
         .unknown => {
@@ -44,7 +42,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
 fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "open")) return .open;
-    if (std.mem.eql(u8, arg, "doctor")) return .doctor;
     if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return .help;
     if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) return .version;
     return .unknown;
@@ -339,85 +336,8 @@ fn checkTerminalSupport(allocator: std.mem.Allocator) !bool {
     std.debug.print("  • Kitty   - https://sw.kovidgoyal.net/kitty/\n", .{});
     std.debug.print("  • WezTerm - https://wezterm.org/\n\n", .{});
     std.debug.print("Please install one of these terminals and try again.\n", .{});
-    std.debug.print("Run 'termweb doctor' to check your system configuration.\n", .{});
 
     return false;
-}
-
-fn cmdDoctor(allocator: std.mem.Allocator) !void {
-    std.debug.print("termweb doctor - System capability check\n", .{});
-    std.debug.print("========================================\n\n", .{});
-
-    const term_env = std.process.getEnvVarOwned(allocator, "TERM") catch null;
-    defer if (term_env) |t| allocator.free(t);
-
-    const term_program = std.process.getEnvVarOwned(allocator, "TERM_PROGRAM") catch null;
-    defer if (term_program) |t| allocator.free(t);
-
-    std.debug.print("Terminal:\n", .{});
-    std.debug.print("  TERM: {s}\n", .{term_env orelse "not set"});
-    std.debug.print("  TERM_PROGRAM: {s}\n", .{term_program orelse "not set"});
-
-    std.debug.print("\nKitty Graphics Protocol:\n", .{});
-    const supports_kitty = blk: {
-        if (term_program) |tp| {
-            if (std.mem.eql(u8, tp, "ghostty") or
-                std.mem.eql(u8, tp, "kitty") or
-                std.mem.eql(u8, tp, "WezTerm"))
-            {
-                break :blk true;
-            }
-        }
-        break :blk false;
-    };
-
-    if (supports_kitty) {
-        std.debug.print("  ✓ Supported (detected: {s})\n", .{term_program.?});
-    } else {
-        std.debug.print("  ✗ Not detected\n", .{});
-        std.debug.print("  Supported terminals: Ghostty, Kitty, WezTerm\n", .{});
-    }
-
-    std.debug.print("\nTruecolor:\n", .{});
-    const colorterm = std.process.getEnvVarOwned(allocator, "COLORTERM") catch null;
-    defer if (colorterm) |c| allocator.free(c);
-
-    const supports_truecolor = blk: {
-        if (colorterm) |ct| {
-            if (std.mem.eql(u8, ct, "truecolor") or std.mem.eql(u8, ct, "24bit")) {
-                break :blk true;
-            }
-        }
-        break :blk false;
-    };
-
-    if (supports_truecolor) {
-        std.debug.print("  ✓ Supported (COLORTERM={s})\n", .{colorterm.?});
-    } else {
-        std.debug.print("  ✗ Not detected\n", .{});
-    }
-
-    std.debug.print("\nChrome/Chromium:\n", .{});
-    if (detector.detectChrome(allocator)) |chrome| {
-        defer {
-            var mut_chrome = chrome;
-            mut_chrome.deinit();
-        }
-        std.debug.print("  ✓ Found: {s}\n", .{chrome.path});
-    } else |_| {
-        std.debug.print("  ✗ Not found\n", .{});
-        std.debug.print("  Install Chrome or set $CHROME_BIN environment variable\n", .{});
-    }
-
-    std.debug.print("\nOverall:\n", .{});
-    if (supports_kitty and supports_truecolor) {
-        std.debug.print("  ✓ Ready for termweb\n", .{});
-    } else {
-        std.debug.print("  ✗ Some capabilities missing\n", .{});
-        if (!supports_kitty) {
-            std.debug.print("  - Use a terminal that supports Kitty graphics protocol\n", .{});
-        }
-    }
 }
 
 fn cmdVersion() !void {
@@ -429,31 +349,28 @@ fn printHelp() void {
         \\termweb - Web browser in your terminal using Kitty graphics
         \\
         \\Usage:
-        \\  termweb <command> [options]
+        \\  termweb open <url> [options]
         \\
-        \\Commands:
-        \\  open <url>     Open a URL in the terminal browser
-        \\                 Options:
-        \\                   --profile <name>      Clone Chrome profile (default: 'Default')
-        \\                   --no-profile          Start with fresh profile (no cloning)
-        \\                   --browser-path <path> Path to browser executable
-        \\                   --list-profiles       Show available Chrome profiles
-        \\                   --list-browsers       Show available browsers
-        \\                   --mobile              Use mobile viewport
-        \\                   --scale N             Set zoom scale (default: 1.0)
-        \\  doctor         Check system capabilities
-        \\  version        Show version information
-        \\  help           Show this help message
+        \\Options:
+        \\  --profile <name>      Clone Chrome profile (default: 'Default')
+        \\  --no-profile          Start with fresh profile (no cloning)
+        \\  --browser-path <path> Path to browser executable
+        \\  --list-profiles       Show available Chrome profiles
+        \\  --list-browsers       Show available browsers
+        \\  --mobile              Use mobile viewport
+        \\  --scale N             Set zoom scale (default: 1.0)
+        \\
+        \\Other commands:
+        \\  termweb version       Show version
+        \\  termweb help          Show this help
         \\
         \\Examples:
         \\  termweb open https://example.com
         \\  termweb open https://github.com --profile Default
-        \\  termweb open ./local.html --browser-path /opt/chrome/chrome
         \\
-        \\Environment:
-        \\  CHROME_BIN     Path to browser executable (overrides auto-detection)
-        \\
-        \\Supported terminals: Ghostty, Kitty, WezTerm
+        \\Requirements:
+        \\  - Chrome or Chromium (set CHROME_BIN if not auto-detected)
+        \\  - Kitty-compatible terminal: Ghostty, Kitty, or WezTerm
         \\
     , .{});
 }

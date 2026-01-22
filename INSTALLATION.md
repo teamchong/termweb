@@ -187,41 +187,10 @@ export PATH="/path/to/termweb/zig-out/bin:$PATH"
 
 ## Verifying Installation
 
-### Run the Doctor Command
-
-The `doctor` command checks your system capabilities:
-
-```bash
-termweb doctor
-```
-
-Expected output if everything is set up correctly:
-```
-termweb doctor - System capability check
-========================================
-
-Terminal:
-  TERM: xterm-ghostty
-  TERM_PROGRAM: ghostty
-
-Kitty Graphics Protocol:
-  ✓ Supported (detected: ghostty)
-
-Truecolor:
-  ✓ Supported (COLORTERM=truecolor)
-
-Chrome/Chromium:
-  ✓ Found: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
-
-Overall:
-  ✓ Ready for termweb
-```
-
 ### Version Check
 
 ```bash
 termweb --version
-# Should output: termweb version 0.6.0
 ```
 
 ### Test with a Simple URL
@@ -233,7 +202,7 @@ termweb open https://example.com
 You should see:
 1. Chrome launching in the background
 2. The example.com page rendered in your terminal
-3. A status bar at the bottom with keyboard shortcuts
+3. A toolbar at the top with navigation buttons
 
 Press `q` to quit.
 
@@ -346,5 +315,4 @@ rm -rf /path/to/termweb
 ## Getting Help
 
 - Check the [Troubleshooting Guide](TROUBLESHOOTING.md)
-- Run `termweb doctor` to diagnose system issues
-- File an issue on GitHub with `termweb doctor` output
+- File an issue on GitHub

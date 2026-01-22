@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Form mode (`f` key no longer enters form mode)
 - Text input mode (direct mouse interaction instead)
 - TUI dialog overlay system
+- `doctor` command (requirements now shown in `termweb help`)
 - Outdated documentation (KEYBINDINGS.md, USAGE.md, ARCHITECTURE.md)
 
 ## [0.6.0] - 2024-01-02 - M5 Packaging + Documentation

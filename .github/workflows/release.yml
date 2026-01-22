@@ -29,9 +29,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v1
         with:
-          version: 0.13.0
+          version: 0.15.0
 
       - name: Build (native)
         if: matrix.arch == 'x86_64' || (matrix.os == 'macos-latest' && matrix.arch == 'aarch64')
@@ -68,3 +68,21 @@ jobs:
             termweb-macos-x86_64/termweb-macos-x86_64
             termweb-linux-x86_64/termweb-linux-x86_64
             termweb-linux-aarch64/termweb-linux-aarch64
+
+  publish-npm:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

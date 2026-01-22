@@ -73,10 +73,9 @@ zig build
 
 ```bash
 # Run directly
-./zig-out/bin/termweb doctor
+./zig-out/bin/termweb open https://example.com
 
 # Or use zig build run
-zig build run -- doctor
 zig build run -- open https://example.com
 ```
 
@@ -127,7 +126,6 @@ Quick overview of the codebase:
    zig build test
 
    # Manual testing
-   ./zig-out/bin/termweb doctor
    ./zig-out/bin/termweb open https://example.com
    ```
 

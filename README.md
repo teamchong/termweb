@@ -39,9 +39,6 @@ zig build
 ## Usage
 
 ```bash
-# Check system capabilities
-termweb doctor
-
 # Open a URL
 termweb open https://example.com
 
@@ -50,6 +47,9 @@ termweb open https://example.com --mobile
 
 # Custom zoom
 termweb open https://example.com --scale 0.8
+
+# Show help
+termweb help
 ```
 
 ## Controls
@@ -88,8 +88,8 @@ termweb open https://example.com --scale 0.8
 ## Development
 
 ```bash
-# Build and run
-zig build run -- doctor
+# Build
+zig build
 
 # Run tests
 zig build test

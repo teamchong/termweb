@@ -4,72 +4,20 @@ This guide helps you diagnose and fix common issues with termweb.
 
 ## Table of Contents
 
-- [Using termweb doctor](#using-termweb-doctor)
+- [Requirements](#requirements)
 - [Installation Issues](#installation-issues)
 - [Runtime Issues](#runtime-issues)
 - [Performance Issues](#performance-issues)
 - [Platform-Specific Issues](#platform-specific-issues)
 - [Getting More Help](#getting-more-help)
 
-## Using termweb doctor
+## Requirements
 
-The `doctor` command is your first debugging tool. Run it before reporting issues:
+termweb requires:
+- **Chrome or Chromium** - Set `CHROME_BIN` if not auto-detected
+- **Kitty-compatible terminal** - Ghostty, Kitty, or WezTerm
 
-```bash
-termweb doctor
-```
-
-### Understanding Doctor Output
-
-**Terminal Detection:**
-```
-Terminal:
-  TERM: xterm-ghostty
-  TERM_PROGRAM: ghostty
-```
-- Shows environment variables used for terminal detection
-- `TERM_PROGRAM` should be `ghostty`, `kitty`, or `WezTerm`
-
-**Kitty Graphics Protocol:**
-```
-Kitty Graphics Protocol:
-  ✓ Supported (detected: ghostty)
-```
-- ✓ = Terminal supports Kitty graphics
-- ✗ = Terminal doesn't support Kitty graphics (termweb won't work)
-
-**Truecolor Support:**
-```
-Truecolor:
-  ✓ Supported (COLORTERM=truecolor)
-```
-- ✓ = Terminal supports 24-bit color
-- ✗ = Limited color support (images may look worse)
-
-**Chrome Detection:**
-```
-Chrome/Chromium:
-  ✓ Found: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
-```
-- ✓ = Chrome found at shown path
-- ✗ = Chrome not found (need to install or set `CHROME_BIN`)
-
-### How to Fix Doctor Failures
-
-**If Kitty Graphics shows ✗:**
-Install a supported terminal:
-- [Ghostty](https://ghostty.org/) (recommended)
-- [Kitty](https://sw.kovidgoyal.net/kitty/)
-- [WezTerm](https://wezfurlong.org/wezterm/)
-
-**If Chrome shows ✗:**
-```bash
-# Install Chrome (macOS)
-brew install --cask google-chrome
-
-# Or set CHROME_BIN to custom location
-export CHROME_BIN=/path/to/chrome
-```
+Run `termweb help` to see requirements and usage.
 
 ## Installation Issues
 
@@ -203,7 +151,7 @@ sudo apt-get install kitty  # Linux
 brew install --cask wezterm  # macOS
 ```
 
-After installing, **launch the new terminal** and run `termweb doctor` again.
+After installing, **launch the new terminal** and try `termweb open https://example.com` again.
 
 ## Runtime Issues
 
@@ -215,10 +163,7 @@ After installing, **launch the new terminal** and run `termweb doctor` again.
 
 **Fix:**
 ```bash
-# Run doctor to see detected path
-termweb doctor
-
-# If path is wrong, set CHROME_BIN
+# Set CHROME_BIN to the correct path
 export CHROME_BIN="/correct/path/to/chrome"
 ```
 
@@ -310,9 +255,6 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "/Applications/Google
 
 **Fix:**
 ```bash
-# Verify terminal support
-termweb doctor
-
 # Check TERM_PROGRAM
 echo $TERM_PROGRAM
 
@@ -604,9 +546,8 @@ If you're testing on Windows, please report your findings!
 
 ### Before Reporting an Issue
 
-1. Run `termweb doctor` and include output
-2. Try latest version from main branch
-3. Search existing GitHub issues
+1. Try latest version from main branch
+2. Search existing GitHub issues
 4. Check this troubleshooting guide thoroughly
 
 ### Reporting a Bug
@@ -617,22 +558,15 @@ Open a GitHub issue with:
 **Environment:**
 - OS: macOS 13.5 / Ubuntu 22.04 / etc.
 - Terminal: Ghostty 0.1.0 / Kitty 0.30.0 / etc.
-- Zig version: (output of `zig version`)
 - termweb version: (output of `termweb --version`)
-
-**Doctor Output:**
-```
-[paste output of `termweb doctor`]
-```
 
 **Steps to Reproduce:**
 1. Run `termweb open https://example.com`
-2. Press 'f'
-3. Press Tab
-4. Observe error
+2. Click on a link
+3. Observe error
 
 **Expected:**
-Should cycle to next element
+Should navigate to link
 
 **Actual:**
 Crash with error: ...
