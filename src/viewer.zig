@@ -1731,7 +1731,13 @@ pub const Viewer = struct {
         if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
             // Ghostty terminal - spawn new window with command
             self.log("[NEW TAB] Launching in Ghostty\n", .{});
-            const cmd = std.fmt.allocPrint(self.allocator, "termweb open {s}", .{url}) catch return;
+            // Get full path to current executable
+            var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+                self.log("[NEW TAB] Failed to get exe path\n", .{});
+                return;
+            };
+            const cmd = std.fmt.allocPrint(self.allocator, "{s} open {s}", .{ exe_path, url }) catch return;
             defer self.allocator.free(cmd);
             const argv = [_][]const u8{ "ghostty", "-e", cmd };
             var child = std.process.Child.init(&argv, self.allocator);
