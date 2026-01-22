@@ -213,16 +213,6 @@ pub fn injectMouseDebugTracker(client: *cdp.CdpClient, allocator: std.mem.Alloca
     defer allocator.free(result);
 }
 
-/// Inject clipboard interceptor - NO-OP, now handled by clipboard_polyfill.js
-/// The polyfill is injected via Page.addScriptToEvaluateOnNewDocument in cdp_client.zig
-/// and runs automatically in all frames (including iframes)
-pub fn injectClipboardInterceptor(client: *cdp.CdpClient, allocator: std.mem.Allocator) !void {
-    _ = client;
-    _ = allocator;
-    // No-op - clipboard interception is now handled by clipboard_polyfill.js
-    // which is injected on all new documents via Page.addScriptToEvaluateOnNewDocument
-}
-
 /// Update browser's clipboard data (called in response to __TERMWEB_CLIPBOARD_REQUEST__)
 /// Uses async command to avoid blocking/hanging on exit
 /// Also increments version counter so JS polling knows data was updated

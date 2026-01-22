@@ -13,7 +13,6 @@ const prompt_mod = @import("terminal/prompt.zig");
 const coordinates_mod = @import("terminal/coordinates.zig");
 const cdp = @import("chrome/cdp_client.zig");
 const screenshot_api = @import("chrome/screenshot.zig");
-const scroll_api = @import("chrome/scroll.zig");
 const mouse_event_bus = @import("mouse_event_bus.zig");
 const dom_mod = @import("chrome/dom.zig");
 const interact_mod = @import("chrome/interact.zig");
@@ -689,80 +688,6 @@ pub const Viewer = struct {
         self.log("[RESIZE] Viewport updated to {}x{}\n", .{ new_width, new_height });
     }
 
-    /// Refresh display - no-op in screencast mode (frames arrive automatically)
-    fn refresh(self: *Viewer) !void {
-        // Screencast mode: frames arrive automatically, nothing to do
-        self.log("[DEBUG] refresh() - screencast handles updates\n", .{});
-    }
-
-    /// Legacy refresh for non-screencast mode (kept for reference)
-    fn refreshLegacy(self: *Viewer) !void {
-        self.log("[DEBUG] refreshLegacy() starting\n", .{});
-
-        var stdout_buf: [8192]u8 = undefined;
-        const stdout_file = std.fs.File.stdout();
-        var stdout_writer = stdout_file.writer(&stdout_buf);
-        const writer = &stdout_writer.interface;
-
-        // Get terminal size
-        self.log("[DEBUG] Getting terminal size...\n", .{});
-        const size = try self.terminal.getSize();
-        self.log("[DEBUG] Terminal size: {}x{} ({}x{} px)\n", .{
-            size.cols,
-            size.rows,
-            size.width_px,
-            size.height_px,
-        });
-
-        // Update coordinate mapper using Chrome's actual viewport (source of truth)
-        const toolbar_h: ?u16 = if (self.toolbar_renderer) |tr| @intCast(tr.toolbar_height) else null;
-        self.coord_mapper = CoordinateMapper.initWithToolbar(
-            size.width_px,
-            size.height_px,
-            size.cols,
-            size.rows,
-            self.chrome_actual_width,
-            self.chrome_actual_height,
-            toolbar_h,
-            null, // auto-detect pixel mode
-        );
-        self.log("[DEBUG] Coordinate mapper initialized (chrome={}x{}, pixel_mode={})\n", .{ self.chrome_actual_width, self.chrome_actual_height, if (self.coord_mapper) |m| m.is_pixel_mode else false });
-
-        // Capture screenshot
-        self.log("[DEBUG] Capturing screenshot...\n", .{});
-        const base64_png = try screenshot_api.captureScreenshot(
-            self.cdp_client,
-            self.allocator,
-            .{ .format = .png },
-        );
-        defer self.allocator.free(base64_png);
-        self.log("[DEBUG] Screenshot captured ({} bytes base64)\n", .{base64_png.len});
-
-        // Display image (leave room for status line)
-        self.log("[DEBUG] Displaying PNG via Kitty graphics...\n", .{});
-
-        // Ensure we have valid dimensions - if terminal size is 0, use reasonable defaults
-        const display_rows = if (size.rows > 1) size.rows - 1 else if (size.rows > 0) size.rows else 24;
-        const display_cols = if (size.cols > 0) size.cols else 80;
-
-        self.log("[DEBUG] Display dimensions: rows={}, cols={}\n", .{display_rows, display_cols});
-
-        // Pass base64 directly (no decode/encode roundtrip)
-        _ = try self.kitty.displayBase64PNG(writer, base64_png, .{
-            .rows = display_rows,
-            .columns = display_cols,
-            .placement_id = 1,
-        });
-        try writer.flush();  // CRITICAL: Flush after Kitty graphics
-        self.log("[DEBUG] PNG displayed and flushed\n", .{});
-
-        // Draw status line
-        self.log("[DEBUG] Drawing status line...\n", .{});
-        try self.drawStatus();
-        self.log("[DEBUG] drawStatus() returned\n", .{});
-        self.log("[DEBUG] refresh() about to return\n", .{});
-    }
-
     /// Try to render latest screencast frame (non-blocking)
     /// Returns true if frame was rendered, false if no new frame
     fn tryRenderScreencast(self: *Viewer) !bool {
@@ -1106,7 +1031,7 @@ pub const Viewer = struct {
             },
             .reload => {
                 try screenshot_api.reload(self.cdp_client, self.allocator, false);
-                try self.refresh();
+                // Screencast mode: frames arrive automatically after reload
             },
             .copy => {
                 if (self.mode == .url_prompt) {
@@ -2084,74 +2009,6 @@ pub const Viewer = struct {
     /// Check if path is within allowed roots
     fn isPathAllowed(self: *Viewer, path: []const u8) bool {
         return fs_handler.isPathAllowed(self.allowed_fs_roots.items, path);
-    }
-
-    /// Copy current browser selection to system clipboard.
-    /// Returns error on timeout/failure so caller can fallback to browser.
-    /// If is_cut is true, also sends Cmd+X to delete the selection after copying.
-    fn copySelectionToClipboard(self: *Viewer, is_cut: bool) !void {
-        // Get selection via JavaScript
-        const js = "window.getSelection().toString()";
-        var escaped_buf: [256]u8 = undefined;
-        const escaped = try json.escapeString(js, &escaped_buf);
-
-        var params_buf: [512]u8 = undefined;
-        const params = try std.fmt.bufPrint(&params_buf, "{{\"expression\":{s},\"returnByValue\":true}}", .{escaped});
-
-        self.log("[COPY] Evaluating: {s}\n", .{js});
-
-        // This can timeout (5s) - error propagates to caller for fallback
-        const result = try self.cdp_client.sendNavCommand("Runtime.evaluate", params);
-        defer self.allocator.free(result);
-
-        self.log("[COPY] Result: {s}\n", .{result});
-
-        // Parse the selection text from result
-        // Format: {"id":N,"result":{"result":{"type":"string","value":"selected text"}}}
-        const selection = self.extractSelectionFromResult(result) orelse {
-            self.log("[COPY] No text selection, passing to browser\n", .{});
-            // No text selection - let the web app handle Cmd+C/X
-            const key: u8 = if (is_cut) 'x' else 'c';
-            interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, key, 4);
-            return;
-        };
-
-        if (selection.len > 0) {
-            self.log("[COPY] Selection: '{s}' (len={d})\n", .{ selection, selection.len });
-            // Write to system clipboard via pbcopy
-            const toolbar = @import("ui/toolbar.zig");
-            toolbar.copyToClipboard(self.allocator, selection);
-            self.log("[COPY] Copied to system clipboard\n", .{});
-
-            // For cut, send Cmd+X to browser to delete selection
-            if (is_cut) {
-                interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'x', 4);
-            }
-        } else {
-            // Empty selection - let the web app handle Cmd+C/X
-            self.log("[COPY] Empty selection, passing to browser\n", .{});
-            const key: u8 = if (is_cut) 'x' else 'c';
-            interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, key, 4);
-        }
-    }
-
-    /// Extract selection text from Runtime.evaluate result
-    fn extractSelectionFromResult(self: *Viewer, result: []const u8) ?[]const u8 {
-        _ = self;
-        // Look for "value":" pattern
-        const value_marker = "\"value\":\"";
-        const value_start_idx = std.mem.indexOf(u8, result, value_marker) orelse return null;
-        const text_start = value_start_idx + value_marker.len;
-
-        // Find closing quote (handle escaped quotes)
-        var i = text_start;
-        while (i < result.len) {
-            if (result[i] == '"' and (i == text_start or result[i - 1] != '\\')) {
-                return result[text_start..i];
-            }
-            i += 1;
-        }
-        return null;
     }
 
     /// Send file system response back to JavaScript
