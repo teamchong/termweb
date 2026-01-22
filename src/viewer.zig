@@ -277,7 +277,7 @@ pub const Viewer = struct {
             var buf: [1024]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
             file.writeAll(msg) catch {};
-            file.sync() catch {}; // Flush to disk immediately
+            // Note: removed file.sync() - was causing major performance issues
         }
     }
 
