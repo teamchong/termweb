@@ -222,6 +222,111 @@ pub fn updateBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocat
     allocator.free(result);
 }
 
+/// Read text from browser's clipboard - tries polyfill cache first, then Clipboard API
+/// Returns allocated string that caller must free, or null if failed
+pub fn readBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocator) ?[]const u8 {
+    // First try our polyfill's cached data (works across frames)
+    // Then fall back to original Clipboard API
+    const js =
+        \\(async function() {
+        \\  try {
+        \\    // Check all frames for _termwebClipboardData
+        \\    if (window._termwebClipboardData) return window._termwebClipboardData;
+        \\    try {
+        \\      if (window.parent && window.parent._termwebClipboardData) return window.parent._termwebClipboardData;
+        \\    } catch(e) {}
+        \\    try {
+        \\      if (window.top && window.top._termwebClipboardData) return window.top._termwebClipboardData;
+        \\    } catch(e) {}
+        \\    // Fall back to Clipboard API
+        \\    if (window._termwebOrigReadText) {
+        \\      return await window._termwebOrigReadText();
+        \\    }
+        \\    return await navigator.clipboard.readText();
+        \\  } catch(e) {
+        \\    return '';
+        \\  }
+        \\})()
+    ;
+
+    var js_escaped_buf: [2048]u8 = undefined;
+    const js_escaped = json.escapeString(js, &js_escaped_buf) catch return null;
+
+    var params_buf: [4096]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s},\"awaitPromise\":true,\"returnByValue\":true}}", .{js_escaped}) catch return null;
+
+    const result = client.sendNavCommand("Runtime.evaluate", params) catch {
+        return null;
+    };
+    defer allocator.free(result);
+
+    // Parse result: {"id":N,"result":{"result":{"type":"string","value":"clipboard text"}}}
+    // Look for "value":" pattern
+    const value_marker = "\"value\":\"";
+    const value_start = std.mem.indexOf(u8, result, value_marker) orelse return null;
+    const text_start = value_start + value_marker.len;
+
+    // Find closing quote (handle escaped quotes)
+    var text_end = text_start;
+    while (text_end < result.len) {
+        if (result[text_end] == '"' and (text_end == text_start or result[text_end - 1] != '\\')) {
+            break;
+        }
+        text_end += 1;
+    }
+
+    if (text_end <= text_start) return null;
+
+    const clipboard_text = result[text_start..text_end];
+    if (clipboard_text.len == 0) return null;
+
+    // Unescape JSON string (handle \n, \t, \\, \", etc.)
+    var unescaped = allocator.alloc(u8, clipboard_text.len) catch return null;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < clipboard_text.len) {
+        if (clipboard_text[i] == '\\' and i + 1 < clipboard_text.len) {
+            switch (clipboard_text[i + 1]) {
+                'n' => {
+                    unescaped[j] = '\n';
+                    i += 2;
+                },
+                't' => {
+                    unescaped[j] = '\t';
+                    i += 2;
+                },
+                'r' => {
+                    unescaped[j] = '\r';
+                    i += 2;
+                },
+                '\\' => {
+                    unescaped[j] = '\\';
+                    i += 2;
+                },
+                '"' => {
+                    unescaped[j] = '"';
+                    i += 2;
+                },
+                else => {
+                    unescaped[j] = clipboard_text[i];
+                    i += 1;
+                },
+            }
+        } else {
+            unescaped[j] = clipboard_text[i];
+            i += 1;
+        }
+        j += 1;
+    }
+
+    // Shrink to actual size
+    const final = allocator.realloc(unescaped, j) catch {
+        allocator.free(unescaped);
+        return null;
+    };
+    return final;
+}
+
 /// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket
 /// Click sequence (HIGH PRIORITY - never throttled):
 ///   1. mouseMoved (triggers CSS :hover, JS mouseenter)

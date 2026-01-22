@@ -5,6 +5,10 @@
   window._termwebClipboardHook = true;
   window._termwebClipboardData = '';
   window._termwebClipboardVersion = 0;
+  // Store original readText for direct access (bypasses our hook)
+  window._termwebOrigReadText = navigator.clipboard && navigator.clipboard.readText
+    ? navigator.clipboard.readText.bind(navigator.clipboard)
+    : null;
   console.log('[TERMWEB] Clipboard polyfill installing in frame:', window.location.href.substring(0, 50));
 
   // Hook navigator.clipboard.writeText
@@ -88,11 +92,14 @@
     if (cmd === 'copy' || cmd === 'cut') {
       let text = '';
       const active = document.activeElement;
-      console.log('[TERMWEB] activeElement:', active ? active.tagName : 'null', active ? active.className?.substring(0,30) : '');
+      console.log('[TERMWEB] activeElement:', active ? active.tagName : 'null',
+        'class:', active ? active.className?.substring(0,50) : '',
+        'value:', active && active.value ? active.value.substring(0, 100) : 'N/A');
       // Try activeElement (Monaco uses hidden textarea)
       if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) {
         const start = active.selectionStart;
         const end = active.selectionEnd;
+        console.log('[TERMWEB] textarea selection:', start, '-', end, 'total:', active.value?.length);
         if (start !== end) {
           text = active.value.substring(start, end);
         } else {
@@ -125,17 +132,19 @@
       }
       if (text) {
         window._termwebClipboardData = text;
+        // Also set in top frame so main context can read it
+        try { window.top._termwebClipboardData = text; } catch(e) {}
         console.log('__TERMWEB_CLIPBOARD__:' + text);
       }
     }
     return origExecCommand(cmd, showUI, value);
   };
 
-  // Listen for copy/cut events - read from clipboardData synchronously
+  // Listen for copy/cut events - use bubbling phase (false) to run AFTER Monaco sets data
   document.addEventListener('copy', function(e) {
-    console.log('[TERMWEB] copy event fired');
+    console.log('[TERMWEB] copy event fired (bubble phase)');
     let text = '';
-    // Try clipboardData first (set by browser during execCommand)
+    // Try clipboardData first (should be set by Monaco now)
     if (e.clipboardData) {
       text = e.clipboardData.getData('text/plain');
       console.log('[TERMWEB] copy clipboardData:', text.length, 'chars');
@@ -148,12 +157,18 @@
     }
     if (text) {
       window._termwebClipboardData = text;
+      // Also set in top frame so main context can read it
+      try { window.top._termwebClipboardData = text; } catch(e) {}
+      // Also write to system clipboard via original writeText
+      if (window._termwebOrigReadText) {
+        navigator.clipboard.writeText(text).catch(() => {});
+      }
       console.log('__TERMWEB_CLIPBOARD__:' + text);
     }
-  }, true);
+  }, false); // false = bubbling phase, runs AFTER capture handlers
 
   document.addEventListener('cut', function(e) {
-    console.log('[TERMWEB] cut event fired');
+    console.log('[TERMWEB] cut event fired (bubble phase)');
     let text = '';
     if (e.clipboardData) {
       text = e.clipboardData.getData('text/plain');
@@ -166,9 +181,13 @@
     }
     if (text) {
       window._termwebClipboardData = text;
+      // Also write to system clipboard
+      if (window._termwebOrigReadText) {
+        navigator.clipboard.writeText(text).catch(() => {});
+      }
       console.log('__TERMWEB_CLIPBOARD__:' + text);
     }
-  }, true);
+  }, false); // false = bubbling phase
 
   // Listen for paste events - inject our clipboard data
   document.addEventListener('paste', function(e) {

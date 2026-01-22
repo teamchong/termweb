@@ -1085,17 +1085,14 @@ pub const Viewer = struct {
                 try self.refresh();
             },
             .copy => {
-                self.log("[ACTION] Copy triggered, mode={s}\n", .{@tagName(self.mode)});
                 if (self.mode == .url_prompt) {
                     if (self.toolbar_renderer) |*renderer| {
                         renderer.handleCopy(self.allocator);
                     }
                 } else {
-                    // Try to copy selection to system clipboard with timeout/recovery
-                    self.copySelectionToClipboard(false) catch |err| {
-                        self.log("[COPY] Failed: {}, falling back to browser\n", .{err});
-                        interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'c', 4);
-                    };
+                    // Send Cmd+C to browser
+                    // Note: Copy to host clipboard doesn't work for Monaco/VSCode due to iframe isolation
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'c', 4);
                 }
             },
             .cut => {
@@ -1105,11 +1102,8 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
-                    // Try to cut selection to system clipboard with timeout/recovery
-                    self.copySelectionToClipboard(true) catch |err| {
-                        self.log("[CUT] Failed: {}, falling back to browser\n", .{err});
-                        interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'x', 4);
-                    };
+                    // Just send Cmd+X to browser - Monaco will cut directly to system clipboard
+                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'x', 4);
                 }
             },
             .paste => {
@@ -1785,12 +1779,9 @@ pub const Viewer = struct {
     fn handleClipboardReadRequest(self: *Viewer) void {
         const toolbar = @import("ui/toolbar.zig");
 
-        std.debug.print("[CLIPBOARD] handleClipboardReadRequest called\n", .{});
-
         // Read from system clipboard (pbpaste on macOS, xclip on Linux)
         const clipboard_text = toolbar.pasteFromClipboard(self.allocator) orelse {
             self.log("[CLIPBOARD] No content in system clipboard\n", .{});
-            std.debug.print("[CLIPBOARD] No content in system clipboard\n", .{});
             // Still update browser with empty string to unblock the JS polling
             interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, "") catch {};
             return;
@@ -1798,7 +1789,6 @@ pub const Viewer = struct {
         defer self.allocator.free(clipboard_text);
 
         self.log("[CLIPBOARD] Sending to browser: len={d}\n", .{clipboard_text.len});
-        std.debug.print("[CLIPBOARD] Sending to browser: len={d}\n", .{clipboard_text.len});
 
         // Send to browser - this updates window._termwebClipboardData and increments version
         interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, clipboard_text) catch |err| {
