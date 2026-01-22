@@ -1729,19 +1729,17 @@ pub const Viewer = struct {
         self.log("[NEW TAB] Detecting terminal: TERM={s} TERM_PROGRAM={s}\n", .{ term, term_program });
 
         if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
-            // Ghostty terminal - use osascript to open new window
+            // Ghostty terminal - spawn new window with command
             self.log("[NEW TAB] Launching in Ghostty\n", .{});
-            const script = std.fmt.allocPrint(self.allocator,
-                "tell application \"Ghostty\" to activate\ntell application \"System Events\" to keystroke \"t\" using command down\ndelay 0.3\ntell application \"System Events\" to keystroke \"termweb open {s}\"\ntell application \"System Events\" to key code 36",
-                .{url}) catch return;
-            defer self.allocator.free(script);
-            const argv = [_][]const u8{ "osascript", "-e", script };
+            const cmd = std.fmt.allocPrint(self.allocator, "termweb open {s}", .{url}) catch return;
+            defer self.allocator.free(cmd);
+            const argv = [_][]const u8{ "ghostty", "-e", cmd };
             var child = std.process.Child.init(&argv, self.allocator);
             child.spawn() catch |err| {
-                self.log("[NEW TAB] Failed to launch Ghostty tab: {}\n", .{err});
+                self.log("[NEW TAB] Failed to launch Ghostty: {}\n", .{err});
                 return;
             };
-            _ = child.wait() catch {};
+            // Don't wait - let it run in background
             self.log("[NEW TAB] Launched in Ghostty: {s}\n", .{url});
         } else if (kitty_listen != null or std.mem.eql(u8, term, "xterm-kitty")) {
             // Kitty terminal - use remote control
