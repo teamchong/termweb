@@ -1101,7 +1101,7 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
-                    // Use execCommand('cut') - same as menu cut, triggers polyfill
+                    // Dispatch Cmd+X event + execCommand('cut')
                     interact_mod.execCut(self.cdp_client);
                 }
             },
@@ -1112,9 +1112,8 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
-                    // Clear browser clipboard cache so polyfill doesn't intercept our paste
-                    interact_mod.clearBrowserClipboard(self.cdp_client);
                     // Get system clipboard and insert via synthetic ClipboardEvent
+                    // typeText clears _termwebClipboardData atomically before dispatch
                     const toolbar = @import("ui/toolbar.zig");
                     if (toolbar.pasteFromClipboard(self.allocator)) |clipboard| {
                         defer self.allocator.free(clipboard);
