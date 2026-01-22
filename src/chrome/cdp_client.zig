@@ -203,6 +203,11 @@ pub const CdpClient = struct {
                 defer allocator.free(download_params);
                 const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
                 allocator.free(download_result);
+
+                // Enable target discovery to detect new tabs/popups
+                std.debug.print("Enabling target discovery on browser_ws...\n", .{});
+                const target_result = try bws.sendCommand("Target.setDiscoverTargets", "{\"discover\":true}");
+                allocator.free(target_result);
             }
         } else |_| {
             std.debug.print("[CDP] Failed to get browser WebSocket URL\n", .{});

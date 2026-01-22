@@ -88,6 +88,7 @@ pub const Viewer = struct {
     mode: ViewerMode,
     prompt_buffer: ?PromptBuffer,
     debug_log: ?std.fs.File,
+    pending_new_targets: std.ArrayList([]const u8), // Target IDs waiting for URL
     viewport_width: u32,  // Requested viewport (for screencast)
     viewport_height: u32,
     chrome_actual_width: u32,  // Chrome's actual window.innerWidth (for coordinate mapping)
@@ -213,6 +214,7 @@ pub const Viewer = struct {
             .mode = .normal,
             .prompt_buffer = null,
             .debug_log = debug_log,
+            .pending_new_targets = std.ArrayList([]const u8).initCapacity(allocator, 4) catch unreachable,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .chrome_actual_width = chrome_actual_w,
@@ -1580,6 +1582,10 @@ pub const Viewer = struct {
         } else if (std.mem.eql(u8, event.method, "Page.frameNavigated") or
                    std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
             self.handleNavigationEvent(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
+            self.handleNewTarget(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Target.targetInfoChanged")) {
+            self.handleTargetInfoChanged(event.payload);
         }
     }
 
@@ -1608,6 +1614,172 @@ pub const Viewer = struct {
 
         // Update back/forward button state
         self.updateNavigationState();
+    }
+
+    /// Handle Target.targetCreated event - launch new terminal tab instead of browser tab
+    fn handleNewTarget(self: *Viewer, payload: []const u8) void {
+        self.log("[NEW TARGET] Payload: {s}\n", .{payload[0..@min(payload.len, 800)]});
+
+        // Parse targetInfo from payload
+        // Format: {"targetInfo":{"targetId":"XXX","type":"page","title":"...","url":"...",...}}
+
+        // Extract targetId
+        const target_id_marker = "\"targetId\":\"";
+        const target_id_start = std.mem.indexOf(u8, payload, target_id_marker) orelse return;
+        const id_start = target_id_start + target_id_marker.len;
+        const id_end = std.mem.indexOfPos(u8, payload, id_start, "\"") orelse return;
+        const target_id = payload[id_start..id_end];
+
+        // Extract type
+        const type_marker = "\"type\":\"";
+        const type_start = std.mem.indexOf(u8, payload, type_marker) orelse return;
+        const t_start = type_start + type_marker.len;
+        const t_end = std.mem.indexOfPos(u8, payload, t_start, "\"") orelse return;
+        const target_type = payload[t_start..t_end];
+
+        // Only handle "page" type targets (not iframes, workers, etc.)
+        if (!std.mem.eql(u8, target_type, "page")) {
+            self.log("[NEW TARGET] Ignoring non-page target type={s}\n", .{target_type});
+            return;
+        }
+
+        // Extract URL
+        const url_marker = "\"url\":\"";
+        const url_start = std.mem.indexOf(u8, payload, url_marker) orelse return;
+        const u_start = url_start + url_marker.len;
+        const u_end = std.mem.indexOfPos(u8, payload, u_start, "\"") orelse return;
+        const url = payload[u_start..u_end];
+
+        // Skip about:blank (empty tabs) - but track the target for later
+        if (std.mem.eql(u8, url, "about:blank") or url.len == 0) {
+            self.log("[NEW TARGET] Empty URL, tracking target id={s}\n", .{target_id});
+            // Store target ID to handle when URL arrives via targetInfoChanged
+            const id_copy = self.allocator.dupe(u8, target_id) catch return;
+            self.pending_new_targets.append(self.allocator, id_copy) catch {
+                self.allocator.free(id_copy);
+            };
+            return;
+        }
+
+        self.log("[NEW TARGET] New tab requested: id={s} url={s}\n", .{ target_id, url });
+
+        // Launch new terminal tab with termweb
+        self.launchInNewTerminal(url);
+
+        // Close the browser target
+        self.closeBrowserTarget(target_id);
+    }
+
+    /// Handle Target.targetInfoChanged - URL may now be available for pending targets
+    fn handleTargetInfoChanged(self: *Viewer, payload: []const u8) void {
+        // Extract targetId
+        const target_id_marker = "\"targetId\":\"";
+        const target_id_start = std.mem.indexOf(u8, payload, target_id_marker) orelse return;
+        const id_start = target_id_start + target_id_marker.len;
+        const id_end = std.mem.indexOfPos(u8, payload, id_start, "\"") orelse return;
+        const target_id = payload[id_start..id_end];
+
+        // Check if this is a pending target
+        var found_index: ?usize = null;
+        for (self.pending_new_targets.items, 0..) |pending_id, i| {
+            if (std.mem.eql(u8, pending_id, target_id)) {
+                found_index = i;
+                break;
+            }
+        }
+
+        if (found_index == null) return; // Not a pending target
+
+        // Extract URL
+        const url_marker = "\"url\":\"";
+        const url_start = std.mem.indexOf(u8, payload, url_marker) orelse return;
+        const u_start = url_start + url_marker.len;
+        const u_end = std.mem.indexOfPos(u8, payload, u_start, "\"") orelse return;
+        const url = payload[u_start..u_end];
+
+        // Skip if still empty or about:blank
+        if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return;
+
+        self.log("[TARGET INFO CHANGED] URL ready: id={s} url={s}\n", .{ target_id, url });
+
+        // Remove from pending list
+        const removed_id = self.pending_new_targets.orderedRemove(found_index.?);
+        self.allocator.free(removed_id);
+
+        // Launch new terminal tab with termweb
+        self.launchInNewTerminal(url);
+
+        // Close the browser target
+        self.closeBrowserTarget(target_id);
+    }
+
+    /// Launch termweb in a new terminal tab
+    fn launchInNewTerminal(self: *Viewer, url: []const u8) void {
+        // Detect terminal and launch appropriately
+        const kitty_listen = std.posix.getenv("KITTY_LISTEN_ON");
+        const term = std.posix.getenv("TERM") orelse "";
+        const term_program = std.posix.getenv("TERM_PROGRAM") orelse "";
+
+        std.debug.print("[NEW TAB] Detecting terminal...\n", .{});
+        std.debug.print("[NEW TAB] KITTY_LISTEN_ON={s}\n", .{kitty_listen orelse "(not set)"});
+        std.debug.print("[NEW TAB] TERM={s}\n", .{term});
+        std.debug.print("[NEW TAB] TERM_PROGRAM={s}\n", .{term_program});
+
+        if (kitty_listen != null or std.mem.eql(u8, term, "xterm-kitty")) {
+            // Kitty terminal - use remote control
+            const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", "termweb", "open", url };
+            var child = std.process.Child.init(&argv, self.allocator);
+            child.spawn() catch |err| {
+                std.debug.print("[NEW TAB] Failed to launch kitty tab: {}\n", .{err});
+                return;
+            };
+            _ = child.wait() catch {};
+            std.debug.print("[NEW TAB] Launched in Kitty tab: {s}\n", .{url});
+        } else if (std.mem.eql(u8, term_program, "iTerm.app")) {
+            // iTerm2 - use osascript
+            const script = std.fmt.allocPrint(self.allocator,
+                "tell application \"iTerm2\" to tell current window to create tab with default profile command \"termweb open {s}\"",
+                .{url}) catch return;
+            defer self.allocator.free(script);
+            const argv = [_][]const u8{ "osascript", "-e", script };
+            var child = std.process.Child.init(&argv, self.allocator);
+            child.spawn() catch |err| {
+                std.debug.print("[NEW TAB] Failed to launch iTerm tab: {}\n", .{err});
+                return;
+            };
+            _ = child.wait() catch {};
+            std.debug.print("[NEW TAB] Launched in iTerm tab: {s}\n", .{url});
+        } else if (std.mem.eql(u8, term_program, "Apple_Terminal")) {
+            // macOS Terminal.app
+            const script = std.fmt.allocPrint(self.allocator,
+                "tell application \"Terminal\" to do script \"termweb open {s}\"",
+                .{url}) catch return;
+            defer self.allocator.free(script);
+            const argv = [_][]const u8{ "osascript", "-e", script };
+            var child = std.process.Child.init(&argv, self.allocator);
+            child.spawn() catch |err| {
+                std.debug.print("[NEW TAB] Failed to launch Terminal tab: {}\n", .{err});
+                return;
+            };
+            _ = child.wait() catch {};
+            std.debug.print("[NEW TAB] Launched in Terminal: {s}\n", .{url});
+        } else {
+            // Fallback - just print URL
+            std.debug.print("[NEW TAB] No supported terminal detected. URL: {s}\n", .{url});
+            std.debug.print("[NEW TAB] Set KITTY_LISTEN_ON or use Kitty/iTerm2/Terminal.app\n", .{});
+        }
+    }
+
+    /// Close a browser target
+    fn closeBrowserTarget(self: *Viewer, target_id: []const u8) void {
+        // Send Target.closeTarget to browser_ws
+        var params_buf: [256]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return;
+
+        if (self.cdp_client.browser_ws) |bws| {
+            bws.sendCommandAsync("Target.closeTarget", params);
+            self.log("[NEW TARGET] Closed browser target: {s}\n", .{target_id});
+        }
     }
 
     /// Handle Browser.downloadWillBegin event - prompt user for save location

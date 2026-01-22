@@ -432,6 +432,8 @@ pub const WebSocketCdpClient = struct {
             "Browser.downloadProgress", // Download progress/completion
             "Page.frameNavigated", // Navigation completed - update URL
             "Page.navigatedWithinDocument", // SPA navigation - update URL
+            "Target.targetCreated", // New tab/popup - launch in new terminal
+            "Target.targetInfoChanged", // Target URL updated - get URL for new tab
         };
 
         var dominated = false;
