@@ -1884,15 +1884,6 @@ pub const Viewer = struct {
 
     /// Handle console messages - look for __TERMWEB_PICKER__ or __TERMWEB_FS__ markers
     fn handleConsoleMessage(self: *Viewer, payload: []const u8) !void {
-        // Debug: log first 200 chars of payload
-        const debug_len = @min(payload.len, 200);
-        self.log("[CONSOLE MSG] payload={s}\n", .{payload[0..debug_len]});
-
-        // Debug: print to stderr if clipboard-related
-        if (std.mem.indexOf(u8, payload, "TERMWEB") != null or std.mem.indexOf(u8, payload, "clipboard") != null) {
-            std.debug.print("[CONSOLE] {s}\n", .{payload[0..debug_len]});
-        }
-
         // Check for clipboard marker - sync browser clipboard to system clipboard
         const clipboard_marker = "__TERMWEB_CLIPBOARD__:";
         if (std.mem.indexOf(u8, payload, clipboard_marker)) |clip_pos| {
@@ -2022,7 +2013,6 @@ pub const Viewer = struct {
         // Send to browser - this updates window._termwebClipboardData and increments version
         interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, clipboard_text) catch |err| {
             self.log("[CLIPBOARD] Failed to update browser: {}\n", .{err});
-            std.debug.print("[CLIPBOARD] Failed to update browser: {}\n", .{err});
         };
     }
 
