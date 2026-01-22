@@ -66,8 +66,8 @@ const ResponseQueueEntry = struct {
 /// Pipe-based CDP client
 pub const PipeCdpClient = struct {
     allocator: std.mem.Allocator,
-    read_file: std.fs.File, 
-    write_file: std.fs.File, 
+    read_file: std.fs.File,
+    write_file: std.fs.File,
     next_id: std.atomic.Value(u32),
 
     reader_thread: ?std.Thread,
@@ -89,6 +89,10 @@ pub const PipeCdpClient = struct {
 
     read_buffer: []u8,
     read_pos: usize,
+
+    // Track if files have been closed to avoid double-close panics
+    read_file_closed: bool,
+    write_file_closed: bool,
 
     pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
         const frame_pool = try FramePool.init(allocator);
@@ -112,6 +116,8 @@ pub const PipeCdpClient = struct {
             .write_mutex = .{},
             .read_buffer = read_buffer,
             .read_pos = 0,
+            .read_file_closed = false,
+            .write_file_closed = false,
         };
 
         return client;
@@ -125,7 +131,11 @@ pub const PipeCdpClient = struct {
         logToFile("[PIPE deinit] After stopReaderThread, response_queue.len={}\n", .{self.response_queue.items.len});
 
         // Close write pipe (we own both fds from launcher)
-        self.write_file.close();
+        // Use raw syscall to handle EBADF gracefully (pipe may already be closed by Chrome)
+        if (!self.write_file_closed) {
+            _ = std.posix.system.close(self.write_file.handle);
+            self.write_file_closed = true;
+        }
 
         self.frame_pool.deinit();
 
@@ -365,7 +375,11 @@ pub const PipeCdpClient = struct {
             self.response_mutex.unlock();
 
             // Close read pipe to unblock the reader thread from blocking read()
-            self.read_file.close();
+            // Use raw syscall to handle EBADF gracefully (pipe may already be closed by Chrome)
+            if (!self.read_file_closed) {
+                _ = std.posix.system.close(self.read_file.handle);
+                self.read_file_closed = true;
+            }
             // Now we can safely wait for thread to finish
             thread.join();
             self.reader_thread = null;
