@@ -31,7 +31,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.15.0
+          version: master
 
       - name: Build (native)
         if: matrix.arch == 'x86_64' || (matrix.os == 'macos-latest' && matrix.arch == 'aarch64')
