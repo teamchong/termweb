@@ -263,23 +263,19 @@ pub fn execCopy(client: *cdp.CdpClient) void {
     client.sendCommandAsync("Runtime.evaluate", params) catch {};
 }
 
-/// Execute cut command - dispatch Cmd+X keyboard event to active element
+/// Execute cut command - copy selection then send Backspace to delete
 pub fn execCut(client: *cdp.CdpClient) void {
-    const js =
-        \\(function() {
-        \\  const el = document.activeElement;
-        \\  if (!el) return;
-        \\  const evt = new KeyboardEvent('keydown', {
-        \\    key: 'x', code: 'KeyX', keyCode: 88, which: 88,
-        \\    metaKey: true, bubbles: true, cancelable: true
-        \\  });
-        \\  el.dispatchEvent(evt);
-        \\  document.execCommand('cut');
-        \\})()
-    ;
-    var params_buf: [512]u8 = undefined;
+    // First copy via execCommand (this works)
+    const js = "document.execCommand('copy')";
+    var params_buf: [256]u8 = undefined;
     const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{js}) catch return;
     client.sendCommandAsync("Runtime.evaluate", params) catch {};
+
+    // Then send Backspace to delete selection
+    const down = "{\"type\":\"keyDown\",\"key\":\"Backspace\",\"code\":\"Backspace\",\"windowsVirtualKeyCode\":8}";
+    const up = "{\"type\":\"keyUp\",\"key\":\"Backspace\",\"code\":\"Backspace\",\"windowsVirtualKeyCode\":8}";
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", down);
+    client.sendKeyboardCommandAsync("Input.dispatchKeyEvent", up);
 }
 
 /// Clear browser's cached clipboard data - prevents polyfill from intercepting paste
