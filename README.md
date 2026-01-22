@@ -17,8 +17,8 @@ https://github.com/user-attachments/assets/192411f7-ac5e-44b1-a09c-1d070ef85c3f
 - **Mouse Support** - Click links, buttons, and interact directly with the page
 - **Clickable Toolbar** - Navigation buttons (back, forward, reload) and tab management
 - **Tab Management** - Multiple tabs with native OS dialog picker (Cmd+click or Tab button)
-- **Clipboard Integration** - Cmd+C/X/V for copy/cut/paste (uses system clipboard)
-- **URL Navigation** - Press Cmd+L to focus address bar
+- **Clipboard Integration** - Ctrl+C/X/V for copy/cut/paste (uses system clipboard)
+- **URL Navigation** - Press Ctrl+L to focus address bar
 - **Mobile Testing** - Use `--mobile` flag for mobile viewport
 - **Zoom Control** - Adjust page scale with `--scale` option
 
@@ -61,13 +61,13 @@ termweb help
 ### Keyboard
 | Key | Action |
 |-----|--------|
-| `Cmd+Q` / `Cmd+W` | Quit |
-| `Cmd+L` | Focus address bar |
-| `Cmd+R` | Reload page |
-| `Cmd+C` | Copy selection |
-| `Cmd+X` | Cut selection |
-| `Cmd+V` | Paste |
-| `Cmd+A` | Select all |
+| `Ctrl+Q` / `Ctrl+W` | Quit |
+| `Ctrl+L` | Focus address bar |
+| `Ctrl+R` | Reload page |
+| `Ctrl+C` | Copy selection |
+| `Ctrl+X` | Cut selection |
+| `Ctrl+V` | Paste |
+| `Ctrl+A` | Select all |
 
 ### Mouse
 - **Click** - Interact with page elements (links, buttons, inputs)
