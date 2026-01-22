@@ -94,6 +94,11 @@ pub const PipeCdpClient = struct {
     read_file_closed: bool,
     write_file_closed: bool,
 
+    // Pending ack for adaptive frame throttling
+    // We delay acking until the viewer consumes the frame via getLatestFrame()
+    pending_ack_frame_sid: ?u32,
+    pending_ack_routing_sid: ?[]u8, // Owned copy
+
     pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
         const frame_pool = try FramePool.init(allocator);
 
@@ -118,6 +123,8 @@ pub const PipeCdpClient = struct {
             .read_pos = 0,
             .read_file_closed = false,
             .write_file_closed = false,
+            .pending_ack_frame_sid = null,
+            .pending_ack_routing_sid = null,
         };
 
         return client;
@@ -138,6 +145,11 @@ pub const PipeCdpClient = struct {
         }
 
         self.frame_pool.deinit();
+
+        // Free pending ack routing sid if set
+        if (self.pending_ack_routing_sid) |sid| {
+            self.allocator.free(sid);
+        }
 
         // Free response queue entries - lock just in case
         self.response_mutex.lock();
@@ -388,6 +400,19 @@ pub const PipeCdpClient = struct {
 
     pub fn getLatestFrame(self: *PipeCdpClient) ?ScreencastFrame {
         const slot = self.frame_pool.acquireLatestFrame() orelse return null;
+
+        // Send pending ack for adaptive throttling
+        // This tells Chrome we're ready for more frames
+        if (self.pending_ack_frame_sid) |frame_sid| {
+            self.acknowledgeFrame(self.pending_ack_routing_sid, frame_sid) catch {};
+            // Free the routing_sid copy
+            if (self.pending_ack_routing_sid) |sid| {
+                self.allocator.free(sid);
+            }
+            self.pending_ack_frame_sid = null;
+            self.pending_ack_routing_sid = null;
+        }
+
         return ScreencastFrame{
             .data = slot.data(),
             .slot = slot,
@@ -470,7 +495,19 @@ pub const PipeCdpClient = struct {
             _ = self.frame_count.fetchAdd(1, .monotonic);
         }
 
-        try self.acknowledgeFrame(routing_sid, frame_sid);
+        // Store pending ack info for adaptive throttling
+        // The ack will be sent when getLatestFrame() is called
+        // Free old routing_sid if there was one
+        if (self.pending_ack_routing_sid) |old_sid| {
+            self.allocator.free(old_sid);
+            self.pending_ack_routing_sid = null;
+        }
+
+        // Store new pending ack info
+        self.pending_ack_frame_sid = frame_sid;
+        if (routing_sid) |rsid| {
+            self.pending_ack_routing_sid = self.allocator.dupe(u8, rsid) catch null;
+        }
     }
 
     fn handleResponse(self: *PipeCdpClient, payload: []const u8) !void {
