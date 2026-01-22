@@ -615,30 +615,58 @@ pub const Viewer = struct {
         if (self.screencast_mode) {
             screenshot_api.stopScreencast(self.cdp_client, self.allocator) catch {};
             self.screencast_mode = false;
+            // Give Chrome time to process the stop
+            std.Thread.sleep(100 * std.time.ns_per_ms);
         }
 
         self.ui_dirty = true;
 
-        // Update Chrome viewport
-        try screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height);
+        // Update Chrome viewport (retry on timeout)
+        var viewport_set = false;
+        for (0..3) |_| {
+            screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height) catch |err| {
+                self.log("[RESIZE] setViewport failed: {}, retrying...\n", .{err});
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                continue;
+            };
+            viewport_set = true;
+            break;
+        }
+        if (!viewport_set) {
+            self.log("[RESIZE] Failed to set viewport after retries\n", .{});
+            return;
+        }
 
         // Clear screen and all Kitty images
         var stdout_buf: [8192]u8 = undefined;
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
         const writer = &stdout_writer.interface;
-        try self.kitty.clearAll(writer);
-        try Screen.clear(writer);
-        try Screen.moveCursor(writer, 1, 1); // Reset cursor to top-left
-        try writer.flush();
+        self.kitty.clearAll(writer) catch {};
+        Screen.clear(writer) catch {};
+        Screen.moveCursor(writer, 1, 1) catch {};
+        writer.flush() catch {};
 
-        // Restart screencast with new dimensions
-        try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-            .format = self.screencast_format,
-            .quality = 80,
-            .width = new_width,
-            .height = new_height,
-        });
+        // Restart screencast with new dimensions (retry on timeout)
+        var screencast_started = false;
+        for (0..3) |_| {
+            screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
+                .format = self.screencast_format,
+                .quality = 80,
+                .width = new_width,
+                .height = new_height,
+            }) catch |err| {
+                self.log("[RESIZE] startScreencast failed: {}, retrying...\n", .{err});
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                continue;
+            };
+            screencast_started = true;
+            break;
+        }
+        if (!screencast_started) {
+            self.log("[RESIZE] Failed to start screencast after retries\n", .{});
+            return;
+        }
         self.screencast_mode = true;
 
         // Reset frame time and wait for first frame before rendering UI
