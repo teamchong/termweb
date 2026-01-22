@@ -1719,78 +1719,26 @@ pub const Viewer = struct {
         self.closeBrowserTarget(target_id);
     }
 
-    /// Launch termweb in a new terminal tab
+    /// Launch termweb in a new terminal tab using kitty @ launch protocol
     fn launchInNewTerminal(self: *Viewer, url: []const u8) void {
-        // Detect terminal and launch appropriately
-        const kitty_listen = std.posix.getenv("KITTY_LISTEN_ON");
-        const term = std.posix.getenv("TERM") orelse "";
-        const term_program = std.posix.getenv("TERM_PROGRAM") orelse "";
-
-        self.log("[NEW TAB] Detecting terminal: TERM={s} TERM_PROGRAM={s}\n", .{ term, term_program });
-
-        // Get full path to current executable for all terminal types
+        // Get full path to current executable
         var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
             self.log("[NEW TAB] Failed to get exe path\n", .{});
             return;
         };
 
-        if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
-            // Ghostty terminal - use open command to launch new window
-            self.log("[NEW TAB] Launching in {s}\n", .{term_program});
-            // Use open -a with detected TERM_PROGRAM
-            const argv = [_][]const u8{ "open", "-na", term_program, "--args", "-e", exe_path, "open", url };
-            var child = std.process.Child.init(&argv, self.allocator);
-            child.spawn() catch |err| {
-                self.log("[NEW TAB] Failed to launch {s}: {}\n", .{ term_program, err });
-                return;
-            };
-            self.log("[NEW TAB] Launched in {s}: {s}\n", .{ term_program, url });
-        } else if (kitty_listen != null or std.mem.eql(u8, term, "xterm-kitty")) {
-            // Kitty terminal - use remote control
-            self.log("[NEW TAB] Launching in Kitty\n", .{});
-            const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", exe_path, "open", url };
-            var child = std.process.Child.init(&argv, self.allocator);
-            child.spawn() catch |err| {
-                self.log("[NEW TAB] Failed to launch kitty tab: {}\n", .{err});
-                return;
-            };
-            _ = child.wait() catch {};
-            self.log("[NEW TAB] Launched in Kitty tab: {s}\n", .{url});
-        } else if (std.mem.eql(u8, term_program, "iTerm.app")) {
-            // iTerm2 - use osascript
-            self.log("[NEW TAB] Launching in iTerm2\n", .{});
-            const script = std.fmt.allocPrint(self.allocator,
-                "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{s} open {s}\"",
-                .{ exe_path, url }) catch return;
-            defer self.allocator.free(script);
-            const argv = [_][]const u8{ "osascript", "-e", script };
-            var child = std.process.Child.init(&argv, self.allocator);
-            child.spawn() catch |err| {
-                self.log("[NEW TAB] Failed to launch iTerm tab: {}\n", .{err});
-                return;
-            };
-            _ = child.wait() catch {};
-            self.log("[NEW TAB] Launched in iTerm tab: {s}\n", .{url});
-        } else if (std.mem.eql(u8, term_program, "Apple_Terminal")) {
-            // macOS Terminal.app
-            self.log("[NEW TAB] Launching in Terminal.app\n", .{});
-            const script = std.fmt.allocPrint(self.allocator,
-                "tell application \"Terminal\" to do script \"{s} open {s}\"",
-                .{ exe_path, url }) catch return;
-            defer self.allocator.free(script);
-            const argv = [_][]const u8{ "osascript", "-e", script };
-            var child = std.process.Child.init(&argv, self.allocator);
-            child.spawn() catch |err| {
-                self.log("[NEW TAB] Failed to launch Terminal tab: {}\n", .{err});
-                return;
-            };
-            _ = child.wait() catch {};
-            self.log("[NEW TAB] Launched in Terminal: {s}\n", .{url});
-        } else {
-            // Fallback - just log URL
-            self.log("[NEW TAB] No supported terminal detected. URL: {s}\n", .{url});
-        }
+        self.log("[NEW TAB] Using kitty @ launch protocol\n", .{});
+
+        // Use kitty @ launch to open new tab - works with any terminal supporting kitty protocol
+        const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", exe_path, "open", url };
+        var child = std.process.Child.init(&argv, self.allocator);
+        child.spawn() catch |err| {
+            self.log("[NEW TAB] Failed: {}\n", .{err});
+            return;
+        };
+        _ = child.wait() catch {};
+        self.log("[NEW TAB] Launched: {s}\n", .{url});
     }
 
     /// Close a browser target
