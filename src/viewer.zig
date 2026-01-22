@@ -1113,16 +1113,13 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
-                    // Get system clipboard and sync to browser, then send Cmd+V
-                    // This allows web apps like VSCode to read from our clipboard
+                    // Get system clipboard and insert directly via Input.insertText
+                    // This bypasses Monaco's paste handler which auto-formats
                     const toolbar = @import("ui/toolbar.zig");
                     if (toolbar.pasteFromClipboard(self.allocator)) |clipboard| {
                         defer self.allocator.free(clipboard);
-                        self.log("[PASTE] Syncing system clipboard to browser: {d} bytes\n", .{clipboard.len});
-                        // Update browser's clipboard data so readText() returns our content
-                        interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, clipboard) catch {};
-                        // Send Cmd+V so web app can handle paste
-                        interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'v', 4);
+                        self.log("[PASTE] Direct insert: {d} bytes\n", .{clipboard.len});
+                        interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
                     }
                 }
             },

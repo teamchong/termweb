@@ -121,14 +121,44 @@ pub fn typeText(
     allocator: std.mem.Allocator,
     text: []const u8,
 ) !void {
+    // Check if text contains newlines - use synthetic paste event for multi-line
+    const has_newline = std.mem.indexOf(u8, text, "\n") != null;
+
     // Escape special characters for JSON
     var escape_buf: [65536]u8 = undefined;
     const escaped = json.escapeContents(text, &escape_buf) catch return;
 
-    // Use Input.insertText - works across all frames including iframes
-    const params = std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped}) catch return;
-    defer allocator.free(params);
-    client.sendKeyboardCommandAsync("Input.insertText", params);
+    if (has_newline) {
+        // Dispatch synthetic paste event - editors handle this without auto-indent
+        const js = std.fmt.allocPrint(allocator,
+            \\(function() {{
+            \\  const el = document.activeElement;
+            \\  if (!el) return false;
+            \\  const dt = new DataTransfer();
+            \\  dt.setData('text/plain', "{s}");
+            \\  const evt = new ClipboardEvent('paste', {{
+            \\    bubbles: true,
+            \\    cancelable: true,
+            \\    clipboardData: dt
+            \\  }});
+            \\  return el.dispatchEvent(evt);
+            \\}})()
+        , .{escaped}) catch return;
+        defer allocator.free(js);
+
+        var js_escape_buf: [131072]u8 = undefined;
+        const js_escaped = json.escapeString(js, &js_escape_buf) catch return;
+
+        var params_buf: [131072]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{js_escaped}) catch return;
+
+        client.sendCommandAsync("Runtime.evaluate", params) catch {};
+    } else {
+        // Single line: use insertText directly
+        const params = std.fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped}) catch return;
+        defer allocator.free(params);
+        client.sendKeyboardCommandAsync("Input.insertText", params);
+    }
 }
 
 /// Toggle checkbox using JavaScript
