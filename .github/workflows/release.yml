@@ -12,15 +12,19 @@ jobs:
         include:
           - os: macos-latest
             arch: aarch64
+            target: aarch64-macos
             name: termweb-macos-aarch64
-          - os: macos-13
+          - os: macos-latest
             arch: x86_64
+            target: x86_64-macos
             name: termweb-macos-x86_64
           - os: ubuntu-latest
             arch: x86_64
+            target: x86_64-linux-gnu
             name: termweb-linux-x86_64
           - os: ubuntu-latest
             arch: aarch64
+            target: aarch64-linux-gnu
             name: termweb-linux-aarch64
 
     runs-on: ${{ matrix.os }}
@@ -33,13 +37,8 @@ jobs:
         with:
           version: master
 
-      - name: Build (native)
-        if: matrix.arch == 'x86_64' || (matrix.os == 'macos-latest' && matrix.arch == 'aarch64')
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Build (cross-compile Linux aarch64)
-        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'aarch64'
-        run: zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
 
       - name: Rename binary
         run: mv zig-out/bin/termweb ${{ matrix.name }}
