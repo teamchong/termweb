@@ -1737,15 +1737,15 @@ pub const Viewer = struct {
 
         if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
             // Ghostty terminal - use open command to launch new window
-            self.log("[NEW TAB] Launching in Ghostty\n", .{});
-            // Use open -a to launch Ghostty with command
-            const argv = [_][]const u8{ "open", "-na", "Ghostty", "--args", "-e", exe_path, "open", url };
+            self.log("[NEW TAB] Launching in {s}\n", .{term_program});
+            // Use open -a with detected TERM_PROGRAM
+            const argv = [_][]const u8{ "open", "-na", term_program, "--args", "-e", exe_path, "open", url };
             var child = std.process.Child.init(&argv, self.allocator);
             child.spawn() catch |err| {
-                self.log("[NEW TAB] Failed to launch Ghostty: {}\n", .{err});
+                self.log("[NEW TAB] Failed to launch {s}: {}\n", .{ term_program, err });
                 return;
             };
-            self.log("[NEW TAB] Launched in Ghostty: {s}\n", .{url});
+            self.log("[NEW TAB] Launched in {s}: {s}\n", .{ term_program, url });
         } else if (kitty_listen != null or std.mem.eql(u8, term, "xterm-kitty")) {
             // Kitty terminal - use remote control
             self.log("[NEW TAB] Launching in Kitty\n", .{});
