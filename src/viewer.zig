@@ -47,8 +47,6 @@ const UIState = ui_mod.UIState;
 const Placement = ui_mod.Placement;
 const ZIndex = ui_mod.ZIndex;
 const cursor_asset = ui_mod.assets.cursor;
-const DialogType = ui_mod.DialogType;
-const DialogState = ui_mod.DialogState;
 const FilePickerMode = ui_mod.FilePickerMode;
 const dialog_mod = ui_mod.dialog;
 
@@ -62,19 +60,16 @@ const isNaturalScrollEnabled = viewer_helpers.isNaturalScrollEnabled;
 
 /// ViewerMode represents the current interaction mode of the viewer.
 ///
-/// The viewer operates as a state machine with three modes:
+/// The viewer operates as a state machine with two modes:
 /// - normal: Default browsing mode - all input goes to the browser
 /// - url_prompt: URL entry mode activated by Ctrl+L
-/// - dialog: Modal dialog mode for JavaScript alerts/confirms/prompts
 ///
 /// Mode transitions:
 ///   Normal → URL Prompt (press Ctrl+L)
-///   Normal → Dialog (JavaScript dialog event)
-///   URL Prompt/Dialog → Normal (press Esc or complete action)
+///   URL Prompt → Normal (press Esc or complete action)
 pub const ViewerMode = enum {
     normal,       // Main browsing mode - all input goes to browser
     url_prompt,   // Entering URL (Ctrl+L)
-    dialog,       // JavaScript dialog (alert/confirm/prompt)
 };
 
 pub const Viewer = struct {
@@ -89,6 +84,11 @@ pub const Viewer = struct {
     prompt_buffer: ?PromptBuffer,
     debug_log: ?std.fs.File,
     pending_new_targets: std.ArrayList([]const u8), // Target IDs waiting for URL
+
+    // Tab management
+    tabs: std.ArrayList(ui_mod.Tab),
+    active_tab_index: usize,
+
     viewport_width: u32,  // Requested viewport (for screencast)
     viewport_height: u32,
     chrome_actual_width: u32,  // Chrome's actual window.innerWidth (for coordinate mapping)
@@ -153,10 +153,6 @@ pub const Viewer = struct {
     last_clipboard_sync: i128,
     last_clipboard_hash: u64,
 
-    // Dialog state for JavaScript dialogs (alert/confirm/prompt)
-    dialog_state: ?*DialogState,
-    dialog_message: ?[]const u8,
-
     // File System Access API - allowed roots (security: only allow access to user-selected directories)
     allowed_fs_roots: std.ArrayList([]const u8),
 
@@ -215,6 +211,8 @@ pub const Viewer = struct {
             .prompt_buffer = null,
             .debug_log = debug_log,
             .pending_new_targets = std.ArrayList([]const u8).initCapacity(allocator, 4) catch unreachable,
+            .tabs = std.ArrayList(ui_mod.Tab).initCapacity(allocator, 8) catch unreachable,
+            .active_tab_index = 0,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .chrome_actual_width = chrome_actual_w,
@@ -250,8 +248,6 @@ pub const Viewer = struct {
             .perf_last_report_time = 0,
             .last_clipboard_sync = 0,
             .last_clipboard_hash = 0,
-            .dialog_state = null,
-            .dialog_message = null,
             .allowed_fs_roots = try std.ArrayList([]const u8).initCapacity(allocator, 0),
             .download_manager = download_mod.DownloadManager.init(allocator, "/tmp/termweb-downloads"),
         };
@@ -346,9 +342,15 @@ pub const Viewer = struct {
         if (self.toolbar_renderer) |*renderer| {
             self.log("[DEBUG] Toolbar initialized, font_renderer={}\n", .{renderer.font_renderer != null});
             renderer.setUrl(self.current_url);
+            renderer.setTabCount(1); // Initial tab
         } else {
             self.log("[DEBUG] Toolbar is null\n", .{});
         }
+
+        // Add initial tab for current URL
+        self.addTab("initial", self.current_url, "") catch |err| {
+            self.log("[DEBUG] Failed to add initial tab: {}\n", .{err});
+        };
 
         // Render initial toolbar using Kitty graphics
         try self.renderToolbar(writer);
@@ -519,17 +521,6 @@ pub const Viewer = struct {
                     self.log("[URL_PROMPT] Flush error: {}\n", .{err});
                 };
                 self.log("[URL_PROMPT] Toolbar rendered\n", .{});
-                self.ui_dirty = false;
-            }
-
-            // In dialog mode, render the dialog overlay
-            if (self.mode == .dialog and self.ui_dirty) {
-                var stdout_buf4: [8192]u8 = undefined;
-                const stdout_file4 = std.fs.File.stdout();
-                var stdout_writer4 = stdout_file4.writer(&stdout_buf4);
-                const writer4 = &stdout_writer4.interface;
-                self.renderDialog(writer4) catch {};
-                writer4.flush() catch {};
                 self.ui_dirty = false;
             }
 
@@ -1038,7 +1029,6 @@ pub const Viewer = struct {
                 switch (self.mode) {
                     .normal => try self.handleNormalModeKey(event),
                     .url_prompt => try self.handleUrlPromptKey(event),
-                    .dialog => try self.handleDialogKey(event),
                 }
             },
             .mouse => |mouse| try self.handleMouse(mouse),
@@ -1281,46 +1271,6 @@ pub const Viewer = struct {
         }
     }
 
-    /// Handle key in dialog mode
-    fn handleDialogKey(self: *Viewer, event: NormalizedKeyEvent) !void {
-        const state = self.dialog_state orelse return;
-
-        switch (event.base_key) {
-            .char => |c| {
-                if (state.dialog_type == .prompt) {
-                    state.handleChar(c);
-                    self.ui_dirty = true;
-                }
-            },
-            .backspace => {
-                if (state.dialog_type == .prompt) {
-                    state.handleBackspace();
-                    self.ui_dirty = true;
-                }
-            },
-            .left => {
-                if (state.dialog_type == .prompt) {
-                    state.handleLeft();
-                    self.ui_dirty = true;
-                }
-            },
-            .right => {
-                if (state.dialog_type == .prompt) {
-                    state.handleRight();
-                    self.ui_dirty = true;
-                }
-            },
-            .enter => {
-                try self.closeDialog(true);
-            },
-            .escape => {
-                const can_cancel = state.dialog_type != .alert;
-                try self.closeDialog(!can_cancel);
-            },
-            else => {},
-        }
-    }
-
     /// Handle mouse event - records to event bus and dispatches to mode-specific handlers
     /// Throttling/prioritization is handled by the event bus (30fps tick)
     fn handleMouse(self: *Viewer, mouse: MouseEvent) !void {
@@ -1384,7 +1334,6 @@ pub const Viewer = struct {
                     }
                 }
             },
-            .dialog => {}, // Ignore mouse in dialog mode (keyboard only)
         }
     }
 
@@ -1434,6 +1383,12 @@ pub const Viewer = struct {
                     .close => {
                         self.log("[CLICK] Close button\n", .{});
                         self.running = false;
+                    },
+                    .tabs => {
+                        self.log("[CLICK] Tabs button\n", .{});
+                        self.showTabPicker() catch |err| {
+                            self.log("[CLICK] Tab picker failed: {}\n", .{err});
+                        };
                     },
                 }
                 return;
@@ -1521,6 +1476,7 @@ pub const Viewer = struct {
                     const old_back = renderer.back_hover;
                     const old_forward = renderer.forward_hover;
                     const old_refresh = renderer.refresh_hover;
+                    const old_tabs = renderer.tabs_hover;
                     const old_url = renderer.url_bar_hover;
 
                     // Reset all hover states
@@ -1528,6 +1484,7 @@ pub const Viewer = struct {
                     renderer.back_hover = false;
                     renderer.forward_hover = false;
                     renderer.refresh_hover = false;
+                    renderer.tabs_hover = false;
                     renderer.url_bar_hover = false;
 
                     // Set hover for the button under cursor
@@ -1538,6 +1495,7 @@ pub const Viewer = struct {
                             .back => renderer.back_hover = true,
                             .forward => renderer.forward_hover = true,
                             .refresh => renderer.refresh_hover = true,
+                            .tabs => renderer.tabs_hover = true,
                         }
                     } else if (mouse_pixels.y < renderer.toolbar_height) {
                         // Check URL bar hover (within toolbar area)
@@ -1553,6 +1511,7 @@ pub const Viewer = struct {
                         renderer.back_hover != old_back or
                         renderer.forward_hover != old_forward or
                         renderer.refresh_hover != old_refresh or
+                        renderer.tabs_hover != old_tabs or
                         renderer.url_bar_hover != old_url)
                     {
                         self.ui_dirty = true;
@@ -1570,7 +1529,8 @@ pub const Viewer = struct {
         self.log("[CDP EVENT] method={s}\n", .{event.method});
 
         if (std.mem.eql(u8, event.method, "Page.javascriptDialogOpening")) {
-            try self.showJsDialog(event.payload);
+            // Let Chrome show native dialog in screencast - don't intercept
+            self.log("[DIALOG] Native dialog opened, user can click in screencast\n", .{});
         } else if (std.mem.eql(u8, event.method, "Page.fileChooserOpened")) {
             try self.showFileChooser(event.payload);
         } else if (std.mem.eql(u8, event.method, "Runtime.consoleAPICalled")) {
@@ -1669,11 +1629,27 @@ pub const Viewer = struct {
 
         self.log("[NEW TARGET] New tab requested: id={s} url={s}\n", .{ target_id, url });
 
-        // Launch new terminal tab with termweb
-        self.launchInNewTerminal(url);
+        // Add new tab to our tab list
+        self.addTab(target_id, url, "") catch |err| {
+            self.log("[NEW TARGET] Failed to add tab: {}\n", .{err});
+        };
 
-        // Close the browser target
+        // Close the browser target (we manage tabs ourselves)
         self.closeBrowserTarget(target_id);
+    }
+
+    /// Add a new tab to the tabs list
+    fn addTab(self: *Viewer, target_id: []const u8, url: []const u8, title: []const u8) !void {
+        const tab = try ui_mod.Tab.init(self.allocator, target_id, url, title);
+        try self.tabs.append(self.allocator, tab);
+
+        // Update toolbar tab count
+        if (self.toolbar_renderer) |*renderer| {
+            renderer.setTabCount(@intCast(self.tabs.items.len));
+        }
+        self.ui_dirty = true;
+
+        self.log("[TABS] Added tab: url={s}, total={}\n", .{ url, self.tabs.items.len });
     }
 
     /// Handle Target.targetInfoChanged - URL may now be available for pending targets
@@ -1712,33 +1688,19 @@ pub const Viewer = struct {
         const removed_id = self.pending_new_targets.orderedRemove(found_index.?);
         self.allocator.free(removed_id);
 
-        // Launch new terminal tab with termweb
-        self.launchInNewTerminal(url);
+        // Add new tab to our tab list
+        self.addTab(target_id, url, "") catch |err| {
+            self.log("[TARGET INFO CHANGED] Failed to add tab: {}\n", .{err});
+        };
 
-        // Close the browser target
+        // Close the browser target (we manage tabs ourselves)
         self.closeBrowserTarget(target_id);
     }
 
-    /// Launch termweb in a new terminal tab using kitty @ launch protocol
+    /// Launch termweb in a new terminal tab/window
+    /// TODO: Implement terminal-specific launching
     fn launchInNewTerminal(self: *Viewer, url: []const u8) void {
-        // Get full path to current executable
-        var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
-            self.log("[NEW TAB] Failed to get exe path\n", .{});
-            return;
-        };
-
-        self.log("[NEW TAB] Using kitty @ launch protocol\n", .{});
-
-        // Use kitty @ launch to open new tab - works with any terminal supporting kitty protocol
-        const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", exe_path, "open", url };
-        var child = std.process.Child.init(&argv, self.allocator);
-        child.spawn() catch |err| {
-            self.log("[NEW TAB] Failed: {}\n", .{err});
-            return;
-        };
-        _ = child.wait() catch {};
-        self.log("[NEW TAB] Launched: {s}\n", .{url});
+        self.log("[NEW TAB] Would open: {s}\n", .{url});
     }
 
     /// Close a browser target
@@ -1751,6 +1713,72 @@ pub const Viewer = struct {
             bws.sendCommandAsync("Target.closeTarget", params);
             self.log("[NEW TARGET] Closed browser target: {s}\n", .{target_id});
         }
+    }
+
+    /// Show native tab picker dialog
+    fn showTabPicker(self: *Viewer) !void {
+        if (self.tabs.items.len == 0) {
+            self.log("[TABS] No tabs to show\n", .{});
+            return;
+        }
+
+        // Build list of tab titles
+        var tab_titles = try std.ArrayList([]const u8).initCapacity(self.allocator, self.tabs.items.len);
+        defer tab_titles.deinit(self.allocator);
+
+        for (self.tabs.items, 0..) |tab, i| {
+            // Format as "N. Title - URL"
+            var title_buf: [256]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buf, "{d}. {s}", .{
+                i + 1,
+                if (tab.title.len > 0) tab.title else tab.url,
+            }) catch continue;
+
+            // Duplicate the title since we need it to persist
+            const title_copy = try self.allocator.dupe(u8, title);
+            try tab_titles.append(self.allocator, title_copy);
+        }
+        defer {
+            for (tab_titles.items) |t| self.allocator.free(t);
+        }
+
+        self.log("[TABS] Showing picker with {} tabs\n", .{tab_titles.items.len});
+
+        // Show native list picker
+        const selected = try dialog_mod.showNativeListPicker(
+            self.allocator,
+            "Select Tab",
+            tab_titles.items,
+        );
+
+        if (selected) |index| {
+            self.log("[TABS] Selected tab {}\n", .{index});
+            try self.switchToTab(index);
+        }
+    }
+
+    /// Switch to a different tab
+    fn switchToTab(self: *Viewer, index: usize) !void {
+        if (index >= self.tabs.items.len) return;
+
+        self.active_tab_index = index;
+        const tab = self.tabs.items[index];
+
+        self.log("[TABS] Switching to tab {}: {s}\n", .{ index, tab.url });
+
+        // Navigate to the tab's URL
+        _ = try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, tab.url);
+
+        // Update URL display
+        if (self.toolbar_renderer) |*renderer| {
+            renderer.setUrl(tab.url);
+        }
+
+        // Update current_url
+        self.allocator.free(self.current_url);
+        self.current_url = try self.allocator.dupe(u8, tab.url);
+
+        self.ui_dirty = true;
     }
 
     /// Handle Browser.downloadWillBegin event - prompt user for save location
@@ -2305,30 +2333,6 @@ pub const Viewer = struct {
         try self.sendFsResponse(id, true, "true");
     }
 
-    /// Show JavaScript dialog (alert/confirm/prompt)
-    fn showJsDialog(self: *Viewer, payload: []const u8) !void {
-        self.log("[DIALOG] showJsDialog payload={s}\n", .{payload});
-
-        // Parse dialog type from payload
-        const dtype = parseDialogType(payload);
-        const message = parseDialogMessage(self.allocator, payload) catch "Dialog";
-        const default_text = parseDefaultPrompt(self.allocator, payload) catch "";
-
-        // Store message for later cleanup
-        if (self.dialog_message) |old_msg| {
-            self.allocator.free(old_msg);
-        }
-        self.dialog_message = message;
-
-        // Create dialog state
-        const state = try self.allocator.create(DialogState);
-        state.* = try DialogState.init(self.allocator, dtype, message, default_text);
-        self.dialog_state = state;
-
-        self.mode = .dialog;
-        self.ui_dirty = true;
-    }
-
     /// Show file chooser (native OS picker)
     fn showFileChooser(self: *Viewer, payload: []const u8) !void {
         self.log("[DIALOG] showFileChooser payload={s}\n", .{payload});
@@ -2355,62 +2359,9 @@ pub const Viewer = struct {
         }
     }
 
-    /// Close dialog and send response to Chrome
-    fn closeDialog(self: *Viewer, accepted: bool) !void {
-        const state = self.dialog_state orelse return;
-
-        // Build response JSON
-        var params_buf: [4096]u8 = undefined;
-        const params = if (state.dialog_type == .prompt) blk: {
-            // Escape prompt text for JSON (handles quotes, newlines, etc.)
-            var escape_buf: [2048]u8 = undefined;
-            const escaped_text = json.escapeContents(state.getText(), &escape_buf) catch return;
-            break :blk std.fmt.bufPrint(&params_buf, "{{\"accept\":{},\"promptText\":\"{s}\"}}", .{ accepted, escaped_text }) catch return;
-        } else
-            std.fmt.bufPrint(&params_buf, "{{\"accept\":{}}}", .{accepted}) catch return;
-
-        const result = self.cdp_client.sendNavCommand("Page.handleJavaScriptDialog", params) catch |err| {
-            self.log("[DIALOG] closeDialog error: {}\n", .{err});
-            return;
-        };
-        self.allocator.free(result);
-
-        // Cleanup
-        var s = state;
-        s.deinit();
-        self.allocator.destroy(state);
-        self.dialog_state = null;
-
-        if (self.dialog_message) |msg| {
-            self.allocator.free(msg);
-            self.dialog_message = null;
-        }
-
-        self.mode = .normal;
-        self.ui_dirty = true;
-
-        // Force re-render the page
-        self.last_frame_time = 0;
-    }
-
-    /// Render dialog overlay
-    fn renderDialog(self: *Viewer, writer: anytype) !void {
-        const state = self.dialog_state orelse return;
-        const size = try self.terminal.getSize();
-        try dialog_mod.renderDialog(writer, state, size.cols, size.rows);
-    }
-
     pub fn deinit(self: *Viewer) void {
         self.input.deinit();
         if (self.prompt_buffer) |*p| p.deinit();
-        if (self.dialog_state) |state| {
-            var s = state;
-            s.deinit();
-            self.allocator.destroy(state);
-        }
-        if (self.dialog_message) |msg| {
-            self.allocator.free(msg);
-        }
         // Free allowed file system roots
         for (self.allowed_fs_roots.items) |root| {
             self.allocator.free(root);
@@ -2421,6 +2372,11 @@ pub const Viewer = struct {
             self.allocator.free(target_id);
         }
         self.pending_new_targets.deinit(self.allocator);
+        // Free tabs
+        for (self.tabs.items) |*tab| {
+            tab.deinit();
+        }
+        self.tabs.deinit(self.allocator);
         self.download_manager.deinit();
         if (self.debug_log) |file| {
             file.close();
@@ -2463,9 +2419,6 @@ pub const Viewer = struct {
 
 // Use helper functions from viewer module
 const extractUrlFromNavEvent = viewer_helpers.extractUrlFromNavEvent;
-const parseDialogType = viewer_helpers.parseDialogType;
-const parseDialogMessage = viewer_helpers.parseDialogMessage;
-const parseDefaultPrompt = viewer_helpers.parseDefaultPrompt;
 const parseFileChooserMode = viewer_helpers.parseFileChooserMode;
 const getMimeType = viewer_helpers.getMimeType;
 const base64Decode = viewer_helpers.base64Decode;

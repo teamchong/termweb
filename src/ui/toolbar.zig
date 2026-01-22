@@ -47,6 +47,7 @@ pub const ButtonIcon = enum {
     back,
     forward,
     refresh,
+    tabs,
 };
 
 /// Selection bounds for URL bar text
@@ -76,10 +77,12 @@ pub const ToolbarRenderer = struct {
     back_hover: bool = false,
     forward_hover: bool = false,
     refresh_hover: bool = false,
+    tabs_hover: bool = false,
     url_bar_hover: bool = false,
     can_go_back: bool = false,
     can_go_forward: bool = false,
     is_loading: bool = false,
+    tab_count: u32 = 1,
 
     // URL state
     current_url: []const u8 = "",
@@ -97,6 +100,8 @@ pub const ToolbarRenderer = struct {
     // Layout info
     url_bar_x: u32 = 0,
     url_bar_width: u32 = 0,
+    tab_btn_x: u32 = 0,
+    tab_btn_width: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, kitty: *KittyGraphics, width_px: u32, cell_width: u32) !ToolbarRenderer {
         // Detect High-DPI: cell_width > 14 means Retina/HiDPI
@@ -139,6 +144,10 @@ pub const ToolbarRenderer = struct {
         self.can_go_back = can_back;
         self.can_go_forward = can_forward;
         self.is_loading = loading;
+    }
+
+    pub fn setTabCount(self: *ToolbarRenderer, count: u32) void {
+        self.tab_count = count;
     }
 
     pub fn setUrl(self: *ToolbarRenderer, url: []const u8) void {
@@ -494,7 +503,21 @@ pub const ToolbarRenderer = struct {
             .x_offset = x_offset,
             .y_offset = y_offset,
         });
-        x_offset += self.button_size + self.button_padding * 2;
+        x_offset += self.button_size + self.button_padding;
+
+        // Tab button (shows tab count)
+        self.tab_btn_x = x_offset;
+        self.tab_btn_width = self.button_size + self.button_padding; // Slightly wider for text
+        const tab_rgba = try self.generateTabButton(self.tab_btn_width, self.button_size);
+        defer self.allocator.free(tab_rgba);
+
+        _ = try self.kitty.displayRawRGBA(writer, tab_rgba, self.tab_btn_width, self.button_size, .{
+            .placement_id = 106, // TAB_BTN placement ID
+            .z = 51,
+            .x_offset = x_offset,
+            .y_offset = y_offset,
+        });
+        x_offset += self.tab_btn_width + self.button_padding;
 
         // URL bar (remaining width)
         self.url_bar_x = x_offset;
@@ -521,6 +544,89 @@ pub const ToolbarRenderer = struct {
             .x_offset = x_offset,
             .y_offset = (self.toolbar_height - self.url_bar_height) / 2,
         });
+    }
+
+    /// Generate tab button with count (pill/badge style)
+    fn generateTabButton(self: *ToolbarRenderer, width: u32, height: u32) ![]u8 {
+        const size = width * height * 4;
+        const data = try self.allocator.alloc(u8, size);
+
+        // Pill style: subtle blue/purple accent when multiple tabs, gray when single
+        const bg_color: [3]u8 = if (self.tab_count > 1)
+            (if (self.tabs_hover) .{ 90, 90, 130 } else .{ 70, 70, 110 }) // Blue-ish for multiple tabs
+        else
+            (if (self.tabs_hover) .{ 75, 75, 80 } else .{ 55, 55, 60 }); // Gray for single tab
+        const border_color: [3]u8 = if (self.tab_count > 1) .{ 100, 100, 150 } else .{ 80, 80, 85 };
+        const radius: u32 = height / 2; // Full pill shape
+
+        // Draw rounded rectangle background
+        var y: u32 = 0;
+        while (y < height) : (y += 1) {
+            var x: u32 = 0;
+            while (x < width) : (x += 1) {
+                const idx = (y * width + x) * 4;
+
+                var inside = true;
+                var on_border = false;
+
+                // Check corners
+                if (x < radius and y < radius) {
+                    const dx = radius - x;
+                    const dy = radius - y;
+                    inside = dx * dx + dy * dy <= radius * radius;
+                    on_border = dx * dx + dy * dy >= (radius - 1) * (radius - 1);
+                } else if (x >= width - radius and y < radius) {
+                    const dx = x - (width - radius - 1);
+                    const dy = radius - y;
+                    inside = dx * dx + dy * dy <= radius * radius;
+                    on_border = dx * dx + dy * dy >= (radius - 1) * (radius - 1);
+                } else if (x < radius and y >= height - radius) {
+                    const dx = radius - x;
+                    const dy = y - (height - radius - 1);
+                    inside = dx * dx + dy * dy <= radius * radius;
+                    on_border = dx * dx + dy * dy >= (radius - 1) * (radius - 1);
+                } else if (x >= width - radius and y >= height - radius) {
+                    const dx = x - (width - radius - 1);
+                    const dy = y - (height - radius - 1);
+                    inside = dx * dx + dy * dy <= radius * radius;
+                    on_border = dx * dx + dy * dy >= (radius - 1) * (radius - 1);
+                } else {
+                    on_border = (x == 0 or x == width - 1 or y == 0 or y == height - 1);
+                }
+
+                if (!inside) {
+                    data[idx] = 0;
+                    data[idx + 1] = 0;
+                    data[idx + 2] = 0;
+                    data[idx + 3] = 0;
+                } else if (on_border) {
+                    data[idx] = border_color[0];
+                    data[idx + 1] = border_color[1];
+                    data[idx + 2] = border_color[2];
+                    data[idx + 3] = 255;
+                } else {
+                    data[idx] = bg_color[0];
+                    data[idx + 1] = bg_color[1];
+                    data[idx + 2] = bg_color[2];
+                    data[idx + 3] = 255;
+                }
+            }
+        }
+
+        // Render tab count text using font renderer
+        if (self.font_renderer) |*font| {
+            var count_buf: [8]u8 = undefined;
+            // Just show the number, no brackets
+            const count_text = std.fmt.bufPrint(&count_buf, "{d}", .{self.tab_count}) catch "?";
+            const text_width = font.measureText(count_text);
+            const text_x: u32 = if (width > text_width) (width - text_width) / 2 else 2;
+            const text_y: u32 = (height - font.getLineHeight()) / 2;
+            // Brighter text when multiple tabs
+            const text_color: [4]u8 = if (self.tab_count > 1) .{ 240, 240, 255, 255 } else .{ 200, 200, 200, 255 };
+            font.renderTextToBuffer(data, width, height, count_text, text_x, text_y, text_color);
+        }
+
+        return data;
     }
 
     /// Generate URL bar with text rendered directly into the image
@@ -692,6 +798,10 @@ pub const ToolbarRenderer = struct {
 
         // Refresh button
         if (pixel_x >= x and pixel_x < x + self.button_size) return .refresh;
+        x += self.button_size + self.button_padding;
+
+        // Tab button
+        if (pixel_x >= x and pixel_x < x + self.tab_btn_width) return .tabs;
 
         return null;
     }

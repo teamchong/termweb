@@ -2,7 +2,41 @@
 //!
 //! Tracks button states for the notcurses-based toolbar.
 
+const std = @import("std");
 const assets = @import("assets.zig");
+
+/// Represents a browser tab
+pub const Tab = struct {
+    target_id: []const u8,
+    url: []const u8,
+    title: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, target_id: []const u8, url: []const u8, title: []const u8) !Tab {
+        return .{
+            .target_id = try allocator.dupe(u8, target_id),
+            .url = try allocator.dupe(u8, url),
+            .title = try allocator.dupe(u8, title),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Tab) void {
+        self.allocator.free(self.target_id);
+        self.allocator.free(self.url);
+        self.allocator.free(self.title);
+    }
+
+    pub fn updateUrl(self: *Tab, new_url: []const u8) !void {
+        self.allocator.free(self.url);
+        self.url = try self.allocator.dupe(u8, new_url);
+    }
+
+    pub fn updateTitle(self: *Tab, new_title: []const u8) !void {
+        self.allocator.free(self.title);
+        self.title = try self.allocator.dupe(u8, new_title);
+    }
+};
 
 pub const ButtonState = enum {
     normal,

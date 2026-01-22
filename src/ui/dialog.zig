@@ -450,3 +450,129 @@ fn tryKdialog(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: 
 
     return result.stdout;
 }
+
+/// Show native OS list picker dialog
+/// Returns the selected item index (0-based) or null if cancelled
+pub fn showNativeListPicker(
+    allocator: std.mem.Allocator,
+    title: []const u8,
+    items: []const []const u8,
+) !?usize {
+    if (builtin.os.tag == .macos) {
+        return showMacOSListPicker(allocator, title, items);
+    } else if (builtin.os.tag == .linux) {
+        return showLinuxListPicker(allocator, title, items);
+    }
+    return null;
+}
+
+fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: []const []const u8) !?usize {
+    if (items.len == 0) return null;
+
+    // Build AppleScript list string: {"item1", "item2", ...}
+    var list_buf = try std.ArrayList(u8).initCapacity(allocator, 256);
+    defer list_buf.deinit(allocator);
+
+    try list_buf.appendSlice(allocator, "{");
+    for (items, 0..) |item, i| {
+        if (i > 0) try list_buf.appendSlice(allocator, ", ");
+        try list_buf.appendSlice(allocator, "\"");
+        // Escape quotes in item
+        for (item) |c| {
+            if (c == '"') {
+                try list_buf.appendSlice(allocator, "\\\"");
+            } else if (c == '\\') {
+                try list_buf.appendSlice(allocator, "\\\\");
+            } else {
+                try list_buf.append(allocator, c);
+            }
+        }
+        try list_buf.appendSlice(allocator, "\"");
+    }
+    try list_buf.appendSlice(allocator, "}");
+
+    // Build script
+    var script_buf: [4096]u8 = undefined;
+    const script = std.fmt.bufPrint(&script_buf,
+        \\set theList to {s}
+        \\set theChoice to choose from list theList with prompt "{s}" default items {{item 1 of theList}}
+        \\if theChoice is false then
+        \\    return ""
+        \\else
+        \\    return item 1 of theChoice
+        \\end if
+    , .{ list_buf.items, title }) catch return null;
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "osascript", "-e", script },
+    }) catch return null;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+
+    // Check if cancelled
+    if (result.term.Exited != 0 or result.stdout.len == 0) {
+        return null;
+    }
+
+    // Trim trailing newline
+    var selected = result.stdout;
+    while (selected.len > 0 and (selected[selected.len - 1] == '\n' or selected[selected.len - 1] == '\r')) {
+        selected = selected[0 .. selected.len - 1];
+    }
+
+    if (selected.len == 0) return null;
+
+    // Find which item was selected
+    for (items, 0..) |item, i| {
+        if (std.mem.eql(u8, item, selected)) {
+            return i;
+        }
+    }
+
+    return null;
+}
+
+fn showLinuxListPicker(allocator: std.mem.Allocator, title: []const u8, items: []const []const u8) !?usize {
+    if (items.len == 0) return null;
+
+    // Try zenity first
+    var argv_list = try std.ArrayList([]const u8).initCapacity(allocator, 8 + items.len);
+    defer argv_list.deinit(allocator);
+
+    try argv_list.append(allocator, "zenity");
+    try argv_list.append(allocator, "--list");
+    try argv_list.append(allocator, "--title");
+    try argv_list.append(allocator, title);
+    try argv_list.append(allocator, "--column");
+    try argv_list.append(allocator, "Tab");
+
+    for (items) |item| {
+        try argv_list.append(allocator, item);
+    }
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv_list.items,
+    }) catch return null;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+
+    if (result.term.Exited != 0 or result.stdout.len == 0) {
+        return null;
+    }
+
+    // Trim and find index
+    var selected = result.stdout;
+    while (selected.len > 0 and (selected[selected.len - 1] == '\n' or selected[selected.len - 1] == '\r')) {
+        selected = selected[0 .. selected.len - 1];
+    }
+
+    for (items, 0..) |item, i| {
+        if (std.mem.eql(u8, item, selected)) {
+            return i;
+        }
+    }
+
+    return null;
+}

@@ -22,6 +22,7 @@ pub const ZIndex = layout.ZIndex;
 pub const Dimensions = layout.Dimensions;
 pub const ButtonState = state.ButtonState;
 pub const UIState = state.UIState;
+pub const Tab = state.Tab;
 pub const ToolbarRenderer = toolbar.ToolbarRenderer;
 pub const DialogType = dialog.DialogType;
 pub const DialogState = dialog.DialogState;

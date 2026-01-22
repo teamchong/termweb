@@ -276,8 +276,14 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--no-default-browser-check");
     try args_list.append(allocator, "--allow-file-access-from-files");
     try args_list.append(allocator, "--enable-features=FileSystemAccessAPI,FileSystemAccessLocal");
-    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts,DownloadBubble,DownloadBubbleV2");
+    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts,DownloadBubble,DownloadBubbleV2,TabHoverCardImages,TabSearch,SidePanel");
     try args_list.append(allocator, "--disable-infobars"); // Disable download shelf/bar
+    try args_list.append(allocator, "--hide-scrollbars"); // Hide scrollbars in viewport
+    try args_list.append(allocator, "--disable-translate"); // Disable translate bar
+    try args_list.append(allocator, "--disable-extensions"); // Disable extensions that might add UI
+    try args_list.append(allocator, "--disable-component-extensions-with-background-pages"); // Disable background extensions
+    try args_list.append(allocator, "--disable-background-networking"); // Prevent background updates
+    try args_list.append(allocator, "--enable-features=DownloadShelfInToolbar:hidden/true"); // Hide download shelf
 
     if (options.disable_gpu) {
         try args_list.append(allocator, "--disable-gpu");

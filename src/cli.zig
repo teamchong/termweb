@@ -117,7 +117,10 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         defer allocator.free(abs_path);
         normalized_url = try std.fmt.allocPrint(allocator, "file://{s}", .{abs_path});
         url = normalized_url.?;
-    } else if (!std.mem.containsAtLeast(u8, url, 1, "://")) {
+    } else if (!std.mem.containsAtLeast(u8, url, 1, "://") and
+        !std.mem.startsWith(u8, url, "data:") and
+        !std.mem.startsWith(u8, url, "javascript:"))
+    {
         // Check if it's a local file that exists even without prefix
         if (std.fs.cwd().access(url, .{})) |_| {
             const abs_path = try std.fs.cwd().realpathAlloc(allocator, url);
