@@ -600,4 +600,50 @@ pub const CdpClient = struct {
     pub fn checkNavigationHappened(self: *CdpClient) bool {
         return self.pipe_client.checkNavigationHappened();
     }
+
+    /// Switch to a different target (for tab switching)
+    /// Attaches to the target and updates the session ID
+    pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {
+        logToFile("[CDP] Switching to target: {s}\n", .{target_id});
+
+        // Activate the target in Chrome (brings it to focus)
+        var activate_buf: [256]u8 = undefined;
+        const activate_params = std.fmt.bufPrint(&activate_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
+        const activate_result = self.pipe_client.sendCommand("Target.activateTarget", activate_params) catch |err| {
+            logToFile("[CDP] Target.activateTarget failed: {}\n", .{err});
+            return err;
+        };
+        self.allocator.free(activate_result);
+
+        // Attach to the target to get a new session
+        var escape_buf: [512]u8 = undefined;
+        const escaped_id = json_utils.escapeContents(target_id, &escape_buf) catch return error.OutOfMemory;
+        const params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"targetId\":\"{s}\",\"flatten\":true}}",
+            .{escaped_id},
+        );
+        defer self.allocator.free(params);
+
+        const attach_response = self.pipe_client.sendCommand("Target.attachToTarget", params) catch |err| {
+            logToFile("[CDP] Target.attachToTarget failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(attach_response);
+
+        // Extract and update session ID
+        const new_session_id = try self.extractSessionId(attach_response);
+
+        // Free old session ID and set new one
+        if (self.session_id) |old_sid| {
+            self.allocator.free(old_sid);
+        }
+        self.session_id = new_session_id;
+
+        logToFile("[CDP] Switched to target, new session: {s}\n", .{new_session_id});
+
+        // Re-enable Page domain on the new session (for events)
+        const page_result = try self.sendCommand("Page.enable", null);
+        self.allocator.free(page_result);
+    }
 };

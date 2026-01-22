@@ -1596,8 +1596,8 @@ pub const Viewer = struct {
             self.log("[NEW TARGET] Failed to add tab: {}\n", .{err});
         };
 
-        // Close the browser target (we manage tabs ourselves)
-        self.closeBrowserTarget(target_id);
+        // Keep the browser target alive for fast tab switching
+        // (Previously we closed it immediately, forcing re-navigation on switch)
     }
 
     /// Add a new tab to the tabs list
@@ -1615,6 +1615,7 @@ pub const Viewer = struct {
     }
 
     /// Handle Target.targetInfoChanged - URL may now be available for pending targets
+    /// Also updates URL for existing tabs when they navigate
     fn handleTargetInfoChanged(self: *Viewer, payload: []const u8) void {
         // Extract targetId
         const target_id_marker = "\"targetId\":\"";
@@ -1623,7 +1624,28 @@ pub const Viewer = struct {
         const id_end = std.mem.indexOfPos(u8, payload, id_start, "\"") orelse return;
         const target_id = payload[id_start..id_end];
 
-        // Check if this is a pending target
+        // Extract URL
+        const url_marker = "\"url\":\"";
+        const url_start = std.mem.indexOf(u8, payload, url_marker) orelse return;
+        const u_start = url_start + url_marker.len;
+        const u_end = std.mem.indexOfPos(u8, payload, u_start, "\"") orelse return;
+        const url = payload[u_start..u_end];
+
+        // Skip if empty or about:blank
+        if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return;
+
+        // First, check if this target is an existing tab - update its URL
+        for (self.tabs.items) |*tab| {
+            if (std.mem.eql(u8, tab.target_id, target_id)) {
+                if (!std.mem.eql(u8, tab.url, url)) {
+                    self.log("[TARGET INFO CHANGED] Updating tab URL: {s} -> {s}\n", .{ tab.url, url });
+                    tab.updateUrl(url) catch {};
+                }
+                return;
+            }
+        }
+
+        // Check if this is a pending target (new tab waiting for URL)
         var found_index: ?usize = null;
         for (self.pending_new_targets.items, 0..) |pending_id, i| {
             if (std.mem.eql(u8, pending_id, target_id)) {
@@ -1634,29 +1656,16 @@ pub const Viewer = struct {
 
         if (found_index == null) return; // Not a pending target
 
-        // Extract URL
-        const url_marker = "\"url\":\"";
-        const url_start = std.mem.indexOf(u8, payload, url_marker) orelse return;
-        const u_start = url_start + url_marker.len;
-        const u_end = std.mem.indexOfPos(u8, payload, u_start, "\"") orelse return;
-        const url = payload[u_start..u_end];
-
-        // Skip if still empty or about:blank
-        if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return;
-
-        self.log("[TARGET INFO CHANGED] URL ready: id={s} url={s}\n", .{ target_id, url });
+        self.log("[TARGET INFO CHANGED] URL ready for new tab: id={s} url={s}\n", .{ target_id, url });
 
         // Remove from pending list
         const removed_id = self.pending_new_targets.orderedRemove(found_index.?);
         self.allocator.free(removed_id);
 
-        // Add new tab to our tab list
+        // Add new tab to our tab list (keep target alive for fast switching)
         self.addTab(target_id, url, "") catch |err| {
             self.log("[TARGET INFO CHANGED] Failed to add tab: {}\n", .{err});
         };
-
-        // Close the browser target (we manage tabs ourselves)
-        self.closeBrowserTarget(target_id);
     }
 
     /// Launch termweb in a new terminal window
@@ -1709,18 +1718,6 @@ pub const Viewer = struct {
         self.log("[NEW TAB] Launched: {s}\n", .{url});
     }
 
-    /// Close a browser target
-    fn closeBrowserTarget(self: *Viewer, target_id: []const u8) void {
-        // Send Target.closeTarget to browser_ws
-        var params_buf: [256]u8 = undefined;
-        const params = std.fmt.bufPrint(&params_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return;
-
-        if (self.cdp_client.browser_ws) |bws| {
-            bws.sendCommandAsync("Target.closeTarget", params);
-            self.log("[NEW TARGET] Closed browser target: {s}\n", .{target_id});
-        }
-    }
-
     /// Show native tab picker dialog
     fn showTabPicker(self: *Viewer) !void {
         if (self.tabs.items.len == 0) {
@@ -1770,10 +1767,24 @@ pub const Viewer = struct {
         self.active_tab_index = index;
         const tab = self.tabs.items[index];
 
-        self.log("[TABS] Switching to tab {}: {s}\n", .{ index, tab.url });
+        self.log("[TABS] Switching to tab {}: {s} (target={s})\n", .{ index, tab.url, tab.target_id });
 
-        // Navigate to the tab's URL
-        _ = try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, tab.url);
+        // Switch to the target (attaches to existing browser target - fast!)
+        self.cdp_client.switchToTarget(tab.target_id) catch |err| {
+            self.log("[TABS] switchToTarget failed: {}, falling back to navigation\n", .{err});
+            // Fallback to navigation if target switch fails (target may have been closed)
+            _ = try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, tab.url);
+        };
+
+        // Restart screencast on the new target
+        screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
+            .format = self.screencast_format,
+            .quality = 80,
+            .width = self.viewport_width,
+            .height = self.viewport_height,
+        }) catch |err| {
+            self.log("[TABS] startScreencast failed after switch: {}\n", .{err});
+        };
 
         // Update URL display
         if (self.toolbar_renderer) |*renderer| {
