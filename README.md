@@ -64,6 +64,7 @@ termweb help
 | `Ctrl+Q` / `Ctrl+W` | Quit |
 | `Ctrl+L` | Focus address bar |
 | `Ctrl+R` | Reload page |
+| `Ctrl+T` | Show tab picker |
 | `Ctrl+C` | Copy selection |
 | `Ctrl+X` | Cut selection |
 | `Ctrl+V` | Paste |

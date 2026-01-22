@@ -25,6 +25,7 @@ pub const AppAction = enum {
     cut,
     paste,
     select_all,
+    tab_picker,
 };
 
 /// Shortcut definition
@@ -51,6 +52,9 @@ pub const app_shortcuts = [_]ShortcutDef{
     .{ .key = 'x', .action = .cut },
     .{ .key = 'v', .action = .paste },
     .{ .key = 'a', .action = .select_all },
+
+    // Tab management
+    .{ .key = 't', .action = .tab_picker },
 };
 
 /// Find an app action for a key event.

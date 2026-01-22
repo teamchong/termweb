@@ -1158,6 +1158,11 @@ pub const Viewer = struct {
                     interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'a', 4); // 4 = meta
                 }
             },
+            .tab_picker => {
+                self.showTabPicker() catch |err| {
+                    self.log("[TAB_PICKER] Failed: {}\n", .{err});
+                };
+            },
         }
     }
 
