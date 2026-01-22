@@ -252,6 +252,31 @@ pub fn updateBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocat
     allocator.free(result);
 }
 
+/// Execute copy command via document.execCommand - triggers same flow as menu copy
+/// This fires the copy event which our polyfill catches
+pub fn execCopy(client: *cdp.CdpClient) void {
+    const js = "document.execCommand('copy')";
+    var params_buf: [256]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{js}) catch return;
+    client.sendCommandAsync("Runtime.evaluate", params) catch {};
+}
+
+/// Execute cut command via document.execCommand - triggers same flow as menu cut
+pub fn execCut(client: *cdp.CdpClient) void {
+    const js = "document.execCommand('cut')";
+    var params_buf: [256]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{js}) catch return;
+    client.sendCommandAsync("Runtime.evaluate", params) catch {};
+}
+
+/// Clear browser's cached clipboard data - prevents polyfill from intercepting paste
+pub fn clearBrowserClipboard(client: *cdp.CdpClient) void {
+    const js = "window._termwebClipboardData = ''";
+    var params_buf: [256]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{js}) catch return;
+    client.sendCommandAsync("Runtime.evaluate", params) catch {};
+}
+
 /// Read text from browser's clipboard - tries polyfill cache first, then Clipboard API
 /// Returns allocated string that caller must free, or null if failed
 pub fn readBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocator) ?[]const u8 {

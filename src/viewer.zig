@@ -1090,9 +1090,8 @@ pub const Viewer = struct {
                         renderer.handleCopy(self.allocator);
                     }
                 } else {
-                    // Send Cmd+C to browser
-                    // Note: Copy to host clipboard doesn't work for Monaco/VSCode due to iframe isolation
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'c', 4);
+                    // Use execCommand('copy') - same as menu copy, triggers polyfill
+                    interact_mod.execCopy(self.cdp_client);
                 }
             },
             .cut => {
@@ -1102,8 +1101,8 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
-                    // Just send Cmd+X to browser - Monaco will cut directly to system clipboard
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'x', 4);
+                    // Use execCommand('cut') - same as menu cut, triggers polyfill
+                    interact_mod.execCut(self.cdp_client);
                 }
             },
             .paste => {
@@ -1113,8 +1112,9 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 } else {
-                    // Get system clipboard and insert directly via Input.insertText
-                    // This bypasses Monaco's paste handler which auto-formats
+                    // Clear browser clipboard cache so polyfill doesn't intercept our paste
+                    interact_mod.clearBrowserClipboard(self.cdp_client);
+                    // Get system clipboard and insert via synthetic ClipboardEvent
                     const toolbar = @import("ui/toolbar.zig");
                     if (toolbar.pasteFromClipboard(self.allocator)) |clipboard| {
                         defer self.allocator.free(clipboard);
