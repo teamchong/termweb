@@ -1698,9 +1698,43 @@ pub const Viewer = struct {
     }
 
     /// Launch termweb in a new terminal tab/window
-    /// TODO: Implement terminal-specific launching
     fn launchInNewTerminal(self: *Viewer, url: []const u8) void {
-        self.log("[NEW TAB] Would open: {s}\n", .{url});
+        // Get full path to current executable
+        var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+            self.log("[NEW TAB] Failed to get exe path\n", .{});
+            return;
+        };
+
+        // Detect terminal type
+        const term_program = std.posix.getenv("TERM_PROGRAM") orelse "";
+        const term = std.posix.getenv("TERM") orelse "";
+        self.log("[NEW TAB] TERM_PROGRAM={s} TERM={s}\n", .{ term_program, term });
+
+        // Try terminal-specific launch methods
+        if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
+            // Ghostty - use open -na to launch new window (need capitalized app name)
+            const argv = [_][]const u8{ "open", "-na", "Ghostty", "--args", "-e", exe_path, "open", url };
+            var child = std.process.Child.init(&argv, self.allocator);
+            child.spawn() catch |err| {
+                self.log("[NEW TAB] Ghostty launch failed: {}\n", .{err});
+                return;
+            };
+            self.log("[NEW TAB] Launched in Ghostty: {s}\n", .{url});
+        } else if (std.posix.getenv("KITTY_LISTEN_ON") != null or std.mem.eql(u8, term, "xterm-kitty")) {
+            // Kitty - use remote control protocol
+            const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", exe_path, "open", url };
+            var child = std.process.Child.init(&argv, self.allocator);
+            child.spawn() catch |err| {
+                self.log("[NEW TAB] Kitty launch failed: {}\n", .{err});
+                return;
+            };
+            _ = child.wait() catch {};
+            self.log("[NEW TAB] Launched in Kitty: {s}\n", .{url});
+        } else {
+            // Fallback - just log
+            self.log("[NEW TAB] No supported terminal. URL: {s}\n", .{url});
+        }
     }
 
     /// Close a browser target
