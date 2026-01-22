@@ -1737,9 +1737,8 @@ pub const Viewer = struct {
                 self.log("[NEW TAB] Failed to get exe path\n", .{});
                 return;
             };
-            const cmd = std.fmt.allocPrint(self.allocator, "{s} open {s}", .{ exe_path, url }) catch return;
-            defer self.allocator.free(cmd);
-            const argv = [_][]const u8{ "ghostty", "-e", cmd };
+            // Pass arguments separately to ghostty -e
+            const argv = [_][]const u8{ "ghostty", "-e", exe_path, "open", url };
             var child = std.process.Child.init(&argv, self.allocator);
             child.spawn() catch |err| {
                 self.log("[NEW TAB] Failed to launch Ghostty: {}\n", .{err});
