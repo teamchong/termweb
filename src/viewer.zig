@@ -2451,6 +2451,11 @@ pub const Viewer = struct {
             self.allocator.free(root);
         }
         self.allowed_fs_roots.deinit(self.allocator);
+        // Free pending new targets
+        for (self.pending_new_targets.items) |target_id| {
+            self.allocator.free(target_id);
+        }
+        self.pending_new_targets.deinit(self.allocator);
         self.download_manager.deinit();
         if (self.debug_log) |file| {
             file.close();
