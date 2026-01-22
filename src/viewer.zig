@@ -1643,6 +1643,12 @@ pub const Viewer = struct {
             return;
         }
 
+        // Skip targets that are already attached (that's our main page)
+        if (std.mem.indexOf(u8, payload, "\"attached\":true") != null) {
+            self.log("[NEW TARGET] Ignoring attached target (our page)\n", .{});
+            return;
+        }
+
         // Extract URL
         const url_marker = "\"url\":\"";
         const url_start = std.mem.indexOf(u8, payload, url_marker) orelse return;
