@@ -1726,23 +1726,37 @@ pub const Viewer = struct {
         const term = std.posix.getenv("TERM") orelse "";
         const term_program = std.posix.getenv("TERM_PROGRAM") orelse "";
 
-        std.debug.print("[NEW TAB] Detecting terminal...\n", .{});
-        std.debug.print("[NEW TAB] KITTY_LISTEN_ON={s}\n", .{kitty_listen orelse "(not set)"});
-        std.debug.print("[NEW TAB] TERM={s}\n", .{term});
-        std.debug.print("[NEW TAB] TERM_PROGRAM={s}\n", .{term_program});
+        self.log("[NEW TAB] Detecting terminal: TERM={s} TERM_PROGRAM={s}\n", .{ term, term_program });
 
-        if (kitty_listen != null or std.mem.eql(u8, term, "xterm-kitty")) {
-            // Kitty terminal - use remote control
-            const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", "termweb", "open", url };
+        if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
+            // Ghostty terminal - use osascript to open new window
+            self.log("[NEW TAB] Launching in Ghostty\n", .{});
+            const script = std.fmt.allocPrint(self.allocator,
+                "tell application \"Ghostty\" to activate\ntell application \"System Events\" to keystroke \"t\" using command down\ndelay 0.3\ntell application \"System Events\" to keystroke \"termweb open {s}\"\ntell application \"System Events\" to key code 36",
+                .{url}) catch return;
+            defer self.allocator.free(script);
+            const argv = [_][]const u8{ "osascript", "-e", script };
             var child = std.process.Child.init(&argv, self.allocator);
             child.spawn() catch |err| {
-                std.debug.print("[NEW TAB] Failed to launch kitty tab: {}\n", .{err});
+                self.log("[NEW TAB] Failed to launch Ghostty tab: {}\n", .{err});
                 return;
             };
             _ = child.wait() catch {};
-            std.debug.print("[NEW TAB] Launched in Kitty tab: {s}\n", .{url});
+            self.log("[NEW TAB] Launched in Ghostty: {s}\n", .{url});
+        } else if (kitty_listen != null or std.mem.eql(u8, term, "xterm-kitty")) {
+            // Kitty terminal - use remote control
+            self.log("[NEW TAB] Launching in Kitty\n", .{});
+            const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", "termweb", "open", url };
+            var child = std.process.Child.init(&argv, self.allocator);
+            child.spawn() catch |err| {
+                self.log("[NEW TAB] Failed to launch kitty tab: {}\n", .{err});
+                return;
+            };
+            _ = child.wait() catch {};
+            self.log("[NEW TAB] Launched in Kitty tab: {s}\n", .{url});
         } else if (std.mem.eql(u8, term_program, "iTerm.app")) {
             // iTerm2 - use osascript
+            self.log("[NEW TAB] Launching in iTerm2\n", .{});
             const script = std.fmt.allocPrint(self.allocator,
                 "tell application \"iTerm2\" to tell current window to create tab with default profile command \"termweb open {s}\"",
                 .{url}) catch return;
@@ -1750,13 +1764,14 @@ pub const Viewer = struct {
             const argv = [_][]const u8{ "osascript", "-e", script };
             var child = std.process.Child.init(&argv, self.allocator);
             child.spawn() catch |err| {
-                std.debug.print("[NEW TAB] Failed to launch iTerm tab: {}\n", .{err});
+                self.log("[NEW TAB] Failed to launch iTerm tab: {}\n", .{err});
                 return;
             };
             _ = child.wait() catch {};
-            std.debug.print("[NEW TAB] Launched in iTerm tab: {s}\n", .{url});
+            self.log("[NEW TAB] Launched in iTerm tab: {s}\n", .{url});
         } else if (std.mem.eql(u8, term_program, "Apple_Terminal")) {
             // macOS Terminal.app
+            self.log("[NEW TAB] Launching in Terminal.app\n", .{});
             const script = std.fmt.allocPrint(self.allocator,
                 "tell application \"Terminal\" to do script \"termweb open {s}\"",
                 .{url}) catch return;
@@ -1764,15 +1779,14 @@ pub const Viewer = struct {
             const argv = [_][]const u8{ "osascript", "-e", script };
             var child = std.process.Child.init(&argv, self.allocator);
             child.spawn() catch |err| {
-                std.debug.print("[NEW TAB] Failed to launch Terminal tab: {}\n", .{err});
+                self.log("[NEW TAB] Failed to launch Terminal tab: {}\n", .{err});
                 return;
             };
             _ = child.wait() catch {};
-            std.debug.print("[NEW TAB] Launched in Terminal: {s}\n", .{url});
+            self.log("[NEW TAB] Launched in Terminal: {s}\n", .{url});
         } else {
-            // Fallback - just print URL
-            std.debug.print("[NEW TAB] No supported terminal detected. URL: {s}\n", .{url});
-            std.debug.print("[NEW TAB] Set KITTY_LISTEN_ON or use Kitty/iTerm2/Terminal.app\n", .{});
+            // Fallback - just log URL
+            self.log("[NEW TAB] No supported terminal detected. URL: {s}\n", .{url});
         }
     }
 
