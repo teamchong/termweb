@@ -1713,14 +1713,14 @@ pub const Viewer = struct {
 
         // Try terminal-specific launch methods
         if (std.mem.eql(u8, term_program, "ghostty") or std.mem.indexOf(u8, term, "ghostty") != null) {
-            // Ghostty - use open -na to launch new window (need capitalized app name)
-            const argv = [_][]const u8{ "open", "-na", "Ghostty", "--args", "-e", exe_path, "open", url };
+            // Ghostty - use ghostty -e to launch new window with command
+            const argv = [_][]const u8{ term_program, "-e", exe_path, "open", url };
             var child = std.process.Child.init(&argv, self.allocator);
             child.spawn() catch |err| {
                 self.log("[NEW TAB] Ghostty launch failed: {}\n", .{err});
                 return;
             };
-            self.log("[NEW TAB] Launched in Ghostty: {s}\n", .{url});
+            self.log("[NEW TAB] Launched in {s}: {s}\n", .{ term_program, url });
         } else if (std.posix.getenv("KITTY_LISTEN_ON") != null or std.mem.eql(u8, term, "xterm-kitty")) {
             // Kitty - use remote control protocol
             const argv = [_][]const u8{ "kitty", "@", "launch", "--type=tab", exe_path, "open", url };
