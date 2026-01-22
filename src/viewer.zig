@@ -166,8 +166,12 @@ pub const Viewer = struct {
         viewport_width: u32,
         viewport_height: u32,
     ) !Viewer {
-        // Create debug log file
-        const debug_log = std.fs.cwd().createFile("termweb_debug.log", .{}) catch null;
+        // Create debug log file only if TERMWEB_DEBUG=1
+        const debug_enabled = viewer_helpers.envVarTruthy(allocator, "TERMWEB_DEBUG");
+        const debug_log = if (debug_enabled)
+            std.fs.cwd().createFile("termweb_debug.log", .{}) catch null
+        else
+            null;
         if (debug_log) |file| {
             file.writeAll("=== termweb debug log ===\n") catch {};
         }
