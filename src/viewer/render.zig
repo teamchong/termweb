@@ -37,11 +37,13 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     // Resolution-based FPS limiting (check AFTER getting frame to ensure ACKs flow)
     const min_interval = getMinFrameInterval(viewer.viewport_width, viewer.viewport_height);
     if (viewer.last_frame_time > 0 and (now - viewer.last_frame_time) < min_interval) {
+        viewer.log("[RENDER] FPS throttle: skipping frame gen={} (too soon)\n", .{frame.generation});
         return false; // Too soon, skip render but frame was ACKed
     }
 
     // Throttle: Don't re-render the same frame multiple times
     if (viewer.last_rendered_generation > 0 and frame.generation <= viewer.last_rendered_generation) {
+        viewer.log("[RENDER] Gen throttle: skipping frame gen={} (already rendered {})\n", .{ frame.generation, viewer.last_rendered_generation });
         return false;
     }
 
@@ -96,8 +98,9 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         const max_ms = @divFloor(viewer.perf_max_render_ns, @as(i128, std.time.ns_per_ms));
         const target_fps = getMaxFpsForResolution(viewer.viewport_width, viewer.viewport_height);
 
-        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}\n", .{
+        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}, content_id={?}, cursor_id={?}, gen={}\n", .{
             viewer.perf_frame_count, avg_ms, max_ms, target_fps, viewer.frames_skipped,
+            viewer.last_content_image_id, viewer.cursor_image_id, viewer.last_rendered_generation,
         });
 
         // Reset counters

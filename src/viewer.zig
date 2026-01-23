@@ -368,17 +368,17 @@ pub const Viewer = struct {
         self.screencast_mode = true;
         self.log("[DEBUG] Screencast started\n", .{});
 
-        // Wait for first frame
+        // Wait for first frame (3 second timeout)
         self.log("[DEBUG] Waiting for first screencast frame...\n", .{});
         var retries: u32 = 0;
-        while (retries < 100) : (retries += 1) {
+        while (retries < 300) : (retries += 1) {
             if (try self.tryRenderScreencast()) {
-                self.log("[DEBUG] First frame received\n", .{});
+                self.log("[DEBUG] First frame received after {} retries\n", .{retries});
                 break;
             }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
-        if (retries >= 100) {
+        if (retries >= 300) {
             return error.ScreencastTimeout;
         }
 
@@ -457,7 +457,20 @@ pub const Viewer = struct {
             // Render new screencast frames (non-blocking) - in all modes
             // Page should continue updating even when typing in address bar
             if (self.screencast_mode) {
-                const new_frame = self.tryRenderScreencast() catch false;
+                const new_frame = self.tryRenderScreencast() catch |err| blk: {
+                    self.log("[RENDER] tryRenderScreencast error: {}\n", .{err});
+                    break :blk false;
+                };
+
+                // Diagnostic: warn if no frame rendered for 2+ seconds
+                const now_ns = std.time.nanoTimestamp();
+                if (self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 2 * std.time.ns_per_s) {
+                    if (loop_count % 200 == 0) { // Limit log spam
+                        self.log("[STALL] No frame rendered for >2s, frames_received={}, last_gen={}\n", .{
+                            self.cdp_client.getFrameCount(), self.last_rendered_generation,
+                        });
+                    }
+                }
 
                 // Reset loading state when we get a new frame (page has loaded)
                 // But only after minimum 300ms to ensure user sees the stop button
@@ -640,6 +653,7 @@ pub const Viewer = struct {
         // Reset frame tracking - next frame will render immediately
         self.last_frame_time = 0;
         self.last_content_image_id = null; // Force new image ID after resize
+        self.cursor_image_id = null; // Reset cursor image ID as well
 
         self.log("[RESIZE] Viewport updated to {}x{}\n", .{ new_width, new_height });
     }
@@ -689,6 +703,18 @@ pub const Viewer = struct {
         self.last_frame_time = 0;
         self.last_rendered_generation = 0;
         self.frames_skipped = 0;
+
+        // Delete old images before resetting IDs (prevents terminal memory leak)
+        if (self.last_content_image_id != null or self.cursor_image_id != null) {
+            var buf: [256]u8 = undefined;
+            const stdout = std.fs.File.stdout();
+            var w = stdout.writer(&buf);
+            if (self.last_content_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
+            if (self.cursor_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
+            w.interface.flush() catch {};
+        }
+        self.last_content_image_id = null;
+        self.cursor_image_id = null;
 
         self.log("[RESET] Screencast reset complete\n", .{});
     }
@@ -1112,6 +1138,18 @@ pub const Viewer = struct {
         // Update current_url
         self.allocator.free(self.current_url);
         self.current_url = try self.allocator.dupe(u8, tab.url);
+
+        // Delete old images before resetting IDs (prevents terminal memory leak)
+        if (self.last_content_image_id != null or self.cursor_image_id != null) {
+            var buf: [256]u8 = undefined;
+            const stdout = std.fs.File.stdout();
+            var w = stdout.writer(&buf);
+            if (self.last_content_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
+            if (self.cursor_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
+            w.interface.flush() catch {};
+        }
+        self.last_content_image_id = null;
+        self.cursor_image_id = null;
 
         self.ui_dirty = true;
     }

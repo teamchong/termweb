@@ -39,7 +39,7 @@ https://github.com/user-attachments/assets/192411f7-ac5e-44b1-a09c-1d070ef85c3f
 
 ```bash
 # Run directly with npx
-npx termweb open https://example.com
+npx termweb@latest open https://example.com
 
 # Or install globally
 npm install -g termweb

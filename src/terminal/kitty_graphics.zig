@@ -50,6 +50,8 @@ pub const KittyGraphics = struct {
         const image_id = opts.image_id orelse blk: {
             const id = self.next_image_id;
             self.next_image_id += 1;
+            // Wrap around to prevent u32 overflow (after ~2072 days of continuous use at 24fps)
+            if (self.next_image_id > 0xFFFFFFF0) self.next_image_id = 1;
             break :blk id;
         };
 
