@@ -243,13 +243,13 @@ pub const MouseEventBus = struct {
                 }
             },
             .move, .drag => {
-                // Send moves immediately for low latency
+                // Throttle moves - keep latest only, dispatch on tick
                 if (mapper.terminalToBrowser(term_x, term_y)) |coords| {
-                    self.sendMove(MoveEvent{
+                    self.pending_move = MoveEvent{
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                         .buttons_state = self.buttons_state,
-                    });
+                    };
                 }
             },
         }
@@ -267,9 +267,15 @@ pub const MouseEventBus = struct {
         }
     }
 
-    /// Dispatch pending wheel events (clicks and moves are now immediate)
+    /// Dispatch pending events (moves and wheel are throttled)
     fn tick(self: *MouseEventBus) void {
-        // Only wheel is queued - clicks and moves are immediate
+        // Dispatch pending move (throttled to ~60fps)
+        if (self.pending_move) |move| {
+            self.sendMove(move);
+            self.pending_move = null;
+        }
+
+        // Dispatch pending wheel
         if (self.pending_wheel) |wheel| {
             self.sendWheel(wheel);
             self.pending_wheel = null;
@@ -337,9 +343,9 @@ pub const MouseEventBus = struct {
         ) catch {};
     }
 
-    /// Clear pending wheel events (e.g., on mode change)
-    /// Note: clicks and moves are now immediate, only wheel is queued
+    /// Clear pending events (e.g., on mode change)
     pub fn clear(self: *MouseEventBus) void {
+        self.pending_move = null;
         self.pending_wheel = null;
     }
 
