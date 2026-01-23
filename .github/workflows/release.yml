@@ -14,7 +14,8 @@ jobs:
             arch: aarch64
             target: aarch64-macos
             name: termweb-macos-aarch64
-          - os: macos-latest
+          # macos-13 is the last x86_64 runner (macos-14+ are ARM64 only)
+          - os: macos-13
             arch: x86_64
             target: x86_64-macos
             name: termweb-macos-x86_64
