@@ -51,9 +51,8 @@ pub const ShortcutDef = struct {
 /// App shortcuts that are intercepted (not sent to browser)
 /// All shortcuts use Ctrl for cross-platform consistency
 pub const app_shortcuts = [_]ShortcutDef{
-    // Quit shortcuts
+    // Quit shortcut
     .{ .key = .{ .char = 'q' }, .shortcut_mod = false, .ctrl = true, .action = .quit },
-    .{ .key = .{ .char = 'w' }, .shortcut_mod = false, .ctrl = true, .action = .quit },
 
     // Navigation
     .{ .key = .{ .char = 'l' }, .shortcut_mod = false, .ctrl = true, .action = .address_bar },

@@ -75,19 +75,22 @@ termweb help
 ## Controls
 
 ### Keyboard
+
+> **Note:** On macOS use `Cmd`, on Linux use `Ctrl`
+
 | Key | Action |
 |-----|--------|
-| `Ctrl+Q` / `Ctrl+W` | Quit |
-| `Ctrl+L` | Focus address bar |
-| `Ctrl+R` | Reload page |
-| `Ctrl+[` | Go back |
-| `Ctrl+]` | Go forward |
-| `Ctrl+.` | Stop loading |
-| `Ctrl+T` | Show tab picker |
-| `Ctrl+C` | Copy selection |
-| `Ctrl+X` | Cut selection |
-| `Ctrl+V` | Paste |
-| `Ctrl+A` | Select all |
+| `Cmd/Ctrl+Q` | Quit |
+| `Cmd/Ctrl+L` | Focus address bar |
+| `Cmd/Ctrl+R` | Reload page |
+| `Cmd/Ctrl+[` | Go back |
+| `Cmd/Ctrl+]` | Go forward |
+| `Cmd/Ctrl+.` | Stop loading |
+| `Cmd/Ctrl+T` | Show tab picker |
+| `Cmd/Ctrl+C` | Copy selection |
+| `Cmd/Ctrl+X` | Cut selection |
+| `Cmd/Ctrl+V` | Paste |
+| `Cmd/Ctrl+A` | Select all |
 
 ### Mouse
 - **Click** - Interact with page elements (links, buttons, inputs)

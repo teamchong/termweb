@@ -462,14 +462,13 @@ pub const Viewer = struct {
                     break :blk false;
                 };
 
-                // Diagnostic: warn if no frame rendered for 2+ seconds
+                // Auto-recovery: if no frame rendered for 3+ seconds, restart screencast
                 const now_ns = std.time.nanoTimestamp();
-                if (self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 2 * std.time.ns_per_s) {
-                    if (loop_count % 200 == 0) { // Limit log spam
-                        self.log("[STALL] No frame rendered for >2s, frames_received={}, last_gen={}\n", .{
-                            self.cdp_client.getFrameCount(), self.last_rendered_generation,
-                        });
-                    }
+                if (self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 3 * std.time.ns_per_s) {
+                    self.log("[STALL] No frame for >3s, restarting screencast (frames={}, gen={})\n", .{
+                        self.cdp_client.getFrameCount(), self.last_rendered_generation,
+                    });
+                    self.resetScreencast();
                 }
 
                 // Reset loading state when we get a new frame (page has loaded)

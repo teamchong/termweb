@@ -361,7 +361,7 @@ fn printHelp() void {
         \\  --scale N             Set zoom scale (default: 1.0)
         \\
         \\Keyboard (Cmd on macOS, Ctrl on Linux):
-        \\  Cmd/Ctrl+Q or W       Quit
+        \\  Cmd/Ctrl+Q            Quit
         \\  Cmd/Ctrl+L            Focus address bar
         \\  Cmd/Ctrl+R            Reload page
         \\  Cmd/Ctrl+[            Go back
