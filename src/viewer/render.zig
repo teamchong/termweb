@@ -1,6 +1,7 @@
 /// Rendering functions for the viewer.
 /// Handles screencast frames, cursor, and toolbar rendering.
 const std = @import("std");
+const config = @import("../config.zig").Config;
 const kitty_mod = @import("../terminal/kitty_graphics.zig");
 const coordinates_mod = @import("../terminal/coordinates.zig");
 const screenshot_api = @import("../chrome/screenshot.zig");
@@ -15,7 +16,7 @@ const cursor_asset = ui_mod.assets.cursor;
 pub fn getMaxFpsForResolution(viewport_width: u32, viewport_height: u32) u32 {
     _ = viewport_width;
     _ = viewport_height;
-    return 24; // Fixed 24 FPS
+    return config.SCREENCAST_FPS; // From config
 }
 
 /// Get minimum frame interval based on resolution

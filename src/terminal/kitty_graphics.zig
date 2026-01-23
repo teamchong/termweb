@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("../config.zig").Config;
 const ShmBuffer = @import("shm.zig").ShmBuffer;
 const decode = @import("../image/decode.zig");
 
@@ -129,8 +130,8 @@ pub const KittyGraphics = struct {
             break :blk id;
         };
 
-        // Kitty protocol chunk size (16KB reduces write amplification)
-        const CHUNK_SIZE: usize = 16384;
+        // Kitty protocol chunk size (reduces write amplification)
+        const CHUNK_SIZE: usize = config.KITTY_CHUNK_SIZE;
 
         var offset: usize = 0;
         var first_chunk = true;

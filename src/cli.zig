@@ -1,5 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const config = @import("config.zig").Config;
 
 const detector = @import("chrome/detector.zig");
 const launcher = @import("chrome/launcher.zig");
@@ -225,7 +226,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Cap total pixels to improve performance on large displays
     // 1.5M pixels ≈ 1920x780 or 1600x937 - good balance of quality and speed
-    const MAX_PIXELS: u64 = 1_500_000;
+    const MAX_PIXELS = config.MAX_PIXELS;
     const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
     if (total_pixels > MAX_PIXELS) {
         // Scale down maintaining aspect ratio

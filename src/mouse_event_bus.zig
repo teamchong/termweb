@@ -3,13 +3,14 @@
 /// Design:
 /// - Viewer records all raw mouse events (no filtering at viewer level)
 /// - Bus decides what to keep/discard based on priority
-/// - Dispatch happens at fixed 30fps tick rate
+/// - Dispatch happens at fixed tick rate (see config.SCREENCAST_FPS)
 ///
 /// Priority (highest to lowest):
 /// 1. Click (press/release) - queued, never dropped
 /// 2. Wheel - keep latest only, replace on new
 /// 3. Move/drag - keep latest only, replace on new
 const std = @import("std");
+const config = @import("config.zig").Config;
 const cdp_mod = @import("chrome/cdp_client.zig");
 const interact_mod = @import("chrome/interact.zig");
 const scroll_mod = @import("chrome/scroll.zig");
@@ -117,9 +118,9 @@ pub const MouseEventBus = struct {
     // Debug
     debug_enabled: bool,
 
-    const TICK_INTERVAL_NS = 33 * std.time.ns_per_ms; // ~30fps
-    const DOUBLE_CLICK_TIME_MS = 400; // max time between clicks for double-click (standard OS default)
-    const DOUBLE_CLICK_DISTANCE = 15; // max pixel distance for double-click
+    const TICK_INTERVAL_NS = config.MOUSE_TICK_MS * std.time.ns_per_ms;
+    const DOUBLE_CLICK_TIME_MS = config.DOUBLE_CLICK_TIME_MS;
+    const DOUBLE_CLICK_DISTANCE = config.DOUBLE_CLICK_DISTANCE;
 
     pub fn init(
         cdp_client: *CdpClient,
@@ -275,7 +276,7 @@ pub const MouseEventBus = struct {
 
     /// Dispatch pending events (moves and wheel are throttled)
     fn tick(self: *MouseEventBus) void {
-        // Dispatch pending move (throttled to ~60fps)
+        // Dispatch pending move (throttled to match screencast fps)
         if (self.pending_move) |move| {
             self.sendMove(move);
             self.pending_move = null;

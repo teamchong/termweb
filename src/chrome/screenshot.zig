@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("../config.zig").Config;
 const cdp = @import("cdp_client.zig");
 const interact = @import("interact.zig");
 const json = @import("../utils/json.zig");
@@ -34,7 +35,7 @@ pub const ScreenshotFormat = enum {
 
 pub const ScreenshotOptions = struct {
     format: ScreenshotFormat = .jpeg,  // JPEG is faster to decode than PNG
-    quality: u8 = 60, // Lower quality = faster encode/transfer (0-100)
+    quality: u8 = config.JPEG_QUALITY, // Lower quality = faster encode/transfer (0-100)
     full_page: bool = false,
     // Viewport dimensions for screencast (1:1 coordinate mapping)
     width: u32 = 1920,

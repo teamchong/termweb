@@ -1,5 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const config = @import("config.zig").Config;
 
 const detector = @import("chrome/detector.zig");
 const launcher = @import("chrome/launcher.zig");
@@ -207,7 +208,7 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, m
     var viewport_width: u32 = raw_width / dpr;
     var viewport_height: u32 = content_pixel_height / dpr;
 
-    const MAX_PIXELS: u64 = 1_500_000;
+    const MAX_PIXELS = config.MAX_PIXELS;
     const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
     if (total_pixels > MAX_PIXELS) {
         const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));

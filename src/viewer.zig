@@ -4,6 +4,7 @@
 /// Handles keyboard input, screenshot rendering, and user interaction modes.
 const std = @import("std");
 const builtin = @import("builtin");
+const config = @import("config.zig").Config;
 const terminal_mod = @import("terminal/terminal.zig");
 const kitty_mod = @import("terminal/kitty_graphics.zig");
 const shm_mod = @import("terminal/shm.zig");
@@ -368,11 +369,13 @@ pub const Viewer = struct {
 
         // Start screencast streaming with viewport dimensions
         // Note: cli.zig already scales viewport for High-DPI displays
-        self.log("[DEBUG] Starting screencast {}x{}...\n", .{ self.viewport_width, self.viewport_height });
-            
+        const total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
+        const adaptive_quality = config.getAdaptiveQuality(total_pixels);
+        self.log("[DEBUG] Starting screencast {}x{} ({}px, quality={})...\n", .{ self.viewport_width, self.viewport_height, total_pixels, adaptive_quality });
+
         try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
-            .quality = 60,
+            .quality = adaptive_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
         });
@@ -582,7 +585,7 @@ pub const Viewer = struct {
         var new_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
 
         // Cap total pixels to improve performance on large displays
-        const MAX_PIXELS: u64 = 1_500_000;
+        const MAX_PIXELS = config.MAX_PIXELS;
         const total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);
         if (total_pixels > MAX_PIXELS) {
             const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
@@ -648,10 +651,12 @@ pub const Viewer = struct {
         // Small yield to let Chrome process viewport change before starting screencast
         std.Thread.sleep(20 * std.time.ns_per_ms);
 
-        // Restart screencast with new dimensions
+        // Restart screencast with new dimensions and adaptive quality
+        const resize_total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);
+        const resize_quality = config.getAdaptiveQuality(resize_total_pixels);
         screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
-            .quality = 60,
+            .quality = resize_quality,
             .width = new_width,
             .height = new_height,
         }) catch |err| {
@@ -665,7 +670,7 @@ pub const Viewer = struct {
         self.last_content_image_id = null; // Force new image ID after resize
         self.cursor_image_id = null; // Reset cursor image ID as well
 
-        self.log("[RESIZE] Viewport updated to {}x{}\n", .{ new_width, new_height });
+        self.log("[RESIZE] Viewport updated to {}x{} (quality={})\n", .{ new_width, new_height, resize_quality });
     }
 
     /// Try to render latest screencast frame (non-blocking)
@@ -697,10 +702,12 @@ pub const Viewer = struct {
         // Small yield to let Chrome process stop
         std.Thread.sleep(20 * std.time.ns_per_ms);
 
-        // Restart screencast
+        // Restart screencast with adaptive quality
+        const reset_total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
+        const reset_quality = config.getAdaptiveQuality(reset_total_pixels);
         screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
-            .quality = 60,
+            .quality = reset_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
         }) catch |err| {
@@ -715,7 +722,7 @@ pub const Viewer = struct {
         self.frames_skipped = 0;
         // Keep image IDs - new frames overwrite using same ID (no memory leak)
 
-        self.log("[RESET] Screencast reset complete\n", .{});
+        self.log("[RESET] Screencast reset complete (quality={})\n", .{reset_quality});
     }
 
     /// Refresh Chrome's actual viewport dimensions (source of truth for coordinate mapping)
@@ -1118,10 +1125,12 @@ pub const Viewer = struct {
             _ = try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, tab.url);
         };
 
-        // Restart screencast on the new target
+        // Restart screencast on the new target with adaptive quality
+        const tab_total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
+        const tab_quality = config.getAdaptiveQuality(tab_total_pixels);
         screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
-            .quality = 60,
+            .quality = tab_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
         }) catch |err| {
