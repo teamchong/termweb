@@ -47,8 +47,9 @@ jobs:
           brew install cmake nasm
           curl -L https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.0/libjpeg-turbo-3.1.0.tar.gz | tar xz
           cd libjpeg-turbo-3.1.0
-          cmake -B build -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake -B build -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_INSTALL_PREFIX=/usr/local/opt/jpeg-turbo
           cmake --build build -j$(sysctl -n hw.ncpu)
+          sudo mkdir -p /usr/local/opt/jpeg-turbo
           sudo cmake --install build
 
       - name: Install libjpeg-turbo (Linux x86_64)
