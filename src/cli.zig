@@ -140,6 +140,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var no_toolbar = false;
     var browser_path: ?[]const u8 = null;
     var disable_gpu = false;
+    var websocket_mode = false;
 
     // Parse flags
     var i: usize = 1;
@@ -175,6 +176,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             no_toolbar = true;
         } else if (std.mem.eql(u8, arg, "--disable-gpu")) {
             disable_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--websocket")) {
+            websocket_mode = true;
         }
         // --list-profiles and --list-browsers are handled at the start of cmdOpen
     }
@@ -279,11 +282,17 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer chrome_instance.deinit();
 
-    // Connect CDP client via Pipe
-    var client = cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port) catch |err| {
-        std.debug.print("Error connecting to Chrome: {}\n", .{err});
-        std.process.exit(1);
-    };
+    // Connect CDP client - use WebSocket-only mode if --websocket flag is set
+    var client = if (websocket_mode)
+        cdp.CdpClient.initFromPort(allocator, chrome_instance.debug_port) catch |err| {
+            std.debug.print("Error connecting to Chrome (WebSocket): {}\n", .{err});
+            std.process.exit(1);
+        }
+    else
+        cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port) catch |err| {
+            std.debug.print("Error connecting to Chrome: {}\n", .{err});
+            std.process.exit(1);
+        };
     defer client.deinit();
 
     // Set viewport size explicitly (ensures Chrome uses exact dimensions for coordinate mapping)
