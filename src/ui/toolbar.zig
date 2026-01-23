@@ -148,6 +148,13 @@ pub const ToolbarRenderer = struct {
         self.is_loading = loading;
     }
 
+    /// Update toolbar width (called on terminal resize)
+    pub fn setWidth(self: *ToolbarRenderer, width_px: u32) void {
+        self.width_px = width_px;
+        // Invalidate cached background image since width changed
+        self.bg_image_id = null;
+    }
+
     pub fn setTabCount(self: *ToolbarRenderer, count: u32) void {
         self.tab_count = count;
     }

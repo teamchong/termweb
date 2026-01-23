@@ -588,6 +588,11 @@ pub const Viewer = struct {
             size.width_px, size.height_px, size.cols, size.rows, toolbar_height, dpr, new_width, new_height,
         });
 
+        // Update toolbar width to match new terminal width
+        if (self.toolbar_renderer) |*renderer| {
+            renderer.setWidth(raw_width);
+        }
+
         // Skip if dimensions haven't changed significantly
         if (new_width == self.viewport_width and new_height == self.viewport_height) {
             self.log("[RESIZE] Dimensions unchanged, skipping\n", .{});
