@@ -110,6 +110,7 @@ pub const Viewer = struct {
 
     // Toolbar renderer (Kitty graphics based)
     toolbar_renderer: ?ui_mod.ToolbarRenderer,
+    toolbar_disabled: bool, // --no-toolbar flag
 
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
@@ -232,6 +233,7 @@ pub const Viewer = struct {
             .last_frame_time = 0,
             .ui_state = UIState{},
             .toolbar_renderer = null,
+            .toolbar_disabled = false,
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -259,6 +261,11 @@ pub const Viewer = struct {
             .allowed_fs_roots = try std.ArrayList([]const u8).initCapacity(allocator, 0),
             .download_manager = download_mod.DownloadManager.init(allocator, "/tmp/termweb-downloads"),
         };
+    }
+
+    /// Disable toolbar (for app/kiosk mode)
+    pub fn disableToolbar(self: *Viewer) void {
+        self.toolbar_disabled = true;
     }
 
     /// Calculate max FPS based on viewport resolution
@@ -331,19 +338,23 @@ pub const Viewer = struct {
         try self.kitty.clearAll(writer);
         try writer.flush();
 
-        // Initialize toolbar renderer with terminal pixel width
+        // Initialize toolbar renderer with terminal pixel width (unless disabled)
         const term_size = try self.terminal.getSize();
         const cell_width = if (term_size.cols > 0) term_size.width_px / term_size.cols else 10;
-        self.toolbar_renderer = ui_mod.ToolbarRenderer.init(self.allocator, &self.kitty, term_size.width_px, cell_width) catch |err| blk: {
-            self.log("[DEBUG] Toolbar init error: {}\n", .{err});
-            break :blk null;
-        };
-        if (self.toolbar_renderer) |*renderer| {
-            self.log("[DEBUG] Toolbar initialized, font_renderer={}\n", .{renderer.font_renderer != null});
-            renderer.setUrl(self.current_url);
-            renderer.setTabCount(1); // Initial tab
+        if (!self.toolbar_disabled) {
+            self.toolbar_renderer = ui_mod.ToolbarRenderer.init(self.allocator, &self.kitty, term_size.width_px, cell_width) catch |err| blk: {
+                self.log("[DEBUG] Toolbar init error: {}\n", .{err});
+                break :blk null;
+            };
+            if (self.toolbar_renderer) |*renderer| {
+                self.log("[DEBUG] Toolbar initialized, font_renderer={}\n", .{renderer.font_renderer != null});
+                renderer.setUrl(self.current_url);
+                renderer.setTabCount(1); // Initial tab
+            } else {
+                self.log("[DEBUG] Toolbar is null\n", .{});
+            }
         } else {
-            self.log("[DEBUG] Toolbar is null\n", .{});
+            self.log("[DEBUG] Toolbar disabled (--no-toolbar)\n", .{});
         }
 
         // Add initial tab for current URL

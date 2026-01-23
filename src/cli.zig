@@ -136,6 +136,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var scale: f32 = 1.0;
     var clone_profile: ?[]const u8 = null; // null means use default from LaunchOptions
     var no_profile = false;
+    var no_toolbar = false;
     var browser_path: ?[]const u8 = null;
 
     // Parse flags
@@ -168,6 +169,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             browser_path = args[i];
         } else if (std.mem.eql(u8, arg, "--no-profile")) {
             no_profile = true;
+        } else if (std.mem.eql(u8, arg, "--no-toolbar")) {
+            no_toolbar = true;
         }
         // --list-profiles and --list-browsers are handled at the start of cmdOpen
     }
@@ -313,6 +316,11 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height);
     defer viewer.deinit();
 
+    // Apply options
+    if (no_toolbar) {
+        viewer.disableToolbar();
+    }
+
     try viewer.run();
 }
 
@@ -356,6 +364,7 @@ fn printHelp() void {
         \\Options:
         \\  --profile <name>      Clone Chrome profile (default: 'Default')
         \\  --no-profile          Start with fresh profile (no cloning)
+        \\  --no-toolbar          Hide navigation bar (app/kiosk mode)
         \\  --browser-path <path> Path to browser executable
         \\  --list-profiles       Show available Chrome profiles
         \\  --list-browsers       Show available browsers
