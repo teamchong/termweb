@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Option to skip NAPI build (for CI where we only need CLI binary)
+    const skip_napi = b.option(bool, "skip-napi", "Skip building NAPI module") orelse false;
+
     // Read version from package.json at build time
     const version = getVersionFromPackageJson(b) orelse "0.0.0";
 
@@ -92,7 +95,8 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // NAPI shared library for Node.js
+    // NAPI shared library for Node.js (skip in CI with -Dskip-napi=true)
+    if (!skip_napi) {
     const napi = b.addLibrary(.{
         .name = "termweb",
         .linkage = .dynamic,
@@ -151,6 +155,7 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = "termweb.node",
     });
     b.getInstallStep().dependOn(&napi_install.step);
+    }
 
     // Run step
     const run_cmd = b.addRunArtifact(exe);
