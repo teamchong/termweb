@@ -190,12 +190,12 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame
 
     // Fallback: Display via base64
     if (!used_shm) {
-        if (viewer.screencast_format == .png) {
-            _ = try viewer.kitty.displayBase64PNG(writer, base64_png, display_opts);
-        } else {
-            _ = try viewer.kitty.displayBase64Image(writer, base64_png, display_opts);
-        }
-        viewer.log("[RENDER] displayFrame via base64 complete\n", .{});
+        const id = if (viewer.screencast_format == .png)
+            try viewer.kitty.displayBase64PNG(writer, base64_png, display_opts)
+        else
+            try viewer.kitty.displayBase64Image(writer, base64_png, display_opts);
+        viewer.last_content_image_id = id;
+        viewer.log("[RENDER] displayFrame via base64 complete (id={d})\n", .{id});
     }
 
     const render_t3 = std.time.nanoTimestamp();
