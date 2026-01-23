@@ -98,7 +98,12 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
         },
         .reload => {
             try screenshot_api.reload(viewer.cdp_client, viewer.allocator, false);
-            // Screencast mode: frames arrive automatically after reload
+            viewer.ui_state.is_loading = true;
+            if (viewer.toolbar_renderer) |*tr| {
+                tr.is_loading = true;
+            }
+            viewer.loading_started_at = std.time.nanoTimestamp();
+            viewer.ui_dirty = true;
         },
         .copy => {
             if (viewer.mode == .url_prompt) {
@@ -169,10 +174,11 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             viewer.ui_dirty = true;
         },
         .stop_loading => {
-            viewer.log("[NAV] Stop loading (Cmd+.)\n", .{});
+            viewer.log("[NAV] Stop loading (Ctrl+.)\n", .{});
             screenshot_api.stopLoading(viewer.cdp_client, viewer.allocator) catch |err| {
                 viewer.log("[NAV] Stop failed: {}\n", .{err});
             };
+            viewer.ui_state.is_loading = false;
             if (viewer.toolbar_renderer) |*tr| {
                 tr.is_loading = false;
             }
