@@ -556,8 +556,22 @@ pub const CdpClient = struct {
         defer self.allocator.free(result);
     }
 
-    /// Stop screencast streaming
+    /// Stop screencast streaming (for resize - keeps reader thread alive)
+    /// Call stopScreencastFull for complete shutdown
     pub fn stopScreencast(self: *CdpClient) !void {
+        // Send Page.stopScreencast to Chrome to stop frames
+        // Don't stop the reader thread - we need it for the next startScreencast
+        const result = self.sendCommand("Page.stopScreencast", null) catch null;
+        if (result) |r| self.allocator.free(r);
+    }
+
+    /// Stop screencast completely including reader thread (for shutdown)
+    pub fn stopScreencastFull(self: *CdpClient) !void {
+        // Send stop command first
+        const result = self.sendCommand("Page.stopScreencast", null) catch null;
+        if (result) |r| self.allocator.free(r);
+
+        // Now stop the reader thread
         self.pipe_client.stopReaderThread();
     }
 

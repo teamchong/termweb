@@ -25,6 +25,9 @@ const json = @import("utils/json.zig");
 const viewer_mod = @import("viewer/mod.zig");
 const viewer_helpers = viewer_mod.helpers;
 const fs_handler = viewer_mod.fs_handler;
+const render_mod = viewer_mod.render;
+const input_handler_mod = viewer_mod.input_handler;
+const mouse_handler_mod = viewer_mod.mouse_handler;
 
 // Import keyboard handling
 const key_normalizer = @import("terminal/key_normalizer.zig");
@@ -259,25 +262,16 @@ pub const Viewer = struct {
     }
 
     /// Calculate max FPS based on viewport resolution
-    /// Larger resolutions get lower FPS to maintain responsiveness
     fn getMaxFpsForResolution(self: *Viewer) u32 {
-        const pixels = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
-
-        // Thresholds based on total pixels
-        if (pixels <= 800 * 600) return 60;           // Small: 60fps
-        if (pixels <= 1280 * 720) return 45;          // 720p: 45fps
-        if (pixels <= 1920 * 1080) return 30;         // 1080p: 30fps
-        if (pixels <= 2560 * 1440) return 24;         // 1440p: 24fps
-        return 15;                                     // 4K+: 15fps
+        return render_mod.getMaxFpsForResolution(self.viewport_width, self.viewport_height);
     }
 
     /// Get minimum frame interval in nanoseconds based on resolution
     fn getMinFrameInterval(self: *Viewer) i128 {
-        const max_fps = self.getMaxFpsForResolution();
-        return @divFloor(std.time.ns_per_s, max_fps);
+        return render_mod.getMinFrameInterval(self.viewport_width, self.viewport_height);
     }
 
-    fn log(self: *Viewer, comptime fmt: []const u8, args: anytype) void {
+    pub fn log(self: *Viewer, comptime fmt: []const u8, args: anytype) void {
         if (self.debug_log) |file| {
             var buf: [1024]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
@@ -525,10 +519,9 @@ pub const Viewer = struct {
 
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
 
-        // Stop screencast - don't wait for response (non-blocking)
+        // Stop screencast completely (including reader thread) for shutdown
         if (self.screencast_mode) {
-            // Stop reader thread via client
-            self.cdp_client.stopScreencast() catch {};
+            self.cdp_client.stopScreencastFull() catch {};
             self.screencast_mode = false;
         }
 
@@ -609,29 +602,22 @@ pub const Viewer = struct {
         if (self.screencast_mode) {
             screenshot_api.stopScreencast(self.cdp_client, self.allocator) catch {};
             self.screencast_mode = false;
-            // Give Chrome time to process the stop
-            std.Thread.sleep(100 * std.time.ns_per_ms);
         }
 
         self.ui_dirty = true;
 
-        // Update Chrome viewport (retry on timeout)
-        var viewport_set = false;
-        for (0..3) |_| {
-            screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height) catch |err| {
-                self.log("[RESIZE] setViewport failed: {}, retrying...\n", .{err});
-                std.Thread.sleep(200 * std.time.ns_per_ms);
-                continue;
-            };
-            viewport_set = true;
-            break;
-        }
-        if (!viewport_set) {
-            self.log("[RESIZE] Failed to set viewport after retries\n", .{});
-            return;
+        // Reallocate SHM buffer if new size is larger
+        const new_shm_size = new_width * new_height * 4;
+        if (self.shm_buffer) |*shm| {
+            if (new_shm_size > shm.size) {
+                self.log("[RESIZE] Reallocating SHM buffer: {} -> {} bytes\n", .{ shm.size, new_shm_size });
+                shm.deinit();
+                self.shm_buffer = ShmBuffer.init(new_shm_size) catch null;
+                self.last_content_image_id = null; // Reset image ID for new buffer
+            }
         }
 
-        // Clear screen and all Kitty images
+        // Clear screen and all Kitty images first (while Chrome processes stop)
         var stdout_buf: [8192]u8 = undefined;
         const stdout_file = std.fs.File.stdout();
         var stdout_writer = stdout_file.writer(&stdout_buf);
@@ -641,40 +627,30 @@ pub const Viewer = struct {
         Screen.moveCursor(writer, 1, 1) catch {};
         writer.flush() catch {};
 
-        // Restart screencast with new dimensions (retry on timeout)
-        var screencast_started = false;
-        for (0..3) |_| {
-            screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-                .format = self.screencast_format,
-                .quality = 80,
-                .width = new_width,
-                .height = new_height,
-            }) catch |err| {
-                self.log("[RESIZE] startScreencast failed: {}, retrying...\n", .{err});
-                std.Thread.sleep(200 * std.time.ns_per_ms);
-                continue;
-            };
-            screencast_started = true;
-            break;
-        }
-        if (!screencast_started) {
-            self.log("[RESIZE] Failed to start screencast after retries\n", .{});
+        // Update Chrome viewport
+        screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height) catch |err| {
+            self.log("[RESIZE] setViewport failed: {}\n", .{err});
             return;
-        }
+        };
+
+        // Small yield to let Chrome process viewport change before starting screencast
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+
+        // Restart screencast with new dimensions
+        screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
+            .format = self.screencast_format,
+            .quality = 80,
+            .width = new_width,
+            .height = new_height,
+        }) catch |err| {
+            self.log("[RESIZE] startScreencast failed: {}\n", .{err});
+            return;
+        };
         self.screencast_mode = true;
 
-        // Reset frame time and wait for first frame before rendering UI
+        // Reset frame tracking - next frame will render immediately
         self.last_frame_time = 0;
-
-        // Wait for first frame after resize (blocking, with timeout)
-        var retries: u32 = 0;
-        while (retries < 50) : (retries += 1) {
-            if (try self.tryRenderScreencast()) {
-                self.log("[RESIZE] First frame after resize received\n", .{});
-                break;
-            }
-            std.Thread.sleep(20 * std.time.ns_per_ms);
-        }
+        self.last_content_image_id = null; // Force new image ID after resize
 
         self.log("[RESIZE] Viewport updated to {}x{}\n", .{ new_width, new_height });
     }
@@ -682,91 +658,11 @@ pub const Viewer = struct {
     /// Try to render latest screencast frame (non-blocking)
     /// Returns true if frame was rendered, false if no new frame
     fn tryRenderScreencast(self: *Viewer) !bool {
-        const now = std.time.nanoTimestamp();
-
-        // Resolution-based FPS limiting
-        const min_interval = self.getMinFrameInterval();
-        if (self.last_frame_time > 0 and (now - self.last_frame_time) < min_interval) {
-            return false; // Too soon, skip to maintain target FPS
-        }
-
-        // Get frame with proper ownership - MUST call deinit when done
-        var frame = screenshot_api.getLatestScreencastFrame(self.cdp_client) orelse return false;
-        defer frame.deinit(); // Proper cleanup!
-
-        // Throttle: Don't re-render the same frame multiple times
-        if (self.last_rendered_generation > 0 and frame.generation <= self.last_rendered_generation) {
-            return false;
-        }
-
-        // Frame skip detection: Check if we skipped frames
-        if (self.last_rendered_generation > 0 and frame.generation > self.last_rendered_generation + 1) {
-            const skipped = frame.generation - self.last_rendered_generation - 1;
-            self.frames_skipped += @intCast(skipped);
-            self.log("[RENDER] Skipped {} frames (gen {} -> {})\n", .{
-                skipped,
-                self.last_rendered_generation,
-                frame.generation,
-            });
-        }
-        self.last_rendered_generation = frame.generation;
-
-        // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
-        // Chrome may send different size than requested viewport
-        const frame_width = if (frame.device_width > 0) frame.device_width else self.viewport_width;
-        const frame_height = if (frame.device_height > 0) frame.device_height else self.viewport_height;
-
-        // NOTE: Do NOT use frame dimensions for coordinate mapping!
-        // Screencast frames may be smaller than Chrome's actual viewport due to DPI scaling.
-        // Mouse events must map to Chrome's window.innerWidth/Height (from refreshChromeViewport).
-        // Frame: 886x980 (what we display) vs Chrome viewport: 984x1088 (where clicks go)
-
-        // Debug: Log actual frame dimensions from Chrome
-        if (self.perf_frame_count < 5) {
-            self.log("[FRAME] device={}x{} (raw={}x{}), chrome={}x{}\n", .{
-                frame_width, frame_height, frame.device_width, frame.device_height,
-                self.chrome_actual_width, self.chrome_actual_height,
-            });
-        }
-
-        // Profile render time
-        const render_start = std.time.nanoTimestamp();
-
-        try self.displayFrameWithDimensions(frame.data, frame_width, frame_height);
-
-        const render_elapsed = std.time.nanoTimestamp() - render_start;
-        self.perf_frame_count += 1;
-        self.perf_total_render_ns += render_elapsed;
-        if (render_elapsed > self.perf_max_render_ns) {
-            self.perf_max_render_ns = render_elapsed;
-        }
-
-        // Log performance stats every 5 seconds
-        if (now - self.perf_last_report_time > 5 * std.time.ns_per_s) {
-            const avg_ms = if (self.perf_frame_count > 0)
-                @divFloor(@divFloor(self.perf_total_render_ns, @as(i128, self.perf_frame_count)), @as(i128, std.time.ns_per_ms))
-            else
-                0;
-            const max_ms = @divFloor(self.perf_max_render_ns, @as(i128, std.time.ns_per_ms));
-            const target_fps = self.getMaxFpsForResolution();
-
-            self.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}\n", .{
-                self.perf_frame_count, avg_ms, max_ms, target_fps, self.frames_skipped,
-            });
-
-            // Reset counters
-            self.perf_frame_count = 0;
-            self.perf_total_render_ns = 0;
-            self.perf_max_render_ns = 0;
-            self.perf_last_report_time = now;
-        }
-
-        self.last_frame_time = now;
-        return true;
+        return render_mod.tryRenderScreencast(self);
     }
 
     /// Update navigation button states from Chrome history (call after navigation events)
-    fn updateNavigationState(self: *Viewer) void {
+    pub fn updateNavigationState(self: *Viewer) void {
         const nav_state = screenshot_api.getNavigationState(self.cdp_client, self.allocator) catch return;
         self.ui_state.can_go_back = nav_state.can_go_back;
         self.ui_state.can_go_forward = nav_state.can_go_forward;
@@ -793,696 +689,62 @@ pub const Viewer = struct {
 
     /// Display a base64 PNG frame with specific dimensions for coordinate mapping
     fn displayFrameWithDimensions(self: *Viewer, base64_png: []const u8, frame_width: u32, frame_height: u32) !void {
-        const render_t0 = std.time.nanoTimestamp();
-
-        // Larger buffer reduces write syscalls (frames can be 300KB+)
-        var stdout_buf: [65536]u8 = undefined;  // 64KB buffer
-        const stdout_file = std.fs.File.stdout();
-        var stdout_writer = stdout_file.writer(&stdout_buf);
-        const writer = &stdout_writer.interface;
-
-        // Get terminal size
-        const size = try self.terminal.getSize();
-        const display_cols: u16 = if (size.cols > 0) size.cols else 80;
-
-        // Calculate cell height and toolbar rows
-        const cell_height: u32 = if (size.rows > 0) size.height_px / size.rows else 20;
-        const toolbar_h: u32 = if (self.toolbar_renderer) |tr| tr.toolbar_height else cell_height;
-
-        // Content starts at row 2, with y_offset to align with toolbar bottom
-        // This avoids gaps between toolbar and content
-        const row_start_pixel = cell_height; // Row 2 starts at 1 * cell_height
-        const y_offset: u32 = if (toolbar_h > row_start_pixel) toolbar_h - row_start_pixel else 0;
-
-        // Calculate content rows (account for toolbar pixel height, not row count)
-        const content_pixel_start = row_start_pixel + y_offset; // = toolbar_h
-        const content_pixel_height = if (size.height_px > content_pixel_start)
-            size.height_px - content_pixel_start
-        else
-            size.height_px;
-        const content_rows: u32 = content_pixel_height / cell_height;
-
-        // Update coordinate mapper with Chrome's ACTUAL viewport (source of truth)
-        // Chrome's window.innerWidth/Height is where mouse events are dispatched
-        self.coord_mapper = CoordinateMapper.initWithToolbar(
-            size.width_px,
-            size.height_px,
-            size.cols,
-            size.rows,
-            self.chrome_actual_width,   // Chrome's actual viewport, not frame size
-            self.chrome_actual_height,
-            @intCast(toolbar_h),
-            null, // auto-detect pixel mode
-        );
-
-        self.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}, chrome={}x{}, y_off={}\n", .{
-            base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
-            self.chrome_actual_width, self.chrome_actual_height, y_offset,
-        });
-
-        // Move cursor to row 2
-        try writer.writeAll("\x1b[2;1H");
-
-        // Like awrit: first frame gets auto-increment ID, subsequent frames reuse it
-        // No z-index needed now that SHM write pattern is correct
-        const display_opts = kitty_mod.DisplayOptions{
-            .rows = content_rows,
-            .columns = display_cols,
-            .y_offset = @intCast(y_offset),
-            .image_id = self.last_content_image_id,
-        };
-
-        const render_t1 = std.time.nanoTimestamp();
-
-        // Try SHM path first
-        var used_shm = false;
-        if (self.shm_buffer) |*shm| {
-            if (self.kitty.displayBase64ImageViaSHM(writer, base64_png, shm, display_opts) catch null) |id| {
-                self.log("[RENDER] displayFrame via SHM complete (id={d})\n", .{id});
-                self.last_content_image_id = id;
-                used_shm = true;
-            } else {
-                self.log("[RENDER] SHM path failed, falling back to base64\n", .{});
-            }
-        }
-
-        const render_t2 = std.time.nanoTimestamp();
-
-        // Fallback: Display via base64
-        if (!used_shm) {
-            if (self.screencast_format == .png) {
-                _ = try self.kitty.displayBase64PNG(writer, base64_png, display_opts);
-            } else {
-                _ = try self.kitty.displayBase64Image(writer, base64_png, display_opts);
-            }
-            self.log("[RENDER] displayFrame via base64 complete\n", .{});
-        }
-
-        const render_t3 = std.time.nanoTimestamp();
-
-        try writer.flush();
-
-        const render_t4 = std.time.nanoTimestamp();
-        const render_t5 = render_t4;
-        const setup_ms = @divFloor(render_t1 - render_t0, std.time.ns_per_ms);
-        const shm_ms = @divFloor(render_t2 - render_t1, std.time.ns_per_ms);
-        const base64_ms = @divFloor(render_t3 - render_t2, std.time.ns_per_ms);
-        const flush_ms = @divFloor(render_t4 - render_t3, std.time.ns_per_ms);
-        const cleanup_ms = @divFloor(render_t5 - render_t4, std.time.ns_per_ms);
-        const total_ms = @divFloor(render_t5 - render_t0, std.time.ns_per_ms);
-        // Always log render timing to debug file
-        self.log("[RENDER PERF] total={}ms setup={}ms shm={}ms base64={}ms flush={}ms cleanup={}ms\n", .{
-            total_ms, setup_ms, shm_ms, base64_ms, flush_ms, cleanup_ms,
-        });
+        return render_mod.displayFrameWithDimensions(self, base64_png, frame_width, frame_height);
     }
 
     /// Display a base64 PNG frame (legacy, uses viewport dimensions)
     fn displayFrame(self: *Viewer, base64_png: []const u8) !void {
-        try self.displayFrameWithDimensions(base64_png, self.viewport_width, self.viewport_height);
+        return render_mod.displayFrame(self, base64_png);
     }
 
     /// Render mouse cursor at current mouse position
     fn renderCursor(self: *Viewer, writer: anytype) !void {
-        if (!self.mouse_visible) return;
-
-        // Delete old cursor image to prevent trailing
-        if (self.cursor_image_id) |old_id| {
-            try self.kitty.deleteImage(writer, old_id);
-        }
-
-        // With SGR pixel mode (1016h), mouse_x/y are pixel coordinates
-        // Convert to cell coordinates for ANSI cursor positioning
-        const mapper = self.coord_mapper orelse return;
-        const cell_width = if (mapper.terminal_cols > 0)
-            mapper.terminal_width_px / mapper.terminal_cols
-        else
-            14;
-        const cell_height = mapper.cell_height;
-
-        // Calculate cell position (1-indexed for ANSI)
-        const cell_col = if (cell_width > 0) (self.mouse_x / cell_width) + 1 else 1;
-        const cell_row = if (cell_height > 0) (self.mouse_y / cell_height) + 1 else 1;
-
-        // Calculate pixel offset within cell for precise positioning
-        const x_offset = if (cell_width > 0) self.mouse_x % cell_width else 0;
-        const raw_y_offset = if (cell_height > 0) self.mouse_y % cell_height else 0;
-        const y_offset = if (raw_y_offset > 0) raw_y_offset - 1 else 0; // Adjust for cursor tip alignment
-
-        // Move cursor to cell position
-        try writer.print("\x1b[{d};{d}H", .{ cell_row, cell_col });
-
-        // Display cursor PNG with pixel offset for precision
-        self.cursor_image_id = try self.kitty.displayPNG(writer, cursor_asset, .{
-            .placement_id = Placement.CURSOR,
-            .z = ZIndex.CURSOR,
-            .x_offset = x_offset,
-            .y_offset = y_offset,
-        });
+        return render_mod.renderCursor(self, writer);
     }
 
     /// Render the toolbar using Kitty graphics
     fn renderToolbar(self: *Viewer, writer: anytype) !void {
-        if (self.toolbar_renderer) |*renderer| {
-            renderer.setNavState(self.ui_state.can_go_back, self.ui_state.can_go_forward, self.ui_state.is_loading);
-            renderer.setUrl(self.current_url);
-            try renderer.render(writer);
-        }
+        return render_mod.renderToolbar(self, writer);
     }
 
     /// Handle input event - dispatches to key or mouse handlers
     fn handleInput(self: *Viewer, input: Input) !void {
-        switch (input) {
-            .key => |key_input| {
-                // 1. Normalize the key input to unified representation
-                const event = key_normalizer.normalize(key_input);
-
-                // Debug log (if enabled)
-                if (self.debug_input) {
-                    if (event.base_key.getChar()) |c| {
-                        self.log("[KEY] char='{c}' shift={} ctrl={} alt={} meta={} shortcut={} cdp={d}\n", .{
-                            c, event.shift, event.ctrl, event.alt, event.meta, event.shortcut_mod, event.cdp_modifiers,
-                        });
-                    } else {
-                        self.log("[KEY] special={} shift={} ctrl={} alt={} meta={} shortcut={} cdp={d}\n", .{
-                            event.base_key, event.shift, event.ctrl, event.alt, event.meta, event.shortcut_mod, event.cdp_modifiers,
-                        });
-                    }
-                }
-
-                // 2. Check for global app shortcuts (work from ANY mode)
-                if (app_shortcuts.findAppAction(event)) |action| {
-                    self.log("[SHORTCUT] Matched action: {s}\n", .{@tagName(action)});
-                    try self.executeAppAction(action, event);
-                    return;
-                } else if (event.shortcut_mod) {
-                    // Log unmatched shortcut keys for debugging
-                    if (event.base_key.getChar()) |c| {
-                        self.log("[SHORTCUT] Unmatched: char='{c}' shift={} alt={}\n", .{ c, event.shift, event.alt });
-                    }
-                }
-
-                // 3. Mode-specific handling
-                switch (self.mode) {
-                    .normal => try self.handleNormalModeKey(event),
-                    .url_prompt => try self.handleUrlPromptKey(event),
-                }
-            },
-            .mouse => |mouse| try self.handleMouse(mouse),
-            .paste => |text| {
-                defer self.allocator.free(text);
-                // Terminal sent bracketed paste (Cmd+V intercepted by terminal)
-                if (self.mode == .normal) {
-                    // Use typeText for reliable direct text insertion (works with Monaco)
-                    interact_mod.typeText(self.cdp_client, self.allocator, text) catch {};
-                } else if (self.mode == .url_prompt) {
-                    // Paste into URL bar
-                    if (self.toolbar_renderer) |*renderer| {
-                        // Insert text at cursor (filter non-printable chars)
-                        for (text) |c| {
-                            if (c >= 32 and c <= 126 and c != '\n' and c != '\r') {
-                                renderer.handleChar(c);
-                            }
-                        }
-                        self.ui_dirty = true;
-                    }
-                }
-            },
-            .none => {},
-        }
+        return input_handler_mod.handleInput(self, input);
     }
 
     /// Execute an app-level action (shortcuts intercepted by termweb)
     fn executeAppAction(self: *Viewer, action: AppAction, event: NormalizedKeyEvent) !void {
-        _ = event;
-        switch (action) {
-            .quit => {
-                self.running = false;
-            },
-            .address_bar => {
-                self.mode = .url_prompt;
-                if (self.toolbar_renderer) |*renderer| {
-                    renderer.setUrl(self.current_url);
-                    renderer.focusUrl();
-                } else {
-                    self.prompt_buffer = try PromptBuffer.init(self.allocator);
-                }
-                self.ui_dirty = true;
-            },
-            .reload => {
-                try screenshot_api.reload(self.cdp_client, self.allocator, false);
-                // Screencast mode: frames arrive automatically after reload
-            },
-            .copy => {
-                if (self.mode == .url_prompt) {
-                    if (self.toolbar_renderer) |*renderer| {
-                        renderer.handleCopy(self.allocator);
-                    }
-                } else {
-                    // Use execCommand('copy') - same as menu copy, triggers polyfill
-                    interact_mod.execCopy(self.cdp_client);
-                }
-            },
-            .cut => {
-                if (self.mode == .url_prompt) {
-                    if (self.toolbar_renderer) |*renderer| {
-                        renderer.handleCut(self.allocator);
-                        self.ui_dirty = true;
-                    }
-                } else {
-                    // Dispatch Cmd+X event + execCommand('cut')
-                    interact_mod.execCut(self.cdp_client);
-                }
-            },
-            .paste => {
-                if (self.mode == .url_prompt) {
-                    if (self.toolbar_renderer) |*renderer| {
-                        renderer.handlePaste(self.allocator);
-                        self.ui_dirty = true;
-                    }
-                } else {
-                    // Get system clipboard and insert via synthetic ClipboardEvent
-                    // typeText clears _termwebClipboardData atomically before dispatch
-                    const toolbar = @import("ui/toolbar.zig");
-                    if (toolbar.pasteFromClipboard(self.allocator)) |clipboard| {
-                        defer self.allocator.free(clipboard);
-                        self.log("[PASTE] Direct insert: {d} bytes\n", .{clipboard.len});
-                        interact_mod.typeText(self.cdp_client, self.allocator, clipboard) catch {};
-                    }
-                }
-            },
-            .select_all => {
-                if (self.mode == .url_prompt) {
-                    if (self.toolbar_renderer) |*renderer| {
-                        renderer.handleSelectAll();
-                        self.ui_dirty = true;
-                    }
-                } else {
-                    // Send Cmd+A to browser for select-all
-                    self.log("[SELECT_ALL] Sending Cmd+A to browser\n", .{});
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'a', 4); // 4 = meta
-                }
-            },
-            .tab_picker => {
-                self.showTabPicker() catch |err| {
-                    self.log("[TAB_PICKER] Failed: {}\n", .{err});
-                };
-            },
-        }
+        return input_handler_mod.executeAppAction(self, action, event);
     }
 
     /// Handle key in normal mode - pass to browser with correct modifiers
     fn handleNormalModeKey(self: *Viewer, event: NormalizedKeyEvent) !void {
-        const mods = event.cdp_modifiers;
-
-        switch (event.base_key) {
-            .char => |c| {
-                // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
-                if (event.ctrl and event.shift and (c == 'p' or c == 'P')) {
-                    const new_mods = (mods & ~@as(u8, 2)) | 4; // remove ctrl, add meta
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, 'p', new_mods);
-                } else {
-                    // Pass to browser with original modifiers
-                    interact_mod.sendCharWithModifiers(self.cdp_client, self.allocator, c, mods);
-                }
-            },
-            .escape => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Escape", 27, mods),
-            .enter => interact_mod.sendEnterKey(self.cdp_client, mods),
-            .backspace => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Backspace", 8, mods),
-            .tab => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Tab", 9, mods),
-            .delete => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Delete", 46, mods),
-            .left => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowLeft", 37, mods),
-            .right => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowRight", 39, mods),
-            .up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowUp", 38, mods),
-            .down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "ArrowDown", 40, mods),
-            .home => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Home", 36, mods),
-            .end => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "End", 35, mods),
-            .page_up => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageUp", 33, mods),
-            .page_down => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "PageDown", 34, mods),
-            .insert => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "Insert", 45, mods),
-            .f1 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F1", 112, mods),
-            .f2 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F2", 113, mods),
-            .f3 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F3", 114, mods),
-            .f4 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F4", 115, mods),
-            .f5 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F5", 116, mods),
-            .f6 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F6", 117, mods),
-            .f7 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F7", 118, mods),
-            .f8 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F8", 119, mods),
-            .f9 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F9", 120, mods),
-            .f10 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F10", 121, mods),
-            .f11 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F11", 122, mods),
-            .f12 => interact_mod.sendSpecialKeyWithModifiers(self.cdp_client, "F12", 123, mods),
-            .none => {},
-        }
+        return input_handler_mod.handleNormalModeKey(self, event);
     }
 
     /// Handle key in URL prompt mode - text editing
     fn handleUrlPromptKey(self: *Viewer, event: NormalizedKeyEvent) !void {
-        const renderer = if (self.toolbar_renderer) |*r| r else return;
-
-        // Platform-specific navigation modifiers
-        const is_macos = comptime builtin.os.tag == .macos;
-        const word_nav = if (is_macos) event.alt else event.ctrl;
-        const line_nav = if (is_macos) event.meta else false;
-
-        switch (event.base_key) {
-            .char => |c| {
-                renderer.handleChar(c);
-                self.ui_dirty = true;
-            },
-            .backspace => {
-                renderer.handleBackspace();
-                self.ui_dirty = true;
-            },
-            .delete => {
-                renderer.handleDelete();
-                self.ui_dirty = true;
-            },
-            .left => {
-                if (event.shift) {
-                    renderer.handleSelectLeft();
-                } else if (line_nav) {
-                    renderer.handleHome();
-                } else if (word_nav) {
-                    renderer.handleWordLeft();
-                } else {
-                    renderer.handleLeft();
-                }
-                self.ui_dirty = true;
-            },
-            .right => {
-                if (event.shift) {
-                    renderer.handleSelectRight();
-                } else if (line_nav) {
-                    renderer.handleEnd();
-                } else if (word_nav) {
-                    renderer.handleWordRight();
-                } else {
-                    renderer.handleRight();
-                }
-                self.ui_dirty = true;
-            },
-            .home => {
-                if (event.shift) {
-                    renderer.handleSelectHome();
-                } else {
-                    renderer.handleHome();
-                }
-                self.ui_dirty = true;
-            },
-            .end => {
-                if (event.shift) {
-                    renderer.handleSelectEnd();
-                } else {
-                    renderer.handleEnd();
-                }
-                self.ui_dirty = true;
-            },
-            .enter => {
-                const url = renderer.getUrlText();
-                self.log("[URL] Enter pressed, url_len={}, url='{s}'\n", .{ url.len, url });
-                if (url.len > 0) {
-                    self.log("[URL] Navigating to: {s}\n", .{url});
-                    screenshot_api.navigateToUrl(self.cdp_client, self.allocator, url) catch |err| {
-                        self.log("[URL] Navigation failed: {}\n", .{err});
-                    };
-                    if (!std.mem.eql(u8, self.current_url, url)) {
-                        const new_url = self.allocator.dupe(u8, url) catch {
-                            self.log("[URL] Failed to allocate new URL\n", .{});
-                            self.updateNavigationState();
-                            renderer.blurUrl();
-                            self.mode = .normal;
-                            self.ui_dirty = true;
-                            return;
-                        };
-                        self.allocator.free(self.current_url);
-                        self.current_url = new_url;
-                    }
-                    self.updateNavigationState();
-                }
-                renderer.blurUrl();
-                self.mode = .normal;
-                self.ui_dirty = true;
-            },
-            .escape => {
-                renderer.blurUrl();
-                self.mode = .normal;
-                self.ui_dirty = true;
-            },
-            else => {},
-        }
+        return input_handler_mod.handleUrlPromptKey(self, event);
     }
 
     /// Handle mouse event - records to event bus and dispatches to mode-specific handlers
-    /// Throttling/prioritization is handled by the event bus (30fps tick)
     fn handleMouse(self: *Viewer, mouse: MouseEvent) !void {
-        // Normalize mouse coordinates:
-        // - SGR 1006 (cell mode): 1-indexed, need to subtract 1
-        // - SGR 1016 (pixel mode): 0-indexed, no adjustment needed
-        const is_pixel = if (self.coord_mapper) |m| m.is_pixel_mode else false;
-        const norm_x = if (is_pixel) mouse.x else if (mouse.x > 0) mouse.x - 1 else 0;
-        const norm_y = if (is_pixel) mouse.y else if (mouse.y > 0) mouse.y - 1 else 0;
-
-        // Track mouse position for cursor rendering
-        self.mouse_x = norm_x;
-        self.mouse_y = norm_y;
-        self.mouse_visible = true;
-        self.ui_dirty = true;
-
-        // Log parsed mouse events (if enabled)
-        if (self.debug_input) {
-            self.log("[MOUSE] type={s} button={s} x={} y={} (raw={},{}) delta_y={}\n", .{
-                @tagName(mouse.type),
-                @tagName(mouse.button),
-                norm_x,
-                norm_y,
-                mouse.x,
-                mouse.y,
-                mouse.delta_y,
-            });
-        }
-
-        // Get viewport size for event bus
-        const term_size = self.terminal.getSize() catch terminal_mod.TerminalSize{
-            .cols = 80,
-            .rows = 24,
-            .width_px = 800,
-            .height_px = 600,
-        };
-
-        // Update event bus coord mapper reference and record the event
-        // The bus handles all throttling/prioritization and dispatches at 30fps
-        if (self.coord_mapper) |*mapper| {
-            self.event_bus.setCoordMapper(mapper);
-        }
-        self.mouse_buttons = self.event_bus.record(mouse, norm_x, norm_y, term_size.width_px, term_size.height_px);
-
-        // Dispatch to mode-specific handlers (for local UI interactions only)
-        switch (self.mode) {
-            .normal => try self.handleMouseNormal(mouse),
-            .url_prompt => {
-                // Click outside URL bar cancels prompt and returns to normal mode
-                if (mouse.type == .press) {
-                    if (self.toolbar_renderer) |*renderer| {
-                        const mouse_pixels = self.mouseToPixels();
-                        const in_url_bar = mouse_pixels.x >= renderer.url_bar_x and
-                            mouse_pixels.x < renderer.url_bar_x + renderer.url_bar_width and
-                            mouse_pixels.y <= renderer.toolbar_height;
-                        if (!in_url_bar) {
-                            renderer.blurUrl();
-                            self.mode = .normal;
-                            self.ui_dirty = true;
-                        }
-                    }
-                }
-            },
-        }
+        return mouse_handler_mod.handleMouse(self, mouse);
     }
 
     /// Handle click on tab bar buttons
     fn handleTabBarClick(self: *Viewer, pixel_x: u32, pixel_y: u32, mapper: CoordinateMapper) !void {
-        if (self.toolbar_renderer) |*renderer| {
-            self.log("[CLICK] handleTabBarClick x={} y={}\n", .{ pixel_x, pixel_y });
-            
-            if (renderer.hitTest(pixel_x, pixel_y)) |button| {
-                self.log("[CLICK] Button hit: {}\n", .{button});
-                
-                switch (button) {
-                    .back => {
-                        self.log("[CLICK] Back button (can_back={})\n", .{self.ui_state.can_go_back});
-                        // Always try to go back even if state says no (state might be stale)
-                        _ = screenshot_api.goBack(self.cdp_client, self.allocator) catch |err| {
-                            self.log("[CLICK] Back failed: {}\n", .{err});
-                            return; // Don't update UI state if command failed
-                        };
-                        // Optimistic update only on success
-                        self.ui_state.can_go_forward = true;
-                        self.ui_dirty = true;
-                    },
-                    .forward => {
-                        self.log("[CLICK] Forward button\n", .{});
-                        if (self.ui_state.can_go_forward) {
-                            _ = screenshot_api.goForward(self.cdp_client, self.allocator) catch |err| {
-                                self.log("[CLICK] Forward failed: {}\n", .{err});
-                                return; // Don't update UI state if command failed
-                            };
-                            self.ui_state.can_go_back = true;
-                            self.ui_dirty = true;
-                        }
-                    },
-                    .refresh => {
-                        self.log("[CLICK] Refresh button (loading={})\n", .{self.ui_state.is_loading});
-                        // Always reload (like most browsers - clicking refresh during load restarts it)
-                        self.log("[CLICK] Sending reload command\n", .{});
-                        _ = screenshot_api.reload(self.cdp_client, self.allocator, true) catch |err| {
-                            self.log("[CLICK] Reload failed: {}\n", .{err});
-                            return;
-                        };
-                        self.ui_state.is_loading = true;
-                        self.loading_started_at = std.time.nanoTimestamp();
-                        self.ui_dirty = true;
-                    },
-                    .close => {
-                        self.log("[CLICK] Close button\n", .{});
-                        self.running = false;
-                    },
-                    .tabs => {
-                        self.log("[CLICK] Tabs button\n", .{});
-                        self.showTabPicker() catch |err| {
-                            self.log("[CLICK] Tab picker failed: {}\n", .{err});
-                        };
-                    },
-                }
-                return;
-            }
-
-            // Check if click is in URL bar area
-            if (pixel_x >= renderer.url_bar_x and pixel_x < renderer.url_bar_x + renderer.url_bar_width) {
-                self.log("[TABBAR] URL bar clicked\n", .{});
-                renderer.focusUrl();
-                self.mode = .url_prompt;
-                self.ui_dirty = true;
-                return;
-            }
-        }
-
-        // Calculate cell width for button positions
-        const cell_width: u16 = if (mapper.terminal_cols > 0)
-            mapper.terminal_width_px / mapper.terminal_cols
-        else
-            14;
-
-        // Convert pixel X to column (0-indexed)
-        const col: i32 = @intCast(pixel_x / cell_width);
-
-        self.log("[TABBAR] Click at pixel_x={}, pixel_y={}, cell_width={}, col={}\n", .{ pixel_x, pixel_y, cell_width, col });
-
-        // Fallback: column-based detection
-        if (col <= 2) {
-            self.running = false;
-        } else if (col >= 4 and col <= 6 and self.ui_state.can_go_back) {
-            _ = try screenshot_api.goBack(self.cdp_client, self.allocator);
-            self.updateNavigationState();
-        } else if (col >= 8 and col <= 10 and self.ui_state.can_go_forward) {
-            _ = try screenshot_api.goForward(self.cdp_client, self.allocator);
-            self.updateNavigationState();
-        } else if (col >= 12 and col <= 14) {
-            try screenshot_api.reload(self.cdp_client, self.allocator, false);
-        } else if (col >= 18) {
-            self.mode = .url_prompt;
-            if (self.toolbar_renderer) |*renderer| {
-                renderer.focusUrl();
-            }
-            self.ui_dirty = true;
-        }
+        return mouse_handler_mod.handleTabBarClick(self, pixel_x, pixel_y, mapper);
     }
 
     /// Handle mouse event in normal mode - local UI interactions only
-    /// CDP dispatch is handled by the event bus (30fps tick)
     fn handleMouseNormal(self: *Viewer, mouse: MouseEvent) !void {
-        const mapper = self.coord_mapper orelse return;
+        return mouse_handler_mod.handleMouseNormal(self, mouse);
+    }
 
-        switch (mouse.type) {
-            .press => {
-                // Check if click is in browser area or tab bar
-                if (mapper.terminalToBrowser(self.mouse_x, self.mouse_y)) |coords| {
-                    // Store click info for status line display
-                    if (mouse.button == .left) {
-                        self.last_click = .{
-                            .term_x = self.mouse_x,
-                            .term_y = self.mouse_y,
-                            .browser_x = coords.x,
-                            .browser_y = coords.y,
-                        };
-                        // Update navigation state (click may have navigated)
-                        self.updateNavigationState();
-                    }
-                } else {
-                    // Click is in tab bar - handle button clicks locally
-                    // We handle this on PRESS for immediate feedback (like most UI buttons)
-                    const mouse_pixels = self.mouseToPixels();
-                    self.log("[CLICK] In tab bar: mouse=({},{}) pixels=({},{}) tabbar_height={} is_pixel_mode={}\n", .{
-                        self.mouse_x, self.mouse_y, mouse_pixels.x, mouse_pixels.y, mapper.tabbar_height, mapper.is_pixel_mode,
-                    });
-                    try self.handleTabBarClick(mouse_pixels.x, mouse_pixels.y, mapper);
-                }
-            },
-            .release => {
-                // No local UI handling needed for release
-            },
-            .move, .drag => {
-                // Check if mouse is hovering over toolbar buttons (local UI)
-                if (self.toolbar_renderer) |*renderer| {
-                    // Track previous hover states
-                    const old_close = renderer.close_hover;
-                    const old_back = renderer.back_hover;
-                    const old_forward = renderer.forward_hover;
-                    const old_refresh = renderer.refresh_hover;
-                    const old_tabs = renderer.tabs_hover;
-                    const old_url = renderer.url_bar_hover;
-
-                    // Reset all hover states
-                    renderer.close_hover = false;
-                    renderer.back_hover = false;
-                    renderer.forward_hover = false;
-                    renderer.refresh_hover = false;
-                    renderer.tabs_hover = false;
-                    renderer.url_bar_hover = false;
-
-                    // Set hover for the button under cursor
-                    const mouse_pixels = self.mouseToPixels();
-                    if (renderer.hitTest(mouse_pixels.x, mouse_pixels.y)) |button| {
-                        switch (button) {
-                            .close => renderer.close_hover = true,
-                            .back => renderer.back_hover = true,
-                            .forward => renderer.forward_hover = true,
-                            .refresh => renderer.refresh_hover = true,
-                            .tabs => renderer.tabs_hover = true,
-                        }
-                    } else if (mouse_pixels.y < renderer.toolbar_height) {
-                        // Check URL bar hover (within toolbar area)
-                        if (mouse_pixels.x >= renderer.url_bar_x and
-                            mouse_pixels.x < renderer.url_bar_x + renderer.url_bar_width)
-                        {
-                            renderer.url_bar_hover = true;
-                        }
-                    }
-
-                    // Re-render toolbar if any hover state changed
-                    if (renderer.close_hover != old_close or
-                        renderer.back_hover != old_back or
-                        renderer.forward_hover != old_forward or
-                        renderer.refresh_hover != old_refresh or
-                        renderer.tabs_hover != old_tabs or
-                        renderer.url_bar_hover != old_url)
-                    {
-                        self.ui_dirty = true;
-                    }
-                }
-            },
-            .wheel => {
-                // Wheel events are fully handled by the event bus
-            },
-        }
+    /// Convert mouse coordinates to pixel coordinates for toolbar hit testing
+    fn mouseToPixels(self: *const Viewer) struct { x: u32, y: u32 } {
+        return mouse_handler_mod.mouseToPixels(self);
     }
 
     /// Handle CDP events (JavaScript dialogs, file chooser, console messages)
@@ -1751,7 +1013,7 @@ pub const Viewer = struct {
     }
 
     /// Show native tab picker dialog
-    fn showTabPicker(self: *Viewer) !void {
+    pub fn showTabPicker(self: *Viewer) !void {
         if (self.tabs.items.len == 0) {
             self.log("[TABS] No tabs to show\n", .{});
             return;
@@ -2361,30 +1623,6 @@ pub const Viewer = struct {
         // Free the URL we own
         self.allocator.free(self.current_url);
         self.terminal.deinit();
-    }
-
-    /// Convert mouse coordinates to pixel coordinates for toolbar hit testing.
-    /// When terminal is in cell mode (not pixel mode), converts cell coordinates to pixels.
-    fn mouseToPixels(self: *const Viewer) struct { x: u32, y: u32 } {
-        const mapper = self.coord_mapper orelse return .{ .x = self.mouse_x, .y = self.mouse_y };
-
-        if (mapper.is_pixel_mode) {
-            // Already in pixel coordinates
-            return .{ .x = self.mouse_x, .y = self.mouse_y };
-        }
-
-        // Convert cell coordinates to pixel coordinates
-        const cell_width: u32 = if (mapper.terminal_cols > 0)
-            mapper.terminal_width_px / mapper.terminal_cols
-        else
-            14;
-        const cell_height: u32 = mapper.cell_height;
-
-        // Convert cell to pixel (top-left of cell)
-        const pixel_x: u32 = @as(u32, self.mouse_x) * cell_width;
-        const pixel_y: u32 = @as(u32, self.mouse_y) * cell_height;
-
-        return .{ .x = pixel_x, .y = pixel_y };
     }
 };
 

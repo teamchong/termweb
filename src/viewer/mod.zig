@@ -9,10 +9,12 @@
 /// - render: Screencast and rendering functions
 /// - input_handler: Keyboard input handling
 /// - mouse_handler: Mouse event handling
-/// - cdp_events: CDP event handling
 
 pub const helpers = @import("helpers.zig");
 pub const fs_handler = @import("fs_handler.zig");
+pub const render = @import("render.zig");
+pub const input_handler = @import("input_handler.zig");
+pub const mouse_handler = @import("mouse_handler.zig");
 
 // Re-export commonly used types
 pub const getMimeType = helpers.getMimeType;
@@ -26,3 +28,24 @@ pub const parseDialogMessage = helpers.parseDialogMessage;
 pub const parseDefaultPrompt = helpers.parseDefaultPrompt;
 pub const parseFileChooserMode = helpers.parseFileChooserMode;
 pub const extractUrlFromNavEvent = helpers.extractUrlFromNavEvent;
+
+// Re-export render functions
+pub const tryRenderScreencast = render.tryRenderScreencast;
+pub const displayFrame = render.displayFrame;
+pub const displayFrameWithDimensions = render.displayFrameWithDimensions;
+pub const renderCursor = render.renderCursor;
+pub const renderToolbar = render.renderToolbar;
+pub const getMaxFpsForResolution = render.getMaxFpsForResolution;
+pub const getMinFrameInterval = render.getMinFrameInterval;
+
+// Re-export input handler functions
+pub const handleInput = input_handler.handleInput;
+pub const executeAppAction = input_handler.executeAppAction;
+pub const handleNormalModeKey = input_handler.handleNormalModeKey;
+pub const handleUrlPromptKey = input_handler.handleUrlPromptKey;
+
+// Re-export mouse handler functions
+pub const handleMouse = mouse_handler.handleMouse;
+pub const handleMouseNormal = mouse_handler.handleMouseNormal;
+pub const handleTabBarClick = mouse_handler.handleTabBarClick;
+pub const mouseToPixels = mouse_handler.mouseToPixels;
