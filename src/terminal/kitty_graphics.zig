@@ -129,8 +129,8 @@ pub const KittyGraphics = struct {
             break :blk id;
         };
 
-        // Kitty protocol chunk size (4096 bytes max per chunk)
-        const CHUNK_SIZE: usize = 4096;
+        // Kitty protocol chunk size (16KB reduces write amplification)
+        const CHUNK_SIZE: usize = 16384;
 
         var offset: usize = 0;
         var first_chunk = true;

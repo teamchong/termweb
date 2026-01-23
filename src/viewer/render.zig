@@ -119,7 +119,7 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame
     const render_t0 = std.time.nanoTimestamp();
 
     // Larger buffer reduces write syscalls (frames can be 300KB+)
-    var stdout_buf: [65536]u8 = undefined; // 64KB buffer
+    var stdout_buf: [262144]u8 = undefined; // 256KB buffer
     const stdout_file = std.fs.File.stdout();
     var stdout_writer = stdout_file.writer(&stdout_buf);
     const writer = &stdout_writer.interface;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 const detector = @import("chrome/detector.zig");
 const launcher = @import("chrome/launcher.zig");
@@ -8,7 +9,8 @@ const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 const toolbar_mod = @import("ui/toolbar.zig");
 
-const VERSION = "0.7.2";
+/// Version from package.json (single source of truth)
+const VERSION = build_options.version;
 
 const Command = enum {
     open,

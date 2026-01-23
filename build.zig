@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Read version from package.json at build time
+    const version = getVersionFromPackageJson(b) orelse "0.0.0";
+
     // Vendor modules
     const hashmap_shim = b.createModule(.{
         .root_source_file = b.path("src/vendor/utils/hashmap_helper.zig"),
@@ -40,6 +43,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+
+    // Embed version from package.json as compile-time option
+    const version_option = b.addOptions();
+    version_option.addOption([]const u8, "version", version);
+    exe.root_module.addOptions("build_options", version_option);
 
     // Add C libraries
     exe.addCSourceFile(.{
@@ -105,4 +113,22 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+/// Read version from package.json (single source of truth)
+fn getVersionFromPackageJson(b: *std.Build) ?[]const u8 {
+    const package_json = b.build_root.handle.openFile("package.json", .{}) catch return null;
+    defer package_json.close();
+
+    var buf: [4096]u8 = undefined;
+    const len = package_json.readAll(&buf) catch return null;
+    const content = buf[0..len];
+
+    // Find "version": "x.y.z"
+    const marker = "\"version\":";
+    const start = std.mem.indexOf(u8, content, marker) orelse return null;
+    const quote1 = std.mem.indexOfPos(u8, content, start + marker.len, "\"") orelse return null;
+    const quote2 = std.mem.indexOfPos(u8, content, quote1 + 1, "\"") orelse return null;
+
+    return b.allocator.dupe(u8, content[quote1 + 1 .. quote2]) catch null;
 }
