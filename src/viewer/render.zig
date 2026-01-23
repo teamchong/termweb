@@ -29,15 +29,16 @@ pub fn getMinFrameInterval(viewport_width: u32, viewport_height: u32) i128 {
 pub fn tryRenderScreencast(viewer: anytype) !bool {
     const now = std.time.nanoTimestamp();
 
-    // Resolution-based FPS limiting
-    const min_interval = getMinFrameInterval(viewer.viewport_width, viewer.viewport_height);
-    if (viewer.last_frame_time > 0 and (now - viewer.last_frame_time) < min_interval) {
-        return false; // Too soon, skip to maintain target FPS
-    }
-
     // Get frame with proper ownership - MUST call deinit when done
+    // This also triggers ACK logic for adaptive throttling
     var frame = screenshot_api.getLatestScreencastFrame(viewer.cdp_client) orelse return false;
     defer frame.deinit(); // Proper cleanup!
+
+    // Resolution-based FPS limiting (check AFTER getting frame to ensure ACKs flow)
+    const min_interval = getMinFrameInterval(viewer.viewport_width, viewer.viewport_height);
+    if (viewer.last_frame_time > 0 and (now - viewer.last_frame_time) < min_interval) {
+        return false; // Too soon, skip render but frame was ACKed
+    }
 
     // Throttle: Don't re-render the same frame multiple times
     if (viewer.last_rendered_generation > 0 and frame.generation <= viewer.last_rendered_generation) {

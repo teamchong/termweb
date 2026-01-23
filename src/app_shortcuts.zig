@@ -31,56 +31,70 @@ pub const AppAction = enum {
     tab_picker,
 };
 
+/// Key type for shortcuts - can be a character or special key
+pub const ShortcutKey = union(enum) {
+    char: u8,
+    left,
+    right,
+};
+
 /// Shortcut definition
 pub const ShortcutDef = struct {
-    key: u8,
-    shortcut_mod: bool = true,
+    key: ShortcutKey,
+    shortcut_mod: bool = true,  // Cmd on macOS, Ctrl on Linux
+    ctrl: bool = false,          // Explicit Ctrl (cross-platform)
     shift: bool = false,
     alt: bool = false,
     action: AppAction,
 };
 
 /// App shortcuts that are intercepted (not sent to browser)
+/// All shortcuts use Ctrl for cross-platform consistency
 pub const app_shortcuts = [_]ShortcutDef{
     // Quit shortcuts
-    .{ .key = 'q', .action = .quit },
-    .{ .key = 'w', .action = .quit },
+    .{ .key = .{ .char = 'q' }, .shortcut_mod = false, .ctrl = true, .action = .quit },
+    .{ .key = .{ .char = 'w' }, .shortcut_mod = false, .ctrl = true, .action = .quit },
 
     // Navigation
-    .{ .key = 'l', .action = .address_bar },
-    .{ .key = 'r', .action = .reload },
-    .{ .key = '[', .action = .go_back },      // Cmd+[ = back (like Safari/Chrome)
-    .{ .key = ']', .action = .go_forward },   // Cmd+] = forward (like Safari/Chrome)
-    .{ .key = '.', .action = .stop_loading }, // Cmd+. = stop (like Safari)
+    .{ .key = .{ .char = 'l' }, .shortcut_mod = false, .ctrl = true, .action = .address_bar },
+    .{ .key = .{ .char = 'r' }, .shortcut_mod = false, .ctrl = true, .action = .reload },
+    .{ .key = .{ .char = '[' }, .shortcut_mod = false, .ctrl = true, .action = .go_back },
+    .{ .key = .{ .char = ']' }, .shortcut_mod = false, .ctrl = true, .action = .go_forward },
+    .{ .key = .{ .char = '.' }, .shortcut_mod = false, .ctrl = true, .action = .stop_loading },
 
     // Clipboard operations (use system clipboard, not browser's)
-    .{ .key = 'c', .action = .copy },
-    .{ .key = 'x', .action = .cut },
-    .{ .key = 'v', .action = .paste },
-    .{ .key = 'a', .action = .select_all },
+    .{ .key = .{ .char = 'c' }, .shortcut_mod = false, .ctrl = true, .action = .copy },
+    .{ .key = .{ .char = 'x' }, .shortcut_mod = false, .ctrl = true, .action = .cut },
+    .{ .key = .{ .char = 'v' }, .shortcut_mod = false, .ctrl = true, .action = .paste },
+    .{ .key = .{ .char = 'a' }, .shortcut_mod = false, .ctrl = true, .action = .select_all },
 
     // Tab management
-    .{ .key = 't', .action = .tab_picker },
+    .{ .key = .{ .char = 't' }, .shortcut_mod = false, .ctrl = true, .action = .tab_picker },
 };
 
 /// Find an app action for a key event.
 /// Returns null if the key should be passed to the browser.
 pub fn findAppAction(event: NormalizedKeyEvent) ?AppAction {
-    // Get the character from the base key
-    const char = event.base_key.getChar() orelse return null;
-    const lower_char = std.ascii.toLower(char);
-
     for (app_shortcuts) |shortcut| {
-        // Check if shortcut modifier requirement matches
+        // Check modifier requirements
         if (shortcut.shortcut_mod and !event.shortcut_mod) continue;
         if (!shortcut.shortcut_mod and event.shortcut_mod) continue;
-
-        // Check additional modifiers
+        if (shortcut.ctrl and !event.ctrl) continue;
+        if (!shortcut.ctrl and !shortcut.shortcut_mod and event.ctrl) continue;
         if (shortcut.shift != event.shift) continue;
         if (shortcut.alt != event.alt) continue;
 
-        // Check key match (case-insensitive)
-        if (std.ascii.toLower(shortcut.key) == lower_char) {
+        // Check key match
+        const matches = switch (shortcut.key) {
+            .char => |c| blk: {
+                const event_char = event.base_key.getChar() orelse break :blk false;
+                break :blk std.ascii.toLower(c) == std.ascii.toLower(event_char);
+            },
+            .left => event.base_key == .left,
+            .right => event.base_key == .right,
+        };
+
+        if (matches) {
             return shortcut.action;
         }
     }
