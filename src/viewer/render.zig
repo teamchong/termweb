@@ -12,19 +12,10 @@ const ZIndex = ui_mod.ZIndex;
 const cursor_asset = ui_mod.assets.cursor;
 
 /// Get maximum FPS based on viewport resolution
-/// Higher resolution = lower FPS to prevent CPU overload
 pub fn getMaxFpsForResolution(viewport_width: u32, viewport_height: u32) u32 {
-    const total_pixels = @as(u64, viewport_width) * @as(u64, viewport_height);
-
-    if (total_pixels > 2_000_000) {
-        return 15; // 2MP+ (e.g., 1920x1080): 15 FPS
-    } else if (total_pixels > 1_000_000) {
-        return 24; // 1-2MP: 24 FPS
-    } else if (total_pixels > 500_000) {
-        return 30; // 500K-1MP: 30 FPS
-    } else {
-        return 30; // <500K: 30 FPS (terminal limited)
-    }
+    _ = viewport_width;
+    _ = viewport_height;
+    return 24; // Fixed 24 FPS
 }
 
 /// Get minimum frame interval based on resolution
