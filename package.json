@@ -1,7 +1,8 @@
 {
   "name": "termweb",
-  "version": "0.7.6",
-  "description": "Web browser in your terminal using Kitty graphics protocol",
+  "version": "0.8.0",
+  "description": "Web browser in your terminal using Kitty graphics protocol. SDK for building terminal apps with web technologies.",
+  "main": "./lib/index.js",
   "bin": {
     "termweb": "./bin/termweb.js"
   },
@@ -11,6 +12,7 @@
   },
   "files": [
     "bin/",
+    "lib/",
     "scripts/install.js",
     "README.md"
   ],
@@ -41,5 +43,16 @@
   "cpu": [
     "x64",
     "arm64"
-  ]
+  ],
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "ws": ">=8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  }
 }
