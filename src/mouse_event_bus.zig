@@ -86,6 +86,10 @@ pub const MouseEventBus = struct {
     pending_wheel: ?WheelEvent,
     pending_move: ?MoveEvent,
 
+    // Last sent position (skip if unchanged)
+    last_sent_x: u32,
+    last_sent_y: u32,
+
     // Mouse button state tracking
     buttons_state: u32,
 
@@ -113,7 +117,7 @@ pub const MouseEventBus = struct {
     // Debug
     debug_enabled: bool,
 
-    const TICK_INTERVAL_NS = 16 * std.time.ns_per_ms; // ~60fps
+    const TICK_INTERVAL_NS = 33 * std.time.ns_per_ms; // ~30fps
     const DOUBLE_CLICK_TIME_MS = 400; // max time between clicks for double-click (standard OS default)
     const DOUBLE_CLICK_DISTANCE = 15; // max pixel distance for double-click
 
@@ -126,6 +130,8 @@ pub const MouseEventBus = struct {
             .pending_clicks = .{},
             .pending_wheel = null,
             .pending_move = null,
+            .last_sent_x = std.math.maxInt(u32),
+            .last_sent_y = std.math.maxInt(u32),
             .buttons_state = 0,
             .last_click_time = 0,
             .last_click_x = 0,
@@ -331,6 +337,13 @@ pub const MouseEventBus = struct {
     }
 
     fn sendMove(self: *MouseEventBus, move: MoveEvent) void {
+        // Skip if position unchanged (reduces CDP bandwidth)
+        if (move.browser_x == self.last_sent_x and move.browser_y == self.last_sent_y) {
+            return;
+        }
+        self.last_sent_x = move.browser_x;
+        self.last_sent_y = move.browser_y;
+
         interact_mod.sendMouseEvent(
             self.cdp_client,
             self.allocator,
