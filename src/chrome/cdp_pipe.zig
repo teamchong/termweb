@@ -456,14 +456,11 @@ pub const PipeCdpClient = struct {
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
 
-        // Set navigation flag for main frame navigation only (not iframes)
-        // Main frame doesn't have parentId in the frame object
-        if (std.mem.eql(u8, method, "Page.frameNavigated")) {
-            // Only trigger for main frame (no parentId field)
-            if (std.mem.indexOf(u8, payload, "\"parentId\"") == null) {
-                self.navigation_happened.store(true, .release);
-            }
-        } else if (std.mem.eql(u8, method, "Page.navigatedWithinDocument")) {
+        // Set navigation flag for navigation events (event bus pattern)
+        // This is lightweight - just an atomic flag, no queueing
+        if (std.mem.eql(u8, method, "Page.frameNavigated") or
+            std.mem.eql(u8, method, "Page.navigatedWithinDocument"))
+        {
             self.navigation_happened.store(true, .release);
         }
 
