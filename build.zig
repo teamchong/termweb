@@ -92,6 +92,66 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // NAPI shared library for Node.js
+    const napi = b.addLibrary(.{
+        .name = "termweb",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/napi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Embed version
+    napi.root_module.addOptions("build_options", version_option);
+
+    // Add C libraries
+    napi.addCSourceFile(.{
+        .file = b.path("src/vendor/stb_image.c"),
+        .flags = &.{"-O2"},
+    });
+    napi.addCSourceFile(.{
+        .file = b.path("src/vendor/stb_truetype.c"),
+        .flags = &.{"-O2"},
+    });
+    napi.addCSourceFile(.{
+        .file = b.path("src/vendor/nanosvg.c"),
+        .flags = &.{ "-O2", "-fno-strict-aliasing" },
+    });
+    napi.addIncludePath(b.path("src/vendor"));
+
+    // libjpeg-turbo
+    if (target.result.os.tag == .macos) {
+        if (target.result.cpu.arch == .aarch64) {
+            napi.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/jpeg-turbo/include" });
+            napi.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.a" });
+        } else {
+            napi.addIncludePath(.{ .cwd_relative = "/usr/local/opt/jpeg-turbo/include" });
+            napi.addObjectFile(.{ .cwd_relative = "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.a" });
+        }
+    } else if (target.result.os.tag == .linux) {
+        napi.addIncludePath(.{ .cwd_relative = "/usr/include" });
+        if (target.result.cpu.arch == .aarch64) {
+            napi.addObjectFile(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu/libturbojpeg.a" });
+        } else {
+            napi.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libturbojpeg.a" });
+        }
+    }
+
+    napi.linkLibC();
+    napi.root_module.addImport("json", json_mod);
+    napi.root_module.addImport("websocket", websocket_mod);
+
+    // Allow undefined NAPI symbols (provided by Node.js at runtime)
+    napi.linker_allow_shlib_undefined = true;
+
+    // Install as .node file
+    const napi_install = b.addInstallArtifact(napi, .{
+        .dest_sub_path = "termweb.node",
+    });
+    b.getInstallStep().dependOn(&napi_install.step);
+
     // Run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

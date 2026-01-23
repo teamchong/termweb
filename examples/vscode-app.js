@@ -20,13 +20,4 @@ console.log('  Cmd/Ctrl+B  - Toggle sidebar');
 console.log('  Cmd/Ctrl+P  - Quick open');
 console.log('');
 
-const proc = termweb.open('https://vscode.dev', { toolbar: !noToolbar });
-
-proc.on('exit', (code) => {
-  process.exit(code || 0);
-});
-
-proc.on('error', (err) => {
-  console.error('Failed to start:', err.message);
-  process.exit(1);
-});
+termweb.open('https://vscode.dev', { toolbar: !noToolbar });

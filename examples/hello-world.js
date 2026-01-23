@@ -11,8 +11,4 @@ console.log('Opening example.com...');
 console.log('Press Cmd/Ctrl+Q to quit');
 console.log('');
 
-const proc = termweb.open('https://example.com');
-
-proc.on('exit', (code) => {
-  process.exit(code || 0);
-});
+termweb.open('https://example.com');
