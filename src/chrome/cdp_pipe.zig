@@ -98,6 +98,7 @@ pub const PipeCdpClient = struct {
     // We delay acking until the viewer consumes the frame via getLatestFrame()
     pending_ack_frame_sid: ?u32,
     pending_ack_routing_sid: ?[]u8, // Owned copy
+    last_ack_time: i128, // Track last ACK time for frame rate limiting
 
     pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
         const frame_pool = try FramePool.init(allocator);
@@ -125,6 +126,7 @@ pub const PipeCdpClient = struct {
             .write_file_closed = false,
             .pending_ack_frame_sid = null,
             .pending_ack_routing_sid = null,
+            .last_ack_time = 0,
         };
 
         return client;
@@ -405,15 +407,24 @@ pub const PipeCdpClient = struct {
         const slot = self.frame_pool.acquireLatestFrame() orelse return null;
 
         // Send pending ack for adaptive throttling
-        // This tells Chrome we're ready for more frames
+        // Only ACK if enough time has passed (24fps = 41.67ms between frames)
+        // This prevents Chrome from sending frames faster than we can render
+        const TARGET_FRAME_TIME_NS: i128 = 41_666_667; // ~24fps
+        const now = std.time.nanoTimestamp();
+
         if (self.pending_ack_frame_sid) |frame_sid| {
-            self.acknowledgeFrame(self.pending_ack_routing_sid, frame_sid) catch {};
-            // Free the routing_sid copy
-            if (self.pending_ack_routing_sid) |sid| {
-                self.allocator.free(sid);
+            const elapsed = now - self.last_ack_time;
+            if (elapsed >= TARGET_FRAME_TIME_NS or self.last_ack_time == 0) {
+                self.acknowledgeFrame(self.pending_ack_routing_sid, frame_sid) catch {};
+                self.last_ack_time = now;
+                // Free the routing_sid copy
+                if (self.pending_ack_routing_sid) |sid| {
+                    self.allocator.free(sid);
+                }
+                self.pending_ack_frame_sid = null;
+                self.pending_ack_routing_sid = null;
             }
-            self.pending_ack_frame_sid = null;
-            self.pending_ack_routing_sid = null;
+            // If not enough time passed, keep pending - will ACK on next getLatestFrame call
         }
 
         return ScreencastFrame{
