@@ -361,7 +361,7 @@ pub const Viewer = struct {
             
         try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
-            .quality = 80,
+            .quality = 60,
             .width = self.viewport_width,
             .height = self.viewport_height,
         });
@@ -644,7 +644,7 @@ pub const Viewer = struct {
         // Restart screencast with new dimensions
         screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
-            .quality = 80,
+            .quality = 60,
             .width = new_width,
             .height = new_height,
         }) catch |err| {
@@ -1078,7 +1078,7 @@ pub const Viewer = struct {
         // Restart screencast on the new target
         screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
-            .quality = 80,
+            .quality = 60,
             .width = self.viewport_width,
             .height = self.viewport_height,
         }) catch |err| {
