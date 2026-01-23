@@ -79,9 +79,6 @@ pub const PipeCdpClient = struct {
     // NOTE: No event queue - pipe is ONLY for screencast frames
     // Events go through nav_ws
 
-    // Navigation event flag - set when Page.frameNavigated or similar events occur
-    navigation_happened: std.atomic.Value(bool),
-
     frame_pool: *FramePool,
     frame_count: std.atomic.Value(u32),
 
@@ -116,7 +113,6 @@ pub const PipeCdpClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .response_queue = try std.ArrayList(ResponseQueueEntry).initCapacity(allocator, 0),
             .response_mutex = .{},
-            .navigation_happened = std.atomic.Value(bool).init(false),
             .frame_pool = frame_pool,
             .frame_count = std.atomic.Value(u32).init(0),
             .write_mutex = .{},
@@ -166,14 +162,6 @@ pub const PipeCdpClient = struct {
 
         self.allocator.free(self.read_buffer);
         self.allocator.destroy(self);
-    }
-
-    /// Check if navigation happened and clear the flag (atomic swap)
-    pub fn checkNavigationHappened(self: *PipeCdpClient) bool {
-        _ = self;
-        // Disabled - loading indicator was too noisy (triggered by iframes)
-        // TODO: Properly detect main frame navigation via websocket events
-        return false;
     }
 
     pub fn sendCommandAsync(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) !void {

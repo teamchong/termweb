@@ -595,12 +595,6 @@ pub const CdpClient = struct {
         };
     }
 
-    /// Check if navigation happened (event bus pattern)
-    /// Returns true if a navigation event occurred since last check, and clears the flag
-    pub fn checkNavigationHappened(self: *CdpClient) bool {
-        return self.pipe_client.checkNavigationHappened();
-    }
-
     /// Switch to a different target (for tab switching)
     /// Attaches to the target and updates the session ID
     pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {
