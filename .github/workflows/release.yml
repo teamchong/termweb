@@ -49,11 +49,11 @@ jobs:
         if: runner.os == 'Linux' && matrix.arch == 'aarch64'
         run: |
           sudo dpkg --add-architecture arm64
-          # Remove all existing sources to avoid arch conflicts
-          sudo rm -f /etc/apt/sources.list.d/*.list
-          sudo rm -f /etc/apt/apt-mirrors.txt
-          # Create clean sources.list with arch-specific repos
-          cat << 'EOF' | sudo tee /etc/apt/sources.list
+          # Completely reset apt sources - remove everything first
+          sudo rm -f /etc/apt/sources.list
+          sudo rm -f /etc/apt/sources.list.d/*
+          # Create fresh sources.list with arch-specific repos
+          sudo tee /etc/apt/sources.list << 'EOF'
           deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
           deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
           deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
