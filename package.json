@@ -4,7 +4,7 @@
   "description": "Web browser in your terminal using Kitty graphics protocol. SDK for building terminal apps with web technologies.",
   "main": "./lib/index.js",
   "bin": {
-    "termweb": "./bin/termweb.js"
+    "termweb": "bin/termweb.js"
   },
   "scripts": {
     "postinstall": "node scripts/install.js",
@@ -28,7 +28,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/teamchong/termweb"
+    "url": "git+https://github.com/teamchong/termweb.git"
   },
   "publishConfig": {
     "access": "public"
