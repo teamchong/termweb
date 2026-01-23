@@ -139,7 +139,6 @@ pub const CdpClient = struct {
 
         // Connect 3 WebSockets for input (mouse, keyboard, navigation)
         // Wait for Chrome to be ready on the discovered port with retries
-        std.debug.print("Connecting WebSockets to port {}...\n", .{client.debug_port});
         var ws_url: ?[]const u8 = null;
         var retry: u32 = 0;
         // Increase timeout to 10s (50 * 200ms) as Chrome can be slow to start listening
@@ -152,68 +151,50 @@ pub const CdpClient = struct {
             if (ws_url != null) break;
         } else {
             // Failed to discover WebSocket URL
-            std.debug.print("[CDP] Failed to discover page WebSocket URL after 50 retries\n", .{});
             return CdpError.WebSocketConnectionFailed;
         }
-        std.debug.print("Got WebSocket URL\n", .{});
 
         if (ws_url) |url| {
             defer allocator.free(url);
 
             // Connect strictly - failure is fatal
-            std.debug.print("Connecting mouse_ws...\n", .{});
             client.mouse_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-            std.debug.print("Connecting keyboard_ws...\n", .{});
             client.keyboard_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-            std.debug.print("Connecting nav_ws...\n", .{});
             client.nav_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
 
             // Start reader threads strictly - failure is fatal
-            std.debug.print("Starting reader threads...\n", .{});
             try client.mouse_ws.?.startReaderThread();
             try client.keyboard_ws.?.startReaderThread();
             try client.nav_ws.?.startReaderThread();
 
             // Enable Runtime domain on nav_ws to receive console events
             // This MUST be on nav_ws, not pipe - pipe is only for screencast
-            std.debug.print("Enabling Runtime on nav_ws...\n", .{});
             const runtime_result = try client.nav_ws.?.sendCommand("Runtime.enable", null);
             allocator.free(runtime_result);
 
             // Enable Page domain on nav_ws to receive navigation events
             // This duplicates pipe's Page.enable but ensures events come through nav_ws
-            std.debug.print("Enabling Page on nav_ws...\n", .{});
             const page_result = try client.nav_ws.?.sendCommand("Page.enable", null);
             allocator.free(page_result);
 
         }
 
         // Connect browser_ws for Browser domain events (downloads)
-        std.debug.print("Connecting browser_ws...\n", .{});
         if (client.discoverBrowserWebSocketUrl(allocator)) |browser_url| {
             defer allocator.free(browser_url);
-            client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch |err| blk: {
-                std.debug.print("[CDP] browser_ws connect failed: {}\n", .{err});
-                break :blk null;
-            };
+            client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch null;
             if (client.browser_ws) |bws| {
                 try bws.startReaderThread();
-                std.debug.print("Enabling downloads on browser_ws...\n", .{});
                 const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
                 defer allocator.free(download_params);
                 const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
                 allocator.free(download_result);
 
                 // Enable target discovery to detect new tabs/popups
-                std.debug.print("Enabling target discovery on browser_ws...\n", .{});
                 const target_result = try bws.sendCommand("Target.setDiscoverTargets", "{\"discover\":true}");
                 allocator.free(target_result);
             }
-        } else |_| {
-            std.debug.print("[CDP] Failed to get browser WebSocket URL\n", .{});
-        }
-
-        std.debug.print("CDP client ready\n", .{});
+        } else |_| {}
         return client;
     }
 

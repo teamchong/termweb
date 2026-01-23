@@ -791,17 +791,6 @@ pub const ToolbarRenderer = struct {
 
     /// Get button at pixel position
     pub fn hitTest(self: *ToolbarRenderer, pixel_x: u32, pixel_y: u32) ?ButtonIcon {
-        // Debug: log to cdp_debug.log
-        {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "[TOOLBAR] hitTest pixel_x={} pixel_y={} toolbar_height={}\n", .{ pixel_x, pixel_y, self.toolbar_height }) catch "";
-            if (std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write })) |f| {
-                defer f.close();
-                f.seekFromEnd(0) catch {};
-                f.writeAll(msg) catch {};
-            } else |_| {}
-        }
-
         if (pixel_y > self.toolbar_height) return null;
 
         var x: u32 = self.button_padding;

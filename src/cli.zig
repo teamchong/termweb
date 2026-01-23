@@ -201,7 +201,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         20;
     if (cell_width > 14) {
         dpr = 2;
-        std.debug.print("Detected High-DPI display ({} px/col), scaling viewport by 0.5\n", .{cell_width});
     }
 
     // Get actual toolbar height (accounts for DPR)
@@ -228,19 +227,10 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
         viewport_width = @intFromFloat(@as(f64, @floatFromInt(viewport_width)) * pixel_scale);
         viewport_height = @intFromFloat(@as(f64, @floatFromInt(viewport_height)) * pixel_scale);
-        std.debug.print("Viewport capped: {}x{} ({} pixels, max {})\n", .{ viewport_width, viewport_height, viewport_width * viewport_height, MAX_PIXELS });
     }
 
-    std.debug.print("Terminal: {}x{} px ({} cols x {} rows)\n", .{
-        size.width_px,
-        size.height_px,
-        size.cols,
-        size.rows,
-    });
-    std.debug.print("Viewport: {}x{} (DPR={})\n", .{ viewport_width, viewport_height, dpr });
-
     // Launch Chrome with Pipe transport
-    std.debug.print("Launching Chrome (Pipe mode)...\n", .{});
+    std.debug.print("Launching browser...\n", .{});
 
     // Determine profile cloning behavior:
     // - Default: clone "Default" profile (from LaunchOptions default)
@@ -279,33 +269,26 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer chrome_instance.deinit();
 
-    std.debug.print("Chrome launched\n", .{});
-
     // Connect CDP client via Pipe
     var client = cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port) catch |err| {
-        std.debug.print("Error connecting to Chrome DevTools Protocol: {}\n", .{err});
+        std.debug.print("Error connecting to Chrome: {}\n", .{err});
         std.process.exit(1);
     };
     defer client.deinit();
-
-    std.debug.print("Connected to Chrome via Pipe\n", .{});
 
     // Set viewport size explicitly (ensures Chrome uses exact dimensions for coordinate mapping)
     screenshot_api.setViewport(client, allocator, viewport_width, viewport_height) catch |err| {
         std.debug.print("Error setting viewport: {}\n", .{err});
         std.process.exit(1);
     };
-    std.debug.print("Viewport set to: {}x{}\n", .{ viewport_width, viewport_height });
 
-    std.debug.print("Navigating to: {s}\n", .{url});
+    std.debug.print("Loading: {s}\n", .{url});
 
     // Navigate to URL
     screenshot_api.navigateToUrl(client, allocator, url) catch |err| {
         std.debug.print("Error navigating to URL: {}\n", .{err});
         std.process.exit(1);
     };
-
-    std.debug.print("Page loaded\n", .{});
 
     // Query Chrome's ACTUAL viewport dimensions for coordinate mapping
     // (setDeviceMetricsOverride may not take effect exactly as specified)
@@ -314,10 +297,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (screenshot_api.getActualViewport(client, allocator)) |actual_vp| {
         if (actual_vp.width > 0) actual_viewport_width = actual_vp.width;
         if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
-        std.debug.print("Chrome actual viewport: {}x{}\n", .{ actual_viewport_width, actual_viewport_height });
-    } else |err| {
-        std.debug.print("Warning: Could not get actual viewport ({}), using requested size\n", .{err});
-    }
+    } else |_| {}
 
     // Ensure actual viewport also respects pixel limit
     const actual_total_pixels: u64 = @as(u64, actual_viewport_width) * @as(u64, actual_viewport_height);
@@ -325,7 +305,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const actual_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(actual_total_pixels)));
         actual_viewport_width = @intFromFloat(@as(f64, @floatFromInt(actual_viewport_width)) * actual_scale);
         actual_viewport_height = @intFromFloat(@as(f64, @floatFromInt(actual_viewport_height)) * actual_scale);
-        std.debug.print("Actual viewport capped: {}x{}\n", .{ actual_viewport_width, actual_viewport_height });
     }
 
     // Run viewer with Chrome's actual viewport for accurate coordinate mapping

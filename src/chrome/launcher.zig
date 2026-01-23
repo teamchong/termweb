@@ -437,13 +437,6 @@ fn extractDebugPort(stderr_fd: std.posix.fd_t) !u16 {
         }
     }
 
-    // Debug: print what we got from Chrome
-    if (total_read > 0) {
-        std.debug.print("\n[DEBUG] Chrome stderr output ({} bytes):\n{s}\n", .{ total_read, output_buf[0..total_read] });
-    } else {
-        std.debug.print("\n[DEBUG] Chrome produced no stderr output\n", .{});
-    }
-
     return LaunchError.TimeoutWaitingForDebugUrl;
 }
 
@@ -582,13 +575,6 @@ fn extractDebugUrl(allocator: std.mem.Allocator, stderr: std.fs.File) ![]const u
                 return try allocator.dupe(u8, url);
             }
         }
-    }
-
-    // Debug: print what we got from Chrome
-    if (total_read > 0) {
-        std.debug.print("\n[DEBUG] Chrome stderr output ({} bytes):\n{s}\n", .{ total_read, output_buf[0..total_read] });
-    } else {
-        std.debug.print("\n[DEBUG] Chrome produced no stderr output\n", .{});
     }
 
     return LaunchError.TimeoutWaitingForDebugUrl;
