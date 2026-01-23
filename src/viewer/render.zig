@@ -177,6 +177,11 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame
 
     const render_t1 = std.time.nanoTimestamp();
 
+    // Delete old image before reusing ID (Kitty requires this for replacement)
+    if (viewer.last_content_image_id) |old_id| {
+        viewer.kitty.deleteImage(writer, old_id) catch {};
+    }
+
     // Try SHM path first
     var used_shm = false;
     if (viewer.shm_buffer) |*shm| {

@@ -703,18 +703,7 @@ pub const Viewer = struct {
         self.last_frame_time = 0;
         self.last_rendered_generation = 0;
         self.frames_skipped = 0;
-
-        // Delete old images before resetting IDs (prevents terminal memory leak)
-        if (self.last_content_image_id != null or self.cursor_image_id != null) {
-            var buf: [256]u8 = undefined;
-            const stdout = std.fs.File.stdout();
-            var w = stdout.writer(&buf);
-            if (self.last_content_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
-            if (self.cursor_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
-            w.interface.flush() catch {};
-        }
-        self.last_content_image_id = null;
-        self.cursor_image_id = null;
+        // Keep image IDs - new frames overwrite using same ID (no memory leak)
 
         self.log("[RESET] Screencast reset complete\n", .{});
     }
@@ -1138,18 +1127,7 @@ pub const Viewer = struct {
         // Update current_url
         self.allocator.free(self.current_url);
         self.current_url = try self.allocator.dupe(u8, tab.url);
-
-        // Delete old images before resetting IDs (prevents terminal memory leak)
-        if (self.last_content_image_id != null or self.cursor_image_id != null) {
-            var buf: [256]u8 = undefined;
-            const stdout = std.fs.File.stdout();
-            var w = stdout.writer(&buf);
-            if (self.last_content_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
-            if (self.cursor_image_id) |id| self.kitty.deleteImage(&w.interface, id) catch {};
-            w.interface.flush() catch {};
-        }
-        self.last_content_image_id = null;
-        self.cursor_image_id = null;
+        // Keep image IDs - new frames overwrite using same ID (no memory leak)
 
         self.ui_dirty = true;
     }
@@ -1287,22 +1265,136 @@ pub const Viewer = struct {
 
     /// Handle clipboard sync - copy browser clipboard to system clipboard
     fn handleClipboardSync(self: *Viewer, payload: []const u8, start: usize) !void {
-        // Find the end of the clipboard text (look for closing quote in JSON)
+        // Find the end of the clipboard text (look for closing quote in JSON, handling escapes)
         var end = start;
-        while (end < payload.len and payload[end] != '"') : (end += 1) {}
+        while (end < payload.len) : (end += 1) {
+            if (payload[end] == '\\' and end + 1 < payload.len) {
+                end += 1; // Skip escaped character
+            } else if (payload[end] == '"') {
+                break;
+            }
+        }
 
         if (end <= start) {
             self.log("[CLIPBOARD] Empty clipboard text\n", .{});
             return;
         }
 
-        const clipboard_text = payload[start..end];
-        self.log("[CLIPBOARD] Syncing to system: '{s}' (len={d})\n", .{ clipboard_text[0..@min(clipboard_text.len, 50)], clipboard_text.len });
+        const raw_text = payload[start..end];
+        self.log("[CLIPBOARD] Raw text len={d}\n", .{raw_text.len});
+
+        // Unescape JSON string (handles \n, \t, \\, \", \uXXXX)
+        const unescaped = self.unescapeJsonString(raw_text) orelse {
+            // Fallback to raw text if unescape fails
+            const toolbar = @import("ui/toolbar.zig");
+            toolbar.copyToClipboard(self.allocator, raw_text);
+            return;
+        };
+        defer self.allocator.free(unescaped);
+
+        self.log("[CLIPBOARD] Unescaped len={d}\n", .{unescaped.len});
 
         // Copy to system clipboard via pbcopy
         const toolbar = @import("ui/toolbar.zig");
-        toolbar.copyToClipboard(self.allocator, clipboard_text);
+        toolbar.copyToClipboard(self.allocator, unescaped);
         self.log("[CLIPBOARD] Copied to system clipboard\n", .{});
+    }
+
+    /// Unescape a JSON string, handling \n, \t, \\, \", and \uXXXX sequences
+    fn unescapeJsonString(self: *Viewer, input: []const u8) ?[]u8 {
+        // Allocate max possible size (input length, since escapes are longer than output)
+        var output = self.allocator.alloc(u8, input.len * 4) catch return null; // *4 for potential UTF-8 expansion
+        var i: usize = 0;
+        var j: usize = 0;
+
+        while (i < input.len) {
+            if (input[i] == '\\' and i + 1 < input.len) {
+                switch (input[i + 1]) {
+                    'n' => {
+                        output[j] = '\n';
+                        j += 1;
+                        i += 2;
+                    },
+                    't' => {
+                        output[j] = '\t';
+                        j += 1;
+                        i += 2;
+                    },
+                    'r' => {
+                        output[j] = '\r';
+                        j += 1;
+                        i += 2;
+                    },
+                    '\\' => {
+                        output[j] = '\\';
+                        j += 1;
+                        i += 2;
+                    },
+                    '"' => {
+                        output[j] = '"';
+                        j += 1;
+                        i += 2;
+                    },
+                    '/' => {
+                        output[j] = '/';
+                        j += 1;
+                        i += 2;
+                    },
+                    'u' => {
+                        // Unicode escape: \uXXXX
+                        if (i + 5 < input.len) {
+                            const hex = input[i + 2 .. i + 6];
+                            const codepoint = std.fmt.parseInt(u21, hex, 16) catch {
+                                output[j] = input[i];
+                                j += 1;
+                                i += 1;
+                                continue;
+                            };
+
+                            // Check for surrogate pair (emojis etc)
+                            if (codepoint >= 0xD800 and codepoint <= 0xDBFF and i + 11 < input.len) {
+                                if (input[i + 6] == '\\' and input[i + 7] == 'u') {
+                                    const hex2 = input[i + 8 .. i + 12];
+                                    const low = std.fmt.parseInt(u21, hex2, 16) catch 0;
+                                    if (low >= 0xDC00 and low <= 0xDFFF) {
+                                        // Combine surrogate pair
+                                        const full_cp: u21 = 0x10000 + ((@as(u21, codepoint) - 0xD800) << 10) + (low - 0xDC00);
+                                        const len = std.unicode.utf8Encode(full_cp, output[j..]) catch 0;
+                                        j += len;
+                                        i += 12;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // Single codepoint
+                            const len = std.unicode.utf8Encode(codepoint, output[j..]) catch 0;
+                            j += len;
+                            i += 6;
+                        } else {
+                            output[j] = input[i];
+                            j += 1;
+                            i += 1;
+                        }
+                    },
+                    else => {
+                        output[j] = input[i];
+                        j += 1;
+                        i += 1;
+                    },
+                }
+            } else {
+                output[j] = input[i];
+                j += 1;
+                i += 1;
+            }
+        }
+
+        // Shrink to actual size
+        return self.allocator.realloc(output, j) catch {
+            self.allocator.free(output);
+            return null;
+        };
     }
 
     /// Handle clipboard read request - browser wants host clipboard

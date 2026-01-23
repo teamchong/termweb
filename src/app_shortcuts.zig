@@ -62,7 +62,7 @@ pub const app_shortcuts = [_]ShortcutDef{
     .{ .key = .{ .char = ']' }, .shortcut_mod = false, .ctrl = true, .action = .go_forward },
     .{ .key = .{ .char = '.' }, .shortcut_mod = false, .ctrl = true, .action = .stop_loading },
 
-    // Clipboard operations (use system clipboard, not browser's)
+    // Clipboard operations (Cmd+C on macOS, Ctrl+C on Linux)
     .{ .key = .{ .char = 'c' }, .shortcut_mod = false, .ctrl = true, .action = .copy },
     .{ .key = .{ .char = 'x' }, .shortcut_mod = false, .ctrl = true, .action = .cut },
     .{ .key = .{ .char = 'v' }, .shortcut_mod = false, .ctrl = true, .action = .paste },
