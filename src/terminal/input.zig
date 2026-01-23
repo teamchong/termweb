@@ -1,17 +1,40 @@
 const std = @import("std");
 
-// File-based debug logging (always on for debugging)
+// Debug logging - disabled by default for performance
+// Set TERMWEB_INPUT_DEBUG=1 to enable (truncates on startup, 10MB max)
+var input_debug_enabled: ?bool = null;
 var input_debug_file: ?std.fs.File = null;
+var input_debug_bytes: usize = 0;
+const INPUT_DEBUG_MAX_SIZE: usize = 10 * 1024 * 1024; // 10MB max
 
 fn inputDebugLog(comptime fmt: []const u8, args: anytype) void {
-    if (input_debug_file == null) {
-        input_debug_file = std.fs.cwd().createFile("/tmp/input_debug.log", .{ .truncate = true }) catch return;
+    // Check if debug is enabled (cached after first check)
+    if (input_debug_enabled == null) {
+        input_debug_enabled = if (std.posix.getenv("TERMWEB_INPUT_DEBUG")) |v|
+            std.mem.eql(u8, v, "1")
+        else
+            false;
+
+        if (input_debug_enabled.?) {
+            input_debug_file = std.fs.cwd().createFile("/tmp/input_debug.log", .{ .truncate = true }) catch null;
+        }
     }
-    if (input_debug_file) |f| {
-        var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
-        _ = f.write(msg) catch {};
+
+    if (!input_debug_enabled.?) return;
+
+    const f = input_debug_file orelse return;
+
+    // Auto-truncate if log gets too large
+    if (input_debug_bytes > INPUT_DEBUG_MAX_SIZE) {
+        f.seekTo(0) catch {};
+        f.setEndPos(0) catch {};
+        input_debug_bytes = 0;
+        _ = f.write("--- LOG TRUNCATED (exceeded 10MB) ---\n") catch {};
     }
+
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    input_debug_bytes += f.write(msg) catch 0;
 }
 
 pub const Key = union(enum) {

@@ -12,19 +12,42 @@ const websocket_cdp = @import("websocket_cdp.zig");
 const json = @import("json");
 const json_utils = @import("../utils/json.zig");
 
+/// Debug logging - disabled by default for performance
+/// Set TERMWEB_CDP_DEBUG=1 to enable (truncates log on startup)
+var cdp_debug_enabled: ?bool = null;
+var cdp_debug_file: ?std.fs.File = null;
+var cdp_debug_bytes: usize = 0;
+const CDP_DEBUG_MAX_SIZE: usize = 10 * 1024 * 1024; // 10MB max, then truncate
+
 fn logToFile(comptime fmt: []const u8, args: anytype) void {
+    // Check if debug is enabled (cached after first check)
+    if (cdp_debug_enabled == null) {
+        cdp_debug_enabled = if (std.posix.getenv("TERMWEB_CDP_DEBUG")) |v|
+            std.mem.eql(u8, v, "1")
+        else
+            false;
+
+        // Truncate on startup for fresh log each run
+        if (cdp_debug_enabled.?) {
+            cdp_debug_file = std.fs.cwd().createFile("cdp_debug.log", .{ .truncate = true }) catch null;
+        }
+    }
+
+    if (!cdp_debug_enabled.?) return;
+
+    const file = cdp_debug_file orelse return;
+
+    // Auto-truncate if log gets too large
+    if (cdp_debug_bytes > CDP_DEBUG_MAX_SIZE) {
+        file.seekTo(0) catch {};
+        file.setEndPos(0) catch {};
+        cdp_debug_bytes = 0;
+        _ = file.write("--- LOG TRUNCATED (exceeded 10MB) ---\n") catch {};
+    }
+
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-
-    const file = std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write }) catch |err| blk: {
-        if (err == error.FileNotFound) {
-             break :blk std.fs.cwd().createFile("cdp_debug.log", .{ .read = true }) catch return;
-        }
-        return;
-    };
-    defer file.close();
-    file.seekFromEnd(0) catch return;
-    file.writeAll(slice) catch return;
+    cdp_debug_bytes += file.write(slice) catch 0;
 }
 
 pub const CdpError = error{
