@@ -37,6 +37,14 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Install libjpeg-turbo (macOS)
+        if: runner.os == 'macOS'
+        run: brew install jpeg-turbo
+
+      - name: Install libjpeg-turbo (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libturbojpeg0-dev
+
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
 

@@ -66,12 +66,37 @@ pub const ShmBuffer = struct {
         return self.name[0..self.name_len];
     }
 
-    /// Write RGBA data to the buffer
+    /// Write RGBA data to the buffer (reopen pattern required for Ghostty)
     pub fn write(self: *ShmBuffer, data: []const u8) void {
+        var name_z: [32]u8 = undefined;
+        @memcpy(name_z[0..self.name_len], self.name[0..self.name_len]);
+        name_z[self.name_len] = 0;
+
+        const fd = c.shm_open(
+            @ptrCast(&name_z),
+            c.O_CREAT | c.O_RDWR,
+            @as(c.mode_t, 0o600),
+        );
+        if (fd < 0) return;
+        defer _ = c.close(fd);
+
+        _ = c.ftruncate(fd, @intCast(self.size));
+
+        const result = c.mmap(
+            null,
+            self.size,
+            c.PROT_READ | c.PROT_WRITE,
+            c.MAP_SHARED,
+            fd,
+            0,
+        );
+        if (result == c.MAP_FAILED) return;
+
+        const ptr: [*]u8 = @ptrCast(result);
         const copy_len = @min(data.len, self.size);
-        @memcpy(self.ptr[0..copy_len], data[0..copy_len]);
-        // Ensure data is visible to other processes (Kitty/Ghostty)
-        _ = c.msync(self.ptr, copy_len, c.MS_SYNC);
+        @memcpy(ptr[0..copy_len], data[0..copy_len]);
+
+        _ = c.munmap(result, self.size);
     }
 
     /// Get a slice to write directly

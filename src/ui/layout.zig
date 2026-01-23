@@ -27,6 +27,11 @@ pub const Placement = struct {
     pub const OVERLAY: u32 = 100;
 };
 
+/// Fixed image ID constants (reuse same ID to replace in-place)
+pub const ImageId = struct {
+    pub const CONTENT: u32 = 1000;
+};
+
 /// Z-index layers
 pub const ZIndex = struct {
     /// Web page content (behind UI chrome)

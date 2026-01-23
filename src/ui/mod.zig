@@ -18,6 +18,7 @@ pub const dialog = @import("dialog.zig");
 // Re-export commonly used types
 pub const Theme = assets.Theme;
 pub const Placement = layout.Placement;
+pub const ImageId = layout.ImageId;
 pub const ZIndex = layout.ZIndex;
 pub const Dimensions = layout.Dimensions;
 pub const ButtonState = state.ButtonState;

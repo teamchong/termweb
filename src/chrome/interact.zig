@@ -405,25 +405,26 @@ pub fn sendMouseEvent(
     // This is part of the click sequence (HIGH PRIORITY) - not subject to move throttling.
     // Without this, complex UIs (React/Vue/Canvas) may ignore the click.
     if (std.mem.eql(u8, event_type, "mousePressed")) {
-        const move_params = try std.fmt.allocPrint(
-            allocator,
+        var move_buf: [256]u8 = undefined;
+        const move_params = std.fmt.bufPrint(
+            &move_buf,
             "{{\"type\":\"mouseMoved\",\"x\":{d},\"y\":{d},\"button\":\"none\",\"buttons\":0,\"modifiers\":0,\"pointerType\":\"mouse\"}}",
             .{ x, y },
-        );
-        defer allocator.free(move_params);
+        ) catch return error.BufferTooSmall;
         debugLog("[MOUSE] mouseMoved (pre-click): {s}\n", .{move_params});
         client.sendMouseCommandAsync("Input.dispatchMouseEvent", move_params);
     }
+    _ = allocator; // No longer needed - using stack buffers
 
     // Note: clickCount is only used for mousePressed/mouseReleased
     // modifiers: 0 = no modifiers (Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8)
     // pointerType: mouse, pen, touch (default is mouse)
-    const params = try std.fmt.allocPrint(
-        allocator,
+    var params_buf: [256]u8 = undefined;
+    const params = std.fmt.bufPrint(
+        &params_buf,
         "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"{s}\",\"buttons\":{d},\"clickCount\":{d},\"modifiers\":0,\"pointerType\":\"mouse\"}}",
         .{ event_type, x, y, button, buttons, click_count },
-    );
-    defer allocator.free(params);
+    ) catch return error.BufferTooSmall;
 
     debugLog("[MOUSE] Sending: {s}\n", .{params});
 

@@ -113,7 +113,7 @@ pub const MouseEventBus = struct {
     // Debug
     debug_enabled: bool,
 
-    const TICK_INTERVAL_NS = 66 * std.time.ns_per_ms; // ~15fps
+    const TICK_INTERVAL_NS = 16 * std.time.ns_per_ms; // ~60fps
     const DOUBLE_CLICK_TIME_MS = 400; // max time between clicks for double-click (standard OS default)
     const DOUBLE_CLICK_DISTANCE = 15; // max pixel distance for double-click
 
@@ -165,7 +165,7 @@ pub const MouseEventBus = struct {
                 const mask = buttonMask(mouse.button);
                 self.buttons_state |= mask;
 
-                // Convert to browser coords and queue
+                // Convert to browser coords and send immediately (clicks are high priority)
                 if (mapper.terminalToBrowser(term_x, term_y)) |coords| {
                     // Detect double/triple click
                     const now = std.time.milliTimestamp();
@@ -192,17 +192,17 @@ pub const MouseEventBus = struct {
                     self.last_click_y = coords.y;
                     self.last_click_button = mouse.button;
 
-                    const click = ClickEvent{
+                    // Send immediately - clicks are highest priority, never queued
+                    self.sendClick(ClickEvent{
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                         .button = mouse.button,
                         .is_press = true,
                         .buttons_state = self.buttons_state,
                         .click_count = click_count,
-                    };
-                    _ = self.pending_clicks.push(click);
+                    });
                     if (self.debug_enabled) {
-                        std.debug.print("[BUS] Queued press: ({},{}) btn={s} state={} clickCount={}\n", .{
+                        std.debug.print("[BUS] Sent press: ({},{}) btn={s} state={} clickCount={}\n", .{
                             coords.x, coords.y, @tagName(mouse.button), self.buttons_state, click_count,
                         });
                     }
@@ -213,20 +213,19 @@ pub const MouseEventBus = struct {
                 const mask = buttonMask(mouse.button);
                 self.buttons_state &= ~mask;
 
-                // Convert to browser coords and queue
+                // Convert to browser coords and send immediately
                 if (mapper.terminalToBrowser(term_x, term_y)) |coords| {
-                    // Use same click_count as the corresponding press
-                    const click = ClickEvent{
+                    // Send immediately - releases are highest priority, never queued
+                    self.sendClick(ClickEvent{
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                         .button = mouse.button,
                         .is_press = false,
                         .buttons_state = self.buttons_state,
                         .click_count = self.current_click_count,
-                    };
-                    _ = self.pending_clicks.push(click);
+                    });
                     if (self.debug_enabled) {
-                        std.debug.print("[BUS] Queued release: ({},{}) btn={s} state={} clickCount={}\n", .{
+                        std.debug.print("[BUS] Sent release: ({},{}) btn={s} state={} clickCount={}\n", .{
                             coords.x, coords.y, @tagName(mouse.button), self.buttons_state, self.current_click_count,
                         });
                     }
@@ -244,13 +243,13 @@ pub const MouseEventBus = struct {
                 }
             },
             .move, .drag => {
-                // Replace pending move with latest (only if in browser area)
+                // Send moves immediately for low latency
                 if (mapper.terminalToBrowser(term_x, term_y)) |coords| {
-                    self.pending_move = MoveEvent{
+                    self.sendMove(MoveEvent{
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                         .buttons_state = self.buttons_state,
-                    };
+                    });
                 }
             },
         }
@@ -268,23 +267,12 @@ pub const MouseEventBus = struct {
         }
     }
 
-    /// Dispatch all pending events (called at 15fps)
+    /// Dispatch pending wheel events (clicks and moves are now immediate)
     fn tick(self: *MouseEventBus) void {
-        // 1. Send ALL pending clicks (highest priority, never drop)
-        while (self.pending_clicks.pop()) |click| {
-            self.sendClick(click);
-        }
-
-        // 2. Send latest wheel if any (medium priority)
+        // Only wheel is queued - clicks and moves are immediate
         if (self.pending_wheel) |wheel| {
             self.sendWheel(wheel);
             self.pending_wheel = null;
-        }
-
-        // 3. Send latest move if any (lowest priority)
-        if (self.pending_move) |move| {
-            self.sendMove(move);
-            self.pending_move = null;
         }
     }
 
@@ -349,11 +337,10 @@ pub const MouseEventBus = struct {
         ) catch {};
     }
 
-    /// Clear all pending events (e.g., on mode change)
+    /// Clear pending wheel events (e.g., on mode change)
+    /// Note: clicks and moves are now immediate, only wheel is queued
     pub fn clear(self: *MouseEventBus) void {
-        self.pending_clicks.clear();
         self.pending_wheel = null;
-        self.pending_move = null;
     }
 
     fn buttonMask(button: MouseButton) u32 {

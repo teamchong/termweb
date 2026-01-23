@@ -24,6 +24,9 @@ pub const DisplayOptions = struct {
 
     // Placement ID (use same ID to replace in place)
     placement_id: ?u32 = null,
+
+    // Image ID (use fixed ID to replace image data in place)
+    image_id: ?u32 = null,
 };
 
 pub const KittyGraphics = struct {
@@ -44,8 +47,11 @@ pub const KittyGraphics = struct {
         png_data: []const u8,
         opts: DisplayOptions,
     ) !u32 {
-        const image_id = self.next_image_id;
-        self.next_image_id += 1;
+        const image_id = opts.image_id orelse blk: {
+            const id = self.next_image_id;
+            self.next_image_id += 1;
+            break :blk id;
+        };
 
         // Base64 encode the PNG data
         const encoder = std.base64.standard.Encoder;
@@ -115,8 +121,11 @@ pub const KittyGraphics = struct {
         opts: DisplayOptions,
         format_code: u32,
     ) !u32 {
-        const image_id = self.next_image_id;
-        self.next_image_id += 1;
+        const image_id = opts.image_id orelse blk: {
+            const id = self.next_image_id;
+            self.next_image_id += 1;
+            break :blk id;
+        };
 
         // Kitty protocol chunk size (4096 bytes max per chunk)
         const CHUNK_SIZE: usize = 4096;
@@ -214,6 +223,7 @@ pub const KittyGraphics = struct {
     }
 
     /// Display raw RGBA data via SHM (t=s)
+    /// Uses fixed image_id to replace existing image data (no delete needed)
     pub fn displayRGBA(
         self: *KittyGraphics,
         writer: anytype,
@@ -222,8 +232,11 @@ pub const KittyGraphics = struct {
         height: u32,
         opts: DisplayOptions,
     ) !u32 {
-        const image_id = self.next_image_id;
-        self.next_image_id += 1;
+        const image_id = opts.image_id orelse blk: {
+            const id = self.next_image_id;
+            self.next_image_id += 1;
+            break :blk id;
+        };
 
         // Use proper POSIX Shared Memory (t=s)
         // Data is already in the buffer via shm.write()
@@ -232,7 +245,8 @@ pub const KittyGraphics = struct {
         // Write Kitty graphics escape sequence
         try writer.writeAll("\x1b_G");
 
-        // f=32 = raw RGBA, t=s = shared memory
+        // a=T (transmit + display), f=32 = raw RGBA, t=s = shared memory
+        // Using same image_id replaces existing image data
         try writer.print("a=T,f=32,t=s,s={d},v={d},i={d},q=2", .{ width, height, image_id });
 
         // Placement options

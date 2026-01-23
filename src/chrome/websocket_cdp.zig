@@ -155,19 +155,20 @@ pub const WebSocketCdpClient = struct {
     pub fn sendCommandAsync(self: *WebSocketCdpClient, method: []const u8, params: ?[]const u8) void {
         const id = self.next_id.fetchAdd(1, .monotonic);
 
+        // Use stack buffer for command JSON to avoid heap allocation
+        var cmd_buf: [2048]u8 = undefined;
         const command = if (params) |p|
-            std.fmt.allocPrint(
-                self.allocator,
+            std.fmt.bufPrint(
+                &cmd_buf,
                 "{{\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
                 .{ id, method, p },
             ) catch return
         else
-            std.fmt.allocPrint(
-                self.allocator,
+            std.fmt.bufPrint(
+                &cmd_buf,
                 "{{\"id\":{d},\"method\":\"{s}\"}}",
                 .{ id, method },
             ) catch return;
-        defer self.allocator.free(command);
 
         // Use priority send for input commands to minimize latency
         // Fire-and-forget: ignore errors (connection may be closed during shutdown)

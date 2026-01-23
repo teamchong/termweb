@@ -56,6 +56,26 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path("src/vendor"));
 
+    // Static link libjpeg-turbo for fast JPEG decoding
+    if (target.result.os.tag == .macos) {
+        // macOS: homebrew on ARM64, /usr/local on x86_64
+        if (target.result.cpu.arch == .aarch64) {
+            exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/jpeg-turbo/include" });
+            exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.a" });
+        } else {
+            exe.addIncludePath(.{ .cwd_relative = "/usr/local/opt/jpeg-turbo/include" });
+            exe.addObjectFile(.{ .cwd_relative = "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.a" });
+        }
+    } else if (target.result.os.tag == .linux) {
+        // Linux: static link from system path
+        exe.addIncludePath(.{ .cwd_relative = "/usr/include" });
+        if (target.result.cpu.arch == .aarch64) {
+            exe.addObjectFile(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu/libturbojpeg.a" });
+        } else {
+            exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libturbojpeg.a" });
+        }
+    }
+
     exe.linkLibC();
 
     // Add vendor imports

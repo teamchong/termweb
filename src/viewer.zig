@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const terminal_mod = @import("terminal/terminal.zig");
 const kitty_mod = @import("terminal/kitty_graphics.zig");
 const shm_mod = @import("terminal/shm.zig");
+const decode_mod = @import("image/decode.zig");
 const input_mod = @import("terminal/input.zig");
 const screen_mod = @import("terminal/screen.zig");
 const prompt_mod = @import("terminal/prompt.zig");
@@ -44,6 +45,7 @@ const CoordinateMapper = coordinates_mod.CoordinateMapper;
 const PromptBuffer = prompt_mod.PromptBuffer;
 const UIState = ui_mod.UIState;
 const Placement = ui_mod.Placement;
+const ImageId = ui_mod.ImageId;
 const ZIndex = ui_mod.ZIndex;
 const cursor_asset = ui_mod.assets.cursor;
 const FilePickerMode = ui_mod.FilePickerMode;
@@ -122,7 +124,7 @@ pub const Viewer = struct {
 
     // Frame tracking for skip detection
     last_rendered_generation: u64,
-    last_content_image_id: ?u32, // Track content image ID for cleanup
+    last_content_image_id: ?u32, // Track content image ID for reuse
 
     // Navigation state debounce (avoid repeated CDP calls on rapid events)
     last_nav_state_update: i128,
@@ -165,6 +167,9 @@ pub const Viewer = struct {
         viewport_width: u32,
         viewport_height: u32,
     ) !Viewer {
+        // Set allocator for turbojpeg fast decoding
+        decode_mod.setAllocator(allocator);
+
         // Create debug log file only if TERMWEB_DEBUG=1
         const debug_enabled = viewer_helpers.envVarTruthy(allocator, "TERMWEB_DEBUG");
         const debug_log = if (debug_enabled)
@@ -187,10 +192,7 @@ pub const Viewer = struct {
         // Initialize SHM buffer for zero-copy Kitty rendering
         // Size: max viewport * 4 bytes (RGBA)
         const shm_size = viewport_width * viewport_height * 4;
-        const force_shm = envVarTruthy(allocator, "TERMWEB_FORCE_SHM");
-        const disable_shm = envVarTruthy(allocator, "TERMWEB_DISABLE_SHM") or
-            (!force_shm and isGhosttyTerminal(allocator));
-        const shm_buffer = if (disable_shm) null else ShmBuffer.init(shm_size) catch null;
+        const shm_buffer = ShmBuffer.init(shm_size) catch null;
         const screencast_format: screenshot_api.ScreenshotFormat = if (shm_buffer == null) .png else .jpeg;
 
         // Query Chrome's ACTUAL viewport (may differ from requested due to DPI scaling)
@@ -446,7 +448,9 @@ pub const Viewer = struct {
                         self.log("[INPUT] Key: {any}\n", .{key});
                         self.ui_dirty = true;
                     },
-                    .mouse => |m| self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y }),
+                    .mouse => |m| {
+                        self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y });
+                    },
                     .paste => |text| self.log("[INPUT] Paste: {d} bytes\n", .{text.len}),
                     .none => {},
                 }
@@ -515,8 +519,8 @@ pub const Viewer = struct {
                 }
             } else |_| {}
 
-            // Throttle inner loop slightly to prevent flooding input/output
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+            // Minimal sleep to yield CPU (1ms = 1000Hz max loop rate)
+            std.Thread.sleep(1 * std.time.ns_per_ms);
         }
 
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
@@ -789,6 +793,8 @@ pub const Viewer = struct {
 
     /// Display a base64 PNG frame with specific dimensions for coordinate mapping
     fn displayFrameWithDimensions(self: *Viewer, base64_png: []const u8, frame_width: u32, frame_height: u32) !void {
+        const render_t0 = std.time.nanoTimestamp();
+
         // Larger buffer reduces write syscalls (frames can be 300KB+)
         var stdout_buf: [65536]u8 = undefined;  // 64KB buffer
         const stdout_file = std.fs.File.stdout();
@@ -837,51 +843,57 @@ pub const Viewer = struct {
         // Move cursor to row 2
         try writer.writeAll("\x1b[2;1H");
 
-        // Use placement ID and Z-index to ensure correct layering and replacement
-        // y_offset shifts content down to start right after toolbar
+        // Like awrit: first frame gets auto-increment ID, subsequent frames reuse it
+        // No z-index needed now that SHM write pattern is correct
         const display_opts = kitty_mod.DisplayOptions{
             .rows = content_rows,
             .columns = display_cols,
-            .placement_id = Placement.CONTENT,
-            .z = ZIndex.CONTENT,
             .y_offset = @intCast(y_offset),
+            .image_id = self.last_content_image_id,
         };
 
-        // Track old image ID for cleanup
-        const old_image_id = self.last_content_image_id;
-        var new_image_id: ?u32 = null;
+        const render_t1 = std.time.nanoTimestamp();
 
-        // Try SHM path first (decode image, write to SHM, zero-copy transfer to Kitty)
+        // Try SHM path first
+        var used_shm = false;
         if (self.shm_buffer) |*shm| {
             if (self.kitty.displayBase64ImageViaSHM(writer, base64_png, shm, display_opts) catch null) |id| {
-                new_image_id = id;
                 self.log("[RENDER] displayFrame via SHM complete (id={d})\n", .{id});
+                self.last_content_image_id = id;
+                used_shm = true;
             } else {
                 self.log("[RENDER] SHM path failed, falling back to base64\n", .{});
             }
         }
 
+        const render_t2 = std.time.nanoTimestamp();
+
         // Fallback: Display via base64
-        if (new_image_id == null) {
+        if (!used_shm) {
             if (self.screencast_format == .png) {
-                new_image_id = try self.kitty.displayBase64PNG(writer, base64_png, display_opts);
+                _ = try self.kitty.displayBase64PNG(writer, base64_png, display_opts);
             } else {
-                new_image_id = try self.kitty.displayBase64Image(writer, base64_png, display_opts);
+                _ = try self.kitty.displayBase64Image(writer, base64_png, display_opts);
             }
-            self.log("[RENDER] displayFrame via base64 complete (id={d})\n", .{new_image_id.?});
+            self.log("[RENDER] displayFrame via base64 complete\n", .{});
         }
 
-        // Update tracking
-        self.last_content_image_id = new_image_id;
-        
-        // IMPORTANT: Flush the new image to screen immediately
+        const render_t3 = std.time.nanoTimestamp();
+
         try writer.flush();
 
-        // Delete previous image resource to prevent terminal memory bloat
-        if (old_image_id) |id| {
-            try self.kitty.deleteImage(writer, id);
-            try writer.flush();
-        }
+        const render_t4 = std.time.nanoTimestamp();
+        const render_t5 = render_t4;
+        const setup_ms = @divFloor(render_t1 - render_t0, std.time.ns_per_ms);
+        const shm_ms = @divFloor(render_t2 - render_t1, std.time.ns_per_ms);
+        const base64_ms = @divFloor(render_t3 - render_t2, std.time.ns_per_ms);
+        const flush_ms = @divFloor(render_t4 - render_t3, std.time.ns_per_ms);
+        const cleanup_ms = @divFloor(render_t5 - render_t4, std.time.ns_per_ms);
+        const total_ms = @divFloor(render_t5 - render_t0, std.time.ns_per_ms);
+        // Always log render timing to debug file
+        self.log("[RENDER PERF] total={}ms setup={}ms shm={}ms base64={}ms flush={}ms cleanup={}ms\n", .{
+            total_ms, setup_ms, shm_ms, base64_ms, flush_ms, cleanup_ms,
+        });
     }
 
     /// Display a base64 PNG frame (legacy, uses viewport dimensions)
