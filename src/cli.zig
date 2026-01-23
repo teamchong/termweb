@@ -216,8 +216,20 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const content_rows: u32 = available_height / cell_height;
     const content_pixel_height: u32 = content_rows * cell_height;
 
-    const viewport_width: u32 = raw_width / dpr;
-    const viewport_height: u32 = content_pixel_height / dpr;
+    var viewport_width: u32 = raw_width / dpr;
+    var viewport_height: u32 = content_pixel_height / dpr;
+
+    // Cap total pixels to improve performance on large displays
+    // 1.5M pixels ≈ 1920x780 or 1600x937 - good balance of quality and speed
+    const MAX_PIXELS: u64 = 1_500_000;
+    const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
+    if (total_pixels > MAX_PIXELS) {
+        // Scale down maintaining aspect ratio
+        const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
+        viewport_width = @intFromFloat(@as(f64, @floatFromInt(viewport_width)) * pixel_scale);
+        viewport_height = @intFromFloat(@as(f64, @floatFromInt(viewport_height)) * pixel_scale);
+        std.debug.print("Viewport capped: {}x{} ({} pixels, max {})\n", .{ viewport_width, viewport_height, viewport_width * viewport_height, MAX_PIXELS });
+    }
 
     std.debug.print("Terminal: {}x{} px ({} cols x {} rows)\n", .{
         size.width_px,
@@ -305,6 +317,15 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.debug.print("Chrome actual viewport: {}x{}\n", .{ actual_viewport_width, actual_viewport_height });
     } else |err| {
         std.debug.print("Warning: Could not get actual viewport ({}), using requested size\n", .{err});
+    }
+
+    // Ensure actual viewport also respects pixel limit
+    const actual_total_pixels: u64 = @as(u64, actual_viewport_width) * @as(u64, actual_viewport_height);
+    if (actual_total_pixels > MAX_PIXELS) {
+        const actual_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(actual_total_pixels)));
+        actual_viewport_width = @intFromFloat(@as(f64, @floatFromInt(actual_viewport_width)) * actual_scale);
+        actual_viewport_height = @intFromFloat(@as(f64, @floatFromInt(actual_viewport_height)) * actual_scale);
+        std.debug.print("Actual viewport capped: {}x{}\n", .{ actual_viewport_width, actual_viewport_height });
     }
 
     // Run viewer with Chrome's actual viewport for accurate coordinate mapping

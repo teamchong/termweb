@@ -574,8 +574,18 @@ pub const Viewer = struct {
 
         // Scale by DPR for browser viewport
         // Use content_pixel_height (cell-aligned) to ensure aspect ratio matches terminal
-        const new_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
-        const new_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
+        var new_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
+        var new_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
+
+        // Cap total pixels to improve performance on large displays
+        const MAX_PIXELS: u64 = 1_500_000;
+        const total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);
+        if (total_pixels > MAX_PIXELS) {
+            const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
+            new_width = @max(MIN_WIDTH, @as(u32, @intFromFloat(@as(f64, @floatFromInt(new_width)) * pixel_scale)));
+            new_height = @max(MIN_HEIGHT, @as(u32, @intFromFloat(@as(f64, @floatFromInt(new_height)) * pixel_scale)));
+            self.log("[RESIZE] Viewport capped to {}x{} (max {} pixels)\n", .{ new_width, new_height, MAX_PIXELS });
+        }
 
         self.log("[RESIZE] New size: {}x{} px, {}x{} cells, toolbar={}px, dpr={} -> viewport {}x{}\n", .{
             size.width_px, size.height_px, size.cols, size.rows, toolbar_height, dpr, new_width, new_height,
