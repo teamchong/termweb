@@ -76,6 +76,29 @@ termweb open https://example.com --scale 0.8
 termweb help
 ```
 
+## SDK Usage
+
+Use termweb as a library in your Node.js applications:
+
+```javascript
+const termweb = require('termweb');
+
+// Open a URL
+termweb.open('https://example.com');
+
+// With options
+termweb.open('https://vscode.dev', {
+  mobile: false,    // Mobile viewport
+  toolbar: false,   // Hide navigation toolbar
+  scale: 0.8,       // Page zoom
+});
+
+// Check availability
+if (termweb.isAvailable()) {
+  termweb.open('https://example.com');
+}
+```
+
 ## Controls
 
 ### Keyboard

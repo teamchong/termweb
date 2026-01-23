@@ -1,27 +1,18 @@
+#!/usr/bin/env node
 /**
- * Hello World - Basic termweb SDK example
+ * Hello World - Basic termweb example
  *
  * Usage: node examples/hello-world.js
  */
 
-const { app, BrowserWindow } = require('../lib');
+const termweb = require('../lib');
 
-app.on('ready', () => {
-  console.log('App ready, creating window...');
+console.log('Opening example.com...');
+console.log('Press Cmd/Ctrl+Q to quit');
+console.log('');
 
-  const win = new BrowserWindow({
-    width: 120,
-    height: 40,
-  });
+const proc = termweb.open('https://example.com');
 
-  // Load a URL
-  win.loadURL('https://example.com');
-
-  win.on('closed', () => {
-    console.log('Window closed');
-  });
-});
-
-app.on('window-all-closed', () => {
-  app.quit();
+proc.on('exit', (code) => {
+  process.exit(code || 0);
 });

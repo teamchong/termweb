@@ -44,15 +44,5 @@
     "x64",
     "arm64"
   ],
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
-  "peerDependencies": {
-    "ws": ">=8.0.0"
-  },
-  "peerDependenciesMeta": {
-    "ws": {
-      "optional": true
-    }
-  }
+  "dependencies": {}
 }
