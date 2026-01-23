@@ -268,26 +268,46 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
             const url = renderer.getUrlText();
             viewer.log("[URL] Enter pressed, url_len={}, url='{s}'\n", .{ url.len, url });
             if (url.len > 0) {
-                viewer.log("[URL] Navigating to: {s}\n", .{url});
-                screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url) catch |err| {
-                    viewer.log("[URL] Navigation failed: {}\n", .{err});
+                // Copy URL before blurring (blur may clear the buffer)
+                const url_copy = viewer.allocator.dupe(u8, url) catch {
+                    viewer.log("[URL] Failed to allocate URL copy\n", .{});
+                    renderer.blurUrl();
+                    viewer.mode = .normal;
+                    viewer.ui_dirty = true;
+                    return;
                 };
-                if (!std.mem.eql(u8, viewer.current_url, url)) {
-                    const new_url = viewer.allocator.dupe(u8, url) catch {
-                        viewer.log("[URL] Failed to allocate new URL\n", .{});
-                        viewer.updateNavigationState();
-                        renderer.blurUrl();
-                        viewer.mode = .normal;
-                        viewer.ui_dirty = true;
-                        return;
-                    };
-                    viewer.allocator.free(viewer.current_url);
-                    viewer.current_url = new_url;
+
+                // Blur first to exit URL mode
+                renderer.blurUrl();
+                viewer.mode = .normal;
+
+                // Show loading indicator
+                if (viewer.toolbar_renderer) |*tr| {
+                    tr.is_loading = true;
                 }
+
+                viewer.log("[URL] Navigating to: {s}\n", .{url_copy});
+                screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url_copy) catch |err| {
+                    viewer.log("[URL] Navigation failed: {}\n", .{err});
+                    viewer.allocator.free(url_copy);
+                    viewer.ui_dirty = true;
+                    return;
+                };
+
+                // Update viewer's current URL
+                viewer.allocator.free(viewer.current_url);
+                viewer.current_url = url_copy;
+
+                // Update active tab's URL
+                if (viewer.active_tab_index < viewer.tabs.items.len) {
+                    viewer.tabs.items[viewer.active_tab_index].updateUrl(url_copy) catch {};
+                }
+
                 viewer.updateNavigationState();
+            } else {
+                renderer.blurUrl();
+                viewer.mode = .normal;
             }
-            renderer.blurUrl();
-            viewer.mode = .normal;
             viewer.ui_dirty = true;
         },
         .escape => {

@@ -1085,8 +1085,9 @@ pub const Viewer = struct {
             self.log("[TABS] startScreencast failed after switch: {}\n", .{err});
         };
 
-        // Update URL display
+        // Update URL display (blur first to ensure buffer is updated)
         if (self.toolbar_renderer) |*renderer| {
+            renderer.blurUrl();
             renderer.setUrl(tab.url);
         }
 

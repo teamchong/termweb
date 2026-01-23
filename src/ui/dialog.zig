@@ -491,16 +491,19 @@ fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: [
     }
     try list_buf.appendSlice(allocator, "}");
 
-    // Build script
+    // Build script - use "System Events" to ensure dialog gets focus
     var script_buf: [4096]u8 = undefined;
     const script = std.fmt.bufPrint(&script_buf,
-        \\set theList to {s}
-        \\set theChoice to choose from list theList with prompt "{s}" default items {{item 1 of theList}}
-        \\if theChoice is false then
-        \\    return ""
-        \\else
-        \\    return item 1 of theChoice
-        \\end if
+        \\tell application "System Events"
+        \\    activate
+        \\    set theList to {s}
+        \\    set theChoice to choose from list theList with prompt "{s}" default items {{item 1 of theList}}
+        \\    if theChoice is false then
+        \\        return ""
+        \\    else
+        \\        return item 1 of theChoice
+        \\    end if
+        \\end tell
     , .{ list_buf.items, title }) catch return null;
 
     const result = std.process.Child.run(.{

@@ -1,5 +1,53 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const detector = @import("detector.zig");
+
+/// Prefix for temporary Chrome profile directories
+pub const TEMP_PROFILE_PREFIX = "termweb-";
+
+/// Clean up old termweb-* directories from /tmp
+/// Removes directories older than max_age_seconds (default: 1 hour)
+/// Uses filesystem metadata (mtime) to determine age, not directory name
+pub fn cleanupOldProfiles(max_age_seconds: i64) void {
+    const tmp_dir = if (builtin.os.tag == .macos)
+        std.posix.getenv("TMPDIR") orelse "/tmp"
+    else
+        "/tmp";
+
+    var dir = std.fs.cwd().openDir(tmp_dir, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    const now_ns = std.time.nanoTimestamp();
+    var iter = dir.iterate();
+
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!std.mem.startsWith(u8, entry.name, TEMP_PROFILE_PREFIX)) continue;
+
+        // Get directory metadata to check age
+        const stat = dir.statFile(entry.name) catch continue;
+        const mtime_ns = stat.mtime;
+        const age_ns = now_ns - mtime_ns;
+        const age_seconds = @divFloor(age_ns, std.time.ns_per_s);
+
+        // Delete if older than max_age
+        if (age_seconds > max_age_seconds) {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ tmp_dir, entry.name }) catch continue;
+            std.fs.cwd().deleteTree(full_path) catch {};
+        }
+    }
+}
+
+/// Generate a random hex string for unique directory names
+fn randomHex(buf: []u8) void {
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    var rng = std.Random.DefaultPrng.init(seed);
+    for (buf) |*c| {
+        const val = rng.random().int(u4);
+        c.* = "0123456789abcdef"[val];
+    }
+}
 
 pub const LaunchError = error{
     ChromeNotFound,
@@ -66,7 +114,6 @@ pub const LaunchOptions = struct {
 
 /// Get Chrome user data directory path for the current platform
 pub fn getChromeUserDataDir(allocator: std.mem.Allocator) ![]const u8 {
-    const builtin = @import("builtin");
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
     defer allocator.free(home);
 
@@ -220,23 +267,35 @@ pub fn launchChromePipe(
     }
     defer if (owns_path) chrome_bin.deinit();
 
-    // 2. Create temporary user data directory if not provided
+    // 2. Clean up old crashed profiles (older than 1 hour)
+    cleanupOldProfiles(3600);
+
+    // 3. Create temporary user data directory if not provided
     var temp_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const user_data_dir = if (options.user_data_dir) |dir|
         dir
     else blk: {
-        const temp_dir = std.fmt.bufPrint(&temp_dir_buf, "/tmp/termweb-chrome-{d}", .{
-            std.time.timestamp(),
+        const tmp_base = if (builtin.os.tag == .macos)
+            std.posix.getenv("TMPDIR") orelse "/tmp"
+        else
+            "/tmp";
+
+        // Use random hex suffix for security (unpredictable directory name)
+        var random_suffix: [16]u8 = undefined;
+        randomHex(&random_suffix);
+
+        const temp_dir = std.fmt.bufPrint(&temp_dir_buf, "{s}/{s}{s}", .{
+            tmp_base,
+            TEMP_PROFILE_PREFIX,
+            random_suffix,
         }) catch return LaunchError.OutOfMemory;
 
-        std.fs.cwd().makeDir(temp_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return LaunchError.LaunchFailed,
-        };
+        // Create with restricted permissions (owner only)
+        std.fs.cwd().makePath(temp_dir) catch return LaunchError.LaunchFailed;
         break :blk temp_dir;
     };
 
-    // 2b. Clone profile if requested
+    // 3b. Clone profile if requested
     if (options.clone_profile) |profile_name| {
         cloneProfile(allocator, profile_name, user_data_dir) catch |err| {
             std.debug.print("Warning: Could not clone profile '{s}': {}\n", .{ profile_name, err });
@@ -467,23 +526,35 @@ pub fn launchChrome(
     }
     defer if (owns_path) chrome_bin.deinit();
 
-    // 2. Create temporary user data directory if not provided
+    // 2. Clean up old crashed profiles (older than 1 hour)
+    cleanupOldProfiles(3600);
+
+    // 3. Create temporary user data directory if not provided
     var temp_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const user_data_dir = if (options.user_data_dir) |dir|
         dir
     else blk: {
-        const temp_dir = std.fmt.bufPrint(&temp_dir_buf, "/tmp/termweb-chrome-{d}", .{
-            std.time.timestamp(),
+        const tmp_base = if (builtin.os.tag == .macos)
+            std.posix.getenv("TMPDIR") orelse "/tmp"
+        else
+            "/tmp";
+
+        // Use random hex suffix for security (unpredictable directory name)
+        var random_suffix: [16]u8 = undefined;
+        randomHex(&random_suffix);
+
+        const temp_dir = std.fmt.bufPrint(&temp_dir_buf, "{s}/{s}{s}", .{
+            tmp_base,
+            TEMP_PROFILE_PREFIX,
+            random_suffix,
         }) catch return LaunchError.OutOfMemory;
 
-        std.fs.cwd().makeDir(temp_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return LaunchError.LaunchFailed,
-        };
+        // Create with restricted permissions (owner only)
+        std.fs.cwd().makePath(temp_dir) catch return LaunchError.LaunchFailed;
         break :blk temp_dir;
     };
 
-    // 3. Build Chrome arguments
+    // 4. Build Chrome arguments
     var args = try std.ArrayList([]const u8).initCapacity(allocator, 16);
     defer args.deinit(allocator);
 
