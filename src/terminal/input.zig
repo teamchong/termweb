@@ -444,53 +444,26 @@ pub const InputReader = struct {
 
     /// Convert unicode codepoint and modifiers to Key enum
     /// modifiers should be the already-adjusted bits (raw value - 1)
+    /// NOTE: For Kitty protocol, we preserve chars with modifiers in cdp_mods
+    /// rather than converting to .ctrl_* variants, so shortcuts can match properly
     fn unicodeToKey(self: *InputReader, code: u32, mod_bits: u8) Key {
         _ = self;
         // Kitty bits: 1=shift, 2=alt, 4=ctrl, 8=super
         const shift = (mod_bits & 1) != 0;
         const alt = (mod_bits & 2) != 0;
-        const ctrl = (mod_bits & 4) != 0;
 
         // Handle shift+tab specifically
         if (shift and code == 9) {
             return .shift_tab;
         }
 
-        // Handle ctrl+key combinations
-        if (ctrl and !alt) {
-            return switch (code) {
-                'a', 'A' => .ctrl_a,
-                'b', 'B' => .ctrl_b,
-                'c', 'C' => .ctrl_c,
-                'd', 'D' => .ctrl_d,
-                'e', 'E' => .ctrl_e,
-                'f', 'F' => .ctrl_f,
-                'g', 'G' => .ctrl_g,
-                'h', 'H' => .ctrl_h,
-                'i', 'I' => .ctrl_i,
-                'j', 'J' => .ctrl_j,
-                'k', 'K' => .ctrl_k,
-                'l', 'L' => .ctrl_l,
-                'm', 'M' => .ctrl_m,
-                'n', 'N' => .ctrl_n,
-                'o', 'O' => .ctrl_o,
-                'p', 'P' => .ctrl_p,
-                'q', 'Q' => .ctrl_q,
-                'r', 'R' => .ctrl_r,
-                's', 'S' => .ctrl_s,
-                't', 'T' => .ctrl_t,
-                'u', 'U' => .ctrl_u,
-                'v', 'V' => .ctrl_v,
-                'w', 'W' => .ctrl_w,
-                'x', 'X' => .ctrl_x,
-                'y', 'Y' => .ctrl_y,
-                'z', 'Z' => .ctrl_z,
-                else => .none,
-            };
-        }
+        // NOTE: We intentionally do NOT convert Ctrl+key to .ctrl_* variants here.
+        // The Kitty protocol provides explicit modifier bits in cdp_mods, so we
+        // return .char and let the normalizer use the modifiers directly.
+        // This allows Ctrl+[ and Ctrl+] to work correctly (not just Ctrl+letter).
 
-        // Handle alt+key combinations
-        if (alt and !ctrl) {
+        // Handle alt+key combinations (alt-only, no ctrl)
+        if (alt and (mod_bits & 4) == 0) {
             if (code >= 'a' and code <= 'z') {
                 return .{ .alt_char = @intCast(code) };
             }
