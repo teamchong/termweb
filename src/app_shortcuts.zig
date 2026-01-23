@@ -21,6 +21,9 @@ pub const AppAction = enum {
     quit,
     address_bar,
     reload,
+    go_back,
+    go_forward,
+    stop_loading,
     copy,
     cut,
     paste,
@@ -46,6 +49,9 @@ pub const app_shortcuts = [_]ShortcutDef{
     // Navigation
     .{ .key = 'l', .action = .address_bar },
     .{ .key = 'r', .action = .reload },
+    .{ .key = '[', .action = .go_back },      // Cmd+[ = back (like Safari/Chrome)
+    .{ .key = ']', .action = .go_forward },   // Cmd+] = forward (like Safari/Chrome)
+    .{ .key = '.', .action = .stop_loading }, // Cmd+. = stop (like Safari)
 
     // Clipboard operations (use system clipboard, not browser's)
     .{ .key = 'c', .action = .copy },

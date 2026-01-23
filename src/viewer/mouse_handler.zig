@@ -108,14 +108,30 @@ pub fn handleTabBarClick(viewer: anytype, pixel_x: u32, pixel_y: u32, mapper: Co
                 },
                 .refresh => {
                     viewer.log("[CLICK] Refresh button (loading={})\n", .{viewer.ui_state.is_loading});
-                    // Always reload (like most browsers - clicking refresh during load restarts it)
-                    viewer.log("[CLICK] Sending reload command\n", .{});
-                    _ = screenshot_api.reload(viewer.cdp_client, viewer.allocator, true) catch |err| {
-                        viewer.log("[CLICK] Reload failed: {}\n", .{err});
-                        return;
-                    };
-                    viewer.ui_state.is_loading = true;
-                    viewer.loading_started_at = std.time.nanoTimestamp();
+                    if (viewer.ui_state.is_loading) {
+                        // Stop loading if currently loading
+                        viewer.log("[CLICK] Sending stop command\n", .{});
+                        screenshot_api.stopLoading(viewer.cdp_client, viewer.allocator) catch |err| {
+                            viewer.log("[CLICK] Stop failed: {}\n", .{err});
+                            return;
+                        };
+                        viewer.ui_state.is_loading = false;
+                        if (viewer.toolbar_renderer) |*tr| {
+                            tr.is_loading = false;
+                        }
+                    } else {
+                        // Reload if not loading
+                        viewer.log("[CLICK] Sending reload command\n", .{});
+                        _ = screenshot_api.reload(viewer.cdp_client, viewer.allocator, true) catch |err| {
+                            viewer.log("[CLICK] Reload failed: {}\n", .{err});
+                            return;
+                        };
+                        viewer.ui_state.is_loading = true;
+                        if (viewer.toolbar_renderer) |*tr| {
+                            tr.is_loading = true;
+                        }
+                        viewer.loading_started_at = std.time.nanoTimestamp();
+                    }
                     viewer.ui_dirty = true;
                 },
                 .close => {

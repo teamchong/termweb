@@ -154,6 +154,30 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
                 viewer.log("[TAB_PICKER] Failed: {}\n", .{err});
             };
         },
+        .go_back => {
+            viewer.log("[NAV] Go back (Cmd+[)\n", .{});
+            _ = screenshot_api.goBack(viewer.cdp_client, viewer.allocator) catch |err| {
+                viewer.log("[NAV] Back failed: {}\n", .{err});
+            };
+            viewer.ui_dirty = true;
+        },
+        .go_forward => {
+            viewer.log("[NAV] Go forward (Cmd+])\n", .{});
+            _ = screenshot_api.goForward(viewer.cdp_client, viewer.allocator) catch |err| {
+                viewer.log("[NAV] Forward failed: {}\n", .{err});
+            };
+            viewer.ui_dirty = true;
+        },
+        .stop_loading => {
+            viewer.log("[NAV] Stop loading (Cmd+.)\n", .{});
+            screenshot_api.stopLoading(viewer.cdp_client, viewer.allocator) catch |err| {
+                viewer.log("[NAV] Stop failed: {}\n", .{err});
+            };
+            if (viewer.toolbar_renderer) |*tr| {
+                tr.is_loading = false;
+            }
+            viewer.ui_dirty = true;
+        },
     }
 }
 

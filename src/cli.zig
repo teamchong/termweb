@@ -360,19 +360,22 @@ fn printHelp() void {
         \\  --mobile              Use mobile viewport
         \\  --scale N             Set zoom scale (default: 1.0)
         \\
-        \\Keyboard:
-        \\  Ctrl+Q / Ctrl+W       Quit
-        \\  Ctrl+L                Focus address bar
-        \\  Ctrl+R                Reload page
-        \\  Ctrl+T                Show tab picker
-        \\  Ctrl+C                Copy selection
-        \\  Ctrl+X                Cut selection
-        \\  Ctrl+V                Paste
-        \\  Ctrl+A                Select all
+        \\Keyboard (Cmd on macOS, Ctrl on Linux):
+        \\  Cmd+Q / Cmd+W         Quit
+        \\  Cmd+L                 Focus address bar
+        \\  Cmd+R                 Reload page
+        \\  Cmd+[                 Go back
+        \\  Cmd+]                 Go forward
+        \\  Cmd+.                 Stop loading
+        \\  Cmd+T                 Show tab picker
+        \\  Cmd+C                 Copy selection
+        \\  Cmd+X                 Cut selection
+        \\  Cmd+V                 Paste
+        \\  Cmd+A                 Select all
         \\
         \\Mouse:
         \\  Click                 Interact with page elements
-        \\  Toolbar               Navigation buttons (back, forward, reload)
+        \\  Toolbar               Navigation buttons (back, forward, reload/stop)
         \\
         \\Other commands:
         \\  termweb version       Show version

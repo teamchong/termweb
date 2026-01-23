@@ -77,14 +77,19 @@ termweb help
 ### Keyboard
 | Key | Action |
 |-----|--------|
-| `Ctrl+Q` / `Ctrl+W` | Quit |
-| `Ctrl+L` | Focus address bar |
-| `Ctrl+R` | Reload page |
-| `Ctrl+T` | Show tab picker |
-| `Ctrl+C` | Copy selection |
-| `Ctrl+X` | Cut selection |
-| `Ctrl+V` | Paste |
-| `Ctrl+A` | Select all |
+| `Cmd+Q` / `Cmd+W` | Quit |
+| `Cmd+L` | Focus address bar |
+| `Cmd+R` | Reload page |
+| `Cmd+[` | Go back |
+| `Cmd+]` | Go forward |
+| `Cmd+.` | Stop loading |
+| `Cmd+T` | Show tab picker |
+| `Cmd+C` | Copy selection |
+| `Cmd+X` | Cut selection |
+| `Cmd+V` | Paste |
+| `Cmd+A` | Select all |
+
+> **Note:** On Linux, use `Ctrl` instead of `Cmd`.
 
 ### Mouse
 - **Click** - Interact with page elements (links, buttons, inputs)
