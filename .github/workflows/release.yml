@@ -49,9 +49,15 @@ jobs:
         if: runner.os == 'Linux' && matrix.arch == 'aarch64'
         run: |
           sudo dpkg --add-architecture arm64
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          # Create new sources.list with arch-specific repos
+          cat << 'EOF' | sudo tee /etc/apt/sources.list
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ noble main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ noble-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ noble-security main restricted universe multiverse
+          EOF
           sudo apt-get update
           sudo apt-get install -y libturbojpeg0-dev:arm64
 
