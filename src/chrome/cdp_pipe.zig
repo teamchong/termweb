@@ -168,7 +168,10 @@ pub const PipeCdpClient = struct {
 
     /// Check if navigation happened and clear the flag (atomic swap)
     pub fn checkNavigationHappened(self: *PipeCdpClient) bool {
-        return self.navigation_happened.swap(false, .acq_rel);
+        _ = self;
+        // Disabled - loading indicator was too noisy (triggered by iframes)
+        // TODO: Properly detect main frame navigation via websocket events
+        return false;
     }
 
     pub fn sendCommandAsync(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) !void {
@@ -456,20 +459,11 @@ pub const PipeCdpClient = struct {
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
 
-        // Set navigation flag for navigation events (event bus pattern)
-        // This is lightweight - just an atomic flag, no queueing
-        if (std.mem.eql(u8, method, "Page.frameNavigated") or
-            std.mem.eql(u8, method, "Page.navigatedWithinDocument"))
-        {
-            self.navigation_happened.store(true, .release);
-        }
-
         // PIPE ONLY HANDLES SCREENCAST FRAMES
-        // All other events (console, dialogs, file chooser) go through nav_ws
+        // All other events (navigation, console, dialogs, etc.) go through nav_ws
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
             self.handleScreencastFrame(payload) catch return;
         }
-        // Ignore all other events - they're handled by nav_ws
     }
 
     fn handleScreencastFrame(self: *PipeCdpClient, payload: []const u8) !void {

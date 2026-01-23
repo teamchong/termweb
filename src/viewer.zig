@@ -471,31 +471,8 @@ pub const Viewer = struct {
                     }
                 }
 
-                // Event bus pattern: Check if navigation happened and update state
-                // Debounced to avoid repeated CDP calls on rapid events (iframes, redirects)
-                if (self.cdp_client.checkNavigationHappened()) {
-                    const now = std.time.nanoTimestamp();
-                    const debounce_interval = 500 * std.time.ns_per_ms; // 500ms debounce
-
-                    if (now - self.last_nav_state_update > debounce_interval) {
-                        self.log("[NAV EVENT] Navigation detected, updating state\n", .{});
-                        const old_back = self.ui_state.can_go_back;
-                        const old_fwd = self.ui_state.can_go_forward;
-                        self.updateNavigationState();
-                        self.last_nav_state_update = now;
-
-                        if (old_back != self.ui_state.can_go_back or old_fwd != self.ui_state.can_go_forward) {
-                            self.ui_dirty = true;
-                        }
-                    }
-                    // Set loading state on navigation event (show stop button)
-                    // Loading will be reset when new frame arrives (after min display time)
-                    if (!self.ui_state.is_loading) {
-                        self.ui_state.is_loading = true;
-                        self.loading_started_at = std.time.nanoTimestamp();
-                        self.ui_dirty = true;
-                    }
-                }
+                // Navigation events are handled via websocket in processWebSocketEvent()
+                // is_loading is only set when user clicks refresh button
 
                 // Redraw UI overlays ONLY if we got a new frame or UI is dirty (e.g. mouse moved)
                 if (new_frame or self.ui_dirty) {
@@ -1501,9 +1478,10 @@ pub const Viewer = struct {
             try self.handleDownloadWillBegin(event.payload);
         } else if (std.mem.eql(u8, event.method, "Browser.downloadProgress")) {
             try self.handleDownloadProgress(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Page.frameNavigated") or
-                   std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
-            self.handleNavigationEvent(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Page.frameNavigated")) {
+            self.handleFrameNavigated(event.payload);
+        } else if (std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
+            self.handleNavigatedWithinDocument(event.payload);
         } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
             self.handleNewTarget(event.payload);
         } else if (std.mem.eql(u8, event.method, "Target.targetInfoChanged")) {
@@ -1511,30 +1489,62 @@ pub const Viewer = struct {
         }
     }
 
-    /// Handle navigation events - extract URL and update address bar
-    fn handleNavigationEvent(self: *Viewer, payload: []const u8) void {
-        // Extract URL from event payload
-        // Page.frameNavigated: {"frame":{"url":"https://...",...}}
-        // Page.navigatedWithinDocument: {"frameId":"...","url":"https://..."}
+    /// Handle Page.frameNavigated - actual page load, show loading for main frame
+    fn handleFrameNavigated(self: *Viewer, payload: []const u8) void {
+        // Extract URL: {"frame":{"url":"https://...", "parentId":"...",...}}
         const url = extractUrlFromNavEvent(payload) orelse return;
 
-        self.log("[NAV EVENT] URL: {s}\n", .{url});
+        // Check if this is the main frame (no parentId means main document)
+        // Iframes have parentId, main frame doesn't
+        const is_main_frame = std.mem.indexOf(u8, payload, "\"parentId\"") == null;
+
+        self.log("[FRAME NAV] URL: {s} (main_frame={})\n", .{ url, is_main_frame });
+
+        // Only process main frame navigation
+        if (!is_main_frame) return;
+
+        // Set loading state for main frame navigation (show stop button)
+        if (!self.ui_state.is_loading) {
+            self.ui_state.is_loading = true;
+            self.loading_started_at = std.time.nanoTimestamp();
+            self.ui_dirty = true;
+        }
 
         // Update current_url if different
         if (!std.mem.eql(u8, self.current_url, url)) {
             const new_url = self.allocator.dupe(u8, url) catch return;
-            // Free old URL and replace
             self.allocator.free(self.current_url);
             self.current_url = new_url;
 
-            // Update toolbar display
             if (self.toolbar_renderer) |*renderer| {
                 renderer.setUrl(new_url);
                 self.ui_dirty = true;
             }
         }
 
-        // Update back/forward button state
+        self.updateNavigationState();
+    }
+
+    /// Handle Page.navigatedWithinDocument - SPA navigation (pushState/hash change)
+    /// Page already loaded, just URL changed - NO loading indicator
+    fn handleNavigatedWithinDocument(self: *Viewer, payload: []const u8) void {
+        // Extract URL: {"frameId":"...","url":"https://..."}
+        const url = extractUrlFromNavEvent(payload) orelse return;
+
+        self.log("[SPA NAV] URL: {s}\n", .{url});
+
+        // Update current_url if different (no loading state change)
+        if (!std.mem.eql(u8, self.current_url, url)) {
+            const new_url = self.allocator.dupe(u8, url) catch return;
+            self.allocator.free(self.current_url);
+            self.current_url = new_url;
+
+            if (self.toolbar_renderer) |*renderer| {
+                renderer.setUrl(new_url);
+                self.ui_dirty = true;
+            }
+        }
+
         self.updateNavigationState();
     }
 

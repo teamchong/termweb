@@ -82,6 +82,8 @@ pub const ToolbarRenderer = struct {
     can_go_back: bool = false,
     can_go_forward: bool = false,
     is_loading: bool = false,
+    prev_is_loading: bool = false,  // Track previous state to avoid re-render
+    prev_refresh_hover: bool = false,
     tab_count: u32 = 1,
 
     // URL state
@@ -447,9 +449,12 @@ pub const ToolbarRenderer = struct {
         const bg_rgba = try generateToolbarBg(self.allocator, self.width_px, self.toolbar_height);
         defer self.allocator.free(bg_rgba);
 
+        // Use column-based sizing to match content (avoids pixel rounding mismatch)
+        const num_cols: u32 = if (self.cell_width > 0) self.width_px / self.cell_width else 80;
         self.bg_image_id = try self.kitty.displayRawRGBA(writer, bg_rgba, self.width_px, self.toolbar_height, .{
             .placement_id = Placement.TOOLBAR_BG,
             .z = 50,
+            .columns = num_cols,
         });
 
         // Button positions
@@ -487,22 +492,32 @@ pub const ToolbarRenderer = struct {
         x_offset += self.button_size + self.button_padding;
 
         // Refresh/Stop button (shows stop icon when loading)
-        const refresh_rgba = if (self.is_loading)
-            try self.svg_cache.getButtonScaled(.stop, true, self.refresh_hover, self.button_size)
-        else
-            try self.svg_cache.getButtonScaled(.refresh, true, self.refresh_hover, self.button_size);
+        // Only re-render if state changed to avoid flashing
+        const refresh_state_changed = self.is_loading != self.prev_is_loading or
+                                       self.refresh_hover != self.prev_refresh_hover or
+                                       self.refresh_image_id == null;
 
-        // Delete old image by ID to avoid overlap (deletePlacement doesn't remove the image data)
-        if (self.refresh_image_id) |old_id| {
-            try self.kitty.deleteImage(writer, old_id);
+        if (refresh_state_changed) {
+            const refresh_rgba = if (self.is_loading)
+                try self.svg_cache.getButtonScaled(.stop, true, self.refresh_hover, self.button_size)
+            else
+                try self.svg_cache.getButtonScaled(.refresh, true, self.refresh_hover, self.button_size);
+
+            // Delete old image by ID to avoid overlap
+            if (self.refresh_image_id) |old_id| {
+                try self.kitty.deleteImage(writer, old_id);
+            }
+
+            self.refresh_image_id = try self.kitty.displayRawRGBA(writer, refresh_rgba, self.button_size, self.button_size, .{
+                .placement_id = Placement.REFRESH_BTN,
+                .z = 51,
+                .x_offset = x_offset,
+                .y_offset = y_offset,
+            });
+
+            self.prev_is_loading = self.is_loading;
+            self.prev_refresh_hover = self.refresh_hover;
         }
-
-        self.refresh_image_id = try self.kitty.displayRawRGBA(writer, refresh_rgba, self.button_size, self.button_size, .{
-            .placement_id = Placement.REFRESH_BTN,
-            .z = 51,
-            .x_offset = x_offset,
-            .y_offset = y_offset,
-        });
         x_offset += self.button_size + self.button_padding;
 
         // Tab button (shows tab count)
