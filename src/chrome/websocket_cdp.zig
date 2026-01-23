@@ -203,7 +203,7 @@ pub const WebSocketCdpClient = struct {
         // Otherwise, fall back to blocking recv (backward compatibility)
         if (self.reader_thread != null) {
             // Poll response queue with timeout
-            const timeout_ns = 5 * std.time.ns_per_s;
+            const timeout_ns = 15 * std.time.ns_per_s;
             const start_time = std.time.nanoTimestamp();
 
             while (true) {
