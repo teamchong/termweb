@@ -41,9 +41,19 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install jpeg-turbo
 
-      - name: Install libjpeg-turbo (Linux)
-        if: runner.os == 'Linux'
+      - name: Install libjpeg-turbo (Linux x86_64)
+        if: runner.os == 'Linux' && matrix.arch == 'x86_64'
         run: sudo apt-get update && sudo apt-get install -y libturbojpeg0-dev
+
+      - name: Install libjpeg-turbo (Linux aarch64 cross-compile)
+        if: runner.os == 'Linux' && matrix.arch == 'aarch64'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update
+          sudo apt-get install -y libturbojpeg0-dev:arm64
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
