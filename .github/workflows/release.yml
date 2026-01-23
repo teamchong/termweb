@@ -14,7 +14,7 @@ jobs:
             arch: aarch64
             target: aarch64-macos
             name: termweb-macos-aarch64
-          - os: macos-13
+          - os: macos-latest
             arch: x86_64
             target: x86_64-macos
             name: termweb-macos-x86_64
