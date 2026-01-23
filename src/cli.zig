@@ -139,6 +139,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var no_profile = false;
     var no_toolbar = false;
     var browser_path: ?[]const u8 = null;
+    var disable_gpu = false;
 
     // Parse flags
     var i: usize = 1;
@@ -172,6 +173,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             no_profile = true;
         } else if (std.mem.eql(u8, arg, "--no-toolbar")) {
             no_toolbar = true;
+        } else if (std.mem.eql(u8, arg, "--disable-gpu")) {
+            disable_gpu = true;
         }
         // --list-profiles and --list-browsers are handled at the start of cmdOpen
     }
@@ -246,6 +249,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .viewport_width = viewport_width,
         .viewport_height = viewport_height,
         .browser_path = browser_path,
+        .disable_gpu = disable_gpu,
     };
 
     // Only override clone_profile if explicitly set

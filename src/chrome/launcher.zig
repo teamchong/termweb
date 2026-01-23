@@ -417,6 +417,11 @@ pub fn launchChromePipe(
 
         // Preparation for exec - the strings are on the heap
         const path = path_z;
+
+        // Unset DISPLAY to prevent X11 connection attempts in headless mode
+        const unsetenv = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = "unsetenv" });
+        _ = unsetenv("DISPLAY");
+
         const envp = std.c.environ;
 
         std.posix.execveZ(path, @ptrCast(argv.ptr), envp) catch {
