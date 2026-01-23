@@ -180,6 +180,8 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             screenshot_api.stopLoading(viewer.cdp_client, viewer.allocator) catch |err| {
                 viewer.log("[NAV] Stop failed: {}\n", .{err});
             };
+            // Reset screencast to recover from any broken state (like reload)
+            viewer.resetScreencast();
             viewer.ui_state.is_loading = false;
             if (viewer.toolbar_renderer) |*tr| {
                 tr.is_loading = false;
