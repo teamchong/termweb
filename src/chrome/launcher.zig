@@ -348,6 +348,11 @@ pub fn launchChromePipe(
         try args_list.append(allocator, "--disable-gpu");
     }
 
+    // Headless-friendly flags for server/SSH environments
+    try args_list.append(allocator, "--no-sandbox");
+    try args_list.append(allocator, "--disable-dev-shm-usage");
+    try args_list.append(allocator, "--disable-software-rasterizer");
+
     const window_size = try std.fmt.allocPrint(allocator, "--window-size={d},{d}", .{ options.viewport_width, options.viewport_height });
     defer allocator.free(window_size);
     try args_list.append(allocator, window_size);
@@ -580,6 +585,11 @@ pub fn launchChrome(
     if (options.disable_gpu) {
         try args.append(allocator, "--disable-gpu");
     }
+
+    // Headless-friendly flags for server/SSH environments
+    try args.append(allocator, "--no-sandbox");
+    try args.append(allocator, "--disable-dev-shm-usage");
+    try args.append(allocator, "--disable-software-rasterizer");
 
     // Viewport size
     const window_size = try std.fmt.allocPrint(
