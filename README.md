@@ -6,9 +6,13 @@ Web browser in your terminal using Kitty graphics protocol.
 
 `termweb` renders web pages via Chrome DevTools Protocol and displays them inside Kitty-graphics-capable terminals (Ghostty, Kitty, WezTerm) using real-time pixel screencasts.
 
-## Demo
+## Demo: CLI - browsing the web in terminal
 
-https://github.com/user-attachments/assets/192411f7-ac5e-44b1-a09c-1d070ef85c3f
+https://github.com/user-attachments/assets/f2782ae1-831e-4153-8c54-60dfd5942ab8
+
+## Demo: SDK: building apps with termweb as render engine
+
+https://github.com/user-attachments/assets/806cac11-3348-48b7-95a0-0c98fd61c873
 
 
 ## Features
