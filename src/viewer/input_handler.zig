@@ -97,6 +97,8 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             viewer.ui_dirty = true;
         },
         .reload => {
+            // Reset screencast to recover from any broken state
+            viewer.resetScreencast();
             try screenshot_api.reload(viewer.cdp_client, viewer.allocator, false);
             viewer.ui_state.is_loading = true;
             if (viewer.toolbar_renderer) |*tr| {

@@ -675,6 +675,40 @@ pub const Viewer = struct {
         self.refreshChromeViewport();
     }
 
+    /// Reset screencast - stops and restarts to recover from broken state
+    /// Call this on reload to ensure clean frame state
+    pub fn resetScreencast(self: *Viewer) void {
+        self.log("[RESET] Resetting screencast...\n", .{});
+
+        // Stop current screencast
+        if (self.screencast_mode) {
+            screenshot_api.stopScreencast(self.cdp_client, self.allocator) catch {};
+            self.screencast_mode = false;
+        }
+
+        // Small yield to let Chrome process stop
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+
+        // Restart screencast
+        screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
+            .format = self.screencast_format,
+            .quality = 60,
+            .width = self.viewport_width,
+            .height = self.viewport_height,
+        }) catch |err| {
+            self.log("[RESET] startScreencast failed: {}\n", .{err});
+            return;
+        };
+        self.screencast_mode = true;
+
+        // Reset frame tracking - next frame will render immediately
+        self.last_frame_time = 0;
+        self.last_rendered_generation = 0;
+        self.frames_skipped = 0;
+
+        self.log("[RESET] Screencast reset complete\n", .{});
+    }
+
     /// Refresh Chrome's actual viewport dimensions (source of truth for coordinate mapping)
     fn refreshChromeViewport(self: *Viewer) void {
         if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |actual_vp| {
