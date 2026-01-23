@@ -454,8 +454,9 @@ pub const Viewer = struct {
             // Tick mouse event bus (dispatch pending events at 30fps)
             self.event_bus.maybeTick();
 
-            // Render new screencast frames (non-blocking) - only in normal mode
-            if (self.screencast_mode and self.mode == .normal) {
+            // Render new screencast frames (non-blocking) - in all modes
+            // Page should continue updating even when typing in address bar
+            if (self.screencast_mode) {
                 const new_frame = self.tryRenderScreencast() catch false;
 
                 // Reset loading state when we get a new frame (page has loaded)
@@ -469,37 +470,20 @@ pub const Viewer = struct {
                     }
                 }
 
-                // Navigation events are handled via websocket in processWebSocketEvent()
-                // is_loading is only set when user clicks refresh button
-
-                // Redraw UI overlays ONLY if we got a new frame or UI is dirty (e.g. mouse moved)
+                // Redraw UI overlays if we got a new frame or UI is dirty
                 if (new_frame or self.ui_dirty) {
                     var stdout_buf2: [262144]u8 = undefined; // 256KB for toolbar graphics
                     const stdout_file2 = std.fs.File.stdout();
                     var stdout_writer2 = stdout_file2.writer(&stdout_buf2);
                     const writer2 = &stdout_writer2.interface;
-                    self.renderCursor(writer2) catch {};
+                    // Only render cursor in normal mode (not when typing URL)
+                    if (self.mode == .normal) {
+                        self.renderCursor(writer2) catch {};
+                    }
                     self.renderToolbar(writer2) catch {};
                     writer2.flush() catch {};
                     self.ui_dirty = false;
                 }
-            }
-
-            // In URL prompt mode, re-render toolbar when dirty (for cursor updates)
-            if (self.mode == .url_prompt and self.ui_dirty) {
-                self.log("[URL_PROMPT] Rendering toolbar...\n", .{});
-                var stdout_buf3: [262144]u8 = undefined; // 256KB for toolbar graphics
-                const stdout_file3 = std.fs.File.stdout();
-                var stdout_writer3 = stdout_file3.writer(&stdout_buf3);
-                const writer3 = &stdout_writer3.interface;
-                self.renderToolbar(writer3) catch |err| {
-                    self.log("[URL_PROMPT] Toolbar render error: {}\n", .{err});
-                };
-                writer3.flush() catch |err| {
-                    self.log("[URL_PROMPT] Flush error: {}\n", .{err});
-                };
-                self.log("[URL_PROMPT] Toolbar rendered\n", .{});
-                self.ui_dirty = false;
             }
 
             // Poll CDP events for JavaScript dialogs and file chooser
