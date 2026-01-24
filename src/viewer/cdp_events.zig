@@ -26,6 +26,11 @@ pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
         try handleDownloadProgress(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Page.frameNavigated")) {
         handleFrameNavigated(viewer, event.payload);
+    } else if (std.mem.eql(u8, event.method, "Page.loadEventFired")) {
+        // Page fully loaded - update navigation state (history is now available)
+        viewer.forceUpdateNavigationState();
+        viewer.ui_state.is_loading = false;
+        viewer.ui_dirty = true;
     } else if (std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
         handleNavigatedWithinDocument(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
@@ -61,7 +66,7 @@ pub fn handleFrameNavigated(viewer: anytype, payload: []const u8) void {
         }
     }
 
-    viewer.updateNavigationState();
+    viewer.forceUpdateNavigationState();
 }
 
 /// Handle Page.navigatedWithinDocument - SPA navigation (pushState/hash change)
@@ -81,7 +86,7 @@ pub fn handleNavigatedWithinDocument(viewer: anytype, payload: []const u8) void 
         }
     }
 
-    viewer.updateNavigationState();
+    viewer.forceUpdateNavigationState();
 }
 
 /// Handle Target.targetCreated event

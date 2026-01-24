@@ -805,12 +805,22 @@ pub const Viewer = struct {
     }
 
     /// Update navigation button states from Chrome history (call after navigation events)
-    /// Debounced to max once per 3 seconds to avoid blocking the main loop
-    /// This makes blocking CDP calls (getNavigationState) infrequent
+    /// Update navigation state (back/forward button availability)
+    /// Debounced to max once per 3 seconds unless force=true
     pub fn updateNavigationState(self: *Viewer) void {
+        self.updateNavigationStateImpl(false);
+    }
+
+    /// Force update navigation state, bypassing debounce
+    /// Use this after actual navigation events (page load, link click)
+    pub fn forceUpdateNavigationState(self: *Viewer) void {
+        self.updateNavigationStateImpl(true);
+    }
+
+    fn updateNavigationStateImpl(self: *Viewer, force: bool) void {
         const now = std.time.nanoTimestamp();
-        // Debounce: skip if called within last 3 seconds
-        if (now - self.last_nav_state_update < 3 * std.time.ns_per_s) {
+        // Debounce: skip if called within last 3 seconds (unless forced)
+        if (!force and now - self.last_nav_state_update < 3 * std.time.ns_per_s) {
             return;
         }
         self.last_nav_state_update = now;
@@ -820,8 +830,9 @@ pub const Viewer = struct {
         self.ui_state.can_go_back = nav_state.can_go_back;
         self.ui_state.can_go_forward = nav_state.can_go_forward;
         self.log("[NAV STATE] Updated: back={} forward={}\n", .{ nav_state.can_go_back, nav_state.can_go_forward });
-        // Note: viewport refresh removed - it rarely changes during navigation
-        // and adds another blocking CDP call. Resize events will update viewport.
+
+        // Request toolbar re-render with new state
+        self.requestToolbarRender();
     }
 
     /// Reset screencast - stops and restarts to recover from broken state
@@ -921,6 +932,8 @@ pub const Viewer = struct {
             // Check if re-render requested
             if (self.toolbar_render_requested.swap(false, .acq_rel)) {
                 if (self.toolbar_renderer) |*renderer| {
+                    // Update nav state before compositing
+                    renderer.setNavState(self.ui_state.can_go_back, self.ui_state.can_go_forward, self.ui_state.is_loading);
                     // Composite to RGBA buffer (main loop will display)
                     const dims = renderer.compositeToRgba(self.toolbar_rgba);
                     self.toolbar_width = dims.width;

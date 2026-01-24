@@ -469,6 +469,33 @@ pub fn showNativeListPicker(
 fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: []const []const u8) !?usize {
     if (items.len == 0) return null;
 
+    // Get frontmost app before showing dialog so we can restore focus
+    const front_app_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "osascript", "-e", "tell application \"System Events\" to get name of first application process whose frontmost is true" },
+    }) catch null;
+    var front_app: ?[]const u8 = null;
+    if (front_app_result) |r| {
+        defer allocator.free(r.stderr);
+        if (r.term.Exited == 0 and r.stdout.len > 0) {
+            // Trim newline
+            var end: usize = r.stdout.len;
+            while (end > 0 and (r.stdout[end - 1] == '\n' or r.stdout[end - 1] == '\r')) {
+                end -= 1;
+            }
+            if (end > 0) {
+                front_app = r.stdout[0..end];
+            } else {
+                allocator.free(r.stdout);
+            }
+        } else {
+            allocator.free(r.stdout);
+        }
+    }
+    defer if (front_app_result) |r| {
+        if (front_app != null) allocator.free(r.stdout);
+    };
+
     // Build AppleScript list string: {"item1", "item2", ...}
     var list_buf = try std.ArrayList(u8).initCapacity(allocator, 256);
     defer list_buf.deinit(allocator);
@@ -512,6 +539,16 @@ fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: [
     }) catch return null;
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
+
+    // Restore focus to original app
+    if (front_app) |app| {
+        var refocus_buf: [256]u8 = undefined;
+        const refocus_script = std.fmt.bufPrint(&refocus_buf, "tell application \"{s}\" to activate", .{app}) catch null;
+        if (refocus_script) |s| {
+            var refocus = std.process.Child.init(&.{ "osascript", "-e", s }, allocator);
+            refocus.spawn() catch {};
+        }
+    }
 
     // Check if cancelled
     if (result.term.Exited != 0 or result.stdout.len == 0) {

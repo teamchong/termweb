@@ -379,7 +379,7 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
                     viewer.tabs.items[viewer.active_tab_index].updateUrl(url_copy) catch {};
                 }
 
-                viewer.updateNavigationState();
+                viewer.forceUpdateNavigationState();
             } else {
                 renderer.blurUrl();
                 viewer.mode = .normal;

@@ -236,13 +236,13 @@ pub const ToolbarRenderer = struct {
         x_offset += self.button_size + self.button_padding;
 
         // Tabs button uses generateTabButton (custom pill style, not SVG)
-        const tab_btn_width = self.button_size + self.button_padding;
-        const tab_rgba = self.generateTabButton(tab_btn_width, self.button_size) catch null;
+        self.tab_btn_width = self.button_size + self.button_padding;
+        const tab_rgba = self.generateTabButton(self.tab_btn_width, self.button_size) catch null;
         if (tab_rgba) |rgba| {
             defer self.allocator.free(rgba);
-            self.blitRgba(dest, stride, x_offset, y_offset, rgba, tab_btn_width, self.button_size);
+            self.blitRgba(dest, stride, x_offset, y_offset, rgba, self.tab_btn_width, self.button_size);
         }
-        x_offset += tab_btn_width + self.button_padding;
+        x_offset += self.tab_btn_width + self.button_padding;
 
         // Composite URL bar
         self.blitUrlBar(dest, stride, x_offset, y_offset, width);

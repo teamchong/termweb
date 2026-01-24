@@ -181,10 +181,10 @@ pub fn handleTabBarClick(viewer: anytype, pixel_x: u32, pixel_y: u32, mapper: Co
         viewer.running = false;
     } else if (col >= 4 and col <= 6 and viewer.ui_state.can_go_back) {
         _ = try screenshot_api.goBack(viewer.cdp_client, viewer.allocator);
-        viewer.updateNavigationState();
+        viewer.forceUpdateNavigationState();
     } else if (col >= 8 and col <= 10 and viewer.ui_state.can_go_forward) {
         _ = try screenshot_api.goForward(viewer.cdp_client, viewer.allocator);
-        viewer.updateNavigationState();
+        viewer.forceUpdateNavigationState();
     } else if (col >= 12 and col <= 14) {
         try screenshot_api.reload(viewer.cdp_client, viewer.allocator, false);
     } else if (col >= 18) {
