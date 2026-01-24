@@ -7,13 +7,12 @@
 ///
 /// Priority (highest to lowest):
 /// 1. Click (press/release) - queued, never dropped
-/// 2. Wheel - keep latest only, replace on new
+/// 2. Wheel - accumulate deltas between ticks
 /// 3. Move/drag - keep latest only, replace on new
 const std = @import("std");
 const config = @import("config.zig").Config;
 const cdp_mod = @import("chrome/cdp_client.zig");
 const interact_mod = @import("chrome/interact.zig");
-const scroll_mod = @import("chrome/scroll.zig");
 const input_mod = @import("terminal/input.zig");
 const coordinates_mod = @import("terminal/coordinates.zig");
 
@@ -225,12 +224,23 @@ pub const MouseEventBus = struct {
                 }
             },
             .wheel => {
-                // Replace pending wheel with latest
-                self.pending_wheel = WheelEvent{
-                    .delta_y = mouse.delta_y,
-                    .viewport_width = viewport_width,
-                    .viewport_height = viewport_height,
-                };
+                // Accumulate wheel deltas with capped maximum
+                // - Accumulation filters touchpad jitter (5 down + 1 jitter up = net down)
+                // - Cap limits "momentum" so direction changes are responsive
+                const max_delta: i16 = 120; // 1 wheel tick max - fast direction change
+                if (self.pending_wheel) |*existing| {
+                    existing.delta_y = std.math.clamp(
+                        existing.delta_y + mouse.delta_y,
+                        -max_delta,
+                        max_delta,
+                    );
+                } else {
+                    self.pending_wheel = WheelEvent{
+                        .delta_y = mouse.delta_y,
+                        .viewport_width = viewport_width,
+                        .viewport_height = viewport_height,
+                    };
+                }
             },
             .move, .drag => {
                 // Throttle moves - keep latest only, dispatch on tick
@@ -259,7 +269,7 @@ pub const MouseEventBus = struct {
 
     /// Dispatch pending events (moves and wheel are throttled)
     fn tick(self: *MouseEventBus) void {
-        // Dispatch pending move (throttled to match screencast fps)
+        // Dispatch pending move
         if (self.pending_move) |move| {
             self.sendMove(move);
             self.pending_move = null;
@@ -289,29 +299,28 @@ pub const MouseEventBus = struct {
     }
 
     fn sendWheel(self: *MouseEventBus, wheel: WheelEvent) void {
-        // Determine scroll direction based on natural_scroll setting
-        const scroll_down = if (self.natural_scroll)
-            wheel.delta_y < 0
-        else
-            wheel.delta_y > 0;
+        // Skip if accumulated delta is too small (filters jitter that cancels out)
+        const abs_delta = if (wheel.delta_y < 0) -wheel.delta_y else wheel.delta_y;
+        if (abs_delta < 40) return; // Filter small jitter
 
-        if (wheel.delta_y != 0) {
-            if (scroll_down) {
-                scroll_mod.scrollLineDown(
-                    self.cdp_client,
-                    self.allocator,
-                    wheel.viewport_width,
-                    wheel.viewport_height,
-                ) catch {};
-            } else {
-                scroll_mod.scrollLineUp(
-                    self.cdp_client,
-                    self.allocator,
-                    wheel.viewport_width,
-                    wheel.viewport_height,
-                ) catch {};
-            }
-        }
+        // Scale delta (terminal sends 120 per tick, too fast for smooth scroll)
+        // Modern terminals like Ghostty already apply system natural scroll setting
+        // to wheel events, so we just scale and pass through
+        const delta: i32 = @divTrunc(@as(i32, wheel.delta_y), 3);
+        _ = self.natural_scroll; // Detection kept for reference but terminal handles it
+
+        // Send wheel event to Chrome
+        // CDP: positive deltaY = scroll down (content moves up)
+        const x = wheel.viewport_width / 2;
+        const y = wheel.viewport_height / 2;
+        const params = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"type\":\"mouseWheel\",\"x\":{d},\"y\":{d},\"deltaX\":0,\"deltaY\":{d}}}",
+            .{ x, y, delta },
+        ) catch return;
+        defer self.allocator.free(params);
+
+        self.cdp_client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
     }
 
     fn sendMove(self: *MouseEventBus, move: MoveEvent) void {
