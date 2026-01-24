@@ -97,7 +97,37 @@ termweb.open('https://vscode.dev', {
 if (termweb.isAvailable()) {
   termweb.open('https://example.com');
 }
+
+// Load a Chrome extension
+termweb.open('https://example.com', {
+  extensionPath: '/path/to/unpacked/extension',
+});
 ```
+
+### Chrome Extensions
+
+You can inject unpacked Chrome extensions to extend browser capabilities:
+
+```javascript
+// Ad blocker extension
+termweb.open('https://example.com', {
+  extensionPath: '/path/to/ublock-origin',
+});
+
+// Custom content scripts
+termweb.open('https://myapp.com', {
+  extensionPath: './extensions/custom-injector',
+});
+```
+
+Extensions can provide:
+- **Content Scripts** - Inject custom JS/CSS into pages
+- **Ad Blocking** - Block ads and trackers
+- **Authentication** - Auto-fill credentials or handle OAuth
+- **Page Manipulation** - Modify DOM, intercept requests
+- **Custom APIs** - Expose additional functionality to pages
+
+> **Note:** termweb creates a temporary Chrome profile in `/tmp/termweb-profile-*` that is cleaned up on each launch. Extensions are loaded fresh each session via the `--load-extension` flag, so extension state (settings, data) does not persist between sessions.
 
 ## Controls
 
@@ -128,6 +158,37 @@ if (termweb.isAvailable()) {
 - Links that open new windows are captured as tabs
 - Click the tab button in toolbar (shows tab count)
 - Native OS dialog appears to select tabs (AppleScript on macOS, zenity on Linux)
+
+## Terminal Apps
+
+Pre-built terminal applications powered by termweb:
+
+### @termweb/code
+
+Full-featured code editor with syntax highlighting for 20+ languages.
+
+```bash
+npx @termweb/code ./src/index.js
+npx @termweb/code ~/projects/app/main.py
+```
+
+### @termweb/markdown
+
+Markdown editor with live preview pane.
+
+```bash
+npx @termweb/markdown ./README.md
+npx @termweb/markdown ~/docs/notes.md
+```
+
+### @termweb/json
+
+JSON editor with validation, formatting, and key sorting.
+
+```bash
+npx @termweb/json ./package.json
+npx @termweb/json ~/config/settings.json
+```
 
 ## Documentation
 
