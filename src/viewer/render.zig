@@ -164,11 +164,14 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame
     try writer.writeAll("\x1b[2;1H");
 
     // Use fixed image_id for content - Kitty replaces in-place (no delete needed)
+    // In hint mode, use negative z-index so text hints appear on top
+    const z_index: i32 = if (viewer.mode == .hint_mode) -1 else 0;
     const display_opts = kitty_mod.DisplayOptions{
         .rows = content_rows,
         .columns = display_cols,
         .y_offset = @intCast(y_offset),
         .image_id = 100, // Fixed ID for content
+        .z = z_index,
     };
 
     const render_t1 = std.time.nanoTimestamp();

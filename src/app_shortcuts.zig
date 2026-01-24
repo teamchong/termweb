@@ -30,6 +30,8 @@ pub const AppAction = enum {
     select_all,
     tab_picker,
     enter_hint_mode,
+    scroll_down,
+    scroll_up,
 };
 
 /// Key type for shortcuts - can be a character or special key
@@ -72,7 +74,11 @@ pub const app_shortcuts = [_]ShortcutDef{
     .{ .key = .{ .char = 't' }, .shortcut_mod = false, .ctrl = true, .action = .tab_picker },
 
     // Hint mode (Vimium-style navigation)
-    .{ .key = .{ .char = 'j' }, .shortcut_mod = false, .ctrl = true, .action = .enter_hint_mode },
+    .{ .key = .{ .char = 'h' }, .shortcut_mod = false, .ctrl = true, .action = .enter_hint_mode },
+
+    // Vim-style scrolling
+    .{ .key = .{ .char = 'j' }, .shortcut_mod = false, .ctrl = true, .action = .scroll_down },
+    .{ .key = .{ .char = 'k' }, .shortcut_mod = false, .ctrl = true, .action = .scroll_up },
 };
 
 /// Find an app action for a key event.

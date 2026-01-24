@@ -138,6 +138,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var clone_profile: ?[]const u8 = null; // null means use default from LaunchOptions
     var no_profile = false;
     var no_toolbar = false;
+    var disable_hotkeys = false;
+    var disable_hints = false;
     var browser_path: ?[]const u8 = null;
     var disable_gpu = false;
 
@@ -173,6 +175,10 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             no_profile = true;
         } else if (std.mem.eql(u8, arg, "--no-toolbar")) {
             no_toolbar = true;
+        } else if (std.mem.eql(u8, arg, "--disable-hotkeys")) {
+            disable_hotkeys = true;
+        } else if (std.mem.eql(u8, arg, "--disable-hints")) {
+            disable_hints = true;
         } else if (std.mem.eql(u8, arg, "--disable-gpu")) {
             disable_gpu = true;
         }
@@ -325,6 +331,12 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (no_toolbar) {
         viewer.disableToolbar();
     }
+    if (disable_hotkeys) {
+        viewer.disableHotkeys();
+    }
+    if (disable_hints) {
+        viewer.disableHints();
+    }
 
     try viewer.run();
 }
@@ -370,24 +382,33 @@ fn printHelp() void {
         \\  --profile <name>      Clone Chrome profile (default: 'Default')
         \\  --no-profile          Start with fresh profile (no cloning)
         \\  --no-toolbar          Hide navigation bar (app/kiosk mode)
+        \\  --disable-hotkeys     Disable all keyboard shortcuts (except Ctrl+Q)
+        \\  --disable-hints       Disable Ctrl+H hint mode
         \\  --browser-path <path> Path to browser executable
         \\  --list-profiles       Show available Chrome profiles
         \\  --list-browsers       Show available browsers
         \\  --mobile              Use mobile viewport
         \\  --scale N             Set zoom scale (default: 1.0)
         \\
-        \\Keyboard (Cmd on macOS, Ctrl on Linux):
-        \\  Cmd/Ctrl+Q            Quit
-        \\  Cmd/Ctrl+L            Focus address bar
-        \\  Cmd/Ctrl+R            Reload page
-        \\  Cmd/Ctrl+[            Go back
-        \\  Cmd/Ctrl+]            Go forward
-        \\  Cmd/Ctrl+.            Stop loading
-        \\  Cmd/Ctrl+T            Show tab picker
-        \\  Cmd/Ctrl+C            Copy selection
-        \\  Cmd/Ctrl+X            Cut selection
-        \\  Cmd/Ctrl+V            Paste
-        \\  Cmd/Ctrl+A            Select all
+        \\Keyboard (all shortcuts use Ctrl):
+        \\  Ctrl+Q                Quit
+        \\  Ctrl+L                Focus address bar
+        \\  Ctrl+R                Reload page
+        \\  Ctrl+[                Go back
+        \\  Ctrl+]                Go forward
+        \\  Ctrl+.                Stop loading
+        \\  Ctrl+T                Show tab picker
+        \\  Ctrl+H                Enter hint mode (Vimium-style click navigation)
+        \\  Ctrl+J                Scroll down
+        \\  Ctrl+K                Scroll up
+        \\  Ctrl+C                Copy selection
+        \\  Ctrl+X                Cut selection
+        \\  Ctrl+V                Paste
+        \\  Ctrl+A                Select all
+        \\
+        \\Hint Mode:
+        \\  Press Ctrl+H to show clickable element labels.
+        \\  Type letters to click. Escape to cancel.
         \\
         \\Mouse:
         \\  Click                 Interact with page elements

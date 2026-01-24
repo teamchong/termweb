@@ -93,6 +93,27 @@ pub fn clickElement(
     try clickAt(client, allocator, center_x, center_y);
 }
 
+/// Scroll the page by delta pixels using smooth JavaScript scrolling
+/// deltaX: horizontal scroll (positive = right, negative = left)
+/// deltaY: vertical scroll (positive = down, negative = up)
+pub fn scroll(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    deltaX: i32,
+    deltaY: i32,
+) !void {
+    _ = allocator;
+    // Use JavaScript scrollBy with instant behavior for fast press-and-hold scrolling
+    // 'instant' allows rapid keypresses to stack up quickly
+    var js_buf: [256]u8 = undefined;
+    const js = std.fmt.bufPrint(&js_buf, "window.scrollBy({{left:{d},top:{d},behavior:'instant'}})", .{ deltaX, deltaY }) catch return;
+
+    var params_buf: [512]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{js}) catch return;
+
+    client.sendCommandAsync("Runtime.evaluate", params) catch {};
+}
+
 /// Focus an element using JavaScript
 pub fn focusElement(
     client: *cdp.CdpClient,

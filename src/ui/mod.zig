@@ -31,4 +31,6 @@ pub const DialogState = dialog.DialogState;
 pub const FilePickerMode = dialog.FilePickerMode;
 pub const HintGrid = hints.HintGrid;
 pub const Hint = hints.Hint;
+pub const ClickableElement = hints.ClickableElement;
 pub const renderHints = hints.renderHints;
+pub const renderHintsOverlay = hints.renderHintsOverlay;

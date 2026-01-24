@@ -28,6 +28,18 @@ const viewer_helpers = viewer_mod.helpers;
 const fs_handler = viewer_mod.fs_handler;
 const render_mod = viewer_mod.render;
 const input_handler_mod = viewer_mod.input_handler;
+
+/// Pre-rendered hint badge data for background thread -> main thread transfer
+const HintBadge = struct {
+    rgba: [70 * 24 * 4]u8, // Max badge size: 70x24 pixels, RGBA
+    width: u32,
+    height: u32,
+    term_row: u16,
+    term_col: u16,
+    valid: bool,
+};
+
+const MAX_HINT_BADGES = 500;
 const mouse_handler_mod = viewer_mod.mouse_handler;
 
 // Import keyboard handling
@@ -116,6 +128,8 @@ pub const Viewer = struct {
     // Toolbar renderer (Kitty graphics based)
     toolbar_renderer: ?ui_mod.ToolbarRenderer,
     toolbar_disabled: bool, // --no-toolbar flag
+    hotkeys_disabled: bool, // --disable-hotkeys flag
+    hints_disabled: bool, // --disable-hints flag
 
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
@@ -153,6 +167,15 @@ pub const Viewer = struct {
     toolbar_thread_running: std.atomic.Value(bool), // Thread control
     toolbar_width: u32,
     toolbar_height: u32,
+
+    // Hint overlay thread - renders badges to buffer (main loop displays)
+    hint_thread: ?std.Thread,
+    hint_thread_running: std.atomic.Value(bool),
+    hint_render_requested: std.atomic.Value(bool), // Signal to render thread
+    hint_badges_ready: std.atomic.Value(bool), // Badges ready to display
+    hint_badges: []HintBadge, // Pre-rendered badge data
+    hint_badge_count: std.atomic.Value(u32), // Number of valid badges
+    hint_last_input_time: i128, // For timeout-based auto-selection
 
     // Input thread - reads stdin independently
     input_thread: ?std.Thread,
@@ -262,6 +285,8 @@ pub const Viewer = struct {
             .hint_grid = null,
             .toolbar_renderer = null,
             .toolbar_disabled = false,
+            .hotkeys_disabled = false,
+            .hints_disabled = false,
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -285,6 +310,13 @@ pub const Viewer = struct {
             .toolbar_thread_running = std.atomic.Value(bool).init(false),
             .toolbar_width = 0,
             .toolbar_height = 0,
+            .hint_thread = null,
+            .hint_thread_running = std.atomic.Value(bool).init(false),
+            .hint_render_requested = std.atomic.Value(bool).init(false),
+            .hint_badges_ready = std.atomic.Value(bool).init(false),
+            .hint_badges = try allocator.alloc(HintBadge, MAX_HINT_BADGES),
+            .hint_badge_count = std.atomic.Value(u32).init(0),
+            .hint_last_input_time = 0,
             .input_thread = null,
             .input_thread_running = std.atomic.Value(bool).init(false),
             .input_pending = std.atomic.Value(bool).init(false),
@@ -310,6 +342,16 @@ pub const Viewer = struct {
     /// Disable toolbar (for app/kiosk mode)
     pub fn disableToolbar(self: *Viewer) void {
         self.toolbar_disabled = true;
+    }
+
+    /// Disable hotkeys (Ctrl+L, Ctrl+R, etc.)
+    pub fn disableHotkeys(self: *Viewer) void {
+        self.hotkeys_disabled = true;
+    }
+
+    /// Disable hint mode (Ctrl+J)
+    pub fn disableHints(self: *Viewer) void {
+        self.hints_disabled = true;
     }
 
     /// Calculate max FPS based on viewport resolution
@@ -601,10 +643,29 @@ pub const Viewer = struct {
                         self.renderCursor(writer2) catch {};
                     }
 
-                    // Render hint labels when in hint mode
-                    if (self.mode == .hint_mode) {
-                        if (self.hint_grid) |grid| {
-                            ui_mod.renderHints(writer2, grid) catch {};
+                    // Display pre-rendered hint badges (rendered by background thread)
+                    if (self.mode == .hint_mode and self.hint_badges_ready.swap(false, .acq_rel)) {
+                        const toolbar_rows: u16 = if (self.toolbar_renderer != null) 2 else 0;
+                        self.displayHintBadges(writer2, toolbar_rows);
+                    }
+
+                    // Check for hint timeout auto-selection (300ms)
+                    if (self.mode == .hint_mode and self.hint_last_input_time > 0) {
+                        const hint_timeout = 300 * std.time.ns_per_ms;
+                        if (now_ns - self.hint_last_input_time > hint_timeout) {
+                            if (self.hint_grid) |grid| {
+                                if (grid.findExactMatch()) |hint| {
+                                    self.log("[HINT] Timeout auto-select at ({}, {})\n", .{ hint.browser_x, hint.browser_y });
+                                    interact_mod.clickAt(
+                                        self.cdp_client,
+                                        self.allocator,
+                                        hint.browser_x,
+                                        hint.browser_y,
+                                    ) catch {};
+                                    self.exitHintMode();
+                                }
+                            }
+                            self.hint_last_input_time = 0; // Reset to prevent repeated triggers
                         }
                     }
 
@@ -952,6 +1013,187 @@ pub const Viewer = struct {
         self.toolbar_render_requested.store(true, .release);
     }
 
+    /// Start hint background render thread
+    fn startHintThread(self: *Viewer) void {
+        if (self.hint_thread != null) return;
+        self.hint_thread_running.store(true, .release);
+        self.hint_thread = std.Thread.spawn(.{}, hintRenderLoop, .{self}) catch null;
+    }
+
+    /// Stop hint background render thread
+    fn stopHintThread(self: *Viewer) void {
+        self.hint_thread_running.store(false, .release);
+        if (self.hint_thread) |thread| {
+            thread.join();
+            self.hint_thread = null;
+        }
+    }
+
+    /// Request hint badges to be re-rendered (non-blocking)
+    pub fn requestHintRender(self: *Viewer) void {
+        self.hint_render_requested.store(true, .release);
+    }
+
+    /// Background thread that pre-renders hint badges (main loop displays)
+    fn hintRenderLoop(self: *Viewer) void {
+        while (self.hint_thread_running.load(.acquire)) {
+            // Check if re-render requested
+            if (self.hint_render_requested.swap(false, .acq_rel)) {
+                if (self.hint_grid) |grid| {
+                    const filter = grid.getInput();
+                    var badge_idx: u32 = 0;
+
+                    for (grid.hints) |hint| {
+                        if (badge_idx >= MAX_HINT_BADGES) break;
+
+                        // Skip hints that don't match filter
+                        if (filter.len > 0) {
+                            var matches = true;
+                            for (filter, 0..) |fc, i| {
+                                if (i >= hint.label_len or hint.label[i] != fc) {
+                                    matches = false;
+                                    break;
+                                }
+                            }
+                            if (!matches) continue;
+                        }
+
+                        // Calculate badge dimensions
+                        const badge_w: u32 = @as(u32, hint.label_len) * 16 + 6;
+                        const badge_h: u32 = 24;
+                        const badge_size = badge_w * badge_h * 4;
+
+                        // Render badge to pre-allocated buffer
+                        var badge = &self.hint_badges[badge_idx];
+                        @memset(&badge.rgba, 0);
+                        ui_mod.hints.drawBadgePublic(&badge.rgba, badge_w, badge_h, &hint.label, hint.label_len);
+
+                        badge.width = badge_w;
+                        badge.height = badge_h;
+                        badge.term_row = hint.term_row;
+                        badge.term_col = hint.term_col;
+                        badge.valid = true;
+                        _ = badge_size;
+
+                        badge_idx += 1;
+                    }
+
+                    // Mark remaining badges as invalid
+                    var i = badge_idx;
+                    while (i < MAX_HINT_BADGES) : (i += 1) {
+                        self.hint_badges[i].valid = false;
+                    }
+
+                    self.hint_badge_count.store(badge_idx, .release);
+                    self.hint_badges_ready.store(true, .release);
+                }
+            }
+            std.Thread.sleep(8 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Display pre-rendered hint badges (main thread only)
+    fn displayHintBadges(self: *Viewer, writer: anytype, toolbar_rows: u16) void {
+        const badge_count = self.hint_badge_count.load(.acquire);
+        var displayed: u32 = 0;
+
+        for (self.hint_badges[0..badge_count]) |badge| {
+            if (!badge.valid) continue;
+            if (badge.term_row <= toolbar_rows) continue;
+
+            // Position cursor
+            writer.print("\x1b[{d};{d}H", .{ badge.term_row, badge.term_col }) catch continue;
+
+            // Display via Kitty graphics
+            const badge_size = badge.width * badge.height * 4;
+            const image_id: u32 = 501 + displayed;
+            _ = self.kitty.displayRawRGBA(
+                writer,
+                badge.rgba[0..badge_size],
+                badge.width,
+                badge.height,
+                .{ .image_id = image_id, .z = 100 },
+            ) catch {};
+
+            displayed += 1;
+        }
+    }
+
+    /// Render hint badges using KittyGraphics (DEPRECATED - use displayHintBadges)
+    fn renderHintBadges(self: *Viewer, writer: anytype, grid: *ui_mod.HintGrid, size: anytype, cell_w: u16, cell_h: u16, toolbar_rows: u16) !void {
+        _ = size;
+        _ = cell_w;
+        _ = cell_h;
+        _ = grid;
+        // Now just calls displayHintBadges
+        self.displayHintBadges(writer, toolbar_rows);
+    }
+
+    /// Old render implementation (kept for reference, not used)
+    fn renderHintBadgesOld(self: *Viewer, writer: anytype, grid: *ui_mod.HintGrid, size: anytype, cell_w: u16, cell_h: u16, toolbar_rows: u16) !void {
+        const filter = grid.getInput();
+
+        // Badge dimensions - dynamic width based on max label length
+        // Each 2x char is 16px wide, plus 4px padding
+        const badge_h: u32 = 24;
+        const max_badge_w: u32 = 70; // Fits 4 chars (4 * 16 = 64 + 6 padding)
+        const max_badge_size = max_badge_w * badge_h * 4;
+
+        // Create badge buffer (sized for max width)
+        const badge_buf = try self.allocator.alloc(u8, max_badge_size);
+        defer self.allocator.free(badge_buf);
+
+        // No limit - terminal size naturally limits hint count
+        var rendered: usize = 0;
+
+        for (grid.hints) |hint| {
+
+            // Skip hints that don't match filter (check all filter chars)
+            if (filter.len > 0) {
+                var matches = true;
+                for (filter, 0..) |fc, i| {
+                    if (i >= hint.label_len or hint.label[i] != fc) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (!matches) continue;
+            }
+
+            // Calculate badge width for this hint's label length
+            // 16px per char + 4px padding
+            const badge_w: u32 = @as(u32, hint.label_len) * 16 + 6;
+
+            // Clear and draw badge
+            const badge_size = badge_w * badge_h * 4;
+            @memset(badge_buf[0..badge_size], 0);
+            ui_mod.hints.drawBadgePublic(badge_buf, badge_w, badge_h, &hint.label, hint.label_len);
+
+            // Position cursor at hint location
+            const row = hint.term_row;
+            const col = hint.term_col;
+            if (row <= toolbar_rows) continue;
+
+            try writer.print("\x1b[{d};{d}H", .{ row, col });
+
+            // Use KittyGraphics to display (handles chunking properly)
+            const image_id: u32 = 501 + @as(u32, @intCast(rendered));
+            _ = try self.kitty.displayRawRGBA(
+                writer,
+                badge_buf[0..badge_size],
+                badge_w,
+                badge_h,
+                .{ .image_id = image_id, .z = 100 },
+            );
+
+            rendered += 1;
+        }
+
+        _ = size;
+        _ = cell_w;
+        _ = cell_h;
+    }
+
     /// Display toolbar if ready (called from main loop only)
     /// Throttled to 30fps max to avoid flooding stdout
     fn displayToolbar(self: *Viewer, writer: anytype) void {
@@ -1122,9 +1364,107 @@ pub const Viewer = struct {
 
     // ========== HINT MODE ==========
 
+    /// Query clickable elements from the DOM
+    fn queryClickableElements(self: *Viewer) ![]ui_mod.ClickableElement {
+        // JavaScript to find all clickable elements and get their bounding boxes
+        const script =
+            \\(function() {
+            \\  const clickable = document.querySelectorAll('a, button, input, select, textarea, [onclick], [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])');
+            \\  const results = [];
+            \\  const seen = new Set();
+            \\  for (const el of clickable) {
+            \\    const rect = el.getBoundingClientRect();
+            \\    if (rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.left >= 0) {
+            \\      const key = Math.round(rect.left) + ',' + Math.round(rect.top);
+            \\      if (!seen.has(key)) {
+            \\        seen.add(key);
+            \\        results.push({
+            \\          x: Math.round(rect.left + rect.width / 2),
+            \\          y: Math.round(rect.top + rect.height / 2),
+            \\          w: Math.round(rect.width),
+            \\          h: Math.round(rect.height)
+            \\        });
+            \\      }
+            \\    }
+            \\  }
+            \\  return JSON.stringify(results);
+            \\})()
+        ;
+
+        // Execute script via CDP
+        var escaped_buf: [4096]u8 = undefined;
+        const escaped = json.escapeString(script, &escaped_buf) catch return error.EscapeFailed;
+        var params_buf: [4096]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s},\"returnByValue\":true}}", .{escaped}) catch return error.FormatFailed;
+
+        const result = self.cdp_client.sendNavCommand("Runtime.evaluate", params) catch return error.CdpFailed;
+        defer self.allocator.free(result);
+
+        // Parse response to get the JSON string result
+        // Look for "value":" pattern and extract the JSON array
+        const value_marker = "\"value\":\"";
+        const value_start = std.mem.indexOf(u8, result, value_marker) orelse return error.NoResult;
+        const json_start = value_start + value_marker.len;
+
+        // Find closing quote (handling escapes)
+        var json_end = json_start;
+        while (json_end < result.len) : (json_end += 1) {
+            if (result[json_end] == '\\' and json_end + 1 < result.len) {
+                json_end += 1; // Skip escaped char
+            } else if (result[json_end] == '"') {
+                break;
+            }
+        }
+
+        // Unescape the JSON string
+        const escaped_json = result[json_start..json_end];
+        const unescaped = self.unescapeJsonString(escaped_json) orelse return error.UnescapeFailed;
+        defer self.allocator.free(unescaped);
+
+        // Parse the JSON array
+        var elements = try std.ArrayList(ui_mod.ClickableElement).initCapacity(self.allocator, 64);
+        errdefer elements.deinit(self.allocator);
+
+        // Simple JSON array parsing: [{"x":1,"y":2,"w":3,"h":4},...]
+        var i: usize = 0;
+        while (i < unescaped.len) {
+            // Find next object
+            const obj_start = std.mem.indexOfPos(u8, unescaped, i, "{") orelse break;
+            const obj_end = std.mem.indexOfPos(u8, unescaped, obj_start, "}") orelse break;
+            const obj = unescaped[obj_start .. obj_end + 1];
+
+            // Parse x, y, w, h
+            const x = parseJsonNumber(obj, "\"x\":") orelse 0;
+            const y = parseJsonNumber(obj, "\"y\":") orelse 0;
+            const w = parseJsonNumber(obj, "\"w\":") orelse 0;
+            const h = parseJsonNumber(obj, "\"h\":") orelse 0;
+
+            if (w > 0 and h > 0) {
+                try elements.append(self.allocator, .{ .x = x, .y = y, .width = w, .height = h });
+            }
+
+            i = obj_end + 1;
+        }
+
+        self.log("[HINT] Found {} clickable elements\n", .{elements.items.len});
+        return try elements.toOwnedSlice(self.allocator);
+    }
+
     /// Enter hint mode (Vimium-style navigation)
     pub fn enterHintMode(self: *Viewer) !void {
         if (self.mode == .hint_mode) return;
+
+        // Query clickable elements from DOM
+        const elements = self.queryClickableElements() catch |err| {
+            self.log("[HINT] Failed to query clickable elements: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(elements);
+
+        if (elements.len == 0) {
+            self.log("[HINT] No clickable elements found\n", .{});
+            return;
+        }
 
         const size = try self.terminal.getSize();
         const cell_width: u16 = if (size.cols > 0) @intCast(size.width_px / size.cols) else 10;
@@ -1134,11 +1474,12 @@ pub const Viewer = struct {
         const content_rows = size.rows - toolbar_rows - 1;
 
         const grid = try self.allocator.create(ui_mod.HintGrid);
-        grid.* = try ui_mod.HintGrid.generate(
+        grid.* = try ui_mod.HintGrid.generateFromElements(
             self.allocator,
+            elements,
             content_start,
-            content_rows,
             size.cols,
+            content_rows,
             cell_width,
             cell_height,
             self.chrome_actual_width,
@@ -1148,11 +1489,19 @@ pub const Viewer = struct {
         self.hint_grid = grid;
         self.mode = .hint_mode;
         self.ui_dirty = true;
+        self.startHintThread();
+        self.requestHintRender(); // Trigger initial render via background thread
         self.log("[HINT] Entered hint mode with {} hints\n", .{grid.hints.len});
     }
 
     /// Exit hint mode
     pub fn exitHintMode(self: *Viewer) void {
+        // Stop hint thread first
+        self.stopHintThread();
+
+        // Get hint count before clearing grid
+        const hint_count: u32 = if (self.hint_grid) |grid| @intCast(grid.hints.len) else 0;
+
         if (self.hint_grid) |grid| {
             grid.deinit();
             self.allocator.destroy(grid);
@@ -1160,7 +1509,25 @@ pub const Viewer = struct {
         }
         self.mode = .normal;
         self.ui_dirty = true;
-        self.log("[HINT] Exited hint mode\n", .{});
+
+        // Clear all hint images by deleting each one individually
+        // Hint images use IDs 501 to 501 + hint_count
+        var stdout_buf: [65536]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&stdout_buf);
+        const writer = stream.writer();
+
+        // Delete all hint images (501 onwards, up to actual hint count + buffer)
+        const max_id: u32 = 501 + hint_count + 100; // Extra buffer for safety
+        var i: u32 = 501;
+        while (i < max_id) : (i += 1) {
+            writer.print("\x1b_Ga=d,d=i,i={d}\x1b\\", .{i}) catch break;
+        }
+
+        // Write all delete commands at once
+        const stdout_file = std.fs.File.stdout();
+        stdout_file.writeAll(stream.getWritten()) catch {};
+
+        self.log("[HINT] Exited hint mode, cleared {} hint images\n", .{hint_count});
     }
 
     /// Handle Browser.downloadWillBegin event - prompt user for save location
@@ -1782,7 +2149,6 @@ pub const Viewer = struct {
         self.stopInputThread();
         self.stopCdpThread();
         self.stopToolbarThread();
-        self.allocator.free(self.toolbar_rgba);
         // Free hint grid if active
         if (self.hint_grid) |grid| {
             grid.deinit();
@@ -1816,6 +2182,9 @@ pub const Viewer = struct {
         if (self.toolbar_renderer) |*renderer| {
             renderer.deinit();
         }
+        // Free hint and toolbar buffers
+        self.allocator.free(self.hint_badges);
+        self.allocator.free(self.toolbar_rgba);
         // Free the URL we own
         self.allocator.free(self.current_url);
         self.terminal.deinit();
@@ -1827,3 +2196,17 @@ const extractUrlFromNavEvent = viewer_helpers.extractUrlFromNavEvent;
 const parseFileChooserMode = viewer_helpers.parseFileChooserMode;
 const getMimeType = viewer_helpers.getMimeType;
 const base64Decode = viewer_helpers.base64Decode;
+
+/// Parse a number from JSON object string (e.g., {"x":123} with key "\"x\":")
+fn parseJsonNumber(obj: []const u8, key: []const u8) ?u32 {
+    const key_pos = std.mem.indexOf(u8, obj, key) orelse return null;
+    const num_start = key_pos + key.len;
+
+    // Find end of number
+    var num_end = num_start;
+    while (num_end < obj.len and (obj[num_end] >= '0' and obj[num_end] <= '9')) : (num_end += 1) {}
+
+    if (num_end == num_start) return null;
+
+    return std.fmt.parseInt(u32, obj[num_start..num_end], 10) catch null;
+}

@@ -5,9 +5,18 @@ All notable changes to termweb will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2025-01-24 - Vimium-style Hint Mode
 
 ### Added
+- **Vimium-style Hint Mode** - Keyboard-driven click navigation
+  - Press `Ctrl+H` to show labels on all clickable elements
+  - Type letters to click that element
+  - Sequential labels: a-z, aa-zz, aaa-zzz
+  - 300ms timeout auto-selects exact matches
+  - Yellow badges with black border (90% opacity)
+- **Vim-style Scrolling** - Keyboard scrolling shortcuts
+  - `Ctrl+J` - Scroll down
+  - `Ctrl+K` - Scroll up
 - **Real-time Screencast** - Live page rendering via CDP screencast
 - **Mouse Support** - Click interactions with page elements
 - **Clickable Toolbar UI** - Navigation buttons rendered via Kitty graphics
@@ -18,14 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Zenity dialog on Linux
   - Links opening new windows captured as tabs
 - **Clipboard Integration** - System clipboard support
-  - Cmd+C to copy selection
-  - Cmd+V to paste
-  - Cmd+X to cut
-  - Cmd+A to select all
+  - Ctrl+C to copy selection
+  - Ctrl+V to paste
+  - Ctrl+X to cut
+  - Ctrl+A to select all
 - **New UI Modules**
   - `src/ui/toolbar.zig` - Toolbar rendering and hit testing
   - `src/ui/state.zig` - Tab state management
   - `src/ui/dialog.zig` - Native OS dialog integration
+  - `src/ui/hints.zig` - Hint mode rendering and label generation
 
 ### Changed
 - Simplified viewer modes from 4 to 2 (normal, url_prompt)

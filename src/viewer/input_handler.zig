@@ -37,6 +37,15 @@ pub fn handleInput(viewer: anytype, input: Input) !void {
 
             // 2. Check for global app shortcuts (work from ANY mode)
             if (app_shortcuts.findAppAction(event)) |action| {
+                // Check if action is disabled
+                if (isActionDisabled(viewer, action)) {
+                    viewer.log("[SHORTCUT] Action disabled: {s}\n", .{@tagName(action)});
+                    // Pass key through to browser if not quit
+                    if (action != .quit) {
+                        try handleNormalModeKey(viewer, event);
+                    }
+                    return;
+                }
                 viewer.log("[SHORTCUT] Matched action: {s}\n", .{@tagName(action)});
                 try executeAppAction(viewer, action, event);
                 return;
@@ -203,6 +212,18 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
                 tr.is_loading = false;
             }
             viewer.ui_dirty = true;
+        },
+        .scroll_down => {
+            // Scroll down by ~150 pixels (instant for fast hold-to-scroll)
+            interact_mod.scroll(viewer.cdp_client, viewer.allocator, 0, 150) catch |err| {
+                viewer.log("[SCROLL] Down failed: {}\n", .{err});
+            };
+        },
+        .scroll_up => {
+            // Scroll up by ~150 pixels (instant for fast hold-to-scroll)
+            interact_mod.scroll(viewer.cdp_client, viewer.allocator, 0, -150) catch |err| {
+                viewer.log("[SCROLL] Up failed: {}\n", .{err});
+            };
         },
     }
 }
@@ -417,8 +438,11 @@ pub fn handleHintModeKey(viewer: anytype, event: NormalizedKeyEvent) !void {
             if (std.ascii.isAlphabetic(c)) {
                 const lower = std.ascii.toLower(c);
                 if (viewer.hint_grid) |grid| {
+                    // Record input time for timeout-based auto-selection
+                    viewer.hint_last_input_time = std.time.nanoTimestamp();
+
                     if (grid.addChar(lower)) |hint| {
-                        // Found a match - click at hint location
+                        // Found a unique match - click at hint location
                         viewer.log("[HINT] Clicking at ({}, {})\n", .{ hint.browser_x, hint.browser_y });
                         try interact_mod.clickAt(
                             viewer.cdp_client,
@@ -428,12 +452,35 @@ pub fn handleHintModeKey(viewer: anytype, event: NormalizedKeyEvent) !void {
                         );
                         viewer.exitHintMode();
                     } else {
-                        // Partial match - update display
+                        // Partial match - re-render badges via background thread
                         viewer.ui_dirty = true;
+                        viewer.requestHintRender();
                     }
                 }
             }
         },
         else => {},
     }
+}
+
+/// Check if an app action is disabled based on viewer settings
+fn isActionDisabled(viewer: anytype, action: AppAction) bool {
+    // Quit is always allowed
+    if (action == .quit) return false;
+
+    // If hotkeys are disabled, block all shortcuts except quit
+    if (viewer.hotkeys_disabled) return true;
+
+    // If hints are disabled, block hint mode
+    if (viewer.hints_disabled and action == .enter_hint_mode) return true;
+
+    // If toolbar is disabled, block navigation actions
+    if (viewer.toolbar_disabled) {
+        switch (action) {
+            .address_bar, .go_back, .go_forward, .stop_loading, .reload => return true,
+            else => {},
+        }
+    }
+
+    return false;
 }

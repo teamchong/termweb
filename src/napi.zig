@@ -105,6 +105,8 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
 
     // Parse options
     var no_toolbar = false;
+    var disable_hotkeys = false;
+    var disable_hints = false;
     var mobile = false;
     var scale: f32 = 1.0;
     var no_profile = false;
@@ -123,6 +125,30 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
                     var toolbar: bool = true;
                     _ = napi_get_value_bool(env, toolbar_val, &toolbar);
                     no_toolbar = !toolbar;
+                }
+            }
+
+            // hotkeys option (default: true)
+            var hotkeys_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "hotkeys", &hotkeys_val) == .ok) {
+                var hotkeys_type: c_uint = 0;
+                _ = napi_typeof(env, hotkeys_val, &hotkeys_type);
+                if (hotkeys_type == @intFromEnum(napi_valuetype.boolean)) {
+                    var hotkeys: bool = true;
+                    _ = napi_get_value_bool(env, hotkeys_val, &hotkeys);
+                    disable_hotkeys = !hotkeys;
+                }
+            }
+
+            // hints option (default: true)
+            var hints_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "hints", &hints_val) == .ok) {
+                var hints_type: c_uint = 0;
+                _ = napi_typeof(env, hints_val, &hints_type);
+                if (hints_type == @intFromEnum(napi_valuetype.boolean)) {
+                    var hints: bool = true;
+                    _ = napi_get_value_bool(env, hints_val, &hints);
+                    disable_hints = !hints;
                 }
             }
 
@@ -199,7 +225,7 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
     }
 
     // Run browser (blocking)
-    runBrowser(allocator, url, no_toolbar, mobile, scale, no_profile, verbose, allowed_path) catch |err| {
+    runBrowser(allocator, url, no_toolbar, disable_hotkeys, disable_hints, mobile, scale, no_profile, verbose, allowed_path) catch |err| {
         // Format error name for debugging
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "{}", .{err}) catch "Unknown error";
@@ -215,7 +241,7 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
     return undef;
 }
 
-fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, mobile: bool, scale: f32, no_profile: bool, verbose: bool, allowed_path: ?[]const u8) !void {
+fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, disable_hotkeys: bool, disable_hints: bool, mobile: bool, scale: f32, no_profile: bool, verbose: bool, allowed_path: ?[]const u8) !void {
     _ = mobile;
     _ = scale;
 
@@ -299,6 +325,12 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, m
 
     if (no_toolbar) {
         viewer.disableToolbar();
+    }
+    if (disable_hotkeys) {
+        viewer.disableHotkeys();
+    }
+    if (disable_hints) {
+        viewer.disableHints();
     }
 
     // Add allowed FS path if specified
