@@ -114,6 +114,13 @@ pub const PipeCdpClient = struct {
     read_file_closed: bool,
     write_file_closed: bool,
 
+    // ACK throttling - limit frame rate to 24fps
+    last_ack_time: i128,
+    pending_ack_session: u32,
+    pending_ack_routing: [256]u8,
+    pending_ack_routing_len: usize,
+    has_pending_ack: bool,
+
     pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
         const frame_pool = try FramePool.init(allocator);
 
@@ -137,6 +144,11 @@ pub const PipeCdpClient = struct {
             .read_pos = 0,
             .read_file_closed = false,
             .write_file_closed = false,
+            .last_ack_time = 0,
+            .pending_ack_session = 0,
+            .pending_ack_routing = undefined,
+            .pending_ack_routing_len = 0,
+            .has_pending_ack = false,
         };
 
         return client;
@@ -478,9 +490,44 @@ pub const PipeCdpClient = struct {
             _ = self.frame_count.fetchAdd(1, .monotonic);
         }
 
-        // ACK every frame immediately - Chrome's adaptive rate limiting needs this
-        // Throttling ACKs breaks Chrome's frame generation flow
-        self.acknowledgeFrame(routing_sid, frame_sid) catch {};
+        // Throttle ACKs to 24fps - Chrome only sends new frame after ACK
+        // Store pending ACK and flush when interval expires
+        const now = std.time.nanoTimestamp();
+        const min_interval = 41 * std.time.ns_per_ms; // 24fps
+
+        // Store this frame for ACK (always keep latest)
+        self.pending_ack_session = frame_sid;
+        if (routing_sid) |rsid| {
+            const len = @min(rsid.len, self.pending_ack_routing.len);
+            @memcpy(self.pending_ack_routing[0..len], rsid[0..len]);
+            self.pending_ack_routing_len = len;
+        } else {
+            self.pending_ack_routing_len = 0;
+        }
+        self.has_pending_ack = true;
+
+        // ACK if enough time has passed
+        if (now - self.last_ack_time >= min_interval) {
+            self.flushPendingAck();
+        }
+    }
+
+    /// Flush pending ACK if interval has passed
+    pub fn flushPendingAck(self: *PipeCdpClient) void {
+        if (!self.has_pending_ack) return;
+
+        const now = std.time.nanoTimestamp();
+        const min_interval = 41 * std.time.ns_per_ms;
+
+        if (now - self.last_ack_time >= min_interval) {
+            self.last_ack_time = now;
+            const rsid: ?[]const u8 = if (self.pending_ack_routing_len > 0)
+                self.pending_ack_routing[0..self.pending_ack_routing_len]
+            else
+                null;
+            self.acknowledgeFrame(rsid, self.pending_ack_session) catch {};
+            self.has_pending_ack = false;
+        }
     }
 
     fn handleResponse(self: *PipeCdpClient, payload: []const u8) !void {

@@ -562,6 +562,13 @@ pub const CdpClient = struct {
         return self.pipe_client.?.getFrameCount();
     }
 
+    /// Flush pending ACK (call from main loop)
+    pub fn flushPendingAck(self: *CdpClient) void {
+        if (self.pipe_client) |pc| {
+            pc.flushPendingAck();
+        }
+    }
+
     /// Get next event from WebSockets
     /// Pipe is ONLY for screencast frames - all events come from WebSockets
     pub fn nextEvent(self: *CdpClient, allocator: std.mem.Allocator) !?CdpEvent {

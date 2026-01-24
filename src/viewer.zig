@@ -437,6 +437,7 @@ pub const Viewer = struct {
             .quality = adaptive_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
+            .every_nth_frame = 1,
         });
         self.screencast_mode = true;
         self.log("[DEBUG] Screencast started\n", .{});
@@ -613,6 +614,9 @@ pub const Viewer = struct {
 
             // CDP events handled by CDP thread
             time_after_events = std.time.nanoTimestamp();
+
+            // Flush pending ACK (throttled to 24fps)
+            self.cdp_client.flushPendingAck();
 
             // Yield CPU (1ms = 1000Hz max loop rate)
             std.Thread.sleep(1 * std.time.ns_per_ms);
