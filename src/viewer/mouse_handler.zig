@@ -100,6 +100,11 @@ pub fn handleTabBarClick(viewer: anytype, pixel_x: u32, pixel_y: u32, mapper: Co
                     };
                     // Optimistic update only on success
                     viewer.ui_state.can_go_forward = true;
+                    viewer.ui_state.is_loading = true;
+                    if (viewer.toolbar_renderer) |*tr| {
+                        tr.is_loading = true;
+                    }
+                    viewer.loading_started_at = std.time.nanoTimestamp();
                     viewer.ui_dirty = true;
                 },
                 .forward => {
@@ -110,6 +115,11 @@ pub fn handleTabBarClick(viewer: anytype, pixel_x: u32, pixel_y: u32, mapper: Co
                             return; // Don't update UI state if command failed
                         };
                         viewer.ui_state.can_go_back = true;
+                        viewer.ui_state.is_loading = true;
+                        if (viewer.toolbar_renderer) |*tr| {
+                            tr.is_loading = true;
+                        }
+                        viewer.loading_started_at = std.time.nanoTimestamp();
                         viewer.ui_dirty = true;
                     }
                 },

@@ -947,7 +947,7 @@ pub const Viewer = struct {
         }
     }
 
-    /// Request toolbar re-render (non-blocking, called from main loop)
+    /// Request toolbar re-render (non-blocking)
     fn requestToolbarRender(self: *Viewer) void {
         self.toolbar_render_requested.store(true, .release);
     }

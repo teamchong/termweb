@@ -172,6 +172,11 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             _ = screenshot_api.goBack(viewer.cdp_client, viewer.allocator) catch |err| {
                 viewer.log("[NAV] Back failed: {}\n", .{err});
             };
+            viewer.ui_state.is_loading = true;
+            if (viewer.toolbar_renderer) |*tr| {
+                tr.is_loading = true;
+            }
+            viewer.loading_started_at = std.time.nanoTimestamp();
             viewer.ui_dirty = true;
         },
         .go_forward => {
@@ -179,6 +184,11 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             _ = screenshot_api.goForward(viewer.cdp_client, viewer.allocator) catch |err| {
                 viewer.log("[NAV] Forward failed: {}\n", .{err});
             };
+            viewer.ui_state.is_loading = true;
+            if (viewer.toolbar_renderer) |*tr| {
+                tr.is_loading = true;
+            }
+            viewer.loading_started_at = std.time.nanoTimestamp();
             viewer.ui_dirty = true;
         },
         .stop_loading => {
@@ -357,16 +367,18 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
                 renderer.blurUrl();
                 viewer.mode = .normal;
 
-                // Show loading indicator
+                // Show loading indicator immediately
+                viewer.ui_state.is_loading = true;
                 if (viewer.toolbar_renderer) |*tr| {
                     tr.is_loading = true;
                 }
+                viewer.loading_started_at = std.time.nanoTimestamp();
+                viewer.ui_dirty = true;
 
                 viewer.log("[URL] Navigating to: {s}\n", .{url_copy});
                 screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url_copy) catch |err| {
                     viewer.log("[URL] Navigation failed: {}\n", .{err});
                     viewer.allocator.free(url_copy);
-                    viewer.ui_dirty = true;
                     return;
                 };
 
@@ -383,8 +395,8 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
             } else {
                 renderer.blurUrl();
                 viewer.mode = .normal;
+                viewer.ui_dirty = true;
             }
-            viewer.ui_dirty = true;
         },
         .escape => {
             renderer.blurUrl();

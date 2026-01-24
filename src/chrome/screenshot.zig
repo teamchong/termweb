@@ -64,7 +64,18 @@ pub fn navigateToUrl(
     allocator: std.mem.Allocator,
     url: []const u8,
 ) !void {
-    logNav("[NAV] navigateToUrl() called with url: '{s}' (len={})\n", .{ url, url.len });
+    // Non-blocking navigation - just send the command and return
+    // CDP events (Page.frameNavigated, Page.loadEventFired) handle the rest
+    return navigateToUrlAsync(client, allocator, url);
+}
+
+/// Navigate to URL without waiting - returns immediately after sending command
+pub fn navigateToUrlAsync(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+) !void {
+    logNav("[NAV] navigateToUrlAsync() called with url: '{s}' (len={})\n", .{ url, url.len });
 
     // Normalize URL - add https:// if no protocol specified
     const has_protocol = std.mem.indexOf(u8, url, "://") != null;
@@ -89,20 +100,7 @@ pub fn navigateToUrl(
     defer allocator.free(result);
 
     logNav("[NAV] Page.navigate result: {s}\n", .{result});
-
-    // Wait for page to load (simple approach - wait fixed time)
-    std.Thread.sleep(3 * std.time.ns_per_s);
-
-    // Inject mouse debug tracker (only if TERMWEB_DEBUG_MOUSE=1)
-    if (isMouseDebugEnabled()) {
-        interact.injectMouseDebugTracker(client, allocator) catch |err| {
-            logNav("[NAV] Failed to inject mouse debug tracker: {}\n", .{err});
-        };
-    }
-
-    // Clipboard interceptor is now injected globally via clipboard_polyfill.js
-
-    logNav("[NAV] navigateToUrl() complete\n", .{});
+    // No waiting - CDP events will notify when page loads
 }
 
 /// Capture screenshot and return base64-encoded PNG/JPEG data
@@ -232,13 +230,7 @@ pub fn goBack(
         return false;
     };
     defer allocator.free(result);
-
-    // Re-inject mouse tracker after back navigation (clipboard is global)
-    std.Thread.sleep(2 * std.time.ns_per_s);
-    if (isMouseDebugEnabled()) {
-        interact.injectMouseDebugTracker(client, allocator) catch {};
-    }
-
+    // Non-blocking - CDP events handle load completion
     return true;
 }
 
@@ -268,13 +260,7 @@ pub fn goForward(
         return false;
     };
     defer allocator.free(result);
-
-    // Re-inject mouse tracker after forward navigation (clipboard is global)
-    std.Thread.sleep(2 * std.time.ns_per_s);
-    if (isMouseDebugEnabled()) {
-        interact.injectMouseDebugTracker(client, allocator) catch {};
-    }
-
+    // Non-blocking - CDP events handle load completion
     return true;
 }
 
@@ -373,12 +359,7 @@ pub fn reload(
 
     const result = try client.sendNavCommand("Page.reload", params);
     defer allocator.free(result);
-
-    // Wait for page to reload then re-inject mouse tracker (clipboard is global)
-    std.Thread.sleep(2 * std.time.ns_per_s);
-    if (isMouseDebugEnabled()) {
-        interact.injectMouseDebugTracker(client, allocator) catch {};
-    }
+    // Non-blocking - CDP events handle load completion
 }
 
 /// Stop page loading - uses dedicated nav WebSocket
