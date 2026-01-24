@@ -108,6 +108,7 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
     var mobile = false;
     var scale: f32 = 1.0;
     var no_profile = false;
+    var verbose = false;
 
     if (argc >= 2) {
         var val_type: c_uint = 0;
@@ -156,12 +157,57 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
                     _ = napi_get_value_bool(env, no_profile_val, &no_profile);
                 }
             }
+
+            // verbose option
+            var verbose_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "verbose", &verbose_val) == .ok) {
+                var verbose_type: c_uint = 0;
+                _ = napi_typeof(env, verbose_val, &verbose_type);
+                if (verbose_type == @intFromEnum(napi_valuetype.boolean)) {
+                    _ = napi_get_value_bool(env, verbose_val, &verbose);
+                }
+            }
+        }
+    }
+
+    // Extract allowed path from URL query param if present
+    // We add the parent directory to allow browsing
+    var allowed_path: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, url, "path=")) |start| {
+        const path_start = start + 5;
+        var path_end = path_start;
+        while (path_end < url.len and url[path_end] != '&') : (path_end += 1) {}
+        if (path_end > path_start) {
+            // URL decode the path
+            const encoded = url[path_start..path_end];
+            const decode_buf = allocator.alloc(u8, encoded.len) catch null;
+            if (decode_buf) |buf| {
+                const decoded = std.Uri.percentDecodeBackwards(buf, encoded);
+                // Get parent directory for FS access
+                if (std.mem.lastIndexOf(u8, decoded, "/")) |last_slash| {
+                    if (last_slash > 0) {
+                        allowed_path = allocator.dupe(u8, decoded[0..last_slash]) catch null;
+                    } else {
+                        allowed_path = allocator.dupe(u8, "/") catch null;
+                    }
+                } else {
+                    allowed_path = allocator.dupe(u8, decoded) catch null;
+                }
+                allocator.free(buf);
+            }
         }
     }
 
     // Run browser (blocking)
-    runBrowser(allocator, url, no_toolbar, mobile, scale, no_profile) catch |err| {
-        std.debug.print("Error: {}\n", .{err});
+    runBrowser(allocator, url, no_toolbar, mobile, scale, no_profile, verbose, allowed_path) catch |err| {
+        // Format error name for debugging
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "{}", .{err}) catch "Unknown error";
+        // Null-terminate for C string
+        var c_err: [257]u8 = undefined;
+        @memcpy(c_err[0..err_msg.len], err_msg);
+        c_err[err_msg.len] = 0;
+        _ = napi_throw_error(env, null, @ptrCast(&c_err));
     };
 
     var undef: napi_value = undefined;
@@ -169,7 +215,7 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
     return undef;
 }
 
-fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, mobile: bool, scale: f32, no_profile: bool) !void {
+fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, mobile: bool, scale: f32, no_profile: bool, verbose: bool, allowed_path: ?[]const u8) !void {
     _ = mobile;
     _ = scale;
 
@@ -220,6 +266,7 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, m
     var launch_opts = launcher.LaunchOptions{
         .viewport_width = viewport_width,
         .viewport_height = viewport_height,
+        .verbose = verbose,
     };
     if (no_profile) {
         launch_opts.clone_profile = null;
@@ -252,6 +299,11 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, m
 
     if (no_toolbar) {
         viewer.disableToolbar();
+    }
+
+    // Add allowed FS path if specified
+    if (allowed_path) |path| {
+        try viewer.addAllowedPath(path);
     }
 
     try viewer.run();

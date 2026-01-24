@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>termweb-json</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      overflow: hidden;
+      background: #1e1e1e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    #header {
+      height: 36px;
+      background: #252526;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    #filename { color: #cccccc; font-size: 13px; flex: 1; }
+    #validation {
+      font-size: 12px;
+      margin-right: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    #validation.valid { color: #6a9955; }
+    #validation.invalid { color: #f14c4c; }
+    #validation .icon { font-size: 14px; }
+    #status { color: #6a9955; font-size: 12px; margin-left: 12px; }
+    #status.modified { color: #dcdcaa; }
+    #status.saving { color: #569cd6; }
+    #status.error { color: #f14c4c; }
+    #toolbar {
+      height: 32px;
+      background: #2d2d2d;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      gap: 8px;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    #toolbar button {
+      background: #0e639c;
+      color: white;
+      border: none;
+      padding: 4px 12px;
+      font-size: 12px;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    #toolbar button:hover { background: #1177bb; }
+    #toolbar button:disabled { background: #3c3c3c; color: #888; cursor: not-allowed; }
+    #toolbar .separator { width: 1px; height: 20px; background: #3c3c3c; margin: 0 4px; }
+    #error-panel {
+      display: none;
+      background: #5a1d1d;
+      border-bottom: 1px solid #f14c4c;
+      padding: 8px 12px;
+      color: #f14c4c;
+      font-size: 12px;
+      font-family: 'Fira Code', Consolas, monospace;
+    }
+    #error-panel.visible { display: block; }
+    #editor { width: 100vw; height: calc(100vh - 92px); }
+    #editor.with-error { height: calc(100vh - 132px); }
+    #shortcuts {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 24px;
+      background: #007acc;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      font-size: 11px;
+      color: white;
+    }
+    #shortcuts span { margin-right: 16px; }
+    #shortcuts kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <span id="filename">Loading...</span>
+    <span id="validation" class="valid">
+      <span class="icon"></span>
+      <span class="text">Valid JSON</span>
+    </span>
+    <span id="status">Saved</span>
+  </div>
+  <div id="toolbar">
+    <button id="btn-format">Format</button>
+    <button id="btn-minify">Minify</button>
+    <div class="separator"></div>
+    <button id="btn-sort">Sort Keys</button>
+  </div>
+  <div id="error-panel"></div>
+  <div id="editor"></div>
+  <div id="shortcuts">
+    <span><kbd>Ctrl+S</kbd> Save</span>
+    <span><kbd>Ctrl+Shift+F</kbd> Format</span>
+    <span><kbd>Ctrl+Z</kbd> Undo</span>
+    <span><kbd>Ctrl+Q</kbd> Quit</span>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
+  <script>
+    // termweb FS IPC
+    const pendingFS = new Map();
+    let fsId = 0;
+
+    window.__termwebFSResponse = (id, success, data) => {
+      const resolve = pendingFS.get(id);
+      if (resolve) {
+        pendingFS.delete(id);
+        resolve({ success, data });
+      }
+    };
+
+    function fsCall(op, path, data = '') {
+      return new Promise(resolve => {
+        const id = ++fsId;
+        pendingFS.set(id, resolve);
+        const msg = data ? `__TERMWEB_FS__:${id}:${op}:${path}:${data}` : `__TERMWEB_FS__:${id}:${op}:${path}`;
+        console.log(msg);
+        setTimeout(() => {
+          if (pendingFS.has(id)) {
+            pendingFS.delete(id);
+            resolve({ success: false, data: 'Timeout' });
+          }
+        }, 5000);
+      });
+    }
+
+    let editor;
+    let originalContent = '';
+    let isModified = false;
+    let currentError = null;
+    let currentFile = null;
+
+    const params = new URLSearchParams(location.search);
+    const filePath = params.get('path') || '';
+    const initContent = params.get('content');
+
+    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
+
+    require(['vs/editor/editor.main'], function () {
+      const fileName = filePath.split('/').pop();
+      const content = initContent ? atob(initContent) : '{}';
+
+      currentFile = filePath;
+      document.getElementById('filename').textContent = fileName;
+      document.title = `${fileName} - termweb-json`;
+      originalContent = content;
+
+      editor = monaco.editor.create(document.getElementById('editor'), {
+        value: content,
+        language: 'json',
+        theme: 'vs-dark',
+        fontSize: 14,
+        lineNumbers: 'on',
+        minimap: { enabled: true },
+        scrollBeyondLastLine: false,
+        automaticLayout: true,
+        wordWrap: 'on',
+        tabSize: 2,
+        insertSpaces: true,
+        renderWhitespace: 'selection',
+        cursorBlinking: 'smooth',
+        smoothScrolling: true,
+        padding: { top: 8 },
+        folding: true,
+        foldingStrategy: 'indentation',
+        formatOnPaste: true,
+      });
+
+      editor.onDidChangeModelContent(() => {
+        const currentContent = editor.getValue();
+        isModified = currentContent !== originalContent;
+        updateStatus();
+        validateJson(currentContent);
+      });
+
+      validateJson(content);
+      // Use WinCtrl for Ctrl on Mac (termweb uses Ctrl on all platforms)
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyS, saveFile);
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyF, formatJson);
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyF, formatJson);
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyM, minifyJson);
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyM, minifyJson);
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
+      setTimeout(() => editor.focus(), 100);
+
+      document.getElementById('btn-format').addEventListener('click', formatJson);
+      document.getElementById('btn-minify').addEventListener('click', minifyJson);
+      document.getElementById('btn-sort').addEventListener('click', sortKeys);
+    });
+
+    function validateJson(content) {
+      const validation = document.getElementById('validation');
+      const errorPanel = document.getElementById('error-panel');
+      const editorEl = document.getElementById('editor');
+
+      try {
+        JSON.parse(content);
+        currentError = null;
+        validation.className = 'valid';
+        validation.querySelector('.icon').textContent = '\u2713';
+        validation.querySelector('.text').textContent = 'Valid JSON';
+        errorPanel.className = '';
+        errorPanel.textContent = '';
+        editorEl.classList.remove('with-error');
+      } catch (err) {
+        currentError = err;
+        validation.className = 'invalid';
+        validation.querySelector('.icon').textContent = '\u2717';
+        validation.querySelector('.text').textContent = 'Invalid JSON';
+        errorPanel.className = 'visible';
+        errorPanel.textContent = err.message;
+        editorEl.classList.add('with-error');
+      }
+    }
+
+    function formatJson() {
+      try {
+        const obj = JSON.parse(editor.getValue());
+        editor.setValue(JSON.stringify(obj, null, 2));
+      } catch (err) {}
+    }
+
+    function minifyJson() {
+      try {
+        const obj = JSON.parse(editor.getValue());
+        editor.setValue(JSON.stringify(obj));
+      } catch (err) {}
+    }
+
+    function sortKeys() {
+      try {
+        const obj = JSON.parse(editor.getValue());
+        editor.setValue(JSON.stringify(sortObject(obj), null, 2));
+      } catch (err) {}
+    }
+
+    function sortObject(obj) {
+      if (Array.isArray(obj)) return obj.map(sortObject);
+      if (obj !== null && typeof obj === 'object') {
+        const sorted = {};
+        Object.keys(obj).sort().forEach(key => sorted[key] = sortObject(obj[key]));
+        return sorted;
+      }
+      return obj;
+    }
+
+    function updateStatus() {
+      const status = document.getElementById('status');
+      status.textContent = isModified ? 'Modified' : 'Saved';
+      status.className = isModified ? 'modified' : '';
+    }
+
+    async function saveFile() {
+      if (currentError) {
+        const status = document.getElementById('status');
+        status.textContent = 'Fix errors first';
+        status.className = 'error';
+        setTimeout(updateStatus, 2000);
+        return;
+      }
+
+      const status = document.getElementById('status');
+      status.textContent = 'Saving...';
+      status.className = 'saving';
+
+      const content = editor.getValue();
+      const encoded = btoa(unescape(encodeURIComponent(content)));
+      const res = await fsCall('writefile', currentFile, encoded);
+
+      if (res.success) {
+        originalContent = content;
+        isModified = false;
+        status.textContent = 'Saved';
+        status.className = '';
+      } else {
+        status.textContent = 'Error: ' + res.data;
+        status.className = 'error';
+        setTimeout(updateStatus, 3000);
+      }
+    }
+
+    window.addEventListener('resize', () => { if (editor) editor.layout(); });
+  </script>
+</body>
+</html>

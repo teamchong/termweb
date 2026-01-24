@@ -279,6 +279,13 @@ pub const Viewer = struct {
         return render_mod.getMinFrameInterval(self.viewport_width, self.viewport_height);
     }
 
+    /// Add an allowed filesystem root path for FS IPC
+    pub fn addAllowedPath(self: *Viewer, path: []const u8) !void {
+        const path_copy = try self.allocator.dupe(u8, path);
+        try self.allowed_fs_roots.append(self.allocator, path_copy);
+        self.log("[FS] Added allowed root: {s}\n", .{path});
+    }
+
     pub fn log(self: *Viewer, comptime fmt: []const u8, args: anytype) void {
         if (self.debug_log) |file| {
             var buf: [1024]u8 = undefined;

@@ -110,6 +110,11 @@ pub const LaunchOptions = struct {
     /// Copies bookmarks, history, cookies, extensions, etc.
     /// Set to "Default" by default, use empty string "" to skip cloning
     clone_profile: ?[]const u8 = "Default",
+    /// Path to unpacked extension directory to load
+    /// SDK users can provide custom extensions for additional functionality
+    extension_path: ?[]const u8 = null,
+    /// Print debug messages (default: true for CLI, false for SDK)
+    verbose: bool = true,
 };
 
 /// Get Chrome user data directory path for the current platform
@@ -162,7 +167,7 @@ pub fn listProfiles(allocator: std.mem.Allocator) ![][]const u8 {
 /// Clone a Chrome profile to a temporary directory
 /// Copies: Bookmarks, Cookies, History, Login Data, Preferences, Extensions
 /// Skips: Sessions, Current Session, Current Tabs (to avoid lock conflicts)
-fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir: []const u8) !void {
+fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir: []const u8, verbose: bool) !void {
     const user_data_dir = try getChromeUserDataDir(allocator);
     defer allocator.free(user_data_dir);
 
@@ -209,7 +214,9 @@ fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir
     // Copy Extensions directory if it exists
     copyDirRecursive(allocator, source_dir, dest_dir_handle, "Extensions") catch {};
 
-    std.debug.print("Cloned profile '{s}' ({} files copied)\n", .{ profile_name, copied });
+    if (verbose) {
+        std.debug.print("Cloned profile '{s}' ({} files copied)\n", .{ profile_name, copied });
+    }
 }
 
 /// Recursively copy a directory
@@ -297,9 +304,11 @@ pub fn launchChromePipe(
 
     // 3b. Clone profile if requested
     if (options.clone_profile) |profile_name| {
-        cloneProfile(allocator, profile_name, user_data_dir) catch |err| {
-            std.debug.print("Warning: Could not clone profile '{s}': {}\n", .{ profile_name, err });
-            std.debug.print("Starting with fresh profile instead.\n", .{});
+        cloneProfile(allocator, profile_name, user_data_dir, options.verbose) catch |err| {
+            if (options.verbose) {
+                std.debug.print("Warning: Could not clone profile '{s}': {}\n", .{ profile_name, err });
+                std.debug.print("Starting with fresh profile instead.\n", .{});
+            }
         };
     }
 
@@ -339,19 +348,26 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--disable-infobars"); // Disable download shelf/bar
     try args_list.append(allocator, "--hide-scrollbars"); // Hide scrollbars in viewport
     try args_list.append(allocator, "--disable-translate"); // Disable translate bar
-    try args_list.append(allocator, "--disable-extensions"); // Disable extensions that might add UI
-    try args_list.append(allocator, "--disable-component-extensions-with-background-pages"); // Disable background extensions
+    // Extension loading - if custom extension provided, enable extensions
+    if (options.extension_path) |ext_path| {
+        const load_ext_arg = try std.fmt.allocPrint(allocator, "--load-extension={s}", .{ext_path});
+        defer allocator.free(load_ext_arg);
+        try args_list.append(allocator, load_ext_arg);
+        try args_list.append(allocator, "--disable-component-extensions-with-background-pages"); // Disable built-in background extensions
+    } else {
+        try args_list.append(allocator, "--disable-extensions"); // Disable all extensions
+        try args_list.append(allocator, "--disable-component-extensions-with-background-pages");
+    }
     try args_list.append(allocator, "--disable-background-networking"); // Prevent background updates
     try args_list.append(allocator, "--enable-features=DownloadShelfInToolbar:hidden/true"); // Hide download shelf
 
     if (options.disable_gpu) {
         try args_list.append(allocator, "--disable-gpu");
+        // Headless-friendly flags for server/SSH environments (only with --disable-gpu)
+        try args_list.append(allocator, "--no-sandbox");
+        try args_list.append(allocator, "--disable-dev-shm-usage");
+        try args_list.append(allocator, "--disable-software-rasterizer");
     }
-
-    // Headless-friendly flags for server/SSH environments
-    try args_list.append(allocator, "--no-sandbox");
-    try args_list.append(allocator, "--disable-dev-shm-usage");
-    try args_list.append(allocator, "--disable-software-rasterizer");
 
     const window_size = try std.fmt.allocPrint(allocator, "--window-size={d},{d}", .{ options.viewport_width, options.viewport_height });
     defer allocator.free(window_size);
@@ -439,7 +455,9 @@ pub fn launchChromePipe(
 
     // Read Chrome's stderr to find "DevTools listening on ws://127.0.0.1:PORT/..."
     const debug_port = extractDebugPort(stderr_pipe[0]) catch |err| {
-        std.debug.print("Failed to extract debug port from Chrome: {}\n", .{err});
+        if (options.verbose) {
+            std.debug.print("Failed to extract debug port from Chrome: {}\n", .{err});
+        }
         // Kill Chrome if we can't get the port
         std.posix.kill(pid, std.posix.SIG.TERM) catch {};
         return LaunchError.TimeoutWaitingForDebugUrl;
@@ -448,7 +466,9 @@ pub fn launchChromePipe(
     // Close stderr pipe read end (we're done with it)
     std.posix.close(stderr_pipe[0]);
 
-    std.debug.print("Chrome debugging on port {}\n", .{debug_port});
+    if (options.verbose) {
+        std.debug.print("Chrome debugging on port {}\n", .{debug_port});
+    }
 
     // Parent uses:
     // - pipe_to_chrome[1] to WRITE to Chrome (Chrome's FD 3)

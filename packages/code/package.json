@@ -1,0 +1,35 @@
+{
+  "name": "@termweb/code",
+  "version": "0.1.0",
+  "description": "Terminal-based code editor powered by Monaco Editor and termweb",
+  "bin": {
+    "termweb-code": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "dist/"
+  ],
+  "keywords": [
+    "terminal",
+    "editor",
+    "monaco",
+    "code",
+    "cli"
+  ],
+  "author": "teamchong",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/termweb.git",
+    "directory": "packages/code"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "termweb": "workspace:*"
+  }
+}

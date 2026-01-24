@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>termweb-code</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      overflow: hidden;
+      background: #1e1e1e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: #cccccc;
+    }
+    #header {
+      height: 36px;
+      background: #252526;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    #back-btn {
+      background: none;
+      border: none;
+      color: #cccccc;
+      font-size: 16px;
+      cursor: pointer;
+      margin-right: 8px;
+      padding: 4px 8px;
+      display: none;
+    }
+    #back-btn:hover { background: #3c3c3c; border-radius: 4px; }
+    #back-btn.visible { display: block; }
+    #title { font-size: 13px; flex: 1; }
+    #status { font-size: 12px; margin-left: 12px; }
+    #status.saved { color: #6a9955; }
+    #status.modified { color: #dcdcaa; }
+    #status.saving { color: #569cd6; }
+    #status.error { color: #f14c4c; }
+
+    #browser { display: none; height: calc(100vh - 60px); overflow: auto; padding: 8px; }
+    #browser.active { display: block; }
+    .file-item { display: flex; align-items: center; padding: 8px 12px; cursor: pointer; border-radius: 4px; }
+    .file-item:hover { background: #2a2d2e; }
+    .file-icon { width: 24px; margin-right: 10px; }
+    .folder-icon { color: #dcb67a; }
+    .file-icon-default { color: #519aba; }
+
+    #editor-container { display: none; height: calc(100vh - 60px); }
+    #editor-container.active { display: block; }
+    #editor { width: 100%; height: 100%; }
+
+    #footer {
+      position: fixed; bottom: 0; left: 0; right: 0; height: 24px;
+      background: #007acc; display: flex; align-items: center;
+      padding: 0 12px; font-size: 11px; color: white;
+    }
+    #footer span { margin-right: 16px; }
+    #footer kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <button id="back-btn">&larr;</button>
+    <span id="title">Loading...</span>
+    <span id="status"></span>
+  </div>
+  <div id="browser"></div>
+  <div id="editor-container"><div id="editor"></div></div>
+  <div id="footer">
+    <span><kbd>Ctrl+S</kbd> Save</span>
+    <span><kbd>Ctrl+Z</kbd> Undo</span>
+    <span><kbd>Ctrl+Q</kbd> Quit</span>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
+  <script>
+    // termweb FS IPC
+    const pendingFS = new Map();
+    let fsId = 0;
+
+    window.__termwebFSResponse = (id, success, data) => {
+      const resolve = pendingFS.get(id);
+      if (resolve) {
+        pendingFS.delete(id);
+        resolve({ success, data });
+      }
+    };
+
+    function fsCall(op, path, data = '') {
+      return new Promise(resolve => {
+        const id = ++fsId;
+        pendingFS.set(id, resolve);
+        const msg = data ? `__TERMWEB_FS__:${id}:${op}:${path}:${data}` : `__TERMWEB_FS__:${id}:${op}:${path}`;
+        console.log(msg);
+        // Timeout fallback
+        setTimeout(() => {
+          if (pendingFS.has(id)) {
+            pendingFS.delete(id);
+            resolve({ success: false, data: 'Timeout' });
+          }
+        }, 5000);
+      });
+    }
+
+    // Language mapping
+    const langMap = {
+      js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'typescript',
+      py: 'python', go: 'go', rs: 'rust', java: 'java', c: 'c', cpp: 'cpp',
+      json: 'json', html: 'html', css: 'css', md: 'markdown', sh: 'shell',
+      yaml: 'yaml', yml: 'yaml', xml: 'xml', sql: 'sql', zig: 'zig',
+    };
+
+    function getLanguage(name) {
+      const ext = name.split('.').pop()?.toLowerCase() || '';
+      return langMap[ext] || 'plaintext';
+    }
+
+    // State
+    let editor = null;
+    let currentMode = 'browser';
+    let currentFile = null;
+    let currentDir = '';
+    let originalContent = '';
+    let isModified = false;
+
+    // Parse URL params
+    const params = new URLSearchParams(location.search);
+    const initPath = params.get('path') || '.';
+    const initIsDir = params.get('isDir') === '1';
+    const initContent = params.get('content');
+
+    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
+
+    async function init() {
+      if (initIsDir) {
+        currentDir = initPath;
+        await showBrowser(initPath);
+      } else {
+        // Single file mode - no directory browsing
+        const content = initContent ? atob(initContent) : '';
+        showEditor(initPath, content);
+      }
+    }
+
+    async function showBrowser(dir) {
+      currentMode = 'browser';
+      currentDir = dir;
+      document.getElementById('browser').classList.add('active');
+      document.getElementById('editor-container').classList.remove('active');
+      document.getElementById('back-btn').classList.remove('visible');
+      document.getElementById('status').textContent = '';
+      document.getElementById('title').textContent = dir;
+
+      const res = await fsCall('readdir', dir);
+      if (!res.success) {
+        document.getElementById('browser').innerHTML = '<div style="padding:20px;color:#f14c4c">Error: ' + res.data + '</div>';
+        return;
+      }
+
+      const files = JSON.parse(res.data);
+      const browser = document.getElementById('browser');
+      browser.innerHTML = '';
+
+      // Parent directory
+      const parent = dir.split('/').slice(0, -1).join('/') || '/';
+      if (parent !== dir) {
+        const item = document.createElement('div');
+        item.className = 'file-item';
+        item.innerHTML = '<span class="file-icon folder-icon">..</span><span>..</span>';
+        item.onclick = () => showBrowser(parent);
+        browser.appendChild(item);
+      }
+
+      for (const file of files) {
+        const item = document.createElement('div');
+        item.className = 'file-item';
+        const icon = file.isDir ? '<span class="file-icon folder-icon">📁</span>' : '<span class="file-icon file-icon-default">📄</span>';
+        item.innerHTML = icon + '<span>' + file.name + '</span>';
+        item.onclick = () => openPath(file.path, file.isDir);
+        browser.appendChild(item);
+      }
+    }
+
+    async function openPath(path, isDir) {
+      if (isDir) {
+        await showBrowser(path);
+      } else {
+        const res = await fsCall('readfile', path);
+        if (res.success) {
+          showEditor(path, res.data);
+        } else {
+          alert('Error reading file: ' + res.data);
+        }
+      }
+    }
+
+    function showEditor(path, content) {
+      currentMode = 'editor';
+      currentFile = path;
+      originalContent = content;
+      isModified = false;
+
+      document.getElementById('browser').classList.remove('active');
+      document.getElementById('editor-container').classList.add('active');
+      document.getElementById('back-btn').classList.add('visible');
+      document.getElementById('title').textContent = path.split('/').pop();
+      updateStatus();
+
+      const lang = getLanguage(path);
+
+      if (!editor) {
+        require(['vs/editor/editor.main'], () => {
+          editor = monaco.editor.create(document.getElementById('editor'), {
+            value: content,
+            language: lang,
+            theme: 'vs-dark',
+            fontSize: 14,
+            automaticLayout: true,
+            minimap: { enabled: true },
+            wordWrap: 'on',
+            padding: { top: 8 },
+          });
+
+          editor.onDidChangeModelContent(() => {
+            isModified = editor.getValue() !== originalContent;
+            updateStatus();
+          });
+
+          // Use WinCtrl for Ctrl on Mac (termweb uses Ctrl on all platforms)
+          editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyS, saveFile);
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
+          editor.addCommand(monaco.KeyCode.Escape, goBack);
+
+          // Undo/redo bindings (both Ctrl and Cmd variants)
+          editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
+          editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
+          editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
+
+          // Auto-focus editor
+          setTimeout(() => editor.focus(), 100);
+        });
+      } else {
+        monaco.editor.setModelLanguage(editor.getModel(), lang);
+        editor.setValue(content);
+        editor.focus();
+      }
+    }
+
+    function updateStatus() {
+      const s = document.getElementById('status');
+      s.textContent = isModified ? 'Modified' : 'Saved';
+      s.className = isModified ? 'modified' : 'saved';
+    }
+
+    async function saveFile() {
+      if (!currentFile) return;
+
+      const s = document.getElementById('status');
+      s.textContent = 'Saving...';
+      s.className = 'saving';
+
+      const content = editor.getValue();
+      const encoded = btoa(unescape(encodeURIComponent(content)));
+      const res = await fsCall('writefile', currentFile, encoded);
+
+      if (res.success) {
+        originalContent = content;
+        isModified = false;
+        s.textContent = 'Saved';
+        s.className = 'saved';
+      } else {
+        s.textContent = 'Error: ' + res.data;
+        s.className = 'error';
+      }
+    }
+
+    function goBack() {
+      if (currentMode === 'editor' && currentDir) {
+        showBrowser(currentDir);
+      }
+    }
+
+    document.getElementById('back-btn').onclick = goBack;
+    init();
+  </script>
+</body>
+</html>
