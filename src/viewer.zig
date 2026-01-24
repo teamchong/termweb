@@ -483,10 +483,10 @@ pub const Viewer = struct {
                     break :blk false;
                 };
 
-                // Auto-recovery: if no frame rendered for 3+ seconds, restart screencast
+                // Auto-recovery: if no frame rendered for 1+ seconds, restart screencast
                 const now_ns = std.time.nanoTimestamp();
-                if (self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 3 * std.time.ns_per_s) {
-                    self.log("[STALL] No frame for >3s, restarting screencast (frames={}, gen={})\n", .{
+                if (self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 1 * std.time.ns_per_s) {
+                    self.log("[STALL] No frame for >1s, restarting screencast (frames={}, gen={})\n", .{
                         self.cdp_client.getFrameCount(), self.last_rendered_generation,
                     });
                     self.resetScreencast();
