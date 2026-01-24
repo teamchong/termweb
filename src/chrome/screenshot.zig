@@ -40,6 +40,8 @@ pub const ScreenshotOptions = struct {
     // Viewport dimensions for screencast (1:1 coordinate mapping)
     width: u32 = 1920,
     height: u32 = 1080,
+    // Frame skip: 1=every frame, 2=every other frame (reduces bandwidth for video)
+    every_nth_frame: u8 = 1,
 };
 
 fn logNav(comptime fmt: []const u8, args: anytype) void {
@@ -457,6 +459,7 @@ pub fn startScreencast(
         options.quality,
         options.width,
         options.height,
+        options.every_nth_frame,
     );
 }
 

@@ -457,14 +457,17 @@ pub const Viewer = struct {
 
                 if (input == .none) break; // No more pending input
 
-                // Log and process (throttling happens inside handleMouse)
+                // Log significant events only (throttling happens inside handleMouse)
                 switch (input) {
                     .key => |key| {
                         self.log("[INPUT] Key: {any}\n", .{key});
                         self.ui_dirty = true;
                     },
                     .mouse => |m| {
-                        self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y });
+                        // Only log clicks, not moves/drags (too noisy)
+                        if (m.type == .press or m.type == .release) {
+                            self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y });
+                        }
                     },
                     .paste => |text| self.log("[INPUT] Paste: {d} bytes\n", .{text.len}),
                     .none => {},
@@ -530,7 +533,7 @@ pub const Viewer = struct {
                 }
             } else |_| {}
 
-            // Minimal sleep to yield CPU (1ms = 1000Hz max loop rate)
+            // Yield CPU (1ms = 1000Hz max loop rate)
             std.Thread.sleep(1 * std.time.ns_per_ms);
         }
 
@@ -666,6 +669,7 @@ pub const Viewer = struct {
             .quality = resize_quality,
             .width = new_width,
             .height = new_height,
+            .every_nth_frame = 1,
         }) catch |err| {
             self.log("[RESIZE] startScreencast failed: {}\n", .{err});
             return;
@@ -717,6 +721,7 @@ pub const Viewer = struct {
             .quality = reset_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
+            .every_nth_frame = 1,
         }) catch |err| {
             self.log("[RESET] startScreencast failed: {}\n", .{err});
             return;
@@ -1140,6 +1145,7 @@ pub const Viewer = struct {
             .quality = tab_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
+            .every_nth_frame = 1,
         }) catch |err| {
             self.log("[TABS] startScreencast failed after switch: {}\n", .{err});
         };

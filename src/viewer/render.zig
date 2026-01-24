@@ -35,12 +35,8 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     var frame = screenshot_api.getLatestScreencastFrame(viewer.cdp_client) orelse return false;
     defer frame.deinit(); // Proper cleanup!
 
-    // Resolution-based FPS limiting (check AFTER getting frame to ensure ACKs flow)
-    const min_interval = getMinFrameInterval(viewer.viewport_width, viewer.viewport_height);
-    if (viewer.last_frame_time > 0 and (now - viewer.last_frame_time) < min_interval) {
-        viewer.log("[RENDER] FPS throttle: skipping frame gen={} (too soon)\n", .{frame.generation});
-        return false; // Too soon, skip render but frame was ACKed
-    }
+    // NOTE: FPS throttling is now done via ACK throttling in cdp_pipe.zig
+    // Don't throttle here - we want to render every frame we receive
 
     // Throttle: Don't re-render the same frame multiple times
     if (viewer.last_rendered_generation > 0 and frame.generation <= viewer.last_rendered_generation) {

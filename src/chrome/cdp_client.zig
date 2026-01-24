@@ -507,15 +507,14 @@ pub const CdpClient = struct {
     }
 
     /// Start screencast streaming
-    /// NOTE: everyNthFrame must be 1 for interactive use - see "Odd Frame Problem"
-    /// Chrome only generates frames on pixel change, so everyNthFrame:2 would drop
-    /// single-keystroke frames, making the terminal appear frozen.
+    /// everyNthFrame controls how many frames Chrome skips (1=all frames, 2=every other)
     pub fn startScreencast(
         self: *CdpClient,
         format: []const u8,
         quality: u8,
         width: u32,
         height: u32,
+        every_nth_frame: u8,
     ) !void {
         // Start reader thread first
         try self.pipe_client.?.startReaderThread();
@@ -523,8 +522,8 @@ pub const CdpClient = struct {
         // Send startScreencast command with session
         const params = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"format\":\"{s}\",\"quality\":{d},\"maxWidth\":{d},\"maxHeight\":{d},\"everyNthFrame\":1}}",
-            .{ format, quality, width, height },
+            "{{\"format\":\"{s}\",\"quality\":{d},\"maxWidth\":{d},\"maxHeight\":{d},\"everyNthFrame\":{d}}}",
+            .{ format, quality, width, height, every_nth_frame },
         );
         defer self.allocator.free(params);
 
