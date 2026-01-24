@@ -16,10 +16,10 @@ pub const Config = struct {
     }
 
     /// Mouse event tick rate in milliseconds
-    pub const MOUSE_TICK_MS: u64 = 42; // ~24fps (matches screencast)
+    pub const MOUSE_TICK_MS: u64 = 33; // ~30fps (matches screencast)
 
     /// Screencast frame rate
-    pub const SCREENCAST_FPS: u32 = 24;
+    pub const SCREENCAST_FPS: u32 = 30;
 
     /// Double-click detection
     pub const DOUBLE_CLICK_TIME_MS: i64 = 400;
