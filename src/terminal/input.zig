@@ -147,10 +147,9 @@ pub const InputReader = struct {
         self.paste_buffer.deinit(self.allocator);
     }
 
-    fn debugLog(self: *InputReader, comptime fmt: []const u8, args: anytype) void {
-        if (self.debug_input) {
-            std.debug.print(fmt, args);
-        }
+    fn debugLog(_: *InputReader, comptime _: []const u8, _: anytype) void {
+        // Debug logging disabled - would corrupt terminal display
+        // Use TERMWEB_DEBUG=1 and viewer.log() for file-based debugging instead
     }
 
     /// Parse single byte into Key (regular chars and control codes)
@@ -763,8 +762,8 @@ pub const InputReader = struct {
                     }
                     return .none;
                 }
-                // DEBUG LOG ERROR
-                std.debug.print("[INPUT ERROR] read failed: {}\n", .{err});
+                // Error reading from stdin - silently return the error
+                // (error logging happens at caller level via viewer.log())
                 return err;
             };
 

@@ -98,6 +98,11 @@ pub const ToolbarRenderer = struct {
     // Cached image IDs
     bg_image_id: ?u32 = null,
     refresh_image_id: ?u32 = null,
+    url_bar_image_id: ?u32 = null,
+
+    // Cached RGBA data (to avoid regenerating on every render)
+    cached_bg_rgba: ?[]u8 = null,
+    cached_bg_width: u32 = 0,
 
     // Layout info
     url_bar_x: u32 = 0,
@@ -138,6 +143,9 @@ pub const ToolbarRenderer = struct {
     pub fn deinit(self: *ToolbarRenderer) void {
         if (self.font_renderer) |*font| {
             font.deinit();
+        }
+        if (self.cached_bg_rgba) |bg| {
+            self.allocator.free(bg);
         }
         self.svg_cache.deinit();
     }
@@ -186,6 +194,127 @@ pub const ToolbarRenderer = struct {
 
     pub fn getUrlText(self: *ToolbarRenderer) []const u8 {
         return self.url_buffer[0..self.url_len];
+    }
+
+    /// Composite entire toolbar to a single RGBA buffer (for background thread rendering)
+    /// Returns dimensions of the composited image
+    pub fn compositeToRgba(self: *ToolbarRenderer, dest: []u8) struct { width: u32, height: u32 } {
+        const width = self.width_px;
+        const height = self.toolbar_height;
+        const stride = width * 4;
+
+        // Clear destination
+        const size = width * height * 4;
+        if (width == 0 or height == 0) return .{ .width = 0, .height = 0 };
+        if (size > dest.len) return .{ .width = 0, .height = 0 };
+        @memset(dest[0..size], 0);
+
+        // Draw background
+        const bg_rgba = generateToolbarBg(self.allocator, width, height) catch return .{ .width = 0, .height = 0 };
+        defer self.allocator.free(bg_rgba);
+        @memcpy(dest[0..size], bg_rgba[0..size]);
+
+        // Button positions
+        var x_offset: u32 = self.button_padding;
+        const y_offset: u32 = (self.toolbar_height - self.button_size) / 2;
+
+        // Composite buttons
+        self.blitButton(dest, stride, x_offset, y_offset, .close, false, self.close_hover);
+        x_offset += self.button_size + self.button_padding;
+
+        self.blitButton(dest, stride, x_offset, y_offset, .back, self.can_go_back, self.back_hover);
+        x_offset += self.button_size + self.button_padding;
+
+        self.blitButton(dest, stride, x_offset, y_offset, .forward, self.can_go_forward, self.forward_hover);
+        x_offset += self.button_size + self.button_padding;
+
+        if (self.is_loading) {
+            self.blitButton(dest, stride, x_offset, y_offset, .stop, true, self.refresh_hover);
+        } else {
+            self.blitButton(dest, stride, x_offset, y_offset, .refresh, true, self.refresh_hover);
+        }
+        x_offset += self.button_size + self.button_padding;
+
+        // Tabs button uses generateTabButton (custom pill style, not SVG)
+        const tab_btn_width = self.button_size + self.button_padding;
+        const tab_rgba = self.generateTabButton(tab_btn_width, self.button_size) catch null;
+        if (tab_rgba) |rgba| {
+            defer self.allocator.free(rgba);
+            self.blitRgba(dest, stride, x_offset, y_offset, rgba, tab_btn_width, self.button_size);
+        }
+        x_offset += tab_btn_width + self.button_padding;
+
+        // Composite URL bar
+        self.blitUrlBar(dest, stride, x_offset, y_offset, width);
+
+        return .{ .width = width, .height = height };
+    }
+
+    /// Blit a button onto the destination buffer
+    fn blitButton(self: *ToolbarRenderer, dest: []u8, stride: u32, x: u32, y: u32, icon: svg_mod.ButtonType, enabled: bool, hover: bool) void {
+        const rgba = self.svg_cache.getButtonScaled(icon, enabled, hover, self.button_size) catch return;
+        self.blitRgba(dest, stride, x, y, rgba, self.button_size, self.button_size);
+    }
+
+    /// Blit URL bar onto the destination buffer
+    fn blitUrlBar(self: *ToolbarRenderer, dest: []u8, stride: u32, x: u32, _: u32, max_width: u32) void {
+        const url_bar_width = if (max_width > x + self.button_padding) max_width - x - self.button_padding else 100;
+        const url_rgba = self.generateUrlBarRgba(url_bar_width) catch return;
+        defer self.allocator.free(url_rgba);
+        // URL bar has its own vertical centering (different height than buttons)
+        const url_y = (self.toolbar_height - self.url_bar_height) / 2;
+        self.blitRgba(dest, stride, x, url_y, url_rgba, url_bar_width, self.url_bar_height);
+    }
+
+    /// Generate URL bar RGBA for compositing
+    fn generateUrlBarRgba(self: *ToolbarRenderer, width: u32) ![]u8 {
+        const display_text = if (self.url_focused)
+            self.url_buffer[0..self.url_len]
+        else
+            self.current_url;
+        return self.generateUrlBarWithText(
+            width,
+            self.url_bar_height,
+            display_text,
+            if (self.url_focused) self.url_cursor else null,
+            self.getSelectionBounds(),
+        );
+    }
+
+    /// Blit RGBA source onto destination at (x, y)
+    fn blitRgba(self: *ToolbarRenderer, dest: []u8, dest_stride: u32, x: u32, y: u32, src: []const u8, src_w: u32, src_h: u32) void {
+        const max_h = self.toolbar_height;
+        const max_w = self.width_px;
+        const src_stride = src_w * 4;
+        var sy: u32 = 0;
+        while (sy < src_h) : (sy += 1) {
+            const dy = y + sy;
+            if (dy >= max_h) break;
+            var sx: u32 = 0;
+            while (sx < src_w) : (sx += 1) {
+                const dx = x + sx;
+                if (dx >= max_w) break;
+                const src_idx = sy * src_stride + sx * 4;
+                const dst_idx = dy * dest_stride + dx * 4;
+                if (src_idx + 3 < src.len and dst_idx + 3 < dest.len) {
+                    const alpha = src[src_idx + 3];
+                    if (alpha == 255) {
+                        dest[dst_idx] = src[src_idx];
+                        dest[dst_idx + 1] = src[src_idx + 1];
+                        dest[dst_idx + 2] = src[src_idx + 2];
+                        dest[dst_idx + 3] = 255;
+                    } else if (alpha > 0) {
+                        // Alpha blend
+                        const a = @as(u16, alpha);
+                        const inv_a = 255 - a;
+                        dest[dst_idx] = @intCast((@as(u16, src[src_idx]) * a + @as(u16, dest[dst_idx]) * inv_a) / 255);
+                        dest[dst_idx + 1] = @intCast((@as(u16, src[src_idx + 1]) * a + @as(u16, dest[dst_idx + 1]) * inv_a) / 255);
+                        dest[dst_idx + 2] = @intCast((@as(u16, src[src_idx + 2]) * a + @as(u16, dest[dst_idx + 2]) * inv_a) / 255);
+                        dest[dst_idx + 3] = 255;
+                    }
+                }
+            }
+        }
     }
 
     pub fn handleChar(self: *ToolbarRenderer, char: u8) void {
@@ -328,17 +457,25 @@ pub const ToolbarRenderer = struct {
     }
 
     /// Handle Ctrl+Left - move cursor to previous word boundary
+    /// Check if character is a URL word boundary
+    fn isUrlWordBoundary(c: u8) bool {
+        return switch (c) {
+            ' ', '/', '.', ':', '?', '#', '&', '=' => true,
+            else => false,
+        };
+    }
+
     pub fn handleWordLeft(self: *ToolbarRenderer) void {
         self.clearSelection();
         if (self.url_cursor == 0) return;
 
-        // Skip any trailing spaces
-        while (self.url_cursor > 0 and self.url_buffer[self.url_cursor - 1] == ' ') {
+        // Skip any trailing boundary characters
+        while (self.url_cursor > 0 and isUrlWordBoundary(self.url_buffer[self.url_cursor - 1])) {
             self.url_cursor -= 1;
         }
 
         // Skip to beginning of word
-        while (self.url_cursor > 0 and self.url_buffer[self.url_cursor - 1] != ' ') {
+        while (self.url_cursor > 0 and !isUrlWordBoundary(self.url_buffer[self.url_cursor - 1])) {
             self.url_cursor -= 1;
         }
     }
@@ -349,14 +486,58 @@ pub const ToolbarRenderer = struct {
         if (self.url_cursor >= self.url_len) return;
 
         // Skip current word
-        while (self.url_cursor < self.url_len and self.url_buffer[self.url_cursor] != ' ') {
+        while (self.url_cursor < self.url_len and !isUrlWordBoundary(self.url_buffer[self.url_cursor])) {
             self.url_cursor += 1;
         }
 
-        // Skip spaces after word
-        while (self.url_cursor < self.url_len and self.url_buffer[self.url_cursor] == ' ') {
+        // Skip boundary characters after word
+        while (self.url_cursor < self.url_len and isUrlWordBoundary(self.url_buffer[self.url_cursor])) {
             self.url_cursor += 1;
         }
+    }
+
+    /// Handle Ctrl+Shift+Left - select to previous word boundary
+    pub fn handleSelectWordLeft(self: *ToolbarRenderer) void {
+        if (self.url_cursor == 0) return;
+
+        // Start selection at current cursor if no selection exists
+        if (self.url_select_start == null) {
+            self.url_select_start = self.url_cursor;
+        }
+
+        // Skip any trailing boundary characters
+        while (self.url_cursor > 0 and isUrlWordBoundary(self.url_buffer[self.url_cursor - 1])) {
+            self.url_cursor -= 1;
+        }
+
+        // Skip to beginning of word
+        while (self.url_cursor > 0 and !isUrlWordBoundary(self.url_buffer[self.url_cursor - 1])) {
+            self.url_cursor -= 1;
+        }
+
+        self.url_select_end = self.url_cursor;
+    }
+
+    /// Handle Ctrl+Shift+Right - select to next word boundary
+    pub fn handleSelectWordRight(self: *ToolbarRenderer) void {
+        if (self.url_cursor >= self.url_len) return;
+
+        // Start selection at current cursor if no selection exists
+        if (self.url_select_start == null) {
+            self.url_select_start = self.url_cursor;
+        }
+
+        // Skip current word
+        while (self.url_cursor < self.url_len and !isUrlWordBoundary(self.url_buffer[self.url_cursor])) {
+            self.url_cursor += 1;
+        }
+
+        // Skip boundary characters after word
+        while (self.url_cursor < self.url_len and isUrlWordBoundary(self.url_buffer[self.url_cursor])) {
+            self.url_cursor += 1;
+        }
+
+        self.url_select_end = self.url_cursor;
     }
 
     /// Handle Ctrl+X - cut selected text to clipboard
@@ -452,13 +633,16 @@ pub const ToolbarRenderer = struct {
         // Move to top-left
         try writer.writeAll("\x1b[1;1H");
 
-        // Render toolbar background (dark bar)
-        const bg_rgba = try generateToolbarBg(self.allocator, self.width_px, self.toolbar_height);
-        defer self.allocator.free(bg_rgba);
+        // Render toolbar background (cached - only regenerate on resize)
+        if (self.cached_bg_rgba == null or self.cached_bg_width != self.width_px) {
+            if (self.cached_bg_rgba) |old| self.allocator.free(old);
+            self.cached_bg_rgba = try generateToolbarBg(self.allocator, self.width_px, self.toolbar_height);
+            self.cached_bg_width = self.width_px;
+        }
 
         // Use column-based sizing to match content (avoids pixel rounding mismatch)
         const num_cols: u32 = if (self.cell_width > 0) self.width_px / self.cell_width else 80;
-        self.bg_image_id = try self.kitty.displayRawRGBA(writer, bg_rgba, self.width_px, self.toolbar_height, .{
+        self.bg_image_id = try self.kitty.displayRawRGBA(writer, self.cached_bg_rgba.?, self.width_px, self.toolbar_height, .{
             .placement_id = Placement.TOOLBAR_BG,
             .z = 50,
             .columns = num_cols,
@@ -560,10 +744,49 @@ pub const ToolbarRenderer = struct {
         );
         defer self.allocator.free(url_rgba);
 
-        _ = try self.kitty.displayRawRGBA(writer, url_rgba, self.url_bar_width, self.url_bar_height, .{
+        // Delete old URL bar image to avoid overlap
+        if (self.url_bar_image_id) |old_id| {
+            try self.kitty.deleteImage(writer, old_id);
+        }
+
+        self.url_bar_image_id = try self.kitty.displayRawRGBA(writer, url_rgba, self.url_bar_width, self.url_bar_height, .{
             .placement_id = Placement.URL_BAR,
             .z = 51,
             .x_offset = x_offset,
+            .y_offset = (self.toolbar_height - self.url_bar_height) / 2,
+        });
+    }
+
+    /// Fast render - only updates URL bar (for typing)
+    pub fn renderUrlBarOnly(self: *ToolbarRenderer, writer: anytype) !void {
+        // Use stored position from render() - if not set, do full render
+        if (self.url_bar_x == 0 or self.url_bar_width == 0) {
+            return self.render(writer);
+        }
+
+        const display_text = if (self.url_focused)
+            self.url_buffer[0..self.url_len]
+        else
+            self.current_url;
+
+        const url_rgba = try self.generateUrlBarWithText(
+            self.url_bar_width,
+            self.url_bar_height,
+            display_text,
+            if (self.url_focused) self.url_cursor else null,
+            self.getSelectionBounds(),
+        );
+        defer self.allocator.free(url_rgba);
+
+        // Delete old URL bar image to avoid overlap
+        if (self.url_bar_image_id) |old_id| {
+            try self.kitty.deleteImage(writer, old_id);
+        }
+
+        self.url_bar_image_id = try self.kitty.displayRawRGBA(writer, url_rgba, self.url_bar_width, self.url_bar_height, .{
+            .placement_id = Placement.URL_BAR,
+            .z = 51,
+            .x_offset = self.url_bar_x,
             .y_offset = (self.toolbar_height - self.url_bar_height) / 2,
         });
     }

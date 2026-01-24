@@ -115,9 +115,6 @@ pub const MouseEventBus = struct {
     // Scroll settings
     natural_scroll: bool,
 
-    // Debug
-    debug_enabled: bool,
-
     const TICK_INTERVAL_NS = config.MOUSE_TICK_MS * std.time.ns_per_ms;
     const DOUBLE_CLICK_TIME_MS = config.DOUBLE_CLICK_TIME_MS;
     const DOUBLE_CLICK_DISTANCE = config.DOUBLE_CLICK_DISTANCE;
@@ -145,7 +142,6 @@ pub const MouseEventBus = struct {
             .allocator = allocator,
             .coord_mapper = null,
             .natural_scroll = natural_scroll,
-            .debug_enabled = false,
         };
     }
 
@@ -208,11 +204,6 @@ pub const MouseEventBus = struct {
                         .buttons_state = self.buttons_state,
                         .click_count = click_count,
                     });
-                    if (self.debug_enabled) {
-                        std.debug.print("[BUS] Sent press: ({},{}) btn={s} state={} clickCount={}\n", .{
-                            coords.x, coords.y, @tagName(mouse.button), self.buttons_state, click_count,
-                        });
-                    }
                 }
             },
             .release => {
@@ -231,11 +222,6 @@ pub const MouseEventBus = struct {
                         .buttons_state = self.buttons_state,
                         .click_count = self.current_click_count,
                     });
-                    if (self.debug_enabled) {
-                        std.debug.print("[BUS] Sent release: ({},{}) btn={s} state={} clickCount={}\n", .{
-                            coords.x, coords.y, @tagName(mouse.button), self.buttons_state, self.current_click_count,
-                        });
-                    }
                 }
             },
             .wheel => {
@@ -245,9 +231,6 @@ pub const MouseEventBus = struct {
                     .viewport_width = viewport_width,
                     .viewport_height = viewport_height,
                 };
-                if (self.debug_enabled) {
-                    std.debug.print("[BUS] Queued wheel: delta={}\n", .{mouse.delta_y});
-                }
             },
             .move, .drag => {
                 // Throttle moves - keep latest only, dispatch on tick
@@ -292,12 +275,6 @@ pub const MouseEventBus = struct {
     fn sendClick(self: *MouseEventBus, click: ClickEvent) void {
         const event_type = if (click.is_press) "mousePressed" else "mouseReleased";
         const button_name = buttonName(click.button);
-
-        if (self.debug_enabled) {
-            std.debug.print("[BUS] Sending {s}: ({},{}) btn={s} clickCount={}\n", .{
-                event_type, click.browser_x, click.browser_y, button_name, click.click_count,
-            });
-        }
 
         interact_mod.sendMouseEvent(
             self.cdp_client,

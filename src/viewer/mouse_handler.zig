@@ -23,7 +23,8 @@ pub fn handleMouse(viewer: anytype, mouse: MouseEvent) !void {
     viewer.mouse_x = norm_x;
     viewer.mouse_y = norm_y;
     viewer.mouse_visible = true;
-    viewer.ui_dirty = true;
+    // NOTE: Don't set ui_dirty here - only set when hover state actually changes
+    // Setting on every mouse move causes toolbar flashing
 
     // Log parsed mouse events (if enabled)
     if (viewer.debug_input) {
@@ -206,8 +207,8 @@ pub fn handleMouseNormal(viewer: anytype, mouse: MouseEvent) !void {
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                     };
-                    // Update navigation state (click may have navigated)
-                    viewer.updateNavigationState();
+                    // Navigation state is updated via CDP events (Page.frameNavigated)
+                    // No need to poll here - it would block the main loop
                 }
             } else {
                 // Click is in tab bar - handle button clicks locally

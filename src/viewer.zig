@@ -139,6 +139,28 @@ pub const Viewer = struct {
     // Debug flags
     debug_input: bool,
     ui_dirty: bool, // Track if UI needs re-rendering
+    last_toolbar_render: i128, // Throttle toolbar renders (expensive)
+
+    // Background toolbar rendering - composites to single RGBA image
+    toolbar_thread: ?std.Thread,
+    toolbar_rgba: []u8, // Pre-composited RGBA image
+    toolbar_rgba_ready: std.atomic.Value(bool), // New image ready to display
+    toolbar_render_requested: std.atomic.Value(bool), // Signal to render thread
+    toolbar_thread_running: std.atomic.Value(bool), // Thread control
+    toolbar_width: u32,
+    toolbar_height: u32,
+
+    // Input thread - reads stdin independently
+    input_thread: ?std.Thread,
+    input_thread_running: std.atomic.Value(bool),
+    input_pending: std.atomic.Value(bool),
+    input_buffer: [64]Input, // Ring buffer for input events
+    input_write_idx: std.atomic.Value(u32),
+    input_read_idx: u32,
+
+    // CDP thread - reads websocket independently
+    cdp_thread: ?std.Thread,
+    cdp_thread_running: std.atomic.Value(bool),
 
     // Shared memory buffer for zero-copy Kitty graphics
     shm_buffer: ?ShmBuffer,
@@ -250,6 +272,22 @@ pub const Viewer = struct {
             .frames_skipped = 0,
             .debug_input = enable_input_debug,
             .ui_dirty = true,
+            .last_toolbar_render = 0,
+            .toolbar_thread = null,
+            .toolbar_rgba = try allocator.alloc(u8, 8192 * 100 * 4), // Max 8192px wide, 100px tall, RGBA (supports 8K/HiDPI)
+            .toolbar_rgba_ready = std.atomic.Value(bool).init(false),
+            .toolbar_render_requested = std.atomic.Value(bool).init(false),
+            .toolbar_thread_running = std.atomic.Value(bool).init(false),
+            .toolbar_width = 0,
+            .toolbar_height = 0,
+            .input_thread = null,
+            .input_thread_running = std.atomic.Value(bool).init(false),
+            .input_pending = std.atomic.Value(bool).init(false),
+            .input_buffer = undefined,
+            .input_write_idx = std.atomic.Value(u32).init(0),
+            .input_read_idx = 0,
+            .cdp_thread = null,
+            .cdp_thread_running = std.atomic.Value(bool).init(false),
             .shm_buffer = shm_buffer,
             .natural_scroll = isNaturalScrollEnabled(),
             .is_ghostty = isGhosttyTerminal(allocator),
@@ -358,6 +396,7 @@ pub const Viewer = struct {
                 self.log("[DEBUG] Toolbar initialized, font_renderer={}\n", .{renderer.font_renderer != null});
                 renderer.setUrl(self.current_url);
                 renderer.setTabCount(1); // Initial tab
+                self.startToolbarThread();
             } else {
                 self.log("[DEBUG] Toolbar is null\n", .{});
             }
@@ -370,9 +409,22 @@ pub const Viewer = struct {
             self.log("[DEBUG] Failed to add initial tab: {}\n", .{err});
         };
 
-        // Render initial toolbar using Kitty graphics
-        try self.renderToolbar(writer);
-        try writer.flush();
+        // Request initial toolbar render and wait for it to be ready
+        self.requestToolbarRender();
+        {
+            // Wait for toolbar to be ready (max 200ms)
+            var wait_count: u32 = 0;
+            while (wait_count < 40 and !self.toolbar_rgba_ready.load(.acquire)) : (wait_count += 1) {
+                std.Thread.sleep(5 * std.time.ns_per_ms);
+            }
+            self.log("[DEBUG] Toolbar ready after {} waits\n", .{wait_count});
+
+            // Display toolbar immediately (before screencast starts)
+            if (self.toolbar_rgba_ready.load(.acquire)) {
+                self.displayToolbar(writer);
+                try writer.flush();
+            }
+        }
 
         // Start screencast streaming with viewport dimensions
         // Note: cli.zig already scales viewport for High-DPI displays
@@ -417,6 +469,11 @@ pub const Viewer = struct {
         self.log("[DEBUG] About to enter event loop\n", .{});
         self.log("[DEBUG] self.running = {}\n", .{self.running});
 
+        // Start worker threads
+        self.startInputThread();
+        self.startCdpThread();
+        self.log("[DEBUG] Worker threads started\n", .{});
+
         // Main loop
         var loop_count: u32 = 0;
         self.log("[DEBUG] Starting while loop\n", .{});
@@ -447,24 +504,26 @@ pub const Viewer = struct {
                 };
             }
 
-            // Drain ALL pending input to avoid backlog (process up to 100 events per iteration)
+            // Timing debug
+            const loop_start = std.time.nanoTimestamp();
+            var time_after_input: i128 = 0;
+            var time_after_bus: i128 = 0;
+            var time_after_render: i128 = 0;
+            var time_after_events: i128 = 0;
+
+            // Process input from ring buffer (filled by input thread)
             var events_processed: u32 = 0;
             while (events_processed < 100) : (events_processed += 1) {
-                const input = self.input.readInput() catch |err| {
-                    self.log("[ERROR] readInput() failed: {}\n", .{err});
-                    return err;
-                };
+                const maybe_input = self.pollInput();
+                if (maybe_input == null) break;
+                const input = maybe_input.?;
 
-                if (input == .none) break; // No more pending input
-
-                // Log significant events only (throttling happens inside handleMouse)
+                // Log significant events only
                 switch (input) {
                     .key => |key| {
                         self.log("[INPUT] Key: {any}\n", .{key});
-                        self.ui_dirty = true;
                     },
                     .mouse => |m| {
-                        // Only log clicks, not moves/drags (too noisy)
                         if (m.type == .press or m.type == .release) {
                             self.log("[INPUT] Mouse: type={s} x={d} y={d}\n", .{ @tagName(m.type), m.x, m.y });
                         }
@@ -472,28 +531,36 @@ pub const Viewer = struct {
                     .paste => |text| self.log("[INPUT] Paste: {d} bytes\n", .{text.len}),
                     .none => {},
                 }
-                try self.handleInput(input);
+                self.handleInput(input) catch {};
             }
+            time_after_input = std.time.nanoTimestamp();
 
             // Tick mouse event bus (dispatch pending events at 30fps)
             self.event_bus.maybeTick();
+            time_after_bus = std.time.nanoTimestamp();
 
             // Render new screencast frames (non-blocking) - in all modes
             // Page should continue updating even when typing in address bar
             if (self.screencast_mode) {
+                const t0 = std.time.nanoTimestamp();
                 const new_frame = self.tryRenderScreencast() catch |err| blk: {
                     self.log("[RENDER] tryRenderScreencast error: {}\n", .{err});
                     break :blk false;
                 };
+                const t1 = std.time.nanoTimestamp();
 
-                // Auto-recovery: if no frame rendered for 1+ seconds, restart screencast
+                // Auto-recovery: if no frame rendered for 3+ seconds AND there was recent input
+                // Don't reset for static pages with no user activity
                 const now_ns = std.time.nanoTimestamp();
-                if (self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 1 * std.time.ns_per_s) {
-                    self.log("[STALL] No frame for >1s, restarting screencast (frames={}, gen={})\n", .{
+                const no_frame_for_3s = self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 3 * std.time.ns_per_s;
+                const had_recent_input = self.last_input_time > 0 and (now_ns - self.last_input_time) < 5 * std.time.ns_per_s;
+                if (no_frame_for_3s and had_recent_input) {
+                    self.log("[STALL] No frame for >3s after input, restarting screencast (frames={}, gen={})\n", .{
                         self.cdp_client.getFrameCount(), self.last_rendered_generation,
                     });
                     self.resetScreencast();
                 }
+                const t2 = std.time.nanoTimestamp();
 
                 // Reset loading state when we get a new frame (page has loaded)
                 // But only after minimum 300ms to ensure user sees the stop button
@@ -505,36 +572,67 @@ pub const Viewer = struct {
                         self.ui_dirty = true;
                     }
                 }
+                const t3 = std.time.nanoTimestamp();
 
-                // Redraw UI overlays if we got a new frame or UI is dirty
-                if (new_frame or self.ui_dirty) {
+                // Signal toolbar thread when UI state changes
+                if (self.ui_dirty) {
+                    self.requestToolbarRender();
+                    self.ui_dirty = false;
+                }
+
+                // Always check for ready toolbar and cursor updates
+                {
                     var stdout_buf2: [262144]u8 = undefined; // 256KB for toolbar graphics
                     const stdout_file2 = std.fs.File.stdout();
                     var stdout_writer2 = stdout_file2.writer(&stdout_buf2);
                     const writer2 = &stdout_writer2.interface;
+
+                    // Display toolbar if ready (checks toolbar_rgba_ready flag)
+                    self.displayToolbar(writer2);
+
                     // Only render cursor in normal mode (not when typing URL)
-                    if (self.mode == .normal) {
+                    if (new_frame and self.mode == .normal) {
                         self.renderCursor(writer2) catch {};
                     }
-                    self.renderToolbar(writer2) catch {};
+
                     writer2.flush() catch {};
-                    self.ui_dirty = false;
+                }
+                const t4 = std.time.nanoTimestamp();
+
+                // Log detailed timing for first 20 iterations
+                if (loop_count <= 20) {
+                    self.log("[RENDER TIMING] frame={}ms stall={}ms load={}ms ui={}ms\n", .{
+                        @divFloor(t1 - t0, std.time.ns_per_ms),
+                        @divFloor(t2 - t1, std.time.ns_per_ms),
+                        @divFloor(t3 - t2, std.time.ns_per_ms),
+                        @divFloor(t4 - t3, std.time.ns_per_ms),
+                    });
                 }
             }
+            time_after_render = std.time.nanoTimestamp();
 
-            // Poll CDP events for JavaScript dialogs and file chooser
-            if (self.cdp_client.nextEvent(self.allocator)) |maybe_event| {
-                if (maybe_event) |*event| {
-                    var evt = event.*;
-                    defer evt.deinit();
-                    self.handleCdpEvent(&evt) catch |err| {
-                        self.log("[CDP EVENT] Error handling event: {}\n", .{err});
-                    };
-                }
-            } else |_| {}
+            // CDP events handled by CDP thread
+            time_after_events = std.time.nanoTimestamp();
 
             // Yield CPU (1ms = 1000Hz max loop rate)
             std.Thread.sleep(1 * std.time.ns_per_ms);
+
+            // Log loop timing for first 20 iterations
+            if (loop_count <= 20) {
+                const loop_elapsed = std.time.nanoTimestamp() - loop_start;
+                const input_ms = @divFloor(time_after_input - loop_start, std.time.ns_per_ms);
+                const bus_ms = @divFloor(time_after_bus - time_after_input, std.time.ns_per_ms);
+                const render_ms = @divFloor(time_after_render - time_after_bus, std.time.ns_per_ms);
+                const events_ms = @divFloor(time_after_events - time_after_render, std.time.ns_per_ms);
+                self.log("[LOOP] iter={} total={}ms (input={}ms bus={}ms render={}ms events={}ms)\n", .{
+                    loop_count,
+                    @divFloor(loop_elapsed, std.time.ns_per_ms),
+                    input_ms,
+                    bus_ms,
+                    render_ms,
+                    events_ms,
+                });
+            }
         }
 
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
@@ -691,12 +789,23 @@ pub const Viewer = struct {
     }
 
     /// Update navigation button states from Chrome history (call after navigation events)
+    /// Debounced to max once per 3 seconds to avoid blocking the main loop
+    /// This makes blocking CDP calls (getNavigationState) infrequent
     pub fn updateNavigationState(self: *Viewer) void {
+        const now = std.time.nanoTimestamp();
+        // Debounce: skip if called within last 3 seconds
+        if (now - self.last_nav_state_update < 3 * std.time.ns_per_s) {
+            return;
+        }
+        self.last_nav_state_update = now;
+
+        self.log("[NAV STATE] Fetching navigation state (blocking CDP call)...\n", .{});
         const nav_state = screenshot_api.getNavigationState(self.cdp_client, self.allocator) catch return;
         self.ui_state.can_go_back = nav_state.can_go_back;
         self.ui_state.can_go_forward = nav_state.can_go_forward;
-        // Refresh Chrome's actual viewport (may change after navigation/zoom)
-        self.refreshChromeViewport();
+        self.log("[NAV STATE] Updated: back={} forward={}\n", .{ nav_state.can_go_back, nav_state.can_go_forward });
+        // Note: viewport refresh removed - it rarely changes during navigation
+        // and adds another blocking CDP call. Resize events will update viewport.
     }
 
     /// Reset screencast - stops and restarts to recover from broken state
@@ -772,6 +881,159 @@ pub const Viewer = struct {
     /// Render the toolbar using Kitty graphics
     fn renderToolbar(self: *Viewer, writer: anytype) !void {
         return render_mod.renderToolbar(self, writer);
+    }
+
+    /// Start the background toolbar render thread
+    fn startToolbarThread(self: *Viewer) void {
+        if (self.toolbar_thread != null) return;
+        self.toolbar_thread_running.store(true, .release);
+        self.toolbar_thread = std.Thread.spawn(.{}, toolbarRenderLoop, .{self}) catch null;
+    }
+
+    /// Stop the background toolbar render thread
+    fn stopToolbarThread(self: *Viewer) void {
+        self.toolbar_thread_running.store(false, .release);
+        if (self.toolbar_thread) |thread| {
+            thread.join();
+            self.toolbar_thread = null;
+        }
+    }
+
+    /// Background thread that composites toolbar (main loop displays)
+    fn toolbarRenderLoop(self: *Viewer) void {
+        while (self.toolbar_thread_running.load(.acquire)) {
+            // Check if re-render requested
+            if (self.toolbar_render_requested.swap(false, .acq_rel)) {
+                if (self.toolbar_renderer) |*renderer| {
+                    // Composite to RGBA buffer (main loop will display)
+                    const dims = renderer.compositeToRgba(self.toolbar_rgba);
+                    self.toolbar_width = dims.width;
+                    self.toolbar_height = dims.height;
+                    if (dims.width > 0 and dims.height > 0) {
+                        self.toolbar_rgba_ready.store(true, .release);
+                    }
+                }
+            }
+            std.Thread.sleep(8 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Request toolbar re-render (non-blocking, called from main loop)
+    fn requestToolbarRender(self: *Viewer) void {
+        self.toolbar_render_requested.store(true, .release);
+    }
+
+    /// Display toolbar if ready (called from main loop only)
+    /// Throttled to 30fps max to avoid flooding stdout
+    fn displayToolbar(self: *Viewer, writer: anytype) void {
+        // Check if ready without consuming the flag yet
+        if (!self.toolbar_rgba_ready.load(.acquire)) return;
+        if (self.toolbar_width == 0 or self.toolbar_height == 0) return;
+
+        // Throttle to 30fps (33ms between displays)
+        const now = std.time.nanoTimestamp();
+        const min_interval = 33 * std.time.ns_per_ms;
+        if (now - self.last_toolbar_render < min_interval) return;
+
+        // Now consume the flag and display
+        _ = self.toolbar_rgba_ready.swap(false, .acq_rel);
+        self.last_toolbar_render = now;
+
+        const size = self.toolbar_width * self.toolbar_height * 4;
+        writer.writeAll("\x1b[1;1H") catch return;
+
+        const cell_width = if (self.toolbar_renderer) |r| r.cell_width else 10;
+        const num_cols: u32 = if (cell_width > 0) self.toolbar_width / cell_width else 80;
+
+        _ = self.kitty.displayRawRGBA(
+            writer,
+            self.toolbar_rgba[0..size],
+            self.toolbar_width,
+            self.toolbar_height,
+            .{ .image_id = 200, .placement_id = 100, .z = 50, .columns = num_cols },
+        ) catch {};
+    }
+
+    // ========== INPUT THREAD ==========
+
+    fn startInputThread(self: *Viewer) void {
+        if (self.input_thread != null) return;
+        self.input_thread_running.store(true, .release);
+        self.input_thread = std.Thread.spawn(.{}, inputLoop, .{self}) catch null;
+    }
+
+    fn stopInputThread(self: *Viewer) void {
+        self.input_thread_running.store(false, .release);
+        if (self.input_thread) |thread| {
+            thread.join();
+            self.input_thread = null;
+        }
+    }
+
+    /// Input thread - reads stdin independently, buffers events for main loop
+    fn inputLoop(self: *Viewer) void {
+        _ = self.log("[INPUT THREAD] Started\n", .{});
+        while (self.input_thread_running.load(.acquire)) {
+            // Read input (non-blocking poll inside readInput)
+            const input = self.input.readInput() catch {
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+                continue;
+            };
+
+            if (input != .none) {
+                // Write to ring buffer
+                const write_idx = self.input_write_idx.load(.acquire);
+                const next_idx = (write_idx + 1) % 64;
+                self.input_buffer[write_idx] = input;
+                self.input_write_idx.store(next_idx, .release);
+                self.input_pending.store(true, .release);
+            } else {
+                // No input, yield CPU
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    /// Poll input from ring buffer (called by main loop)
+    fn pollInput(self: *Viewer) ?Input {
+        const write_idx = self.input_write_idx.load(.acquire);
+        if (self.input_read_idx == write_idx) {
+            return null; // Buffer empty
+        }
+        const input = self.input_buffer[self.input_read_idx];
+        self.input_read_idx = (self.input_read_idx + 1) % 64;
+        return input;
+    }
+
+    // ========== CDP THREAD ==========
+
+    fn startCdpThread(self: *Viewer) void {
+        if (self.cdp_thread != null) return;
+        self.cdp_thread_running.store(true, .release);
+        self.cdp_thread = std.Thread.spawn(.{}, cdpLoop, .{self}) catch null;
+    }
+
+    fn stopCdpThread(self: *Viewer) void {
+        self.cdp_thread_running.store(false, .release);
+        if (self.cdp_thread) |thread| {
+            thread.join();
+            self.cdp_thread = null;
+        }
+    }
+
+    /// CDP thread - reads websocket events independently
+    fn cdpLoop(self: *Viewer) void {
+        while (self.cdp_thread_running.load(.acquire)) {
+            // Poll for CDP events
+            if (self.cdp_client.nextEvent(self.allocator)) |maybe_event| {
+                if (maybe_event) |*event| {
+                    var evt = event.*;
+                    defer evt.deinit();
+                    self.handleCdpEvent(&evt) catch {};
+                }
+            } else |_| {}
+            std.Thread.sleep(2 * std.time.ns_per_ms);
+        }
     }
 
     /// Handle input event - dispatches to key or mouse handlers
@@ -1779,6 +2041,11 @@ pub const Viewer = struct {
     }
 
     pub fn deinit(self: *Viewer) void {
+        // Stop all threads before freeing resources
+        self.stopInputThread();
+        self.stopCdpThread();
+        self.stopToolbarThread();
+        self.allocator.free(self.toolbar_rgba);
         self.input.deinit();
         if (self.prompt_buffer) |*p| p.deinit();
         // Free allowed file system roots
