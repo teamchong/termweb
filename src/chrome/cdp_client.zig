@@ -77,23 +77,18 @@ pub const CdpEvent = struct {
 };
 
 /// CDP Client - Hybrid Pipe + WebSocket architecture
-/// - pipe_client: screencast frames (high bandwidth) - optional for WebSocket-only mode
-/// - mouse_ws: mouse input (low latency)
-/// - keyboard_ws: keyboard input (low latency)
-/// - nav_ws: navigation commands (low latency)
+/// - pipe_client: screencast frames (high bandwidth)
+/// - page_ws: all page-level commands (mouse, keyboard, navigation, events)
+/// - browser_ws: browser-level commands (downloads)
 pub const CdpClient = struct {
     allocator: std.mem.Allocator,
-    pipe_client: ?*cdp_pipe.PipeCdpClient, // null for WebSocket-only mode
+    pipe_client: ?*cdp_pipe.PipeCdpClient,
     session_id: ?[]const u8, // Session ID for page-level commands
     debug_port: u16, // Chrome's debugging port for WebSocket connections
-    websocket_only: bool, // true if using WebSocket for everything (no pipe)
 
     // WebSocket clients (pipe is ONLY for screencast frames)
-    mouse_ws: ?*websocket_cdp.WebSocketCdpClient,
-    keyboard_ws: ?*websocket_cdp.WebSocketCdpClient,
-    nav_ws: ?*websocket_cdp.WebSocketCdpClient,
+    page_ws: ?*websocket_cdp.WebSocketCdpClient, // All page-level commands
     browser_ws: ?*websocket_cdp.WebSocketCdpClient, // Browser-level for downloads
-    screencast_ws: ?*websocket_cdp.WebSocketCdpClient, // For WebSocket-only screencast
 
     /// Initialize CDP client from pipe file descriptors
     /// read_fd: FD to read from Chrome (Chrome's FD 4)
@@ -106,12 +101,8 @@ pub const CdpClient = struct {
             .pipe_client = try cdp_pipe.PipeCdpClient.init(allocator, read_fd, write_fd),
             .session_id = null,
             .debug_port = debug_port,
-            .websocket_only = false,
-            .mouse_ws = null,
-            .keyboard_ws = null,
-            .nav_ws = null,
+            .page_ws = null,
             .browser_ws = null,
-            .screencast_ws = null,
         };
 
         // Attach to page target to enable page-level commands
@@ -127,7 +118,7 @@ pub const CdpClient = struct {
         const intercept_file = try client.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
         allocator.free(intercept_file);
 
-        // Create downloads directory (actual download setup happens on nav_ws later)
+        // Create downloads directory (actual download setup happens on page_ws later)
         std.fs.makeDirAbsolute("/tmp/termweb-downloads") catch |err| {
             if (err != error.PathAlreadyExists) {
                 logToFile("[CDP] Failed to create download dir: {}\n", .{err});
@@ -161,8 +152,8 @@ pub const CdpClient = struct {
         const clipboard_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
         allocator.free(clipboard_result);
 
-        // NOTE: Runtime.enable is called on nav_ws after WebSocket connect (not on pipe)
-        // Pipe is ONLY for screencast frames - events come from nav_ws
+        // NOTE: Runtime.enable is called on page_ws after WebSocket connect (not on pipe)
+        // Pipe is ONLY for screencast frames - events come from page_ws
 
         // Connect 3 WebSockets for input (mouse, keyboard, navigation)
         // Wait for Chrome to be ready on the discovered port with retries
@@ -184,26 +175,17 @@ pub const CdpClient = struct {
         if (ws_url) |url| {
             defer allocator.free(url);
 
-            // Connect strictly - failure is fatal
-            client.mouse_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-            client.keyboard_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-            client.nav_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
+            // Connect single page WebSocket for all page-level commands
+            client.page_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
+            try client.page_ws.?.startReaderThread();
 
-            // Start reader threads strictly - failure is fatal
-            try client.mouse_ws.?.startReaderThread();
-            try client.keyboard_ws.?.startReaderThread();
-            try client.nav_ws.?.startReaderThread();
-
-            // Enable Runtime domain on nav_ws to receive console events
-            // This MUST be on nav_ws, not pipe - pipe is only for screencast
-            const runtime_result = try client.nav_ws.?.sendCommand("Runtime.enable", null);
+            // Enable Runtime domain to receive console events
+            const runtime_result = try client.page_ws.?.sendCommand("Runtime.enable", null);
             allocator.free(runtime_result);
 
-            // Enable Page domain on nav_ws to receive navigation events
-            // This duplicates pipe's Page.enable but ensures events come through nav_ws
-            const page_result = try client.nav_ws.?.sendCommand("Page.enable", null);
+            // Enable Page domain to receive navigation events
+            const page_result = try client.page_ws.?.sendCommand("Page.enable", null);
             allocator.free(page_result);
-
         }
 
         // Connect browser_ws for Browser domain events (downloads)
@@ -222,102 +204,6 @@ pub const CdpClient = struct {
                 allocator.free(target_result);
             }
         } else |_| {}
-        return client;
-    }
-
-    /// Initialize CDP client from WebSocket only (no pipe)
-    /// Use this when pipe transport doesn't work (e.g., some Linux environments)
-    pub fn initFromPort(allocator: std.mem.Allocator, debug_port: u16) !*CdpClient {
-        const client = try allocator.create(CdpClient);
-        client.* = .{
-            .allocator = allocator,
-            .pipe_client = null, // No pipe in WebSocket-only mode
-            .session_id = null,
-            .debug_port = debug_port,
-            .websocket_only = true,
-            .mouse_ws = null,
-            .keyboard_ws = null,
-            .nav_ws = null,
-            .browser_ws = null,
-            .screencast_ws = null,
-        };
-
-        // Connect WebSockets first (no pipe to initialize)
-        var ws_url: ?[]const u8 = null;
-        var retry: u32 = 0;
-        while (retry < 50) : (retry += 1) {
-            std.Thread.sleep(200 * std.time.ns_per_ms);
-            ws_url = client.discoverPageWebSocketUrl(allocator) catch continue;
-            break;
-        }
-
-        if (ws_url == null) {
-            allocator.destroy(client);
-            return CdpError.WebSocketConnectionFailed;
-        }
-
-        {
-            const url = ws_url.?;
-            defer allocator.free(url);
-
-            // Connect all WebSockets including screencast_ws
-            client.mouse_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-            client.keyboard_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-            client.nav_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-            client.screencast_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
-
-            // Start reader thread on nav_ws and screencast_ws
-            try client.nav_ws.?.startReaderThread();
-            try client.screencast_ws.?.startReaderThread();
-
-            // Enable domains via nav_ws
-            const runtime_result = try client.nav_ws.?.sendCommand("Runtime.enable", null);
-            allocator.free(runtime_result);
-
-            const page_result = try client.nav_ws.?.sendCommand("Page.enable", null);
-            allocator.free(page_result);
-
-            const network_result = try client.nav_ws.?.sendCommand("Network.enable", null);
-            allocator.free(network_result);
-
-            // Intercept file chooser
-            const intercept_result = try client.nav_ws.?.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
-            allocator.free(intercept_result);
-        }
-
-        // Inject polyfills via nav_ws
-        const polyfill_script = @embedFile("fs_polyfill.js");
-        var polyfill_json_buf: [65536]u8 = undefined;
-        const polyfill_json = json_utils.escapeString(polyfill_script, &polyfill_json_buf) catch return error.OutOfMemory;
-
-        var polyfill_params_buf: [65536]u8 = undefined;
-        const polyfill_params = std.fmt.bufPrint(&polyfill_params_buf, "{{\"source\":{s}}}", .{polyfill_json}) catch return error.OutOfMemory;
-        const polyfill_result = try client.nav_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
-        allocator.free(polyfill_result);
-
-        // Clipboard polyfill
-        const clipboard_script = @embedFile("clipboard_polyfill.js");
-        var clipboard_json_buf: [16384]u8 = undefined;
-        const clipboard_json = json_utils.escapeString(clipboard_script, &clipboard_json_buf) catch return error.OutOfMemory;
-
-        var clipboard_params_buf: [32768]u8 = undefined;
-        const clipboard_params = std.fmt.bufPrint(&clipboard_params_buf, "{{\"source\":{s}}}", .{clipboard_json}) catch return error.OutOfMemory;
-        const clipboard_result = try client.nav_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
-        allocator.free(clipboard_result);
-
-        // Connect browser_ws
-        if (client.discoverBrowserWebSocketUrl(allocator)) |browser_url| {
-            defer allocator.free(browser_url);
-            client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch null;
-            if (client.browser_ws) |bws| {
-                try bws.startReaderThread();
-                const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
-                defer allocator.free(download_params);
-                const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
-                allocator.free(download_result);
-            }
-        } else |_| {}
-
         return client;
     }
 
@@ -472,11 +358,8 @@ pub const CdpClient = struct {
     }
 
     pub fn deinit(self: *CdpClient) void {
-        if (self.mouse_ws) |ws| ws.deinit();
-        if (self.keyboard_ws) |ws| ws.deinit();
-        if (self.nav_ws) |ws| ws.deinit();
+        if (self.page_ws) |ws| ws.deinit();
         if (self.browser_ws) |ws| ws.deinit();
-        if (self.screencast_ws) |ws| ws.deinit();
         if (self.session_id) |sid| self.allocator.free(sid);
         if (self.pipe_client) |pc| pc.deinit();
         self.allocator.destroy(self);
@@ -511,11 +394,11 @@ pub const CdpClient = struct {
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        if (self.mouse_ws) |ws| {
+        if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
             return;
         }
-        // Fallback to pipe if websocket not connected (pipe mode only)
+        // Fallback to pipe if websocket not connected
         if (self.pipe_client) |pc| {
             if (self.session_id != null) {
                 pc.sendSessionCommandAsync(self.session_id.?, method, params) catch {};
@@ -525,18 +408,18 @@ pub const CdpClient = struct {
         }
     }
 
-    /// Send keyboard command (fire-and-forget) - uses dedicated keyboard WebSocket
+    /// Send keyboard command (fire-and-forget) - uses page WebSocket
     /// Silently ignores errors - safe during shutdown
     pub fn sendKeyboardCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        if (self.keyboard_ws) |ws| {
+        if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
             return;
         }
-        // Fallback to pipe if websocket not connected (pipe mode only)
+        // Fallback to pipe if websocket not connected
         if (self.pipe_client) |pc| {
             if (self.session_id != null) {
                 pc.sendSessionCommandAsync(self.session_id.?, method, params) catch {};
@@ -546,77 +429,57 @@ pub const CdpClient = struct {
         }
     }
 
-    /// Send navigation command and wait for response - uses dedicated nav WebSocket
+    /// Send navigation command and wait for response - uses page WebSocket
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        if (self.nav_ws) |ws| {
+        if (self.page_ws) |ws| {
             return ws.sendCommand(method, params);
         }
         return CdpError.WebSocketConnectionFailed;
     }
 
-    /// Send navigation command (fire-and-forget) - uses dedicated nav WebSocket
+    /// Send navigation command (fire-and-forget) - uses page WebSocket
     pub fn sendNavCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        if (self.nav_ws) |ws| {
+        if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
         }
     }
 
-    /// Reconnect all 3 WebSockets to current page target
-    /// Cross-origin navigation creates new page target, invalidating all connections
-    fn reconnectAllWebSockets(self: *CdpClient) !void {
-        logToFile("[CDP] Reconnecting all WebSockets...\n", .{});
+    /// Reconnect page WebSocket to current page target
+    /// Cross-origin navigation creates new page target, invalidating connections
+    fn reconnectPageWebSocket(self: *CdpClient) !void {
+        logToFile("[CDP] Reconnecting page WebSocket...\n", .{});
 
-        // Close old connections
-        if (self.mouse_ws) |ws| {
+        // Close old connection
+        if (self.page_ws) |ws| {
             ws.deinit();
-            self.mouse_ws = null;
-        }
-        if (self.keyboard_ws) |ws| {
-            ws.deinit();
-            self.keyboard_ws = null;
-        }
-        if (self.nav_ws) |ws| {
-            ws.deinit();
-            self.nav_ws = null;
+            self.page_ws = null;
         }
 
         // Discover new page WebSocket URL
         const ws_url = try self.discoverPageWebSocketUrl(self.allocator);
         defer self.allocator.free(ws_url);
 
-        // Connect all 3 WebSockets
-        self.mouse_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
-        self.keyboard_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
-        self.nav_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
+        // Connect page WebSocket
+        self.page_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
+        try self.page_ws.?.startReaderThread();
 
-        // Start reader threads
-        try self.mouse_ws.?.startReaderThread();
-        try self.keyboard_ws.?.startReaderThread();
-        try self.nav_ws.?.startReaderThread();
-
-        // Re-enable Runtime domain on nav_ws for console events
-        const runtime_result = try self.nav_ws.?.sendCommand("Runtime.enable", null);
+        // Re-enable Runtime domain for console events
+        const runtime_result = try self.page_ws.?.sendCommand("Runtime.enable", null);
         self.allocator.free(runtime_result);
 
-        // Re-enable Page domain on nav_ws for navigation events
-        const page_result = try self.nav_ws.?.sendCommand("Page.enable", null);
+        // Re-enable Page domain for navigation events
+        const page_result = try self.page_ws.?.sendCommand("Page.enable", null);
         self.allocator.free(page_result);
 
-        // Re-enable downloads on nav_ws for download events
-        const download_params = try std.fmt.allocPrint(self.allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
-        defer self.allocator.free(download_params);
-        const download_result = try self.nav_ws.?.sendCommand("Browser.setDownloadBehavior", download_params);
-        self.allocator.free(download_result);
-
-        logToFile("[CDP] All WebSockets reconnected successfully\n", .{});
+        logToFile("[CDP] Page WebSocket reconnected successfully\n", .{});
     }
 
     /// Send CDP command and wait for response - uses session
@@ -625,14 +488,6 @@ pub const CdpClient = struct {
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // In WebSocket-only mode, use nav_ws
-        if (self.websocket_only) {
-            if (self.nav_ws) |ws| {
-                return ws.sendCommand(method, params);
-            }
-            return CdpError.WebSocketConnectionFailed;
-        }
-        // Pipe mode
         if (self.session_id != null) {
             return self.pipe_client.?.sendSessionCommand(self.session_id.?, method, params);
         }
@@ -645,15 +500,6 @@ pub const CdpClient = struct {
         method: []const u8,
         params: ?[]const u8,
     ) !void {
-        // In WebSocket-only mode, use nav_ws
-        if (self.websocket_only) {
-            if (self.nav_ws) |ws| {
-                ws.sendCommandAsync(method, params);
-                return;
-            }
-            return CdpError.WebSocketConnectionFailed;
-        }
-        // Pipe mode
         if (self.session_id != null) {
             return self.pipe_client.?.sendSessionCommandAsync(self.session_id.?, method, params);
         }
@@ -661,6 +507,9 @@ pub const CdpClient = struct {
     }
 
     /// Start screencast streaming
+    /// NOTE: everyNthFrame must be 1 for interactive use - see "Odd Frame Problem"
+    /// Chrome only generates frames on pixel change, so everyNthFrame:2 would drop
+    /// single-keystroke frames, making the terminal appear frozen.
     pub fn startScreencast(
         self: *CdpClient,
         format: []const u8,
@@ -668,6 +517,9 @@ pub const CdpClient = struct {
         width: u32,
         height: u32,
     ) !void {
+        // Start reader thread first
+        try self.pipe_client.?.startReaderThread();
+
         // Send startScreencast command with session
         const params = try std.fmt.allocPrint(
             self.allocator,
@@ -676,18 +528,8 @@ pub const CdpClient = struct {
         );
         defer self.allocator.free(params);
 
-        if (self.websocket_only) {
-            // WebSocket-only mode - screencast frames come via screencast_ws events
-            if (self.screencast_ws) |ws| {
-                const result = try ws.sendCommand("Page.startScreencast", params);
-                self.allocator.free(result);
-            }
-        } else {
-            // Pipe mode - start reader thread first
-            try self.pipe_client.?.startReaderThread();
-            const result = try self.sendCommand("Page.startScreencast", params);
-            self.allocator.free(result);
-        }
+        const result = try self.sendCommand("Page.startScreencast", params);
+        self.allocator.free(result);
     }
 
     /// Stop screencast streaming (for resize - keeps reader thread alive)
@@ -713,19 +555,11 @@ pub const CdpClient = struct {
 
     /// Get latest screencast frame (non-blocking)
     pub fn getLatestFrame(self: *CdpClient) ?ScreencastFrame {
-        if (self.websocket_only) {
-            // WebSocket mode - frames come via events, need different handling
-            // TODO: Implement WebSocket-based frame retrieval
-            return null;
-        }
         return self.pipe_client.?.getLatestFrame();
     }
 
     /// Get count of frames received
     pub fn getFrameCount(self: *CdpClient) u32 {
-        if (self.websocket_only) {
-            return 0; // TODO: Track WebSocket frame count
-        }
         return self.pipe_client.?.getFrameCount();
     }
 
@@ -743,8 +577,8 @@ pub const CdpClient = struct {
                 };
             }
         }
-        // Check nav_ws for page events
-        const ws = self.nav_ws orelse return null;
+        // Check page_ws for page events
+        const ws = self.page_ws orelse return null;
         const raw = ws.nextEvent() orelse return null;
         return CdpEvent{
             .method = raw.method,
@@ -755,24 +589,8 @@ pub const CdpClient = struct {
 
     /// Switch to a different target (for tab switching)
     /// Attaches to the target and updates the session ID
-    /// Note: Tab switching not fully supported in WebSocket-only mode
     pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {
         logToFile("[CDP] Switching to target: {s}\n", .{target_id});
-
-        // WebSocket-only mode doesn't support session-based targeting well
-        // TODO: For WebSocket-only, would need to reconnect to different WebSocket URL
-        if (self.websocket_only) {
-            logToFile("[CDP] Tab switching not fully supported in WebSocket-only mode\n", .{});
-            // Try to activate via nav_ws but don't change sessions
-            var activate_buf: [256]u8 = undefined;
-            const activate_params = std.fmt.bufPrint(&activate_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
-            const activate_result = self.sendCommand("Target.activateTarget", activate_params) catch |err| {
-                logToFile("[CDP] Target.activateTarget failed: {}\n", .{err});
-                return err;
-            };
-            self.allocator.free(activate_result);
-            return;
-        }
 
         // Activate the target in Chrome (brings it to focus)
         var activate_buf: [256]u8 = undefined;
