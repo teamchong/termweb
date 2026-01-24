@@ -114,6 +114,11 @@ pub const PipeCdpClient = struct {
     read_file_closed: bool,
     write_file_closed: bool,
 
+    // Throttled ACK state - ACK at 24fps to control Chrome's frame rate
+    // Unlike old code, we NEVER drop ACKs - always ACK the latest frame eventually
+    last_ack_time: i128,
+    pending_ack_frame_sid: ?u32,
+    pending_ack_routing_sid: ?[]u8, // Owned copy
 
     pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
         const frame_pool = try FramePool.init(allocator);
@@ -138,6 +143,9 @@ pub const PipeCdpClient = struct {
             .read_pos = 0,
             .read_file_closed = false,
             .write_file_closed = false,
+            .last_ack_time = 0,
+            .pending_ack_frame_sid = null,
+            .pending_ack_routing_sid = null,
         };
 
         return client;
@@ -158,6 +166,11 @@ pub const PipeCdpClient = struct {
         }
 
         self.frame_pool.deinit();
+
+        // Free pending ack routing sid if set
+        if (self.pending_ack_routing_sid) |sid| {
+            self.allocator.free(sid);
+        }
 
         // Free response queue entries - lock just in case
         self.response_mutex.lock();
@@ -404,8 +417,17 @@ pub const PipeCdpClient = struct {
     pub fn getLatestFrame(self: *PipeCdpClient) ?ScreencastFrame {
         const slot = self.frame_pool.acquireLatestFrame() orelse return null;
 
-        // ACKs are now sent immediately when frames are received in handleScreencastFrame()
-        // This prevents ACK debt that causes Chrome to pause sending frames
+        // Flush any pending ACK when viewer consumes a frame
+        // This ensures we never build up ACK debt even if frames arrive slowly
+        if (self.pending_ack_frame_sid) |frame_sid| {
+            self.acknowledgeFrame(self.pending_ack_routing_sid, frame_sid) catch {};
+            self.last_ack_time = std.time.nanoTimestamp();
+            if (self.pending_ack_routing_sid) |sid| {
+                self.allocator.free(sid);
+            }
+            self.pending_ack_frame_sid = null;
+            self.pending_ack_routing_sid = null;
+        }
 
         return ScreencastFrame{
             .data = slot.data(),
@@ -480,9 +502,38 @@ pub const PipeCdpClient = struct {
             _ = self.frame_count.fetchAdd(1, .monotonic);
         }
 
-        // ACK frames immediately to prevent ACK debt (Chrome stalls if ACKs pile up)
-        // The old "adaptive throttling" approach caused ACK debt by only ACKing rendered frames
-        self.acknowledgeFrame(routing_sid, frame_sid) catch {};
+        // Throttled ACK: control Chrome's frame rate by ACKing at ~24fps
+        // Key difference from old code: we NEVER drop ACKs, just delay them
+        // The pending ACK is always updated to the LATEST frame, and will be sent
+        // either when 42ms passes or in getLatestFrame()
+        const TARGET_FRAME_TIME_NS: i128 = 41_666_667; // ~24fps
+        const now = std.time.nanoTimestamp();
+
+        // Free old routing_sid if we're replacing it
+        if (self.pending_ack_routing_sid) |old_sid| {
+            self.allocator.free(old_sid);
+            self.pending_ack_routing_sid = null;
+        }
+
+        // Store latest frame info for ACK
+        self.pending_ack_frame_sid = frame_sid;
+        if (routing_sid) |rsid| {
+            self.pending_ack_routing_sid = self.allocator.dupe(u8, rsid) catch null;
+        }
+
+        // ACK if enough time has passed (throttle to 24fps)
+        // First frame (last_ack_time == 0) is ACKed immediately
+        if (self.last_ack_time == 0 or (now - self.last_ack_time) >= TARGET_FRAME_TIME_NS) {
+            self.acknowledgeFrame(self.pending_ack_routing_sid, frame_sid) catch {};
+            self.last_ack_time = now;
+            // Clear pending since we just ACKed
+            if (self.pending_ack_routing_sid) |sid| {
+                self.allocator.free(sid);
+            }
+            self.pending_ack_frame_sid = null;
+            self.pending_ack_routing_sid = null;
+        }
+        // If not enough time, keep pending - will be ACKed on next frame or in getLatestFrame
     }
 
     fn handleResponse(self: *PipeCdpClient, payload: []const u8) !void {
