@@ -9,10 +9,10 @@ pub const Config = struct {
     /// Calculate adaptive JPEG quality based on pixel count
     /// Smaller screens get higher quality, larger screens get more compression
     pub fn getAdaptiveQuality(total_pixels: u64) u8 {
-        if (total_pixels < 200_000) return 60;
-        if (total_pixels < 400_000) return 40;
-        if (total_pixels < 500_000) return 30;
-        return 20;
+        if (total_pixels < 150_000) return 80;
+        if (total_pixels < 300_000) return 60;
+        if (total_pixels < 450_000) return 45;
+        return 30;
     }
 
     /// Mouse event tick rate in milliseconds
