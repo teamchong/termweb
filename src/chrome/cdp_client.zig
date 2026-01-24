@@ -671,7 +671,7 @@ pub const CdpClient = struct {
         // Send startScreencast command with session
         const params = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"format\":\"{s}\",\"quality\":{d},\"maxWidth\":{d},\"maxHeight\":{d},\"everyNthFrame\":2}}",
+            "{{\"format\":\"{s}\",\"quality\":{d},\"maxWidth\":{d},\"maxHeight\":{d},\"everyNthFrame\":1}}",
             .{ format, quality, width, height },
         );
         defer self.allocator.free(params);
