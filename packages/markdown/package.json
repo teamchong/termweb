@@ -1,0 +1,36 @@
+{
+  "name": "@termweb/markdown",
+  "version": "0.1.0",
+  "description": "Terminal-based Markdown editor with live preview powered by Monaco Editor and termweb",
+  "bin": {
+    "termweb-markdown": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "dist/"
+  ],
+  "keywords": [
+    "terminal",
+    "editor",
+    "monaco",
+    "markdown",
+    "preview",
+    "cli"
+  ],
+  "author": "teamchong",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/termweb.git",
+    "directory": "packages/markdown"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "termweb": "workspace:*"
+  }
+}

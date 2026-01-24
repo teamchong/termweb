@@ -1,0 +1,36 @@
+{
+  "name": "@termweb/json",
+  "version": "0.1.0",
+  "description": "Terminal-based JSON editor with validation and formatting powered by Monaco Editor and termweb",
+  "bin": {
+    "termweb-json": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "dist/"
+  ],
+  "keywords": [
+    "terminal",
+    "editor",
+    "monaco",
+    "json",
+    "validation",
+    "cli"
+  ],
+  "author": "teamchong",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/termweb.git",
+    "directory": "packages/json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "termweb": "workspace:*"
+  }
+}

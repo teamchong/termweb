@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>termweb-markdown</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      overflow: hidden;
+      background: #1e1e1e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    #header {
+      height: 36px;
+      background: #252526;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    #filename { color: #cccccc; font-size: 13px; flex: 1; }
+    #status { color: #6a9955; font-size: 12px; margin-left: 12px; }
+    #status.modified { color: #dcdcaa; }
+    #status.saving { color: #569cd6; }
+    #status.error { color: #f14c4c; }
+    #container { display: flex; width: 100vw; height: calc(100vh - 60px); }
+    #editor-pane { width: 50%; height: 100%; border-right: 1px solid #3c3c3c; }
+    #editor { width: 100%; height: 100%; }
+    #preview-pane { width: 50%; height: 100%; overflow: auto; background: #1e1e1e; }
+    #preview {
+      padding: 20px;
+      color: #d4d4d4;
+      line-height: 1.6;
+    }
+    #preview h1, #preview h2, #preview h3, #preview h4, #preview h5, #preview h6 {
+      color: #569cd6;
+      margin-top: 24px;
+      margin-bottom: 16px;
+      font-weight: 600;
+      line-height: 1.25;
+    }
+    #preview h1 { font-size: 2em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
+    #preview h2 { font-size: 1.5em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
+    #preview h3 { font-size: 1.25em; }
+    #preview p { margin-bottom: 16px; }
+    #preview a { color: #4ec9b0; text-decoration: none; }
+    #preview a:hover { text-decoration: underline; }
+    #preview code {
+      background: #2d2d2d;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'Fira Code', Consolas, monospace;
+      font-size: 0.9em;
+    }
+    #preview pre {
+      background: #2d2d2d;
+      padding: 16px;
+      border-radius: 6px;
+      overflow-x: auto;
+      margin-bottom: 16px;
+    }
+    #preview pre code { background: transparent; padding: 0; }
+    #preview ul, #preview ol { margin-bottom: 16px; padding-left: 2em; }
+    #preview li { margin-bottom: 4px; }
+    #preview blockquote {
+      border-left: 4px solid #569cd6;
+      padding-left: 16px;
+      color: #9cdcfe;
+      margin-bottom: 16px;
+    }
+    #preview table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+    #preview th, #preview td { border: 1px solid #3c3c3c; padding: 8px 12px; text-align: left; }
+    #preview th { background: #252526; }
+    #preview img { max-width: 100%; height: auto; }
+    #preview hr { border: none; border-top: 1px solid #3c3c3c; margin: 24px 0; }
+    #shortcuts {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 24px;
+      background: #007acc;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      font-size: 11px;
+      color: white;
+    }
+    #shortcuts span { margin-right: 16px; }
+    #shortcuts kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
+    .pane-label {
+      position: absolute;
+      top: 44px;
+      padding: 4px 12px;
+      background: #3c3c3c;
+      color: #888;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      z-index: 10;
+    }
+    #editor-label { left: 8px; }
+    #preview-label { left: calc(50% + 8px); }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <span id="filename">Loading...</span>
+    <span id="status">Saved</span>
+  </div>
+  <span id="editor-label" class="pane-label">Editor</span>
+  <span id="preview-label" class="pane-label">Preview</span>
+  <div id="container">
+    <div id="editor-pane">
+      <div id="editor"></div>
+    </div>
+    <div id="preview-pane">
+      <div id="preview"></div>
+    </div>
+  </div>
+  <div id="shortcuts">
+    <span><kbd>Ctrl+S</kbd> Save</span>
+    <span><kbd>Ctrl+B</kbd> Bold</span>
+    <span><kbd>Ctrl+I</kbd> Italic</span>
+    <span><kbd>Ctrl+Z</kbd> Undo</span>
+    <span><kbd>Ctrl+Q</kbd> Quit</span>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
+  <script>
+    // termweb FS IPC
+    const pendingFS = new Map();
+    let fsId = 0;
+
+    window.__termwebFSResponse = (id, success, data) => {
+      const resolve = pendingFS.get(id);
+      if (resolve) {
+        pendingFS.delete(id);
+        resolve({ success, data });
+      }
+    };
+
+    function fsCall(op, path, data = '') {
+      return new Promise(resolve => {
+        const id = ++fsId;
+        pendingFS.set(id, resolve);
+        const msg = data ? `__TERMWEB_FS__:${id}:${op}:${path}:${data}` : `__TERMWEB_FS__:${id}:${op}:${path}`;
+        console.log(msg);
+        setTimeout(() => {
+          if (pendingFS.has(id)) {
+            pendingFS.delete(id);
+            resolve({ success: false, data: 'Timeout' });
+          }
+        }, 5000);
+      });
+    }
+
+    let editor;
+    let originalContent = '';
+    let isModified = false;
+    let updateTimeout;
+    let currentFile = null;
+
+    const params = new URLSearchParams(location.search);
+    const filePath = params.get('path') || '';
+    const initContent = params.get('content');
+
+    marked.setOptions({ breaks: true, gfm: true });
+
+    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
+
+    require(['vs/editor/editor.main'], function () {
+      const fileName = filePath.split('/').pop();
+      const content = initContent ? atob(initContent) : '# New Document\n';
+
+      currentFile = filePath;
+      document.getElementById('filename').textContent = fileName;
+      document.title = `${fileName} - termweb-markdown`;
+      originalContent = content;
+      updatePreview(content);
+
+      editor = monaco.editor.create(document.getElementById('editor'), {
+        value: content,
+        language: 'markdown',
+        theme: 'vs-dark',
+        fontSize: 14,
+        lineNumbers: 'on',
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        automaticLayout: true,
+        wordWrap: 'on',
+        tabSize: 2,
+        insertSpaces: true,
+        cursorBlinking: 'smooth',
+        smoothScrolling: true,
+        padding: { top: 32 },
+      });
+
+      editor.onDidChangeModelContent(() => {
+        const currentContent = editor.getValue();
+        isModified = currentContent !== originalContent;
+        updateStatus();
+        clearTimeout(updateTimeout);
+        updateTimeout = setTimeout(() => updatePreview(currentContent), 150);
+      });
+
+      // Use WinCtrl for Ctrl on Mac (termweb uses Ctrl on all platforms)
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyS, saveFile);
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyB, () => wrapSelection('**', '**'));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, () => wrapSelection('**', '**'));
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyI, () => wrapSelection('*', '*'));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyI, () => wrapSelection('*', '*'));
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
+      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
+
+      setTimeout(() => editor.focus(), 100);
+    });
+
+    function wrapSelection(before, after) {
+      const selection = editor.getSelection();
+      const text = editor.getModel().getValueInRange(selection);
+      editor.executeEdits('', [{ range: selection, text: `${before}${text}${after}` }]);
+    }
+
+    function updatePreview(content) {
+      document.getElementById('preview').innerHTML = marked.parse(content);
+    }
+
+    function updateStatus() {
+      const status = document.getElementById('status');
+      status.textContent = isModified ? 'Modified' : 'Saved';
+      status.className = isModified ? 'modified' : '';
+    }
+
+    async function saveFile() {
+      const status = document.getElementById('status');
+      status.textContent = 'Saving...';
+      status.className = 'saving';
+
+      const content = editor.getValue();
+      const encoded = btoa(unescape(encodeURIComponent(content)));
+      const res = await fsCall('writefile', currentFile, encoded);
+
+      if (res.success) {
+        originalContent = content;
+        isModified = false;
+        status.textContent = 'Saved';
+        status.className = '';
+      } else {
+        status.textContent = 'Error: ' + res.data;
+        status.className = 'error';
+        setTimeout(updateStatus, 3000);
+      }
+    }
+
+    window.addEventListener('resize', () => { if (editor) editor.layout(); });
+  </script>
+</body>
+</html>
