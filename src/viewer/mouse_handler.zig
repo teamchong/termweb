@@ -73,6 +73,12 @@ pub fn handleMouse(viewer: anytype, mouse: MouseEvent) !void {
                 }
             }
         },
+        .hint_mode => {
+            // Any click in hint mode exits hint mode
+            if (mouse.type == .press) {
+                viewer.exitHintMode();
+            }
+        },
     }
 }
 

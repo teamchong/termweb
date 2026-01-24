@@ -29,6 +29,7 @@ pub const AppAction = enum {
     paste,
     select_all,
     tab_picker,
+    enter_hint_mode,
 };
 
 /// Key type for shortcuts - can be a character or special key
@@ -69,6 +70,9 @@ pub const app_shortcuts = [_]ShortcutDef{
 
     // Tab management
     .{ .key = .{ .char = 't' }, .shortcut_mod = false, .ctrl = true, .action = .tab_picker },
+
+    // Hint mode (Vimium-style navigation)
+    .{ .key = .{ .char = 'j' }, .shortcut_mod = false, .ctrl = true, .action = .enter_hint_mode },
 };
 
 /// Find an app action for a key event.

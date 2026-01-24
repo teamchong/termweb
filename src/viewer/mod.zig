@@ -15,6 +15,8 @@ pub const fs_handler = @import("fs_handler.zig");
 pub const render = @import("render.zig");
 pub const input_handler = @import("input_handler.zig");
 pub const mouse_handler = @import("mouse_handler.zig");
+pub const cdp_events = @import("cdp_events.zig");
+pub const tabs = @import("tabs.zig");
 
 // Re-export commonly used types
 pub const getMimeType = helpers.getMimeType;
@@ -49,3 +51,20 @@ pub const handleMouse = mouse_handler.handleMouse;
 pub const handleMouseNormal = mouse_handler.handleMouseNormal;
 pub const handleTabBarClick = mouse_handler.handleTabBarClick;
 pub const mouseToPixels = mouse_handler.mouseToPixels;
+
+// Re-export CDP event handler functions
+pub const handleCdpEvent = cdp_events.handleCdpEvent;
+pub const handleFrameNavigated = cdp_events.handleFrameNavigated;
+pub const handleNavigatedWithinDocument = cdp_events.handleNavigatedWithinDocument;
+pub const handleNewTarget = cdp_events.handleNewTarget;
+pub const handleTargetInfoChanged = cdp_events.handleTargetInfoChanged;
+pub const handleDownloadWillBegin = cdp_events.handleDownloadWillBegin;
+pub const handleDownloadProgress = cdp_events.handleDownloadProgress;
+pub const handleConsoleMessage = cdp_events.handleConsoleMessage;
+pub const showFileChooser = cdp_events.showFileChooser;
+
+// Re-export tab management functions
+pub const addTab = tabs.addTab;
+pub const showTabPicker = tabs.showTabPicker;
+pub const switchToTab = tabs.switchToTab;
+pub const launchInNewTerminal = tabs.launchInNewTerminal;

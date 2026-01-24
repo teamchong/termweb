@@ -51,6 +51,7 @@ pub fn handleInput(viewer: anytype, input: Input) !void {
             switch (viewer.mode) {
                 .normal => try handleNormalModeKey(viewer, event),
                 .url_prompt => try handleUrlPromptKey(viewer, event),
+                .hint_mode => try handleHintModeKey(viewer, event),
             }
         },
         .mouse => |mouse| try mouse_handler.handleMouse(viewer, mouse),
@@ -159,6 +160,11 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
         .tab_picker => {
             viewer.showTabPicker() catch |err| {
                 viewer.log("[TAB_PICKER] Failed: {}\n", .{err});
+            };
+        },
+        .enter_hint_mode => {
+            viewer.enterHintMode() catch |err| {
+                viewer.log("[HINT] Failed to enter hint mode: {}\n", .{err});
             };
         },
         .go_back => {
@@ -384,6 +390,37 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
             renderer.blurUrl();
             viewer.mode = .normal;
             viewer.ui_dirty = true;
+        },
+        else => {},
+    }
+}
+
+/// Handle key in hint mode - type letters to click at hint location
+pub fn handleHintModeKey(viewer: anytype, event: NormalizedKeyEvent) !void {
+    switch (event.base_key) {
+        .escape => {
+            viewer.exitHintMode();
+        },
+        .char => |c| {
+            if (std.ascii.isAlphabetic(c)) {
+                const lower = std.ascii.toLower(c);
+                if (viewer.hint_grid) |grid| {
+                    if (grid.addChar(lower)) |hint| {
+                        // Found a match - click at hint location
+                        viewer.log("[HINT] Clicking at ({}, {})\n", .{ hint.browser_x, hint.browser_y });
+                        try interact_mod.clickAt(
+                            viewer.cdp_client,
+                            viewer.allocator,
+                            hint.browser_x,
+                            hint.browser_y,
+                        );
+                        viewer.exitHintMode();
+                    } else {
+                        // Partial match - update display
+                        viewer.ui_dirty = true;
+                    }
+                }
+            }
         },
         else => {},
     }

@@ -14,6 +14,7 @@ pub const toolbar = @import("toolbar.zig");
 pub const svg = @import("svg.zig");
 pub const font = @import("font.zig");
 pub const dialog = @import("dialog.zig");
+pub const hints = @import("hints.zig");
 
 // Re-export commonly used types
 pub const Theme = assets.Theme;
@@ -28,3 +29,6 @@ pub const ToolbarRenderer = toolbar.ToolbarRenderer;
 pub const DialogType = dialog.DialogType;
 pub const DialogState = dialog.DialogState;
 pub const FilePickerMode = dialog.FilePickerMode;
+pub const HintGrid = hints.HintGrid;
+pub const Hint = hints.Hint;
+pub const renderHints = hints.renderHints;

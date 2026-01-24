@@ -75,6 +75,7 @@ const isNaturalScrollEnabled = viewer_helpers.isNaturalScrollEnabled;
 pub const ViewerMode = enum {
     normal,       // Main browsing mode - all input goes to browser
     url_prompt,   // Entering URL (Ctrl+L)
+    hint_mode,    // Vimium-style hint navigation (Ctrl+J)
 };
 
 pub const Viewer = struct {
@@ -108,6 +109,9 @@ pub const Viewer = struct {
 
     // UI state for layered rendering
     ui_state: UIState,
+
+    // Hint mode grid (Vimium-style navigation)
+    hint_grid: ?*ui_mod.HintGrid,
 
     // Toolbar renderer (Kitty graphics based)
     toolbar_renderer: ?ui_mod.ToolbarRenderer,
@@ -255,6 +259,7 @@ pub const Viewer = struct {
             .screencast_format = screencast_format,
             .last_frame_time = 0,
             .ui_state = UIState{},
+            .hint_grid = null,
             .toolbar_renderer = null,
             .toolbar_disabled = false,
             .mouse_x = 0,
@@ -596,6 +601,13 @@ pub const Viewer = struct {
                         self.renderCursor(writer2) catch {};
                     }
 
+                    // Render hint labels when in hint mode
+                    if (self.mode == .hint_mode) {
+                        if (self.hint_grid) |grid| {
+                            ui_mod.renderHints(writer2, grid) catch {};
+                        }
+                    }
+
                     writer2.flush() catch {};
                 }
                 const t4 = std.time.nanoTimestamp();
@@ -851,7 +863,7 @@ pub const Viewer = struct {
     }
 
     /// Refresh Chrome's actual viewport dimensions (source of truth for coordinate mapping)
-    fn refreshChromeViewport(self: *Viewer) void {
+    pub fn refreshChromeViewport(self: *Viewer) void {
         if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |actual_vp| {
             self.log("[VIEWPORT] Query returned: {}x{} (current: {}x{})\n", .{
                 actual_vp.width, actual_vp.height,
@@ -1027,13 +1039,14 @@ pub const Viewer = struct {
 
     /// CDP thread - reads websocket events independently
     fn cdpLoop(self: *Viewer) void {
+        const cdp_events_mod = @import("viewer/cdp_events.zig");
         while (self.cdp_thread_running.load(.acquire)) {
             // Poll for CDP events
             if (self.cdp_client.nextEvent(self.allocator)) |maybe_event| {
                 if (maybe_event) |*event| {
                     var evt = event.*;
                     defer evt.deinit();
-                    self.handleCdpEvent(&evt) catch {};
+                    cdp_events_mod.handleCdpEvent(self, &evt) catch {};
                 }
             } else |_| {}
             std.Thread.sleep(2 * std.time.ns_per_ms);
@@ -1080,354 +1093,61 @@ pub const Viewer = struct {
         return mouse_handler_mod.mouseToPixels(self);
     }
 
-    /// Handle CDP events (JavaScript dialogs, file chooser, console messages)
-    fn handleCdpEvent(self: *Viewer, event: *cdp.CdpEvent) !void {
-        self.log("[CDP EVENT] method={s}\n", .{event.method});
-
-        if (std.mem.eql(u8, event.method, "Page.javascriptDialogOpening")) {
-            // Let Chrome show native dialog in screencast - don't intercept
-            self.log("[DIALOG] Native dialog opened, user can click in screencast\n", .{});
-        } else if (std.mem.eql(u8, event.method, "Page.fileChooserOpened")) {
-            try self.showFileChooser(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Runtime.consoleAPICalled")) {
-            try self.handleConsoleMessage(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Browser.downloadWillBegin")) {
-            try self.handleDownloadWillBegin(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Browser.downloadProgress")) {
-            try self.handleDownloadProgress(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Page.frameNavigated")) {
-            self.handleFrameNavigated(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
-            self.handleNavigatedWithinDocument(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
-            self.handleNewTarget(event.payload);
-        } else if (std.mem.eql(u8, event.method, "Target.targetInfoChanged")) {
-            self.handleTargetInfoChanged(event.payload);
-        }
-    }
-
-    /// Handle Page.frameNavigated - actual page load, show loading for main frame
-    fn handleFrameNavigated(self: *Viewer, payload: []const u8) void {
-        // Extract URL: {"frame":{"url":"https://...", "parentId":"...",...}}
-        const url = extractUrlFromNavEvent(payload) orelse return;
-
-        // Check if this is the main frame (no parentId means main document)
-        // Iframes have parentId, main frame doesn't
-        const is_main_frame = std.mem.indexOf(u8, payload, "\"parentId\"") == null;
-
-        self.log("[FRAME NAV] URL: {s} (main_frame={})\n", .{ url, is_main_frame });
-
-        // Only process main frame navigation
-        if (!is_main_frame) return;
-
-        // Set loading state for main frame navigation (show stop button)
-        if (!self.ui_state.is_loading) {
-            self.ui_state.is_loading = true;
-            self.loading_started_at = std.time.nanoTimestamp();
-            self.ui_dirty = true;
-        }
-
-        // Update current_url if different
-        if (!std.mem.eql(u8, self.current_url, url)) {
-            const new_url = self.allocator.dupe(u8, url) catch return;
-            self.allocator.free(self.current_url);
-            self.current_url = new_url;
-
-            if (self.toolbar_renderer) |*renderer| {
-                renderer.setUrl(new_url);
-                self.ui_dirty = true;
-            }
-        }
-
-        self.updateNavigationState();
-    }
-
-    /// Handle Page.navigatedWithinDocument - SPA navigation (pushState/hash change)
-    /// Page already loaded, just URL changed - NO loading indicator
-    fn handleNavigatedWithinDocument(self: *Viewer, payload: []const u8) void {
-        // Extract URL: {"frameId":"...","url":"https://..."}
-        const url = extractUrlFromNavEvent(payload) orelse return;
-
-        self.log("[SPA NAV] URL: {s}\n", .{url});
-
-        // Update current_url if different (no loading state change)
-        if (!std.mem.eql(u8, self.current_url, url)) {
-            const new_url = self.allocator.dupe(u8, url) catch return;
-            self.allocator.free(self.current_url);
-            self.current_url = new_url;
-
-            if (self.toolbar_renderer) |*renderer| {
-                renderer.setUrl(new_url);
-                self.ui_dirty = true;
-            }
-        }
-
-        self.updateNavigationState();
-    }
-
-    /// Handle Target.targetCreated event - launch new terminal tab instead of browser tab
-    fn handleNewTarget(self: *Viewer, payload: []const u8) void {
-        self.log("[NEW TARGET] Payload: {s}\n", .{payload[0..@min(payload.len, 800)]});
-
-        // Parse targetInfo from payload
-        // Format: {"targetInfo":{"targetId":"XXX","type":"page","title":"...","url":"...",...}}
-
-        // Extract targetId
-        const target_id_marker = "\"targetId\":\"";
-        const target_id_start = std.mem.indexOf(u8, payload, target_id_marker) orelse return;
-        const id_start = target_id_start + target_id_marker.len;
-        const id_end = std.mem.indexOfPos(u8, payload, id_start, "\"") orelse return;
-        const target_id = payload[id_start..id_end];
-
-        // Extract type
-        const type_marker = "\"type\":\"";
-        const type_start = std.mem.indexOf(u8, payload, type_marker) orelse return;
-        const t_start = type_start + type_marker.len;
-        const t_end = std.mem.indexOfPos(u8, payload, t_start, "\"") orelse return;
-        const target_type = payload[t_start..t_end];
-
-        // Only handle "page" type targets (not iframes, workers, etc.)
-        if (!std.mem.eql(u8, target_type, "page")) {
-            self.log("[NEW TARGET] Ignoring non-page target type={s}\n", .{target_type});
-            return;
-        }
-
-        // Skip targets that are already attached (that's our main page)
-        if (std.mem.indexOf(u8, payload, "\"attached\":true") != null) {
-            self.log("[NEW TARGET] Ignoring attached target (our page)\n", .{});
-            return;
-        }
-
-        // Extract URL
-        const url_marker = "\"url\":\"";
-        const url_start = std.mem.indexOf(u8, payload, url_marker) orelse return;
-        const u_start = url_start + url_marker.len;
-        const u_end = std.mem.indexOfPos(u8, payload, u_start, "\"") orelse return;
-        const url = payload[u_start..u_end];
-
-        // Skip about:blank (empty tabs) - but track the target for later
-        if (std.mem.eql(u8, url, "about:blank") or url.len == 0) {
-            self.log("[NEW TARGET] Empty URL, tracking target id={s}\n", .{target_id});
-            // Store target ID to handle when URL arrives via targetInfoChanged
-            const id_copy = self.allocator.dupe(u8, target_id) catch return;
-            self.pending_new_targets.append(self.allocator, id_copy) catch {
-                self.allocator.free(id_copy);
-            };
-            return;
-        }
-
-        self.log("[NEW TARGET] New tab requested: id={s} url={s}\n", .{ target_id, url });
-
-        // Add new tab to our tab list
-        self.addTab(target_id, url, "") catch |err| {
-            self.log("[NEW TARGET] Failed to add tab: {}\n", .{err});
-        };
-
-        // Keep the browser target alive for fast tab switching
-        // (Previously we closed it immediately, forcing re-navigation on switch)
-    }
+    // ========== TABS ==========
 
     /// Add a new tab to the tabs list
-    fn addTab(self: *Viewer, target_id: []const u8, url: []const u8, title: []const u8) !void {
-        const tab = try ui_mod.Tab.init(self.allocator, target_id, url, title);
-        try self.tabs.append(self.allocator, tab);
-
-        // Update toolbar tab count
-        if (self.toolbar_renderer) |*renderer| {
-            renderer.setTabCount(@intCast(self.tabs.items.len));
-        }
-        self.ui_dirty = true;
-
-        self.log("[TABS] Added tab: url={s}, total={}\n", .{ url, self.tabs.items.len });
-    }
-
-    /// Handle Target.targetInfoChanged - URL may now be available for pending targets
-    /// Also updates URL for existing tabs when they navigate
-    fn handleTargetInfoChanged(self: *Viewer, payload: []const u8) void {
-        // Extract targetId
-        const target_id_marker = "\"targetId\":\"";
-        const target_id_start = std.mem.indexOf(u8, payload, target_id_marker) orelse return;
-        const id_start = target_id_start + target_id_marker.len;
-        const id_end = std.mem.indexOfPos(u8, payload, id_start, "\"") orelse return;
-        const target_id = payload[id_start..id_end];
-
-        // Extract URL
-        const url_marker = "\"url\":\"";
-        const url_start = std.mem.indexOf(u8, payload, url_marker) orelse return;
-        const u_start = url_start + url_marker.len;
-        const u_end = std.mem.indexOfPos(u8, payload, u_start, "\"") orelse return;
-        const url = payload[u_start..u_end];
-
-        // Skip if empty or about:blank
-        if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return;
-
-        // First, check if this target is an existing tab - update its URL
-        for (self.tabs.items) |*tab| {
-            if (std.mem.eql(u8, tab.target_id, target_id)) {
-                if (!std.mem.eql(u8, tab.url, url)) {
-                    self.log("[TARGET INFO CHANGED] Updating tab URL: {s} -> {s}\n", .{ tab.url, url });
-                    tab.updateUrl(url) catch {};
-                }
-                return;
-            }
-        }
-
-        // Check if this is a pending target (new tab waiting for URL)
-        var found_index: ?usize = null;
-        for (self.pending_new_targets.items, 0..) |pending_id, i| {
-            if (std.mem.eql(u8, pending_id, target_id)) {
-                found_index = i;
-                break;
-            }
-        }
-
-        if (found_index == null) return; // Not a pending target
-
-        self.log("[TARGET INFO CHANGED] URL ready for new tab: id={s} url={s}\n", .{ target_id, url });
-
-        // Remove from pending list
-        const removed_id = self.pending_new_targets.orderedRemove(found_index.?);
-        self.allocator.free(removed_id);
-
-        // Add new tab to our tab list (keep target alive for fast switching)
-        self.addTab(target_id, url, "") catch |err| {
-            self.log("[TARGET INFO CHANGED] Failed to add tab: {}\n", .{err});
-        };
-    }
-
-    /// Launch termweb in a new terminal window
-    fn launchInNewTerminal(self: *Viewer, url: []const u8) void {
-        // Get full path to current executable
-        var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
-            self.log("[NEW TAB] Failed to get exe path\n", .{});
-            return;
-        };
-
-        // Create temp script to launch termweb
-        const tmp_dir = std.posix.getenv("TMPDIR") orelse "/tmp";
-        var script_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const script_path = std.fmt.bufPrint(&script_path_buf, "{s}/termweb_launch_{d}.command", .{ tmp_dir, std.time.milliTimestamp() }) catch return;
-
-        // Get current working directory
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch ".";
-
-        // Write script content
-        var script_buf: [2048]u8 = undefined;
-        const script = std.fmt.bufPrint(&script_buf,
-            \\#!/bin/bash
-            \\cd "{s}"
-            \\exec "{s}" open "{s}"
-        , .{ cwd, exe_path, url }) catch return;
-
-        const file = std.fs.createFileAbsolute(script_path, .{}) catch |err| {
-            self.log("[NEW TAB] Failed to create script: {}\n", .{err});
-            return;
-        };
-        defer file.close();
-        file.writeAll(script) catch return;
-
-        // Make executable
-        std.fs.chdirAbsolute(tmp_dir) catch {};
-        const chmod_argv = [_][]const u8{ "chmod", "+x", script_path };
-        var chmod_child = std.process.Child.init(&chmod_argv, self.allocator);
-        _ = chmod_child.spawnAndWait() catch {};
-
-        // Use 'open' which launches in user's default terminal
-        self.log("[NEW TAB] Launching via open: {s}\n", .{url});
-        const argv = [_][]const u8{ "open", script_path };
-        var child = std.process.Child.init(&argv, self.allocator);
-        child.spawn() catch |err| {
-            self.log("[NEW TAB] Launch failed: {}\n", .{err});
-            return;
-        };
-        self.log("[NEW TAB] Launched: {s}\n", .{url});
+    pub fn addTab(self: *Viewer, target_id: []const u8, url: []const u8, title: []const u8) !void {
+        const tabs_mod = @import("viewer/tabs.zig");
+        return tabs_mod.addTab(self, target_id, url, title);
     }
 
     /// Show native tab picker dialog
     pub fn showTabPicker(self: *Viewer) !void {
-        if (self.tabs.items.len == 0) {
-            self.log("[TABS] No tabs to show\n", .{});
-            return;
-        }
-
-        // Build list of tab titles
-        var tab_titles = try std.ArrayList([]const u8).initCapacity(self.allocator, self.tabs.items.len);
-        defer tab_titles.deinit(self.allocator);
-
-        for (self.tabs.items, 0..) |tab, i| {
-            // Format as "N. Title - URL"
-            var title_buf: [256]u8 = undefined;
-            const title = std.fmt.bufPrint(&title_buf, "{d}. {s}", .{
-                i + 1,
-                if (tab.title.len > 0) tab.title else tab.url,
-            }) catch continue;
-
-            // Duplicate the title since we need it to persist
-            const title_copy = try self.allocator.dupe(u8, title);
-            try tab_titles.append(self.allocator, title_copy);
-        }
-        defer {
-            for (tab_titles.items) |t| self.allocator.free(t);
-        }
-
-        self.log("[TABS] Showing picker with {} tabs\n", .{tab_titles.items.len});
-
-        // Show native list picker
-        const selected = try dialog_mod.showNativeListPicker(
-            self.allocator,
-            "Select Tab",
-            tab_titles.items,
-        );
-
-        if (selected) |index| {
-            self.log("[TABS] Selected tab {}\n", .{index});
-            try self.switchToTab(index);
-        }
+        const tabs_mod = @import("viewer/tabs.zig");
+        return tabs_mod.showTabPicker(self);
     }
 
-    /// Switch to a different tab
-    fn switchToTab(self: *Viewer, index: usize) !void {
-        if (index >= self.tabs.items.len) return;
+    // ========== HINT MODE ==========
 
-        self.active_tab_index = index;
-        const tab = self.tabs.items[index];
+    /// Enter hint mode (Vimium-style navigation)
+    pub fn enterHintMode(self: *Viewer) !void {
+        if (self.mode == .hint_mode) return;
 
-        self.log("[TABS] Switching to tab {}: {s} (target={s})\n", .{ index, tab.url, tab.target_id });
+        const size = try self.terminal.getSize();
+        const cell_width: u16 = if (size.cols > 0) @intCast(size.width_px / size.cols) else 10;
+        const cell_height: u16 = if (size.rows > 0) @intCast(size.height_px / size.rows) else 20;
+        const toolbar_rows: u16 = if (self.toolbar_renderer != null) 2 else 0;
+        const content_start = toolbar_rows;
+        const content_rows = size.rows - toolbar_rows - 1;
 
-        // Switch to the target (attaches to existing browser target - fast!)
-        self.cdp_client.switchToTarget(tab.target_id) catch |err| {
-            self.log("[TABS] switchToTarget failed: {}, falling back to navigation\n", .{err});
-            // Fallback to navigation if target switch fails (target may have been closed)
-            _ = try screenshot_api.navigateToUrl(self.cdp_client, self.allocator, tab.url);
-        };
+        const grid = try self.allocator.create(ui_mod.HintGrid);
+        grid.* = try ui_mod.HintGrid.generate(
+            self.allocator,
+            content_start,
+            content_rows,
+            size.cols,
+            cell_width,
+            cell_height,
+            self.chrome_actual_width,
+            self.chrome_actual_height,
+        );
 
-        // Restart screencast on the new target with adaptive quality
-        const tab_total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
-        const tab_quality = config.getAdaptiveQuality(tab_total_pixels);
-        screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-            .format = self.screencast_format,
-            .quality = tab_quality,
-            .width = self.viewport_width,
-            .height = self.viewport_height,
-            .every_nth_frame = 1,
-        }) catch |err| {
-            self.log("[TABS] startScreencast failed after switch: {}\n", .{err});
-        };
-
-        // Update URL display (blur first to ensure buffer is updated)
-        if (self.toolbar_renderer) |*renderer| {
-            renderer.blurUrl();
-            renderer.setUrl(tab.url);
-        }
-
-        // Update current_url
-        self.allocator.free(self.current_url);
-        self.current_url = try self.allocator.dupe(u8, tab.url);
-        // Keep image IDs - new frames overwrite using same ID (no memory leak)
-
+        self.hint_grid = grid;
+        self.mode = .hint_mode;
         self.ui_dirty = true;
+        self.log("[HINT] Entered hint mode with {} hints\n", .{grid.hints.len});
+    }
+
+    /// Exit hint mode
+    pub fn exitHintMode(self: *Viewer) void {
+        if (self.hint_grid) |grid| {
+            grid.deinit();
+            self.allocator.destroy(grid);
+            self.hint_grid = null;
+        }
+        self.mode = .normal;
+        self.ui_dirty = true;
+        self.log("[HINT] Exited hint mode\n", .{});
     }
 
     /// Handle Browser.downloadWillBegin event - prompt user for save location
@@ -1718,7 +1438,7 @@ pub const Viewer = struct {
     }
 
     /// Handle file system operation request
-    fn handleFsRequest(self: *Viewer, payload: []const u8, start: usize) !void {
+    pub fn handleFsRequest(self: *Viewer, payload: []const u8, start: usize) !void {
         // Format: __TERMWEB_FS__:id:type:path[:data]
         // Find the end of the console message string (look for closing quote)
         var end = start;
@@ -1780,7 +1500,7 @@ pub const Viewer = struct {
     }
 
     /// Execute JavaScript in the browser
-    fn evalJavaScript(self: *Viewer, script: []const u8) !void {
+    pub fn evalJavaScript(self: *Viewer, script: []const u8) !void {
         // Escape the script for JSON (escapeString includes quotes)
         var escaped_buf: [131072]u8 = undefined;
         const escaped = json.escapeString(script, &escaped_buf) catch return;
@@ -2019,7 +1739,7 @@ pub const Viewer = struct {
     }
 
     /// Show file chooser (native OS picker)
-    fn showFileChooser(self: *Viewer, payload: []const u8) !void {
+    pub fn showFileChooser(self: *Viewer, payload: []const u8) !void {
         self.log("[DIALOG] showFileChooser payload={s}\n", .{payload});
 
         // Parse file chooser mode
@@ -2050,6 +1770,12 @@ pub const Viewer = struct {
         self.stopCdpThread();
         self.stopToolbarThread();
         self.allocator.free(self.toolbar_rgba);
+        // Free hint grid if active
+        if (self.hint_grid) |grid| {
+            grid.deinit();
+            self.allocator.destroy(grid);
+            self.hint_grid = null;
+        }
         self.input.deinit();
         if (self.prompt_buffer) |*p| p.deinit();
         // Free allowed file system roots
