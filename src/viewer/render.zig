@@ -163,21 +163,18 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame
     // Move cursor to row 2
     try writer.writeAll("\x1b[2;1H");
 
-    // Like awrit: first frame gets auto-increment ID, subsequent frames reuse it
-    // No z-index needed now that SHM write pattern is correct
+    // Use fixed image_id for content - Kitty replaces in-place (no delete needed)
     const display_opts = kitty_mod.DisplayOptions{
         .rows = content_rows,
         .columns = display_cols,
         .y_offset = @intCast(y_offset),
-        .image_id = viewer.last_content_image_id,
+        .image_id = 100, // Fixed ID for content
     };
 
     const render_t1 = std.time.nanoTimestamp();
 
-    // Delete old image before reusing ID (Kitty requires this for replacement)
-    if (viewer.last_content_image_id) |old_id| {
-        viewer.kitty.deleteImage(writer, old_id) catch {};
-    }
+    // NOTE: Don't delete old image - Kitty replaces it when we use same image_id
+    // Deleting first causes flash (white bar) as terminal background shows through
 
     // Try SHM path first
     var used_shm = false;
@@ -230,10 +227,7 @@ pub fn displayFrame(viewer: anytype, base64_png: []const u8) !void {
 pub fn renderCursor(viewer: anytype, writer: anytype) !void {
     if (!viewer.mouse_visible) return;
 
-    // Delete old cursor image to prevent trailing
-    if (viewer.cursor_image_id) |old_id| {
-        try viewer.kitty.deleteImage(writer, old_id);
-    }
+    // NOTE: Using fixed image_id=300, so Kitty replaces in-place (no delete needed)
 
     // With SGR pixel mode (1016h), mouse_x/y are pixel coordinates
     // Convert to cell coordinates for ANSI cursor positioning
@@ -257,7 +251,9 @@ pub fn renderCursor(viewer: anytype, writer: anytype) !void {
     try writer.print("\x1b[{d};{d}H", .{ cell_row, cell_col });
 
     // Display cursor PNG with pixel offset for precision
+    // Use fixed image_id to replace in-place (no delete needed)
     viewer.cursor_image_id = try viewer.kitty.displayPNG(writer, cursor_asset, .{
+        .image_id = 300, // Fixed ID for cursor
         .placement_id = Placement.CURSOR,
         .z = ZIndex.CURSOR,
         .x_offset = x_offset,

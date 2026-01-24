@@ -240,13 +240,45 @@ pub fn handleNormalModeKey(viewer: anytype, event: NormalizedKeyEvent) !void {
 pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
     const renderer = if (viewer.toolbar_renderer) |*r| r else return;
 
-    // Platform-specific navigation modifiers
+    // Word navigation: Ctrl+arrow (or Alt+arrow on macOS for compatibility)
+    // Line navigation: Cmd+arrow on macOS
     const is_macos = comptime builtin.os.tag == .macos;
-    const word_nav = if (is_macos) event.alt else event.ctrl;
+    const word_nav = event.ctrl or (is_macos and event.alt);
     const line_nav = if (is_macos) event.meta else false;
+
+    // Debug: log arrow key with modifiers
+    if (event.base_key == .left or event.base_key == .right) {
+        viewer.log("[URL KEY] arrow={s} ctrl={} alt={} shift={} word_nav={}\n", .{
+            @tagName(event.base_key), event.ctrl, event.alt, event.shift, word_nav,
+        });
+    }
 
     switch (event.base_key) {
         .char => |c| {
+            // macOS sends ESC+b/f for Alt+Left/Right (readline-style word navigation)
+            if (event.alt) {
+                switch (c) {
+                    'b', 'B' => {
+                        if (event.shift) {
+                            renderer.handleSelectWordLeft();
+                        } else {
+                            renderer.handleWordLeft();
+                        }
+                        viewer.ui_dirty = true;
+                        return;
+                    },
+                    'f', 'F' => {
+                        if (event.shift) {
+                            renderer.handleSelectWordRight();
+                        } else {
+                            renderer.handleWordRight();
+                        }
+                        viewer.ui_dirty = true;
+                        return;
+                    },
+                    else => {},
+                }
+            }
             renderer.handleChar(c);
             viewer.ui_dirty = true;
         },
@@ -259,7 +291,9 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
             viewer.ui_dirty = true;
         },
         .left => {
-            if (event.shift) {
+            if (event.shift and word_nav) {
+                renderer.handleSelectWordLeft();
+            } else if (event.shift) {
                 renderer.handleSelectLeft();
             } else if (line_nav) {
                 renderer.handleHome();
@@ -271,7 +305,9 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
             viewer.ui_dirty = true;
         },
         .right => {
-            if (event.shift) {
+            if (event.shift and word_nav) {
+                renderer.handleSelectWordRight();
+            } else if (event.shift) {
                 renderer.handleSelectRight();
             } else if (line_nav) {
                 renderer.handleEnd();
