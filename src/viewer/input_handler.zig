@@ -225,20 +225,6 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
                 viewer.log("[SCROLL] Up failed: {}\n", .{err});
             };
         },
-        .dev_console => {
-            // Get DevTools URL and navigate to it
-            if (viewer.cdp_client.getDevToolsUrl()) |url| {
-                defer viewer.allocator.free(url);
-                viewer.log("[DEV] Opening DevTools: {s}\n", .{url});
-
-                // Navigate to DevTools URL in current tab
-                screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url) catch |err| {
-                    viewer.log("[DEV] Failed to navigate: {}\n", .{err});
-                };
-            } else {
-                viewer.log("[DEV] Failed to get DevTools URL\n", .{});
-            }
-        },
         .new_tab => {
             const tabs_mod = @import("tabs.zig");
             tabs_mod.createNewTab(viewer) catch |err| {
@@ -507,9 +493,6 @@ fn isActionDisabled(viewer: anytype, action: AppAction) bool {
 
     // If hints are disabled, block hint mode
     if (viewer.hints_disabled and action == .enter_hint_mode) return true;
-
-    // If devtools is disabled, block dev_console
-    if (viewer.devtools_disabled and action == .dev_console) return true;
 
     // If toolbar is disabled, block navigation actions
     if (viewer.toolbar_disabled) {

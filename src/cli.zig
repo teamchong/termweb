@@ -9,6 +9,7 @@ const screenshot_api = @import("chrome/screenshot.zig");
 const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 const toolbar_mod = @import("ui/toolbar.zig");
+const helpers = @import("viewer/helpers.zig");
 
 /// Version from package.json (single source of truth)
 const VERSION = build_options.version;
@@ -93,7 +94,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     if (args.len < 1) {
         std.debug.print("Error: URL required\n", .{});
-        std.debug.print("Usage: termweb open <url> [--mobile] [--scale N]\n", .{});
+        std.debug.print("Usage: termweb open <url> [options]\n", .{});
         std.process.exit(1);
     }
 
@@ -128,13 +129,10 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             url = normalized_url.?;
         }
     }
-    var mobile = false;
-    var scale: f32 = 1.0;
     var clone_profile: ?[]const u8 = null; // Default: no profile cloning
     var no_toolbar = false;
     var disable_hotkeys = false;
     var disable_hints = false;
-    var disable_devtools = false;
     var browser_path: ?[]const u8 = null;
     var disable_gpu = false;
     var fps: u32 = config.DEFAULT_FPS;
@@ -143,16 +141,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--mobile")) {
-            mobile = true;
-        } else if (std.mem.eql(u8, arg, "--scale")) {
-            if (i + 1 >= args.len) {
-                std.debug.print("Error: --scale requires a value\n", .{});
-                std.process.exit(1);
-            }
-            i += 1;
-            scale = try std.fmt.parseFloat(f32, args[i]);
-        } else if (std.mem.eql(u8, arg, "--profile")) {
+        if (std.mem.eql(u8, arg, "--profile")) {
             // --profile [name] - name is optional, defaults to "Default"
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 i += 1;
@@ -173,8 +162,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             disable_hotkeys = true;
         } else if (std.mem.eql(u8, arg, "--disable-hints")) {
             disable_hints = true;
-        } else if (std.mem.eql(u8, arg, "--disable-devtools")) {
-            disable_devtools = true;
         } else if (std.mem.eql(u8, arg, "--disable-gpu")) {
             disable_gpu = true;
         } else if (std.mem.eql(u8, arg, "--fps")) {
@@ -193,10 +180,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
         // --list-profiles and --list-browsers are handled at the start of cmdOpen
     }
-
-    // TODO: Implement mobile viewport and scaling
-    if (mobile) std.debug.print("Note: --mobile not yet implemented\n", .{});
-    if (scale != 1.0) std.debug.print("Note: --scale not yet implemented\n", .{});
 
     // Get terminal size for viewport
     var term = terminal_mod.Terminal.init();
@@ -348,9 +331,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (disable_hints) {
         viewer.disableHints();
     }
-    if (disable_devtools) {
-        viewer.disableDevtools();
-    }
 
     try viewer.run();
 }
@@ -371,13 +351,10 @@ fn printHelp() void {
         \\  --no-toolbar          Hide navigation bar (app/kiosk mode)
         \\  --disable-hotkeys     Disable all keyboard shortcuts (except Ctrl+Q)
         \\  --disable-hints       Disable Ctrl+H hint mode
-        \\  --disable-devtools    Disable Ctrl+I DevTools hotkey
         \\  --browser-path <path> Path to browser executable
         \\  --fps <N>             Set frame rate 1-60 (default: 30, use 12 for SSH)
         \\  --list-profiles       Show available Chrome profiles
         \\  --list-browsers       Show available browsers
-        \\  --mobile              Use mobile viewport
-        \\  --scale N             Set zoom scale (default: 1.0)
         \\
         \\Keyboard (all shortcuts use Ctrl):
         \\  Ctrl+Q                Quit
@@ -396,7 +373,6 @@ fn printHelp() void {
         \\  Ctrl+X                Cut selection
         \\  Ctrl+V                Paste
         \\  Ctrl+A                Select all
-        \\  Ctrl+I                Open DevTools in browser
         \\
         \\Hint Mode:
         \\  Press Ctrl+H to show clickable element labels.

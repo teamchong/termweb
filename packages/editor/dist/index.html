@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>termweb-editor</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      overflow: hidden;
+      background: #1e1e1e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: #cccccc;
+    }
+    #header {
+      height: 36px;
+      background: #252526;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    #back-btn {
+      background: none;
+      border: none;
+      color: #cccccc;
+      font-size: 16px;
+      cursor: pointer;
+      margin-right: 8px;
+      padding: 4px 8px;
+      display: none;
+    }
+    #back-btn:hover { background: #3c3c3c; border-radius: 4px; }
+    #back-btn.visible { display: block; }
+    #title { font-size: 13px; flex: 1; }
+    #status { font-size: 12px; margin-left: 12px; }
+    #status.saved { color: #6a9955; }
+    #status.modified { color: #dcdcaa; }
+    #status.saving { color: #569cd6; }
+    #status.error { color: #f14c4c; }
+
+    #browser { display: none; height: calc(100vh - 60px); overflow: auto; padding: 8px; }
+    #browser.active { display: block; }
+    .file-item { display: flex; align-items: center; padding: 8px 12px; cursor: pointer; border-radius: 4px; }
+    .file-item:hover { background: #2a2d2e; }
+    .file-icon { width: 24px; margin-right: 10px; }
+    .folder-icon { color: #dcb67a; }
+    .file-icon-default { color: #519aba; }
+
+    #editor-container { display: none; height: calc(100vh - 60px); }
+    #editor-container.active { display: block; }
+    #editor { width: 100%; height: 100%; }
+
+    /* CodeMirror dark theme overrides */
+    .cm-editor { height: 100%; font-size: 14px; }
+    .cm-editor .cm-scroller { overflow: auto; }
+    .cm-gutters { background: #1e1e1e; border-right: 1px solid #3c3c3c; }
+    .cm-activeLineGutter { background: #282828; }
+    .cm-activeLine { background: #282828 !important; }
+
+    #footer {
+      position: fixed; bottom: 0; left: 0; right: 0; height: 24px;
+      background: #007acc; display: flex; align-items: center;
+      padding: 0 12px; font-size: 11px; color: white;
+    }
+    #footer span { margin-right: 16px; }
+    #footer kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
+    #vim-indicator { display: none; margin-left: auto; }
+    #vim-indicator.active { display: block; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <button id="back-btn">&larr;</button>
+    <span id="title">Loading...</span>
+    <span id="status"></span>
+  </div>
+  <div id="browser"></div>
+  <div id="editor-container"><div id="editor"></div></div>
+  <div id="footer">
+    <span><kbd>Ctrl+S</kbd> Save</span>
+    <span><kbd>Ctrl+Z</kbd> Undo</span>
+    <span><kbd>Ctrl+Q</kbd> Quit</span>
+    <span id="vim-indicator">VIM</span>
+  </div>
+
+  <!-- CodeMirror 6 via ESM CDN -->
+  <script type="module">
+    import {EditorView, basicSetup} from 'https://esm.sh/@codemirror/basic-setup@0.20.0';
+    import {EditorState} from 'https://esm.sh/@codemirror/state@6.4.0';
+    import {keymap} from 'https://esm.sh/@codemirror/view@6.24.0';
+    import {javascript} from 'https://esm.sh/@codemirror/lang-javascript@6.2.1';
+    import {python} from 'https://esm.sh/@codemirror/lang-python@6.1.4';
+    import {html} from 'https://esm.sh/@codemirror/lang-html@6.4.7';
+    import {css} from 'https://esm.sh/@codemirror/lang-css@6.2.1';
+    import {json} from 'https://esm.sh/@codemirror/lang-json@6.0.1';
+    import {markdown} from 'https://esm.sh/@codemirror/lang-markdown@6.2.3';
+    import {rust} from 'https://esm.sh/@codemirror/lang-rust@6.0.1';
+    import {cpp} from 'https://esm.sh/@codemirror/lang-cpp@6.0.2';
+    import {java} from 'https://esm.sh/@codemirror/lang-java@6.0.1';
+    import {sql} from 'https://esm.sh/@codemirror/lang-sql@6.5.4';
+    import {xml} from 'https://esm.sh/@codemirror/lang-xml@6.0.2';
+    import {oneDark} from 'https://esm.sh/@codemirror/theme-one-dark@6.1.2';
+    import {vim} from 'https://esm.sh/@replit/codemirror-vim@6.1.0';
+    import {indentWithTab} from 'https://esm.sh/@codemirror/commands@6.3.3';
+
+    // termweb FS IPC
+    const pendingFS = new Map();
+    let fsId = 0;
+
+    window.__termwebFSResponse = (id, success, data) => {
+      const resolve = pendingFS.get(id);
+      if (resolve) {
+        pendingFS.delete(id);
+        resolve({ success, data });
+      }
+    };
+
+    function fsCall(op, path, data = '') {
+      return new Promise(resolve => {
+        const id = ++fsId;
+        pendingFS.set(id, resolve);
+        const msg = data ? `__TERMWEB_FS__:${id}:${op}:${path}:${data}` : `__TERMWEB_FS__:${id}:${op}:${path}`;
+        console.log(msg);
+        setTimeout(() => {
+          if (pendingFS.has(id)) {
+            pendingFS.delete(id);
+            resolve({ success: false, data: 'Timeout' });
+          }
+        }, 5000);
+      });
+    }
+
+    // Language mapping
+    const langMap = {
+      js: javascript, jsx: javascript, ts: javascript, tsx: javascript, mjs: javascript,
+      py: python, go: null, rs: rust, java: java, c: cpp, cpp: cpp, h: cpp, hpp: cpp,
+      json: json, html: html, htm: html, css: css, scss: css, less: css,
+      md: markdown, markdown: markdown,
+      sh: null, bash: null, zsh: null,
+      yaml: null, yml: null, xml: xml, sql: sql, zig: null,
+    };
+
+    function getLanguage(name) {
+      const ext = name.split('.').pop()?.toLowerCase() || '';
+      const lang = langMap[ext];
+      return lang ? lang() : [];
+    }
+
+    // State
+    let editorView = null;
+    let currentMode = 'browser';
+    let currentFile = null;
+    let currentDir = '';
+    let originalContent = '';
+    let isModified = false;
+
+    // Parse URL params
+    const params = new URLSearchParams(location.search);
+    const initPath = params.get('path') || '.';
+    const initIsDir = params.get('isDir') === '1';
+    const initContent = params.get('content');
+    const enableVim = params.get('vim') === '1';
+
+    if (enableVim) {
+      document.getElementById('vim-indicator').classList.add('active');
+    }
+
+    async function init() {
+      if (initIsDir) {
+        currentDir = initPath;
+        await showBrowser(initPath);
+      } else {
+        const content = initContent ? atob(initContent) : '';
+        showEditor(initPath, content);
+      }
+    }
+
+    async function showBrowser(dir) {
+      currentMode = 'browser';
+      currentDir = dir;
+      document.getElementById('browser').classList.add('active');
+      document.getElementById('editor-container').classList.remove('active');
+      document.getElementById('back-btn').classList.remove('visible');
+      document.getElementById('status').textContent = '';
+      document.getElementById('title').textContent = dir;
+
+      const res = await fsCall('readdir', dir);
+      if (!res.success) {
+        document.getElementById('browser').innerHTML = '<div style="padding:20px;color:#f14c4c">Error: ' + res.data + '</div>';
+        return;
+      }
+
+      const files = JSON.parse(res.data);
+      const browser = document.getElementById('browser');
+      browser.innerHTML = '';
+
+      // Parent directory
+      const parent = dir.split('/').slice(0, -1).join('/') || '/';
+      if (parent !== dir) {
+        const item = document.createElement('div');
+        item.className = 'file-item';
+        item.innerHTML = '<span class="file-icon folder-icon">..</span><span>..</span>';
+        item.onclick = () => showBrowser(parent);
+        browser.appendChild(item);
+      }
+
+      for (const file of files) {
+        const item = document.createElement('div');
+        item.className = 'file-item';
+        const icon = file.isDir ? '<span class="file-icon folder-icon">📁</span>' : '<span class="file-icon file-icon-default">📄</span>';
+        item.innerHTML = icon + '<span>' + file.name + '</span>';
+        item.onclick = () => openPath(file.path, file.isDir);
+        browser.appendChild(item);
+      }
+    }
+
+    async function openPath(path, isDir) {
+      if (isDir) {
+        await showBrowser(path);
+      } else {
+        const res = await fsCall('readfile', path);
+        if (res.success) {
+          showEditor(path, res.data);
+        } else {
+          alert('Error reading file: ' + res.data);
+        }
+      }
+    }
+
+    function showEditor(path, content) {
+      currentMode = 'editor';
+      currentFile = path;
+      originalContent = content;
+      isModified = false;
+
+      document.getElementById('browser').classList.remove('active');
+      document.getElementById('editor-container').classList.add('active');
+      document.getElementById('back-btn').classList.add('visible');
+      document.getElementById('title').textContent = path.split('/').pop();
+      updateStatus();
+
+      const editorEl = document.getElementById('editor');
+      editorEl.innerHTML = '';
+
+      // Build extensions
+      const extensions = [
+        basicSetup,
+        oneDark,
+        getLanguage(path),
+        keymap.of([indentWithTab]),
+        keymap.of([{
+          key: 'Ctrl-s',
+          run: () => { saveFile(); return true; },
+          preventDefault: true
+        }]),
+        keymap.of([{
+          key: 'Escape',
+          run: () => { goBack(); return true; }
+        }]),
+        EditorView.updateListener.of(update => {
+          if (update.docChanged) {
+            isModified = editorView.state.doc.toString() !== originalContent;
+            updateStatus();
+          }
+        }),
+        EditorView.theme({
+          '&': { height: '100%' },
+          '.cm-scroller': { overflow: 'auto' }
+        })
+      ];
+
+      if (enableVim) {
+        extensions.unshift(vim());
+      }
+
+      const state = EditorState.create({
+        doc: content,
+        extensions
+      });
+
+      editorView = new EditorView({
+        state,
+        parent: editorEl
+      });
+
+      setTimeout(() => editorView.focus(), 100);
+    }
+
+    function updateStatus() {
+      const s = document.getElementById('status');
+      s.textContent = isModified ? 'Modified' : 'Saved';
+      s.className = isModified ? 'modified' : 'saved';
+    }
+
+    async function saveFile() {
+      if (!currentFile || !editorView) return;
+
+      const s = document.getElementById('status');
+      s.textContent = 'Saving...';
+      s.className = 'saving';
+
+      const content = editorView.state.doc.toString();
+      const encoded = btoa(unescape(encodeURIComponent(content)));
+      const res = await fsCall('writefile', currentFile, encoded);
+
+      if (res.success) {
+        originalContent = content;
+        isModified = false;
+        s.textContent = 'Saved';
+        s.className = 'saved';
+      } else {
+        s.textContent = 'Error: ' + res.data;
+        s.className = 'error';
+      }
+    }
+
+    function goBack() {
+      if (currentMode === 'editor' && currentDir) {
+        showBrowser(currentDir);
+      }
+    }
+
+    document.getElementById('back-btn').onclick = goBack;
+    init();
+  </script>
+</body>
+</html>

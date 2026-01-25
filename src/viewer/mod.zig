@@ -23,7 +23,6 @@ pub const getMimeType = helpers.getMimeType;
 pub const base64Decode = helpers.base64Decode;
 pub const isPathAllowed = fs_handler.isPathAllowed;
 pub const envVarTruthy = helpers.envVarTruthy;
-pub const isGhosttyTerminal = helpers.isGhosttyTerminal;
 pub const isNaturalScrollEnabled = helpers.isNaturalScrollEnabled;
 pub const parseDialogType = helpers.parseDialogType;
 pub const parseDialogMessage = helpers.parseDialogMessage;

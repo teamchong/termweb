@@ -33,7 +33,6 @@ pub const AppAction = enum {
     enter_hint_mode,
     scroll_down,
     scroll_up,
-    dev_console,
     new_tab,
     close_tab,
 };
@@ -83,9 +82,6 @@ pub const app_shortcuts = [_]ShortcutDef{
     // Vim-style scrolling
     .{ .key = .{ .char = 'j' }, .shortcut_mod = false, .ctrl = true, .action = .scroll_down },
     .{ .key = .{ .char = 'k' }, .shortcut_mod = false, .ctrl = true, .action = .scroll_up },
-
-    // Developer tools
-    .{ .key = .{ .char = 'i' }, .shortcut_mod = false, .ctrl = true, .action = .dev_console },
 
     // Tab management
     .{ .key = .{ .char = 'n' }, .shortcut_mod = false, .ctrl = true, .action = .new_tab },

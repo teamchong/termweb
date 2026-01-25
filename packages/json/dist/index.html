@@ -34,6 +34,7 @@
     #status.modified { color: #dcdcaa; }
     #status.saving { color: #569cd6; }
     #status.error { color: #f14c4c; }
+
     #toolbar {
       height: 32px;
       background: #2d2d2d;
@@ -54,19 +55,22 @@
     }
     #toolbar button:hover { background: #1177bb; }
     #toolbar button:disabled { background: #3c3c3c; color: #888; cursor: not-allowed; }
+    #toolbar button.active { background: #1177bb; box-shadow: inset 0 0 0 1px #fff; }
     #toolbar .separator { width: 1px; height: 20px; background: #3c3c3c; margin: 0 4px; }
-    #error-panel {
-      display: none;
-      background: #5a1d1d;
-      border-bottom: 1px solid #f14c4c;
-      padding: 8px 12px;
-      color: #f14c4c;
-      font-size: 12px;
-      font-family: 'Fira Code', Consolas, monospace;
+
+    #editor-container { width: 100vw; height: calc(100vh - 92px); }
+
+    /* vanilla-jsoneditor dark theme overrides */
+    .jse-main,
+    .jse-contents,
+    .jse-tree-mode,
+    .jse-text-mode {
+      --jse-background-color: #1e1e1e !important;
+      --jse-text-color: #cccccc !important;
+      --jse-panel-background: #252526 !important;
+      --jse-selection-background-color: #264f78 !important;
     }
-    #error-panel.visible { display: block; }
-    #editor { width: 100vw; height: calc(100vh - 92px); }
-    #editor.with-error { height: calc(100vh - 132px); }
+
     #shortcuts {
       position: fixed;
       bottom: 0;
@@ -83,6 +87,7 @@
     #shortcuts span { margin-right: 16px; }
     #shortcuts kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
   </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vanilla-jsoneditor@0.23.8/themes/jse-theme-dark.css">
 </head>
 <body>
   <div id="header">
@@ -94,22 +99,26 @@
     <span id="status">Saved</span>
   </div>
   <div id="toolbar">
+    <button id="btn-tree" class="active">Tree</button>
+    <button id="btn-text">Text</button>
+    <div class="separator"></div>
     <button id="btn-format">Format</button>
     <button id="btn-minify">Minify</button>
     <div class="separator"></div>
     <button id="btn-sort">Sort Keys</button>
+    <button id="btn-expand">Expand All</button>
+    <button id="btn-collapse">Collapse All</button>
   </div>
-  <div id="error-panel"></div>
-  <div id="editor"></div>
+  <div id="editor-container"></div>
   <div id="shortcuts">
     <span><kbd>Ctrl+S</kbd> Save</span>
-    <span><kbd>Ctrl+Shift+F</kbd> Format</span>
-    <span><kbd>Ctrl+Z</kbd> Undo</span>
+    <span><kbd>Ctrl+\\</kbd> Format</span>
     <span><kbd>Ctrl+Q</kbd> Quit</span>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
-  <script>
+  <script type="module">
+    import { JSONEditor } from 'https://cdn.jsdelivr.net/npm/vanilla-jsoneditor@0.23.8/standalone.js';
+
     // termweb FS IPC
     const pendingFS = new Map();
     let fsId = 0;
@@ -142,14 +151,13 @@
     let isModified = false;
     let currentError = null;
     let currentFile = null;
+    let currentMode = 'tree';
 
     const params = new URLSearchParams(location.search);
     const filePath = params.get('path') || '';
     const initContent = params.get('content');
 
-    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
-
-    require(['vs/editor/editor.main'], function () {
+    function init() {
       const fileName = filePath.split('/').pop();
       const content = initContent ? atob(initContent) : '{}';
 
@@ -158,98 +166,111 @@
       document.title = `${fileName} - termweb-json`;
       originalContent = content;
 
-      editor = monaco.editor.create(document.getElementById('editor'), {
-        value: content,
-        language: 'json',
-        theme: 'vs-dark',
-        fontSize: 14,
-        lineNumbers: 'on',
-        minimap: { enabled: true },
-        scrollBeyondLastLine: false,
-        automaticLayout: true,
-        wordWrap: 'on',
-        tabSize: 2,
-        insertSpaces: true,
-        renderWhitespace: 'selection',
-        cursorBlinking: 'smooth',
-        smoothScrolling: true,
-        padding: { top: 8 },
-        folding: true,
-        foldingStrategy: 'indentation',
-        formatOnPaste: true,
+      let initialJson;
+      try {
+        initialJson = JSON.parse(content);
+        updateValidation(true);
+      } catch (err) {
+        initialJson = {};
+        updateValidation(false, err.message);
+      }
+
+      editor = new JSONEditor({
+        target: document.getElementById('editor-container'),
+        props: {
+          content: { json: initialJson },
+          mode: 'tree',
+          mainMenuBar: false,
+          navigationBar: true,
+          statusBar: true,
+          onChange: (updatedContent, previousContent, { contentErrors }) => {
+            if (contentErrors) {
+              currentError = contentErrors;
+              updateValidation(false, contentErrors.parseError?.message || 'Invalid JSON');
+            } else {
+              currentError = null;
+              updateValidation(true);
+            }
+
+            // Check if modified
+            try {
+              const currentText = editor.get().text || JSON.stringify(editor.get().json);
+              isModified = currentText !== originalContent;
+              updateStatus();
+            } catch (e) {
+              isModified = true;
+              updateStatus();
+            }
+          }
+        }
       });
 
-      editor.onDidChangeModelContent(() => {
-        const currentContent = editor.getValue();
-        isModified = currentContent !== originalContent;
-        updateStatus();
-        validateJson(currentContent);
+      // Keyboard shortcuts
+      document.addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.key === 's') {
+          e.preventDefault();
+          saveFile();
+        } else if (e.ctrlKey && e.key === '\\') {
+          e.preventDefault();
+          formatJson();
+        }
       });
 
-      validateJson(content);
-      // Use WinCtrl for Ctrl on Mac (termweb uses Ctrl on all platforms)
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyS, saveFile);
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyF, formatJson);
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyF, formatJson);
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyM, minifyJson);
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyM, minifyJson);
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
-      setTimeout(() => editor.focus(), 100);
-
+      // Toolbar buttons
+      document.getElementById('btn-tree').addEventListener('click', () => switchMode('tree'));
+      document.getElementById('btn-text').addEventListener('click', () => switchMode('text'));
       document.getElementById('btn-format').addEventListener('click', formatJson);
       document.getElementById('btn-minify').addEventListener('click', minifyJson);
       document.getElementById('btn-sort').addEventListener('click', sortKeys);
-    });
+      document.getElementById('btn-expand').addEventListener('click', () => editor.expand(() => true));
+      document.getElementById('btn-collapse').addEventListener('click', () => editor.collapse(() => true));
+    }
 
-    function validateJson(content) {
+    function switchMode(mode) {
+      currentMode = mode;
+      editor.updateProps({ mode });
+      document.getElementById('btn-tree').classList.toggle('active', mode === 'tree');
+      document.getElementById('btn-text').classList.toggle('active', mode === 'text');
+    }
+
+    function updateValidation(valid, errorMsg = '') {
       const validation = document.getElementById('validation');
-      const errorPanel = document.getElementById('error-panel');
-      const editorEl = document.getElementById('editor');
-
-      try {
-        JSON.parse(content);
-        currentError = null;
+      if (valid) {
         validation.className = 'valid';
         validation.querySelector('.icon').textContent = '\u2713';
         validation.querySelector('.text').textContent = 'Valid JSON';
-        errorPanel.className = '';
-        errorPanel.textContent = '';
-        editorEl.classList.remove('with-error');
-      } catch (err) {
-        currentError = err;
+      } else {
         validation.className = 'invalid';
         validation.querySelector('.icon').textContent = '\u2717';
-        validation.querySelector('.text').textContent = 'Invalid JSON';
-        errorPanel.className = 'visible';
-        errorPanel.textContent = err.message;
-        editorEl.classList.add('with-error');
+        validation.querySelector('.text').textContent = errorMsg.slice(0, 50);
       }
     }
 
     function formatJson() {
       try {
-        const obj = JSON.parse(editor.getValue());
-        editor.setValue(JSON.stringify(obj, null, 2));
+        const content = editor.get();
+        if (content.json) {
+          editor.set({ json: content.json });
+        } else if (content.text) {
+          const parsed = JSON.parse(content.text);
+          editor.set({ json: parsed });
+        }
       } catch (err) {}
     }
 
     function minifyJson() {
       try {
-        const obj = JSON.parse(editor.getValue());
-        editor.setValue(JSON.stringify(obj));
+        const content = editor.get();
+        const json = content.json || JSON.parse(content.text);
+        editor.set({ text: JSON.stringify(json) });
       } catch (err) {}
     }
 
     function sortKeys() {
       try {
-        const obj = JSON.parse(editor.getValue());
-        editor.setValue(JSON.stringify(sortObject(obj), null, 2));
+        const content = editor.get();
+        const json = content.json || JSON.parse(content.text);
+        editor.set({ json: sortObject(json) });
       } catch (err) {}
     }
 
@@ -282,23 +303,30 @@
       status.textContent = 'Saving...';
       status.className = 'saving';
 
-      const content = editor.getValue();
-      const encoded = btoa(unescape(encodeURIComponent(content)));
-      const res = await fsCall('writefile', currentFile, encoded);
+      try {
+        const content = editor.get();
+        const text = content.text || JSON.stringify(content.json, null, 2);
+        const encoded = btoa(unescape(encodeURIComponent(text)));
+        const res = await fsCall('writefile', currentFile, encoded);
 
-      if (res.success) {
-        originalContent = content;
-        isModified = false;
-        status.textContent = 'Saved';
-        status.className = '';
-      } else {
-        status.textContent = 'Error: ' + res.data;
+        if (res.success) {
+          originalContent = text;
+          isModified = false;
+          status.textContent = 'Saved';
+          status.className = '';
+        } else {
+          status.textContent = 'Error: ' + res.data;
+          status.className = 'error';
+          setTimeout(updateStatus, 3000);
+        }
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
         status.className = 'error';
         setTimeout(updateStatus, 3000);
       }
     }
 
-    window.addEventListener('resize', () => { if (editor) editor.layout(); });
+    init();
   </script>
 </body>
 </html>

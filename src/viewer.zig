@@ -86,7 +86,6 @@ const PendingTabAdd = struct {
 
 // Use helper functions from viewer module
 const envVarTruthy = viewer_helpers.envVarTruthy;
-const isGhosttyTerminal = viewer_helpers.isGhosttyTerminal;
 const isNaturalScrollEnabled = viewer_helpers.isNaturalScrollEnabled;
 
 /// ViewerMode represents the current interaction mode of the viewer.
@@ -155,7 +154,6 @@ pub const Viewer = struct {
     toolbar_disabled: bool, // --no-toolbar flag
     hotkeys_disabled: bool, // --disable-hotkeys flag
     hints_disabled: bool, // --disable-hints flag
-    devtools_disabled: bool, // --disable-devtools flag
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
     pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
     pending_tab_add: PendingTabAdd, // Deferred tab add (uses atomic ready flag)
@@ -330,7 +328,6 @@ pub const Viewer = struct {
             .toolbar_disabled = false,
             .hotkeys_disabled = false,
             .hints_disabled = false,
-            .devtools_disabled = false,
             .single_tab_mode = false,
             .pending_tab_switch = null,
             .pending_tab_add = .{
@@ -385,7 +382,7 @@ pub const Viewer = struct {
             .cdp_thread_running = std.atomic.Value(bool).init(false),
             .shm_buffer = shm_buffer,
             .natural_scroll = isNaturalScrollEnabled(),
-            .is_ghostty = isGhosttyTerminal(allocator),
+            .is_ghostty = true, // Kitty-compatible terminal required
             .dpr = 2, // Default to HiDPI, will be updated on first resize
             .perf_frame_count = 0,
             .perf_total_render_ns = 0,
@@ -411,11 +408,6 @@ pub const Viewer = struct {
     /// Disable hint mode (Ctrl+H)
     pub fn disableHints(self: *Viewer) void {
         self.hints_disabled = true;
-    }
-
-    /// Disable DevTools hotkey (Ctrl+I)
-    pub fn disableDevtools(self: *Viewer) void {
-        self.devtools_disabled = true;
     }
 
     /// Request a deferred tab switch (processed in main loop to avoid re-entrancy)
@@ -873,10 +865,10 @@ pub const Viewer = struct {
         // Cleanup - clear images, reset screen, show cursor
         self.log("[DEBUG] Clearing screen...\n", .{});
         self.kitty.clearAll(writer) catch {};
+        writer.writeAll("\x1b[0m") catch {}; // Reset all attributes BEFORE clear
         Screen.clear(writer) catch {};
         Screen.showCursor(writer) catch {};
         Screen.moveCursor(writer, 1, 1) catch {};
-        writer.writeAll("\x1b[0m") catch {}; // Reset all attributes
         writer.flush() catch {};
         self.log("[DEBUG] Cleanup complete\n", .{});
     }

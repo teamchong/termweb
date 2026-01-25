@@ -24,8 +24,7 @@ https://github.com/user-attachments/assets/806cac11-3348-48b7-95a0-0c98fd61c873
 - **Tab Management** - Multiple tabs with native OS dialog picker (Cmd+click or Tab button)
 - **Clipboard Integration** - Ctrl+C/X/V for copy/cut/paste (uses system clipboard)
 - **URL Navigation** - Press Ctrl+L to focus address bar
-- **Mobile Testing** - Use `--mobile` flag for mobile viewport
-- **Zoom Control** - Adjust page scale with `--scale` option
+- **Hint Mode** - Vimium-style keyboard navigation (Ctrl+H)
 
 ## Requirements
 
@@ -67,11 +66,14 @@ zig build
 # Open a URL
 termweb open https://example.com
 
-# Mobile viewport
-termweb open https://example.com --mobile
+# Clone Chrome profile (use existing logins, extensions, settings)
+termweb open https://example.com --profile Default
 
-# Custom zoom
-termweb open https://example.com --scale 0.8
+# App mode (hide navigation bar)
+termweb open https://example.com --no-toolbar
+
+# SSH-optimized (lower frame rate)
+termweb open https://example.com --fps 12
 
 # Show help
 termweb help
@@ -89,9 +91,7 @@ termweb.open('https://example.com');
 
 // With options
 termweb.open('https://vscode.dev', {
-  mobile: false,    // Mobile viewport
   toolbar: false,   // Hide navigation toolbar
-  scale: 0.8,       // Page zoom
 });
 
 // Check availability

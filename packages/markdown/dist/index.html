@@ -24,56 +24,105 @@
     #status.modified { color: #dcdcaa; }
     #status.saving { color: #569cd6; }
     #status.error { color: #f14c4c; }
-    #container { display: flex; width: 100vw; height: calc(100vh - 60px); }
-    #editor-pane { width: 50%; height: 100%; border-right: 1px solid #3c3c3c; }
-    #editor { width: 100%; height: 100%; }
-    #preview-pane { width: 50%; height: 100%; overflow: auto; background: #1e1e1e; }
-    #preview {
-      padding: 20px;
+
+    #toolbar {
+      height: 32px;
+      background: #2d2d2d;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      gap: 4px;
+      border-bottom: 1px solid #3c3c3c;
+    }
+    #toolbar button {
+      background: transparent;
+      color: #cccccc;
+      border: none;
+      padding: 4px 8px;
+      font-size: 14px;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    #toolbar button:hover { background: #3c3c3c; }
+    #toolbar .separator { width: 1px; height: 20px; background: #3c3c3c; margin: 0 8px; }
+
+    #editor-container {
+      width: 100vw;
+      height: calc(100vh - 92px);
+      overflow: auto;
+      padding: 20px 40px;
+    }
+
+    /* Milkdown dark theme */
+    .milkdown {
+      background: #1e1e1e;
       color: #d4d4d4;
       line-height: 1.6;
     }
-    #preview h1, #preview h2, #preview h3, #preview h4, #preview h5, #preview h6 {
+    .milkdown .editor {
+      padding: 0;
+      outline: none;
+    }
+    .milkdown h1, .milkdown h2, .milkdown h3, .milkdown h4, .milkdown h5, .milkdown h6 {
       color: #569cd6;
       margin-top: 24px;
       margin-bottom: 16px;
       font-weight: 600;
-      line-height: 1.25;
     }
-    #preview h1 { font-size: 2em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
-    #preview h2 { font-size: 1.5em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
-    #preview h3 { font-size: 1.25em; }
-    #preview p { margin-bottom: 16px; }
-    #preview a { color: #4ec9b0; text-decoration: none; }
-    #preview a:hover { text-decoration: underline; }
-    #preview code {
+    .milkdown h1 { font-size: 2em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
+    .milkdown h2 { font-size: 1.5em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
+    .milkdown p { margin-bottom: 16px; }
+    .milkdown a { color: #4ec9b0; text-decoration: none; }
+    .milkdown a:hover { text-decoration: underline; }
+    .milkdown code {
       background: #2d2d2d;
       padding: 2px 6px;
       border-radius: 4px;
       font-family: 'Fira Code', Consolas, monospace;
       font-size: 0.9em;
     }
-    #preview pre {
+    .milkdown pre {
       background: #2d2d2d;
       padding: 16px;
       border-radius: 6px;
       overflow-x: auto;
       margin-bottom: 16px;
     }
-    #preview pre code { background: transparent; padding: 0; }
-    #preview ul, #preview ol { margin-bottom: 16px; padding-left: 2em; }
-    #preview li { margin-bottom: 4px; }
-    #preview blockquote {
+    .milkdown pre code { background: transparent; padding: 0; }
+    .milkdown ul, .milkdown ol { margin-bottom: 16px; padding-left: 2em; }
+    .milkdown li { margin-bottom: 4px; }
+    .milkdown blockquote {
       border-left: 4px solid #569cd6;
       padding-left: 16px;
       color: #9cdcfe;
       margin-bottom: 16px;
+      margin-left: 0;
     }
-    #preview table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
-    #preview th, #preview td { border: 1px solid #3c3c3c; padding: 8px 12px; text-align: left; }
-    #preview th { background: #252526; }
-    #preview img { max-width: 100%; height: auto; }
-    #preview hr { border: none; border-top: 1px solid #3c3c3c; margin: 24px 0; }
+    .milkdown table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+    .milkdown th, .milkdown td { border: 1px solid #3c3c3c; padding: 8px 12px; text-align: left; }
+    .milkdown th { background: #252526; }
+    .milkdown img { max-width: 100%; height: auto; }
+    .milkdown hr { border: none; border-top: 1px solid #3c3c3c; margin: 24px 0; }
+    .milkdown .task-list-item { list-style: none; margin-left: -1.5em; }
+    .milkdown .task-list-item input { margin-right: 0.5em; }
+
+    /* Slash menu */
+    .milkdown-menu {
+      background: #252526;
+      border: 1px solid #3c3c3c;
+      border-radius: 6px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      padding: 4px;
+    }
+    .milkdown-menu-item {
+      padding: 8px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .milkdown-menu-item:hover, .milkdown-menu-item.active {
+      background: #3c3c3c;
+    }
+
     #shortcuts {
       position: fixed;
       bottom: 0;
@@ -89,19 +138,6 @@
     }
     #shortcuts span { margin-right: 16px; }
     #shortcuts kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
-    .pane-label {
-      position: absolute;
-      top: 44px;
-      padding: 4px 12px;
-      background: #3c3c3c;
-      color: #888;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      z-index: 10;
-    }
-    #editor-label { left: 8px; }
-    #preview-label { left: calc(50% + 8px); }
   </style>
 </head>
 <body>
@@ -109,27 +145,43 @@
     <span id="filename">Loading...</span>
     <span id="status">Saved</span>
   </div>
-  <span id="editor-label" class="pane-label">Editor</span>
-  <span id="preview-label" class="pane-label">Preview</span>
-  <div id="container">
-    <div id="editor-pane">
-      <div id="editor"></div>
-    </div>
-    <div id="preview-pane">
-      <div id="preview"></div>
-    </div>
+  <div id="toolbar">
+    <button id="btn-h1" title="Heading 1">H1</button>
+    <button id="btn-h2" title="Heading 2">H2</button>
+    <button id="btn-h3" title="Heading 3">H3</button>
+    <div class="separator"></div>
+    <button id="btn-bold" title="Bold (Ctrl+B)"><b>B</b></button>
+    <button id="btn-italic" title="Italic (Ctrl+I)"><i>I</i></button>
+    <button id="btn-code" title="Code">&lt;/&gt;</button>
+    <div class="separator"></div>
+    <button id="btn-ul" title="Bullet List">&#8226; List</button>
+    <button id="btn-ol" title="Numbered List">1. List</button>
+    <button id="btn-quote" title="Quote">&ldquo;</button>
+    <div class="separator"></div>
+    <button id="btn-link" title="Link">Link</button>
+    <button id="btn-image" title="Image">Image</button>
+    <button id="btn-table" title="Table">Table</button>
+  </div>
+  <div id="editor-container">
+    <div id="editor"></div>
   </div>
   <div id="shortcuts">
     <span><kbd>Ctrl+S</kbd> Save</span>
     <span><kbd>Ctrl+B</kbd> Bold</span>
     <span><kbd>Ctrl+I</kbd> Italic</span>
-    <span><kbd>Ctrl+Z</kbd> Undo</span>
+    <span><kbd>/</kbd> Slash Commands</span>
     <span><kbd>Ctrl+Q</kbd> Quit</span>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
-  <script>
+  <script type="module">
+    import { Editor, rootCtx, defaultValueCtx } from 'https://esm.sh/@milkdown/core@7.3.6';
+    import { commonmark } from 'https://esm.sh/@milkdown/preset-commonmark@7.3.6';
+    import { gfm } from 'https://esm.sh/@milkdown/preset-gfm@7.3.6';
+    import { listener, listenerCtx } from 'https://esm.sh/@milkdown/plugin-listener@7.3.6';
+    import { history } from 'https://esm.sh/@milkdown/plugin-history@7.3.6';
+    import { clipboard } from 'https://esm.sh/@milkdown/plugin-clipboard@7.3.6';
+    import { getMarkdown, replaceAll } from 'https://esm.sh/@milkdown/utils@7.3.6';
+
     // termweb FS IPC
     const pendingFS = new Map();
     let fsId = 0;
@@ -160,77 +212,79 @@
     let editor;
     let originalContent = '';
     let isModified = false;
-    let updateTimeout;
     let currentFile = null;
 
     const params = new URLSearchParams(location.search);
     const filePath = params.get('path') || '';
     const initContent = params.get('content');
 
-    marked.setOptions({ breaks: true, gfm: true });
-
-    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
-
-    require(['vs/editor/editor.main'], function () {
+    async function init() {
       const fileName = filePath.split('/').pop();
-      const content = initContent ? atob(initContent) : '# New Document\n';
+      const content = initContent ? atob(initContent) : '# New Document\n\nStart writing here...\n';
 
       currentFile = filePath;
       document.getElementById('filename').textContent = fileName;
       document.title = `${fileName} - termweb-markdown`;
       originalContent = content;
-      updatePreview(content);
 
-      editor = monaco.editor.create(document.getElementById('editor'), {
-        value: content,
-        language: 'markdown',
-        theme: 'vs-dark',
-        fontSize: 14,
-        lineNumbers: 'on',
-        minimap: { enabled: false },
-        scrollBeyondLastLine: false,
-        automaticLayout: true,
-        wordWrap: 'on',
-        tabSize: 2,
-        insertSpaces: true,
-        cursorBlinking: 'smooth',
-        smoothScrolling: true,
-        padding: { top: 32 },
+      editor = await Editor.make()
+        .config((ctx) => {
+          ctx.set(rootCtx, document.getElementById('editor'));
+          ctx.set(defaultValueCtx, content);
+          ctx.get(listenerCtx).markdownUpdated((ctx, markdown) => {
+            isModified = markdown !== originalContent;
+            updateStatus();
+          });
+        })
+        .use(commonmark)
+        .use(gfm)
+        .use(listener)
+        .use(history)
+        .use(clipboard)
+        .create();
+
+      // Keyboard shortcuts
+      document.addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.key === 's') {
+          e.preventDefault();
+          saveFile();
+        }
       });
 
-      editor.onDidChangeModelContent(() => {
-        const currentContent = editor.getValue();
-        isModified = currentContent !== originalContent;
-        updateStatus();
-        clearTimeout(updateTimeout);
-        updateTimeout = setTimeout(() => updatePreview(currentContent), 150);
-      });
-
-      // Use WinCtrl for Ctrl on Mac (termweb uses Ctrl on all platforms)
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyS, saveFile);
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyB, () => wrapSelection('**', '**'));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, () => wrapSelection('**', '**'));
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyI, () => wrapSelection('*', '*'));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyI, () => wrapSelection('*', '*'));
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'undo', null));
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyZ, () => editor.trigger('keyboard', 'redo', null));
-      editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyY, () => editor.trigger('keyboard', 'redo', null));
-
-      setTimeout(() => editor.focus(), 100);
-    });
-
-    function wrapSelection(before, after) {
-      const selection = editor.getSelection();
-      const text = editor.getModel().getValueInRange(selection);
-      editor.executeEdits('', [{ range: selection, text: `${before}${text}${after}` }]);
+      // Toolbar buttons
+      setupToolbar();
     }
 
-    function updatePreview(content) {
-      document.getElementById('preview').innerHTML = marked.parse(content);
+    function setupToolbar() {
+      document.getElementById('btn-h1').onclick = () => insertMarkdown('# ');
+      document.getElementById('btn-h2').onclick = () => insertMarkdown('## ');
+      document.getElementById('btn-h3').onclick = () => insertMarkdown('### ');
+      document.getElementById('btn-bold').onclick = () => wrapMarkdown('**');
+      document.getElementById('btn-italic').onclick = () => wrapMarkdown('*');
+      document.getElementById('btn-code').onclick = () => wrapMarkdown('`');
+      document.getElementById('btn-ul').onclick = () => insertMarkdown('- ');
+      document.getElementById('btn-ol').onclick = () => insertMarkdown('1. ');
+      document.getElementById('btn-quote').onclick = () => insertMarkdown('> ');
+      document.getElementById('btn-link').onclick = () => insertMarkdown('[link text](url)');
+      document.getElementById('btn-image').onclick = () => insertMarkdown('![alt text](image-url)');
+      document.getElementById('btn-table').onclick = () => insertMarkdown('\n| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |\n');
+    }
+
+    function getMarkdownContent() {
+      if (!editor) return '';
+      return editor.action(getMarkdown());
+    }
+
+    function insertMarkdown(text) {
+      // Get current markdown and append
+      const current = getMarkdownContent();
+      const newContent = current + '\n' + text;
+      editor.action(replaceAll(newContent));
+    }
+
+    function wrapMarkdown(wrapper) {
+      // For now, append wrapped placeholder
+      insertMarkdown(wrapper + 'text' + wrapper);
     }
 
     function updateStatus() {
@@ -244,7 +298,7 @@
       status.textContent = 'Saving...';
       status.className = 'saving';
 
-      const content = editor.getValue();
+      const content = getMarkdownContent();
       const encoded = btoa(unescape(encodeURIComponent(content)));
       const res = await fsCall('writefile', currentFile, encoded);
 
@@ -260,7 +314,7 @@
       }
     }
 
-    window.addEventListener('resize', () => { if (editor) editor.layout(); });
+    init();
   </script>
 </body>
 </html>

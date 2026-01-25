@@ -148,30 +148,6 @@ pub fn envVarTruthy(allocator: std.mem.Allocator, name: []const u8) bool {
         std.mem.eql(u8, value, "yes");
 }
 
-/// Check if running in Ghostty terminal (or compatible Kitty graphics terminal)
-/// Defaults to true for SSH connections or unknown terminals to support remote usage
-pub fn isGhosttyTerminal(allocator: std.mem.Allocator) bool {
-    const term_program = std.process.getEnvVarOwned(allocator, "TERM_PROGRAM") catch null;
-    if (term_program) |tp| {
-        defer allocator.free(tp);
-        if (std.mem.eql(u8, tp, "ghostty")) return true;
-        if (std.mem.eql(u8, tp, "WezTerm")) return true;
-    }
-
-    const term = std.process.getEnvVarOwned(allocator, "TERM") catch null;
-    if (term) |t| {
-        defer allocator.free(t);
-        if (std.mem.indexOf(u8, t, "ghostty") != null) return true;
-        if (std.mem.indexOf(u8, t, "kitty") != null) return true;
-        if (std.mem.indexOf(u8, t, "wezterm") != null) return true;
-    }
-
-    // Default to true: assume Kitty graphics support
-    // This enables SSH usage where TERM may be "dumb" or "xterm-256color"
-    // but the local terminal (Ghostty/Kitty/WezTerm) supports graphics
-    return true;
-}
-
 /// Detect if macOS natural scrolling is enabled
 /// Returns true if natural scrolling is ON (default on macOS)
 pub fn isNaturalScrollEnabled() bool {

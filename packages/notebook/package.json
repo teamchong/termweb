@@ -1,23 +1,24 @@
 {
-  "name": "@termweb/markdown",
+  "name": "@termweb/notebook",
   "version": "0.1.0",
-  "description": "Terminal-based WYSIWYG Markdown editor powered by Milkdown and termweb",
+  "description": "Terminal-based Jupyter notebook viewer and executor powered by JupyterLab and termweb",
   "bin": {
-    "termweb-markdown": "bin/cli.js"
+    "termweb-notebook": "bin/cli.js"
   },
   "scripts": {
     "start": "node bin/cli.js"
   },
   "files": [
     "bin/",
-    "dist/"
+    "dist/",
+    "lib/"
   ],
   "keywords": [
     "terminal",
-    "editor",
-    "milkdown",
-    "markdown",
-    "wysiwyg",
+    "jupyter",
+    "notebook",
+    "python",
+    "ipython",
     "cli"
   ],
   "author": "teamchong",
@@ -25,13 +26,15 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/teamchong/termweb.git",
-    "directory": "packages/markdown"
+    "directory": "packages/notebook"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
     "@termweb/shared": "workspace:*",
-    "termweb": "workspace:*"
+    "termweb": "workspace:*",
+    "ws": "^8.14.0",
+    "uuid": "^9.0.0"
   }
 }

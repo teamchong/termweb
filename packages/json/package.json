@@ -1,7 +1,7 @@
 {
   "name": "@termweb/json",
   "version": "0.1.0",
-  "description": "Terminal-based JSON editor with validation and formatting powered by Monaco Editor and termweb",
+  "description": "Terminal-based JSON editor with tree view, validation, and formatting powered by vanilla-jsoneditor and termweb",
   "bin": {
     "termweb-json": "bin/cli.js"
   },
@@ -15,8 +15,8 @@
   "keywords": [
     "terminal",
     "editor",
-    "monaco",
     "json",
+    "tree",
     "validation",
     "cli"
   ],
@@ -31,6 +31,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@termweb/shared": "workspace:*",
     "termweb": "workspace:*"
   }
 }
