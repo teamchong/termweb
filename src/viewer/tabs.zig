@@ -53,8 +53,8 @@ pub fn showTabPicker(viewer: anytype) !void {
     );
 
     if (selected) |index| {
-        viewer.log("[TABS] Selected tab {}\n", .{index});
-        try switchToTab(viewer, index);
+        viewer.log("[TABS] Selected tab {}, requesting deferred switch\n", .{index});
+        viewer.requestTabSwitch(index);
     }
 }
 
