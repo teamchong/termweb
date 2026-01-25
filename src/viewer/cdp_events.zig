@@ -260,6 +260,27 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
 
 /// Handle console messages - look for special markers
 pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
+    // Check for resize marker (from extension's ResizeObserver)
+    const resize_marker = "__TERMWEB_RESIZE__:";
+    if (std.mem.indexOf(u8, payload, resize_marker)) |resize_pos| {
+        handleResizeEvent(viewer, payload, resize_pos + resize_marker.len);
+        return;
+    }
+
+    // Check for page event marker (from extension)
+    const page_marker = "__TERMWEB_PAGE__:";
+    if (std.mem.indexOf(u8, payload, page_marker)) |page_pos| {
+        handlePageEvent(viewer, payload, page_pos + page_marker.len);
+        return;
+    }
+
+    // Check for bridge ready marker
+    const bridge_marker = "__TERMWEB_BRIDGE__:";
+    if (std.mem.indexOf(u8, payload, bridge_marker) != null) {
+        viewer.log("[EXTENSION] Bridge ready\n", .{});
+        return;
+    }
+
     // Check for clipboard marker
     const clipboard_marker = "__TERMWEB_CLIPBOARD__:";
     if (std.mem.indexOf(u8, payload, clipboard_marker)) |clip_pos| {
@@ -290,6 +311,68 @@ pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
         viewer.log("[CONSOLE MSG] Found picker marker\n", .{});
         try handlePickerRequest(viewer, payload, picker_pos + picker_marker.len);
         return;
+    }
+}
+
+/// Handle resize event from extension - format: W:H
+fn handleResizeEvent(viewer: anytype, payload: []const u8, start: usize) void {
+    // Parse width:height format
+    // Find end of dimension data (end of JSON string or end of meaningful content)
+    const data_start = start;
+    var data_end = start;
+    for (payload[start..]) |c| {
+        if (c == '"' or c == '\n' or c == '\r' or c == ' ') break;
+        data_end += 1;
+    }
+
+    if (data_end <= data_start) return;
+    const dimensions = payload[data_start..data_end];
+
+    // Split on ':'
+    const sep_pos = std.mem.indexOf(u8, dimensions, ":") orelse return;
+    const width_str = dimensions[0..sep_pos];
+    const height_str = dimensions[sep_pos + 1 ..];
+
+    const width = std.fmt.parseInt(u32, width_str, 10) catch return;
+    const height = std.fmt.parseInt(u32, height_str, 10) catch return;
+
+    viewer.log("[RESIZE] Extension reported viewport: {d}x{d}\n", .{ width, height });
+
+    // Update chrome inner dimensions (used for coordinate mapping)
+    viewer.chrome_inner_width = width;
+    viewer.chrome_inner_height = height;
+}
+
+/// Handle page event from extension - format: status:url
+fn handlePageEvent(viewer: anytype, payload: []const u8, start: usize) void {
+    // Parse status:url format
+    const data_start = start;
+    var data_end = start;
+    for (payload[start..]) |c| {
+        if (c == '"' or c == '\n' or c == '\r') break;
+        data_end += 1;
+    }
+
+    if (data_end <= data_start) return;
+    const data = payload[data_start..data_end];
+
+    // Split on first ':'
+    const sep_pos = std.mem.indexOf(u8, data, ":") orelse return;
+    const status = data[0..sep_pos];
+    const url = if (sep_pos + 1 < data.len) data[sep_pos + 1 ..] else "";
+
+    viewer.log("[PAGE EVENT] status={s} url={s}\n", .{ status, url });
+
+    if (std.mem.eql(u8, status, "loading")) {
+        if (!viewer.ui_state.is_loading) {
+            viewer.ui_state.is_loading = true;
+            viewer.loading_started_at = std.time.nanoTimestamp();
+            viewer.ui_dirty = true;
+        }
+    } else if (std.mem.eql(u8, status, "complete")) {
+        viewer.ui_state.is_loading = false;
+        viewer.ui_dirty = true;
+        viewer.needs_nav_state_update = true;
     }
 }
 
@@ -492,12 +575,9 @@ fn handleFsRequest(viewer: anytype, payload: []const u8, start: usize) !void {
     return viewer.handleFsRequest(payload, start);
 }
 
-/// Handle picker request from browser
+/// Handle picker request from browser - delegates to viewer.handlePickerRequest
 fn handlePickerRequest(viewer: anytype, payload: []const u8, start: usize) !void {
-    _ = viewer;
-    _ = payload;
-    _ = start;
-    // Picker handling - can be expanded later
+    return viewer.handlePickerRequest(payload, start);
 }
 
 /// Show file chooser dialog - delegates to viewer.showFileChooser

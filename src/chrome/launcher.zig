@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const detector = @import("detector.zig");
+const extension = @import("extension.zig");
 
 /// Prefix for temporary Chrome profile directories
 pub const TEMP_PROFILE_PREFIX = "termweb-";
@@ -78,6 +79,7 @@ pub const ChromePipeInstance = struct {
     read_fd: std.posix.fd_t, // FD to read from Chrome (Chrome's FD 4)
     write_fd: std.posix.fd_t, // FD to write to Chrome (Chrome's FD 3)
     user_data_dir: []const u8, // Path to temporary user data directory
+    extension_dir: ?[]const u8, // Path to temporary extension directory (if using built-in)
     debug_port: u16, // Random port Chrome is listening on for WebSocket connections
     allocator: std.mem.Allocator,
 
@@ -92,6 +94,12 @@ pub const ChromePipeInstance = struct {
         // Recursively delete temporary user data directory
         std.fs.cwd().deleteTree(self.user_data_dir) catch {};
         self.allocator.free(self.user_data_dir);
+
+        // Clean up extension directory if we created one
+        if (self.extension_dir) |ext_dir| {
+            std.fs.cwd().deleteTree(ext_dir) catch {};
+            self.allocator.free(ext_dir);
+        }
     }
 };
 
@@ -109,7 +117,7 @@ pub const LaunchOptions = struct {
     /// Clone from an existing Chrome profile (e.g., "Default", "Profile 1")
     /// Copies bookmarks, history, cookies, extensions, etc.
     /// Set to "Default" by default, use empty string "" to skip cloning
-    clone_profile: ?[]const u8 = "Default",
+    clone_profile: ?[]const u8 = null, // Default: fresh profile (no cloning)
     /// Path to unpacked extension directory to load
     /// SDK users can provide custom extensions for additional functionality
     extension_path: ?[]const u8 = null,
@@ -337,8 +345,12 @@ pub fn launchChromePipe(
     }
     defer if (owns_path) chrome_bin.deinit();
 
-    // 2. Clean up old crashed profiles (older than 1 hour)
+    // 2. Clean up old crashed profiles and extension directories (older than 1 hour)
     cleanupOldProfiles(3600);
+    extension.cleanupOldExtensions(3600);
+
+    // 2b. Set up built-in termweb extension (required for operation)
+    const builtin_extension_dir = try extension.setupExtension(allocator, options.verbose);
 
     // 3. Create temporary user data directory if not provided
     var temp_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -395,8 +407,10 @@ pub fn launchChromePipe(
         try args_list.append(allocator, "--headless=new");
     }
 
-    try args_list.append(allocator, "--remote-debugging-pipe");
-    try args_list.append(allocator, "--remote-debugging-port=0"); // Let OS pick random available port
+    // NOTE: Using WebSocket only (no pipe) to allow extensions in headless mode
+    // Pipe mode doesn't support extensions ("Multiple targets not supported")
+    // try args_list.append(allocator, "--remote-debugging-pipe");
+    try args_list.append(allocator, "--remote-debugging-port=0");
     try args_list.append(allocator, "--remote-allow-origins=*");
 
     const user_data_arg = try std.fmt.allocPrint(allocator, "--user-data-dir={s}", .{user_data_dir});
@@ -419,16 +433,15 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--renderer-process-limit=1");
     try args_list.append(allocator, "--disable-site-isolation-trials");
     try args_list.append(allocator, "--no-zygote");
-    // Extension loading - if custom extension provided, enable extensions
-    if (options.extension_path) |ext_path| {
-        const load_ext_arg = try std.fmt.allocPrint(allocator, "--load-extension={s}", .{ext_path});
-        defer allocator.free(load_ext_arg);
-        try args_list.append(allocator, load_ext_arg);
-        try args_list.append(allocator, "--disable-component-extensions-with-background-pages"); // Disable built-in background extensions
-    } else {
-        try args_list.append(allocator, "--disable-extensions"); // Disable all extensions
-        try args_list.append(allocator, "--disable-component-extensions-with-background-pages");
-    }
+    // Extension loading - load termweb extension (WebSocket mode supports extensions)
+    // Defer free: dupeZ in argv conversion creates copies, original can be freed
+    const load_ext_arg = if (options.extension_path) |user_ext|
+        try std.fmt.allocPrint(allocator, "--load-extension={s},{s}", .{ builtin_extension_dir, user_ext })
+    else
+        try std.fmt.allocPrint(allocator, "--load-extension={s}", .{builtin_extension_dir});
+    defer allocator.free(load_ext_arg);
+    try args_list.append(allocator, load_ext_arg);
+    try args_list.append(allocator, "--disable-component-extensions-with-background-pages");
     try args_list.append(allocator, "--disable-background-networking");
 
     if (options.disable_gpu) {
@@ -473,23 +486,12 @@ pub fn launchChromePipe(
         std.posix.close(pipe_from_chrome[0]); // Parent's read end
         std.posix.close(stderr_pipe[0]); // Parent's read end of stderr
 
-        // Set up FD 3 (Chrome reads commands from us)
-        if (pipe_to_chrome[0] != 3) {
-            std.posix.dup2(pipe_to_chrome[0], 3) catch std.posix.exit(1);
-            std.posix.close(pipe_to_chrome[0]);
-        }
-
-        // Set up FD 4 (Chrome writes responses to us)
-        if (pipe_from_chrome[1] != 4) {
-            std.posix.dup2(pipe_from_chrome[1], 4) catch std.posix.exit(1);
-            std.posix.close(pipe_from_chrome[1]);
-        }
-
-        // CRITICAL: Clear O_CLOEXEC on FD 3 and 4 so they survive exec
-        const fd3_flags = std.posix.fcntl(3, 1, 0) catch 0;
-        _ = std.posix.fcntl(3, 2, fd3_flags & ~@as(usize, 1)) catch {};
-        const fd4_flags = std.posix.fcntl(4, 1, 0) catch 0;
-        _ = std.posix.fcntl(4, 2, fd4_flags & ~@as(usize, 1)) catch {};
+        // NOTE: WebSocket-only mode - do NOT set up FD 3/4 for pipe
+        // Chrome auto-detects pipe mode if FD 3/4 are open, which triggers
+        // "Multiple targets not supported" error when extensions are loaded
+        // Just close the pipe FDs - we'll use WebSocket for all CDP communication
+        std.posix.close(pipe_to_chrome[0]);
+        std.posix.close(pipe_from_chrome[1]);
 
         // Redirect stdout to /dev/null
         const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(1);
@@ -522,6 +524,11 @@ pub fn launchChromePipe(
     std.posix.close(pipe_from_chrome[1]); // Chrome's write end
     std.posix.close(stderr_pipe[1]); // Child's write end of stderr
 
+    // Close parent ends too - we're using WebSocket-only mode, not pipe mode
+    // These FDs are not used anymore since Chrome doesn't use --remote-debugging-pipe
+    std.posix.close(pipe_to_chrome[1]); // Parent's write end (unused)
+    std.posix.close(pipe_from_chrome[0]); // Parent's read end (unused)
+
     // Read Chrome's stderr to find "DevTools listening on ws://127.0.0.1:PORT/..."
     const debug_port = extractDebugPort(stderr_pipe[0]) catch |err| {
         if (options.verbose) {
@@ -539,14 +546,14 @@ pub fn launchChromePipe(
         std.debug.print("Chrome debugging on port {}\n", .{debug_port});
     }
 
-    // Parent uses:
-    // - pipe_to_chrome[1] to WRITE to Chrome (Chrome's FD 3)
-    // - pipe_from_chrome[0] to READ from Chrome (Chrome's FD 4)
+    // In WebSocket-only mode, we don't use pipe FDs
+    // Set them to -1 to indicate they're not valid
     return ChromePipeInstance{
         .pid = pid,
-        .write_fd = pipe_to_chrome[1],
-        .read_fd = pipe_from_chrome[0],
+        .write_fd = -1, // Not used in WebSocket-only mode
+        .read_fd = -1, // Not used in WebSocket-only mode
         .user_data_dir = try allocator.dupe(u8, user_data_dir),
+        .extension_dir = builtin_extension_dir, // Already allocated by setupExtension
         .debug_port = debug_port,
         .allocator = allocator,
     };
@@ -595,6 +602,10 @@ fn extractDebugPort(stderr_fd: std.posix.fd_t) !u16 {
         }
     }
 
+    // Debug: show Chrome stderr
+    if (total_read > 0) {
+        std.debug.print("Chrome stderr: {s}\n", .{output_buf[0..@min(total_read, 500)]});
+    }
     return LaunchError.TimeoutWaitingForDebugUrl;
 }
 

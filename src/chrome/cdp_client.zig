@@ -55,9 +55,16 @@ pub const CdpEvent = struct {
     }
 };
 
-/// CDP Client - Hybrid Pipe + WebSocket architecture
+/// CDP Client - Supports both Pipe+WebSocket and WebSocket-only modes
+///
+/// Pipe+WebSocket mode (legacy):
 /// - pipe_client: screencast frames (high bandwidth)
 /// - page_ws: all page-level commands (mouse, keyboard, navigation, events)
+/// - browser_ws: browser-level commands (downloads)
+///
+/// WebSocket-only mode (for extension support in headless):
+/// - pipe_client: null
+/// - page_ws: handles EVERYTHING including screencast frames
 /// - browser_ws: browser-level commands (downloads)
 pub const CdpClient = struct {
     allocator: std.mem.Allocator,
@@ -66,7 +73,8 @@ pub const CdpClient = struct {
     current_target_id: ?[]const u8, // Current target ID (for tab switching)
     debug_port: u16, // Chrome's debugging port for WebSocket connections
 
-    // WebSocket clients (pipe is ONLY for screencast frames)
+    // WebSocket clients
+    // In WebSocket-only mode, page_ws handles screencast frames too
     page_ws: ?*websocket_cdp.WebSocketCdpClient, // All page-level commands
     browser_ws: ?*websocket_cdp.WebSocketCdpClient, // Browser-level for downloads
     page_ws_mutex: std.Thread.Mutex, // Protects page_ws reconnection
@@ -97,7 +105,7 @@ pub const CdpClient = struct {
         const network_enable = try client.sendCommand("Network.enable", null);
         allocator.free(network_enable);
 
-        // Intercept file chooser dialogs
+        // Intercept file chooser dialogs (CDP-only feature for <input type="file">)
         const intercept_file = try client.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
         allocator.free(intercept_file);
 
@@ -109,6 +117,7 @@ pub const CdpClient = struct {
         };
 
         // Inject File System Access API polyfill with full file system bridge
+        // Note: In non-headless mode, the termweb extension handles this instead
         // Security: Only allows access to directories user explicitly selected via picker
         const polyfill_script = @embedFile("fs_polyfill.js");
         var polyfill_json_buf: [65536]u8 = undefined;
@@ -125,6 +134,7 @@ pub const CdpClient = struct {
         if (perm_result) |r| allocator.free(r);
 
         // Inject Clipboard interceptor polyfill - runs in all frames (including iframes)
+        // Note: In non-headless mode, the termweb extension handles this instead
         // This enables bidirectional clipboard sync between browser and host
         const clipboard_script = @embedFile("clipboard_polyfill.js");
         var clipboard_json_buf: [16384]u8 = undefined;
@@ -169,6 +179,10 @@ pub const CdpClient = struct {
             // Enable Page domain to receive navigation events
             const page_result = try client.page_ws.?.sendCommand("Page.enable", null);
             allocator.free(page_result);
+
+            // Enable file chooser interception on page_ws (events come from here)
+            const file_result = try client.page_ws.?.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
+            allocator.free(file_result);
         }
 
         // Connect browser_ws for Browser domain events (downloads)
@@ -187,6 +201,113 @@ pub const CdpClient = struct {
                 allocator.free(target_result);
             }
         } else |_| {}
+        return client;
+    }
+
+    /// Initialize CDP client using WebSocket-only mode (for extension support in headless)
+    /// This mode allows extensions to run because Chrome doesn't enter pipe mode
+    /// All CDP communication including screencast goes through WebSocket
+    pub fn initFromWebSocket(allocator: std.mem.Allocator, debug_port: u16) !*CdpClient {
+        const client = try allocator.create(CdpClient);
+        client.* = .{
+            .allocator = allocator,
+            .pipe_client = null, // No pipe in WebSocket-only mode
+            .session_id = null,
+            .current_target_id = null,
+            .debug_port = debug_port,
+            .page_ws = null,
+            .browser_ws = null,
+            .page_ws_mutex = .{},
+        };
+
+        // Create downloads directory
+        std.fs.makeDirAbsolute("/tmp/termweb-downloads") catch |err| {
+            if (err != error.PathAlreadyExists) {
+                logToFile("[CDP] Failed to create download dir: {}\n", .{err});
+            }
+        };
+
+        // Wait for Chrome to be ready on the discovered port with retries
+        var ws_url: ?[]const u8 = null;
+        var retry: u32 = 0;
+        while (retry < 50) : (retry += 1) {
+            std.Thread.sleep(200 * std.time.ns_per_ms);
+            ws_url = client.discoverPageWebSocketUrl(allocator) catch blk: {
+                if (retry % 5 == 0) logToFile("[CDP WS-only] Retry {}/50: Failed to get WS URL\n", .{retry});
+                break :blk null;
+            };
+            if (ws_url != null) break;
+        } else {
+            allocator.destroy(client);
+            return CdpError.WebSocketConnectionFailed;
+        }
+
+        if (ws_url) |url| {
+            defer allocator.free(url);
+
+            // Connect page WebSocket for all page-level commands including screencast
+            client.page_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
+            try client.page_ws.?.startReaderThread();
+
+            // Enable Runtime domain for console events
+            const runtime_result = try client.page_ws.?.sendCommand("Runtime.enable", null);
+            allocator.free(runtime_result);
+
+            // Enable Page domain for navigation events
+            const page_result = try client.page_ws.?.sendCommand("Page.enable", null);
+            allocator.free(page_result);
+
+            // Enable Network domain
+            const network_result = try client.page_ws.?.sendCommand("Network.enable", null);
+            allocator.free(network_result);
+
+            // Intercept file chooser dialogs
+            const file_result = try client.page_ws.?.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
+            allocator.free(file_result);
+
+            // Grant clipboard permissions
+            const perm_result = client.page_ws.?.sendCommand("Browser.grantPermissions", "{\"permissions\":[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]}") catch null;
+            if (perm_result) |r| allocator.free(r);
+
+            // Inject polyfills via Page.addScriptToEvaluateOnNewDocument
+            // Note: In extension mode, the extension handles this, but we inject as backup
+            const polyfill_script = @embedFile("fs_polyfill.js");
+            var polyfill_json_buf: [65536]u8 = undefined;
+            const polyfill_json = json_utils.escapeString(polyfill_script, &polyfill_json_buf) catch return CdpError.OutOfMemory;
+
+            var polyfill_params_buf: [65536]u8 = undefined;
+            const polyfill_params = std.fmt.bufPrint(&polyfill_params_buf, "{{\"source\":{s}}}", .{polyfill_json}) catch return CdpError.OutOfMemory;
+            const polyfill_result = try client.page_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
+            allocator.free(polyfill_result);
+
+            // Inject clipboard polyfill
+            const clipboard_script = @embedFile("clipboard_polyfill.js");
+            var clipboard_json_buf: [16384]u8 = undefined;
+            const clipboard_json = json_utils.escapeString(clipboard_script, &clipboard_json_buf) catch return CdpError.OutOfMemory;
+
+            var clipboard_params_buf: [32768]u8 = undefined;
+            const clipboard_params = std.fmt.bufPrint(&clipboard_params_buf, "{{\"source\":{s}}}", .{clipboard_json}) catch return CdpError.OutOfMemory;
+            const clipboard_result = try client.page_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
+            allocator.free(clipboard_result);
+        }
+
+        // Connect browser_ws for Browser domain events (downloads)
+        if (client.discoverBrowserWebSocketUrl(allocator)) |browser_url| {
+            defer allocator.free(browser_url);
+            client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch null;
+            if (client.browser_ws) |bws| {
+                try bws.startReaderThread();
+                const download_params = "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}";
+                const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
+                allocator.free(download_result);
+
+                // Enable target discovery to detect new tabs/popups
+                const target_result = try bws.sendCommand("Target.setDiscoverTargets", "{\"discover\":true}");
+                allocator.free(target_result);
+            }
+        } else |_| {}
+
+        logToFile("[CDP] Initialized in WebSocket-only mode on port {}\n", .{debug_port});
         return client;
     }
 
@@ -582,27 +703,49 @@ pub const CdpClient = struct {
         const page_result = try self.page_ws.?.sendCommand("Page.enable", null);
         self.allocator.free(page_result);
 
+        // Re-enable file chooser interception
+        logToFile("[CDP reconnectWS] Enabling file chooser interception...\n", .{});
+        const file_result = try self.page_ws.?.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
+        self.allocator.free(file_result);
+
         logToFile("[CDP reconnectWS] Done\n", .{});
     }
 
-    /// Send CDP command and wait for response - uses session
+    /// Send CDP command and wait for response - uses session (pipe) or WebSocket
     pub fn sendCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
+        // WebSocket-only mode: use page_ws
+        if (self.pipe_client == null) {
+            if (self.page_ws) |ws| {
+                return ws.sendCommand(method, params);
+            }
+            return CdpError.WebSocketConnectionFailed;
+        }
+        // Pipe mode: use pipe_client with session
         if (self.session_id != null) {
             return self.pipe_client.?.sendSessionCommand(self.session_id.?, method, params);
         }
         return self.pipe_client.?.sendCommand(method, params);
     }
 
-    /// Send CDP command without waiting for response - uses session
+    /// Send CDP command without waiting for response - uses session (pipe) or WebSocket
     pub fn sendCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) !void {
+        // WebSocket-only mode: use page_ws
+        if (self.pipe_client == null) {
+            if (self.page_ws) |ws| {
+                ws.sendCommandAsync(method, params);
+                return;
+            }
+            return CdpError.WebSocketConnectionFailed;
+        }
+        // Pipe mode: use pipe_client with session
         if (self.session_id != null) {
             return self.pipe_client.?.sendSessionCommandAsync(self.session_id.?, method, params);
         }
@@ -619,10 +762,19 @@ pub const CdpClient = struct {
         height: u32,
         every_nth_frame: u8,
     ) !void {
-        // Start reader thread first
-        try self.pipe_client.?.startReaderThread();
+        // WebSocket-only mode: initialize frame pool in page_ws
+        if (self.pipe_client == null) {
+            if (self.page_ws) |ws| {
+                try ws.initFramePool();
+            } else {
+                return CdpError.WebSocketConnectionFailed;
+            }
+        } else {
+            // Pipe mode: start reader thread
+            try self.pipe_client.?.startReaderThread();
+        }
 
-        // Send startScreencast command with session
+        // Send startScreencast command
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"format\":\"{s}\",\"quality\":{d},\"maxWidth\":{d},\"maxHeight\":{d},\"everyNthFrame\":{d}}}",
@@ -653,15 +805,44 @@ pub const CdpClient = struct {
         if (self.pipe_client) |pc| {
             pc.stopReaderThread();
         }
+        // WebSocket mode: frame pool cleanup happens in deinit
     }
 
     /// Get latest screencast frame (non-blocking)
+    /// Works in both pipe mode and WebSocket-only mode
     pub fn getLatestFrame(self: *CdpClient) ?ScreencastFrame {
+        // WebSocket-only mode: get from page_ws
+        if (self.pipe_client == null) {
+            if (self.page_ws) |ws| {
+                if (ws.getLatestFrame()) |ws_frame| {
+                    // Convert websocket_cdp.ScreencastFrame to cdp_pipe.ScreencastFrame
+                    // They have the same structure, so we can reinterpret
+                    return ScreencastFrame{
+                        .data = ws_frame.data,
+                        .slot = ws_frame.slot,
+                        .session_id = ws_frame.session_id,
+                        .device_width = ws_frame.device_width,
+                        .device_height = ws_frame.device_height,
+                        .generation = ws_frame.generation,
+                    };
+                }
+            }
+            return null;
+        }
+        // Pipe mode
         return self.pipe_client.?.getLatestFrame();
     }
 
     /// Get count of frames received
     pub fn getFrameCount(self: *CdpClient) u32 {
+        // WebSocket-only mode: get from page_ws
+        if (self.pipe_client == null) {
+            if (self.page_ws) |ws| {
+                return ws.getFrameCount();
+            }
+            return 0;
+        }
+        // Pipe mode
         return self.pipe_client.?.getFrameCount();
     }
 
@@ -669,6 +850,10 @@ pub const CdpClient = struct {
     pub fn flushPendingAck(self: *CdpClient) void {
         if (self.pipe_client) |pc| {
             pc.flushPendingAck();
+        }
+        // WebSocket mode: ACKs are sent immediately, no-op
+        if (self.page_ws) |ws| {
+            ws.flushPendingAck();
         }
     }
 
@@ -706,11 +891,46 @@ pub const CdpClient = struct {
     }
 
     /// Switch to a different target (for tab switching)
-    /// Detaches from current session and attaches to new target
-    /// Uses pipe for Target.* commands (session must be on same transport as Page.*)
+    /// In pipe mode: Detaches from current session and attaches to new target
+    /// In WebSocket-only mode: Closes current page_ws and reconnects to new target
     pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {
         logToFile("[CDP switchToTarget] START target={s}\n", .{target_id});
 
+        // WebSocket-only mode: just update target and reconnect
+        if (self.pipe_client == null) {
+            // Update current target ID
+            if (self.current_target_id) |old_tid| {
+                self.allocator.free(old_tid);
+            }
+            self.current_target_id = try self.allocator.dupe(u8, target_id);
+
+            // Activate target via browser_ws
+            if (self.browser_ws) |bws| {
+                var activate_buf: [256]u8 = undefined;
+                const activate_params = std.fmt.bufPrint(&activate_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
+                const activate_result = bws.sendCommand("Target.activateTarget", activate_params) catch |err| {
+                    logToFile("[CDP switchToTarget] Target.activateTarget FAILED: {}\n", .{err});
+                    return err;
+                };
+                self.allocator.free(activate_result);
+            }
+
+            // Close and reconnect page_ws (will connect to new target)
+            {
+                self.page_ws_mutex.lock();
+                defer self.page_ws_mutex.unlock();
+                if (self.page_ws) |ws| {
+                    ws.deinit();
+                    self.page_ws = null;
+                }
+            }
+            // Reconnect immediately (needed for screencast)
+            try self.reconnectPageWebSocket();
+            logToFile("[CDP switchToTarget] END success (WS-only mode)\n", .{});
+            return;
+        }
+
+        // Pipe mode: use session-based attach/detach
         // Detach from current session first (if any) to allow clean re-attach
         if (self.session_id) |old_sid| {
             logToFile("[CDP switchToTarget] Detaching from session: {s}\n", .{old_sid});
@@ -809,9 +1029,21 @@ pub const CdpClient = struct {
         logToFile("[CDP] Creating new target: {s}\n", .{url});
         var buf: [512]u8 = undefined;
         const params = std.fmt.bufPrint(&buf, "{{\"url\":\"{s}\"}}", .{url}) catch return error.OutOfMemory;
-        const result = self.pipe_client.?.sendCommand("Target.createTarget", params) catch |err| {
-            logToFile("[CDP] Target.createTarget failed: {}\n", .{err});
-            return err;
+
+        // Use browser_ws for Target.* commands in WebSocket-only mode
+        const result = if (self.pipe_client == null) blk: {
+            if (self.browser_ws) |bws| {
+                break :blk bws.sendCommand("Target.createTarget", params) catch |err| {
+                    logToFile("[CDP] Target.createTarget failed: {}\n", .{err});
+                    return err;
+                };
+            }
+            return CdpError.WebSocketConnectionFailed;
+        } else blk: {
+            break :blk self.pipe_client.?.sendCommand("Target.createTarget", params) catch |err| {
+                logToFile("[CDP] Target.createTarget failed: {}\n", .{err});
+                return err;
+            };
         };
         defer self.allocator.free(result);
 
@@ -829,12 +1061,23 @@ pub const CdpClient = struct {
     pub fn createAndAttachTarget(self: *CdpClient, url: []const u8) ![]const u8 {
         logToFile("[CDP createAndAttach] START url={s}\n", .{url});
 
-        // Create target
+        // Create target via browser_ws (WebSocket-only) or pipe_client
         var create_buf: [512]u8 = undefined;
         const create_params = std.fmt.bufPrint(&create_buf, "{{\"url\":\"{s}\"}}", .{url}) catch return error.OutOfMemory;
-        const create_result = self.pipe_client.?.sendCommand("Target.createTarget", create_params) catch |err| {
-            logToFile("[CDP createAndAttach] createTarget failed: {}\n", .{err});
-            return err;
+
+        const create_result = if (self.pipe_client == null) blk: {
+            if (self.browser_ws) |bws| {
+                break :blk bws.sendCommand("Target.createTarget", create_params) catch |err| {
+                    logToFile("[CDP createAndAttach] createTarget failed: {}\n", .{err});
+                    return err;
+                };
+            }
+            return CdpError.WebSocketConnectionFailed;
+        } else blk: {
+            break :blk self.pipe_client.?.sendCommand("Target.createTarget", create_params) catch |err| {
+                logToFile("[CDP createAndAttach] createTarget failed: {}\n", .{err});
+                return err;
+            };
         };
         defer self.allocator.free(create_result);
 
@@ -846,6 +1089,29 @@ pub const CdpClient = struct {
         const target_id = create_result[id_start..id_end];
         logToFile("[CDP createAndAttach] Created target: {s}\n", .{target_id});
 
+        // WebSocket-only mode: just update target and reconnect
+        if (self.pipe_client == null) {
+            // Update current target ID
+            if (self.current_target_id) |old_tid| {
+                self.allocator.free(old_tid);
+            }
+            self.current_target_id = try self.allocator.dupe(u8, target_id);
+
+            // Close and reconnect page_ws
+            {
+                self.page_ws_mutex.lock();
+                defer self.page_ws_mutex.unlock();
+                if (self.page_ws) |ws| {
+                    ws.deinit();
+                    self.page_ws = null;
+                }
+            }
+            try self.reconnectPageWebSocket();
+            logToFile("[CDP createAndAttach] END success (WS-only mode)\n", .{});
+            return try self.allocator.dupe(u8, target_id);
+        }
+
+        // Pipe mode: use session-based attach
         // Detach from current session (if any)
         if (self.session_id) |old_sid| {
             var detach_buf: [256]u8 = undefined;
@@ -910,9 +1176,21 @@ pub const CdpClient = struct {
         logToFile("[CDP] Closing target: {s}\n", .{target_id});
         var buf: [256]u8 = undefined;
         const params = std.fmt.bufPrint(&buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
-        const result = self.pipe_client.?.sendCommand("Target.closeTarget", params) catch |err| {
-            logToFile("[CDP] Target.closeTarget failed: {}\n", .{err});
-            return err;
+
+        // Use browser_ws for Target.* commands in WebSocket-only mode
+        const result = if (self.pipe_client == null) blk: {
+            if (self.browser_ws) |bws| {
+                break :blk bws.sendCommand("Target.closeTarget", params) catch |err| {
+                    logToFile("[CDP] Target.closeTarget failed: {}\n", .{err});
+                    return err;
+                };
+            }
+            return CdpError.WebSocketConnectionFailed;
+        } else blk: {
+            break :blk self.pipe_client.?.sendCommand("Target.closeTarget", params) catch |err| {
+                logToFile("[CDP] Target.closeTarget failed: {}\n", .{err});
+                return err;
+            };
         };
         self.allocator.free(result);
     }

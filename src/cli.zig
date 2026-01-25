@@ -135,8 +135,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     var mobile = false;
     var scale: f32 = 1.0;
-    var clone_profile: ?[]const u8 = null; // null means use default from LaunchOptions
-    var no_profile = false;
+    var clone_profile: ?[]const u8 = null; // Default: no profile cloning
     var no_toolbar = false;
     var disable_hotkeys = false;
     var disable_hints = false;
@@ -173,8 +172,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             }
             i += 1;
             browser_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--no-profile")) {
-            no_profile = true;
         } else if (std.mem.eql(u8, arg, "--no-toolbar")) {
             no_toolbar = true;
         } else if (std.mem.eql(u8, arg, "--disable-hotkeys")) {
@@ -272,22 +269,15 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     std.debug.print("Launching browser...\n", .{});
 
     // Determine profile cloning behavior:
-    // - Default: clone "Default" profile (from LaunchOptions default)
-    // - --profile X: clone profile X
-    // - --no-profile: don't clone any profile (fresh)
-    var launch_opts = launcher.LaunchOptions{
+    // Default: fresh profile (no cloning) - avoids Google session logout issues
+    // --profile X: clone profile X for logged-in sessions
+    const launch_opts = launcher.LaunchOptions{
         .viewport_width = viewport_width,
         .viewport_height = viewport_height,
         .browser_path = browser_path,
         .disable_gpu = disable_gpu,
+        .clone_profile = clone_profile,
     };
-
-    // Only override clone_profile if explicitly set
-    if (no_profile) {
-        launch_opts.clone_profile = null;
-    } else if (clone_profile) |p| {
-        launch_opts.clone_profile = p;
-    }
 
     var chrome_instance = launcher.launchChromePipe(allocator, launch_opts) catch |err| {
         switch (err) {
@@ -309,8 +299,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer chrome_instance.deinit();
 
-    // Connect CDP client via pipe
-    var client = cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port) catch |err| {
+    // Connect CDP client via WebSocket (WebSocket-only mode for extension support)
+    var client = cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port) catch |err| {
         std.debug.print("Error connecting to Chrome: {}\n", .{err});
         std.process.exit(1);
     };
@@ -408,8 +398,7 @@ fn printHelp() void {
         \\  termweb open <url> [options]
         \\
         \\Options:
-        \\  --profile <name>      Clone Chrome profile (default: 'Default')
-        \\  --no-profile          Start with fresh profile (no cloning)
+        \\  --profile <name>      Clone Chrome profile for logged-in sessions
         \\  --no-toolbar          Hide navigation bar (app/kiosk mode)
         \\  --disable-hotkeys     Disable all keyboard shortcuts (except Ctrl+Q)
         \\  --disable-hints       Disable Ctrl+H hint mode

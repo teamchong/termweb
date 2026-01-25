@@ -1809,6 +1809,64 @@ pub const Viewer = struct {
         }
     }
 
+    /// Handle picker request from File System Access API polyfill
+    pub fn handlePickerRequest(self: *Viewer, payload: []const u8, start: usize) !void {
+        // Extract picker type: file, directory, or save
+        const type_end = std.mem.indexOfPos(u8, payload, start, ":") orelse
+            std.mem.indexOfPos(u8, payload, start, "\"") orelse return;
+        const picker_type = payload[start..type_end];
+
+        self.log("[PICKER] type={s}\n", .{picker_type});
+
+        // Determine native picker mode
+        const mode: FilePickerMode = if (std.mem.eql(u8, picker_type, "directory"))
+            .folder
+        else if (std.mem.eql(u8, picker_type, "file"))
+            .single
+        else if (std.mem.eql(u8, picker_type, "save"))
+            .single // save uses single file picker
+        else
+            return;
+
+        // Show native OS file picker
+        const file_path = try dialog_mod.showNativeFilePicker(self.allocator, mode);
+        defer if (file_path) |p| self.allocator.free(p);
+
+        // Send result back to JavaScript
+        if (file_path) |path| {
+            // Remove trailing slash if present
+            const trimmed_path = if (path.len > 1 and path[path.len - 1] == '/')
+                path[0 .. path.len - 1]
+            else
+                path;
+
+            // Extract just the name from the path
+            const name = if (std.mem.lastIndexOfScalar(u8, trimmed_path, '/')) |idx|
+                trimmed_path[idx + 1 ..]
+            else
+                trimmed_path;
+
+            const is_dir = mode == .folder;
+
+            // Add to allowed roots for security (only selected directories/files can be accessed)
+            const path_copy = try self.allocator.dupe(u8, trimmed_path);
+            try self.allowed_fs_roots.append(self.allocator, path_copy);
+            self.log("[PICKER] Added allowed root: {s}\n", .{trimmed_path});
+
+            // Call the JavaScript callback
+            var script_buf: [4096]u8 = undefined;
+            const script = std.fmt.bufPrint(&script_buf,
+                "window.__termwebPickerResult(true, '{s}', '{s}', {s})",
+                .{ trimmed_path, name, if (is_dir) "true" else "false" },
+            ) catch return;
+
+            try self.evalJavaScript(script);
+        } else {
+            // User cancelled
+            try self.evalJavaScript("window.__termwebPickerResult(false)");
+        }
+    }
+
     /// Handle clipboard sync - copy browser clipboard to system clipboard
     fn handleClipboardSync(self: *Viewer, payload: []const u8, start: usize) !void {
         // Find the end of the clipboard text (look for closing quote in JSON, handling escapes)

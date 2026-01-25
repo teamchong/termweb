@@ -305,8 +305,8 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     var chrome_instance = try launcher.launchChromePipe(allocator, launch_opts);
     defer chrome_instance.deinit();
 
-    // Connect CDP
-    var client = try cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port);
+    // Connect CDP via WebSocket (WebSocket-only mode for extension support)
+    var client = try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
     defer client.deinit();
 
     // Set viewport with matching DPR

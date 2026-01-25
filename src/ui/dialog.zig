@@ -259,7 +259,12 @@ fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode, defau
     var front_app: ?[]const u8 = null;
     if (front_app_result) |r| {
         defer allocator.free(r.stderr);
-        if (r.term.Exited == 0 and r.stdout.len > 0) {
+        // Check if process exited normally (not killed by signal)
+        const exited_ok = switch (r.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (exited_ok and r.stdout.len > 0) {
             var end: usize = r.stdout.len;
             while (end > 0 and (r.stdout[end - 1] == '\n' or r.stdout[end - 1] == '\r')) {
                 end -= 1;
@@ -359,8 +364,12 @@ fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode, defau
         }
     }
 
-    // Check if cancelled (non-zero exit)
-    if (result.term.Exited != 0) {
+    // Check if cancelled (non-zero exit or killed by signal)
+    const exited_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!exited_ok) {
         allocator.free(result.stdout);
         return null;
     }
@@ -440,7 +449,11 @@ fn tryZenity(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: ?
     }) catch return null;
     defer allocator.free(result.stderr);
 
-    if (result.term.Exited != 0 or result.stdout.len == 0) {
+    const exited_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!exited_ok or result.stdout.len == 0) {
         allocator.free(result.stdout);
         return null;
     }
@@ -506,7 +519,11 @@ fn tryKdialog(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: 
     }) catch return null;
     defer allocator.free(result.stderr);
 
-    if (result.term.Exited != 0 or result.stdout.len == 0) {
+    const exited_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!exited_ok or result.stdout.len == 0) {
         allocator.free(result.stdout);
         return null;
     }
@@ -562,7 +579,11 @@ fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: [
     var front_app: ?[]const u8 = null;
     if (front_app_result) |r| {
         defer allocator.free(r.stderr);
-        if (r.term.Exited == 0 and r.stdout.len > 0) {
+        const exited_ok = switch (r.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (exited_ok and r.stdout.len > 0) {
             // Trim newline
             var end: usize = r.stdout.len;
             while (end > 0 and (r.stdout[end - 1] == '\n' or r.stdout[end - 1] == '\r')) {
@@ -636,7 +657,11 @@ fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: [
     }
 
     // Check if cancelled
-    if (result.term.Exited != 0 or result.stdout.len == 0) {
+    const exited_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!exited_ok or result.stdout.len == 0) {
         return null;
     }
 
@@ -683,7 +708,11 @@ fn showLinuxListPicker(allocator: std.mem.Allocator, title: []const u8, items: [
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
 
-    if (result.term.Exited != 0 or result.stdout.len == 0) {
+    const exited_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!exited_ok or result.stdout.len == 0) {
         return null;
     }
 
