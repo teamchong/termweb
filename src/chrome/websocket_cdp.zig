@@ -8,6 +8,7 @@
 /// - Automatic ping/pong handling for connection keep-alive
 /// - Screencast frame handling with zero-copy FramePool
 const std = @import("std");
+const builtin = @import("builtin");
 const simd = @import("../simd/dispatch.zig");
 const FramePool = @import("../simd/frame_pool.zig").FramePool;
 const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
@@ -164,12 +165,22 @@ pub const WebSocketCdpClient = struct {
         // Signal thread to stop
         self.running.store(false, .release);
 
-        // Close stream to unblock any pending reads
+        // Shutdown socket to unblock any pending reads (sends FIN)
+        // This wakes up the reader thread blocked on recv()
+        const socket_fd = self.stream.handle;
+        _ = std.posix.shutdown(socket_fd, .both) catch {};
+
+        // Close stream
         self.stream.close();
 
-        // Join thread (wait for it to exit) - MUST happen before freeing queues
+        // On Linux, detach thread (join hangs even after shutdown)
+        // On macOS, join works properly after shutdown
         if (self.reader_thread) |thread| {
-            thread.join();
+            if (comptime builtin.os.tag == .linux) {
+                thread.detach();
+            } else {
+                thread.join();
+            }
             self.reader_thread = null;
         }
 

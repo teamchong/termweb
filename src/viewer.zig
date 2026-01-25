@@ -862,18 +862,22 @@ pub const Viewer = struct {
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
 
         // Stop screencast completely (including reader thread) for shutdown
+        self.log("[DEBUG] Stopping screencast...\n", .{});
         if (self.screencast_mode) {
             self.cdp_client.stopScreencastFull() catch {};
             self.screencast_mode = false;
         }
+        self.log("[DEBUG] Screencast stopped\n", .{});
 
         // Cleanup - clear images, reset screen, show cursor
+        self.log("[DEBUG] Clearing screen...\n", .{});
         self.kitty.clearAll(writer) catch {};
         Screen.clear(writer) catch {};
         Screen.showCursor(writer) catch {};
         Screen.moveCursor(writer, 1, 1) catch {};
         writer.writeAll("\x1b[0m") catch {}; // Reset all attributes
         writer.flush() catch {};
+        self.log("[DEBUG] Cleanup complete\n", .{});
     }
 
     /// Handle terminal resize (SIGWINCH)
@@ -2357,16 +2361,22 @@ pub const Viewer = struct {
 
     pub fn deinit(self: *Viewer) void {
         // Stop all threads before freeing resources
+        self.log("[DEBUG] deinit: stopping input thread...\n", .{});
         self.stopInputThread();
+        self.log("[DEBUG] deinit: stopping CDP thread...\n", .{});
         self.stopCdpThread();
+        self.log("[DEBUG] deinit: stopping toolbar thread...\n", .{});
         self.stopToolbarThread();
+        self.log("[DEBUG] deinit: threads stopped\n", .{});
         // Free hint grid if active
         if (self.hint_grid) |grid| {
             grid.deinit();
             self.allocator.destroy(grid);
             self.hint_grid = null;
         }
+        self.log("[DEBUG] deinit: stopping input...\n", .{});
         self.input.deinit();
+        self.log("[DEBUG] deinit: input stopped\n", .{});
         if (self.prompt_buffer) |*p| p.deinit();
         // Free allowed file system roots
         for (self.allowed_fs_roots.items) |root| {

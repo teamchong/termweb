@@ -12,6 +12,7 @@
 /// - Cmd+F: Find (passed to browser)
 /// - Cmd+S: Save (passed to browser)
 const std = @import("std");
+const builtin = @import("builtin");
 const key_normalizer = @import("terminal/key_normalizer.zig");
 const NormalizedKeyEvent = key_normalizer.NormalizedKeyEvent;
 const BaseKey = key_normalizer.BaseKey;
@@ -94,10 +95,16 @@ pub const app_shortcuts = [_]ShortcutDef{
 /// Find an app action for a key event.
 /// Returns null if the key should be passed to the browser.
 pub fn findAppAction(event: NormalizedKeyEvent) ?AppAction {
+    const is_linux = comptime builtin.os.tag == .linux;
+
     for (app_shortcuts) |shortcut| {
         // Check modifier requirements
-        if (shortcut.shortcut_mod and !event.shortcut_mod) continue;
-        if (!shortcut.shortcut_mod and event.shortcut_mod) continue;
+        // On Linux, Ctrl is the shortcut modifier, so ctrl=true implies shortcut_mod=true
+        // Skip the shortcut_mod check if shortcut requires ctrl (they're the same on Linux)
+        if (!is_linux or !shortcut.ctrl) {
+            if (shortcut.shortcut_mod and !event.shortcut_mod) continue;
+            if (!shortcut.shortcut_mod and event.shortcut_mod) continue;
+        }
         if (shortcut.ctrl and !event.ctrl) continue;
         if (!shortcut.ctrl and !shortcut.shortcut_mod and event.ctrl) continue;
         if (shortcut.shift != event.shift) continue;

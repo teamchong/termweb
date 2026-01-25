@@ -7,6 +7,16 @@ pub const Screen = struct {
         try writer.writeAll("\x1b[2J\x1b[H");
     }
 
+    /// Enter alternate screen buffer (used by fullscreen apps)
+    pub fn enterAlternateBuffer(writer: anytype) !void {
+        try writer.writeAll("\x1b[?1049h");
+    }
+
+    /// Exit alternate screen buffer (restores previous screen content)
+    pub fn exitAlternateBuffer(writer: anytype) !void {
+        try writer.writeAll("\x1b[?1049l");
+    }
+
     pub fn hideCursor(writer: anytype) !void {
         try writer.writeAll("\x1b[?25l");
     }
