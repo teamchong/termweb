@@ -91,13 +91,10 @@ pub const app_shortcuts = [_]ShortcutDef{
 /// Find an app action for a key event.
 /// Returns null if the key should be passed to the browser.
 pub fn findAppAction(event: NormalizedKeyEvent) ?AppAction {
-    const is_linux = comptime builtin.os.tag == .linux;
-
     for (app_shortcuts) |shortcut| {
         // Check modifier requirements
-        // On Linux, Ctrl is the shortcut modifier, so ctrl=true implies shortcut_mod=true
-        // Skip the shortcut_mod check if shortcut requires ctrl (they're the same on Linux)
-        if (!is_linux or !shortcut.ctrl) {
+        // If shortcut requires ctrl, skip shortcut_mod check (ctrl implies shortcut_mod on all platforms)
+        if (!shortcut.ctrl) {
             if (shortcut.shortcut_mod and !event.shortcut_mod) continue;
             if (!shortcut.shortcut_mod and event.shortcut_mod) continue;
         }

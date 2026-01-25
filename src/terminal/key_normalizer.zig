@@ -215,20 +215,19 @@ fn normalizeCtrlKey(char: u8, additional_mods: u8) NormalizedKeyEvent {
 
     // Extract additional modifiers
     const alt = (additional_mods & 1) != 0;
-    const extra_ctrl = (additional_mods & 2) != 0;
     const meta = (additional_mods & 4) != 0;
     const shift = (additional_mods & 8) != 0;
 
-    // On macOS: ctrl_x from terminal = user pressed Cmd+X
-    // The terminal converted Cmd to Ctrl, so we set shortcut_mod=true
-    // We also set meta=true for CDP so browser sees it as Cmd
+    // On macOS: ctrl_x from terminal = user pressed Cmd+X or Ctrl+X
+    // The terminal sends the control character either way
+    // Set ctrl=true so app shortcuts match, and shortcut_mod=true for cross-platform
     if (is_macos) {
         return .{
             .base_key = .{ .char = char },
             .shift = shift,
-            .ctrl = extra_ctrl, // Only if there's additional ctrl modifier
+            .ctrl = true, // Control character was sent
             .alt = alt,
-            .meta = true, // Treat as Cmd on macOS
+            .meta = true, // Treat as Cmd on macOS for browser
             .shortcut_mod = true,
             .cdp_modifiers = 4 | additional_mods, // Set meta bit for browser
         };
