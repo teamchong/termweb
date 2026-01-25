@@ -111,6 +111,7 @@ pub const Viewer = struct {
     viewport_height: u32,
     original_viewport_width: u32,  // Viewport BEFORE MAX_PIXELS limit (for coord ratio)
     original_viewport_height: u32,
+    target_fps: u32,  // Target frame rate (affects screencast and mouse tick)
     chrome_inner_width: u32,  // Chrome's actual window.innerWidth (queried from JS)
     chrome_inner_height: u32, // Chrome's actual window.innerHeight (queried from JS)
     chrome_inner_frame_width: u32,  // Frame dimensions when chrome_inner was captured
@@ -235,6 +236,7 @@ pub const Viewer = struct {
         viewport_height: u32,
         original_viewport_width: u32,
         original_viewport_height: u32,
+        target_fps: u32,
     ) !Viewer {
         // Set allocator for turbojpeg fast decoding
         decode_mod.setAllocator(allocator);
@@ -285,6 +287,7 @@ pub const Viewer = struct {
             .viewport_height = viewport_height,
             .original_viewport_width = original_viewport_width,
             .original_viewport_height = original_viewport_height,
+            .target_fps = target_fps,
             .chrome_inner_width = 0, // Will be queried from Chrome after page load
             .chrome_inner_height = 0,
             .chrome_inner_frame_width = 0,
@@ -310,7 +313,7 @@ pub const Viewer = struct {
             .mouse_visible = false,
             .mouse_buttons = 0,
             .cursor_image_id = null,
-            .event_bus = mouse_event_bus.MouseEventBus.init(cdp_client, allocator, isNaturalScrollEnabled()),
+            .event_bus = mouse_event_bus.MouseEventBus.initWithFps(cdp_client, allocator, isNaturalScrollEnabled(), target_fps),
             .last_input_time = 0,
             .last_mouse_move_time = 0,
             .last_rendered_generation = 0,
@@ -378,14 +381,14 @@ pub const Viewer = struct {
         self.single_tab_mode = true;
     }
 
-    /// Calculate max FPS based on viewport resolution
-    fn getMaxFpsForResolution(self: *Viewer) u32 {
-        return render_mod.getMaxFpsForResolution(self.viewport_width, self.viewport_height);
+    /// Get target FPS
+    fn getTargetFps(self: *Viewer) u32 {
+        return render_mod.getTargetFps(self);
     }
 
-    /// Get minimum frame interval in nanoseconds based on resolution
+    /// Get minimum frame interval in nanoseconds based on target FPS
     fn getMinFrameInterval(self: *Viewer) i128 {
-        return render_mod.getMinFrameInterval(self.viewport_width, self.viewport_height);
+        return render_mod.getMinFrameInterval(self);
     }
 
     /// Add an allowed filesystem root path for FS IPC
@@ -501,14 +504,15 @@ pub const Viewer = struct {
         // Note: cli.zig already scales viewport for High-DPI displays
         const total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
         const adaptive_quality = config.getAdaptiveQuality(total_pixels);
-        self.log("[DEBUG] Starting screencast {}x{} ({}px, quality={})...\n", .{ self.viewport_width, self.viewport_height, total_pixels, adaptive_quality });
+        const every_nth = config.getEveryNthFrame(self.target_fps);
+        self.log("[DEBUG] Starting screencast {}x{} ({}px, quality={}, fps={}, everyNth={})...\n", .{ self.viewport_width, self.viewport_height, total_pixels, adaptive_quality, self.target_fps, every_nth });
 
         try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
             .quality = adaptive_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
-            .every_nth_frame = 1,
+            .every_nth_frame = every_nth,
         });
         self.screencast_mode = true;
         self.log("[DEBUG] Screencast started\n", .{});
@@ -873,12 +877,13 @@ pub const Viewer = struct {
         // Restart screencast with new dimensions and adaptive quality
         const resize_total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);
         const resize_quality = config.getAdaptiveQuality(resize_total_pixels);
+        const resize_every_nth = config.getEveryNthFrame(self.target_fps);
         screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
             .quality = resize_quality,
             .width = new_width,
             .height = new_height,
-            .every_nth_frame = 1,
+            .every_nth_frame = resize_every_nth,
         }) catch |err| {
             self.log("[RESIZE] startScreencast failed: {}\n", .{err});
             return;
@@ -951,12 +956,13 @@ pub const Viewer = struct {
         // Restart screencast with adaptive quality
         const reset_total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
         const reset_quality = config.getAdaptiveQuality(reset_total_pixels);
+        const reset_every_nth = config.getEveryNthFrame(self.target_fps);
         screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
             .quality = reset_quality,
             .width = self.viewport_width,
             .height = self.viewport_height,
-            .every_nth_frame = 1,
+            .every_nth_frame = reset_every_nth,
         }) catch |err| {
             self.log("[RESET] startScreencast failed: {}\n", .{err});
             return;

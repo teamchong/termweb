@@ -79,12 +79,13 @@ pub fn switchToTab(viewer: anytype, index: usize) !void {
 
     const tab_total_pixels: u64 = @as(u64, viewer.viewport_width) * @as(u64, viewer.viewport_height);
     const tab_quality = config.getAdaptiveQuality(tab_total_pixels);
+    const tab_every_nth = config.getEveryNthFrame(viewer.target_fps);
     screenshot_api.startScreencast(viewer.cdp_client, viewer.allocator, .{
         .format = viewer.screencast_format,
         .quality = tab_quality,
         .width = viewer.viewport_width,
         .height = viewer.viewport_height,
-        .every_nth_frame = 1,
+        .every_nth_frame = tab_every_nth,
     }) catch |err| {
         viewer.log("[TABS] startScreencast failed after switch: {}\n", .{err});
     };

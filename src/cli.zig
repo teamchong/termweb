@@ -142,6 +142,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var disable_hints = false;
     var browser_path: ?[]const u8 = null;
     var disable_gpu = false;
+    var fps: u32 = config.DEFAULT_FPS;
 
     // Parse flags
     var i: usize = 1;
@@ -181,6 +182,19 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             disable_hints = true;
         } else if (std.mem.eql(u8, arg, "--disable-gpu")) {
             disable_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--fps")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --fps requires a value (e.g., 12, 24, 30)\n", .{});
+                std.process.exit(1);
+            }
+            i += 1;
+            fps = std.fmt.parseInt(u32, args[i], 10) catch {
+                std.debug.print("Error: Invalid FPS value: {s}\n", .{args[i]});
+                std.process.exit(1);
+            };
+            // Clamp FPS to reasonable range
+            if (fps < 1) fps = 1;
+            if (fps > 60) fps = 60;
         }
         // --list-profiles and --list-browsers are handled at the start of cmdOpen
     }
@@ -333,7 +347,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Run viewer with Chrome's actual viewport for accurate coordinate mapping
     // Also pass original (pre-MAX_PIXELS) dimensions for coordinate ratio calculation
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, fps);
     defer viewer.deinit();
 
     // Apply options
@@ -394,6 +408,7 @@ fn printHelp() void {
         \\  --disable-hotkeys     Disable all keyboard shortcuts (except Ctrl+Q)
         \\  --disable-hints       Disable Ctrl+H hint mode
         \\  --browser-path <path> Path to browser executable
+        \\  --fps <N>             Set frame rate 1-60 (default: 30, use 12 for SSH)
         \\  --list-profiles       Show available Chrome profiles
         \\  --list-browsers       Show available browsers
         \\  --mobile              Use mobile viewport

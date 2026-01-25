@@ -16,11 +16,18 @@ pub const Config = struct {
         return 25;                                // Full HD+: max compression
     }
 
-    /// Mouse event tick rate in milliseconds
-    pub const MOUSE_TICK_MS: u64 = 33; // ~30fps (matches screencast)
+    /// Default screencast frame rate
+    pub const DEFAULT_FPS: u32 = 30;
 
-    /// Screencast frame rate
-    pub const SCREENCAST_FPS: u32 = 30;
+    /// Calculate mouse tick interval from FPS
+    pub fn getMouseTickMs(fps: u32) u64 {
+        return if (fps > 0) 1000 / fps else 33;
+    }
+
+    /// Calculate everyNthFrame for Chrome screencast (Chrome renders at 60fps internally)
+    pub fn getEveryNthFrame(fps: u32) u8 {
+        return if (fps > 0) @intCast(60 / fps) else 2;
+    }
 
     /// Double-click detection
     pub const DOUBLE_CLICK_TIME_MS: i64 = 400;

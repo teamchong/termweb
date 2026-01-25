@@ -324,7 +324,7 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     } else |_| {}
 
     // Run viewer with original (pre-MAX_PIXELS) dimensions for coordinate ratio
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, config.DEFAULT_FPS);
     defer viewer.deinit();
 
     if (no_toolbar) {

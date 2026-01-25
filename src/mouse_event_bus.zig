@@ -114,7 +114,6 @@ pub const MouseEventBus = struct {
     // Scroll settings
     natural_scroll: bool,
 
-    const TICK_INTERVAL_NS = config.MOUSE_TICK_MS * std.time.ns_per_ms;
     const DOUBLE_CLICK_TIME_MS = config.DOUBLE_CLICK_TIME_MS;
     const DOUBLE_CLICK_DISTANCE = config.DOUBLE_CLICK_DISTANCE;
 
@@ -123,6 +122,16 @@ pub const MouseEventBus = struct {
         allocator: std.mem.Allocator,
         natural_scroll: bool,
     ) MouseEventBus {
+        return initWithFps(cdp_client, allocator, natural_scroll, config.DEFAULT_FPS);
+    }
+
+    pub fn initWithFps(
+        cdp_client: *CdpClient,
+        allocator: std.mem.Allocator,
+        natural_scroll: bool,
+        fps: u32,
+    ) MouseEventBus {
+        const tick_ms = config.getMouseTickMs(fps);
         return .{
             .pending_clicks = .{},
             .pending_wheel = null,
@@ -136,7 +145,7 @@ pub const MouseEventBus = struct {
             .last_click_button = .none,
             .current_click_count = 0,
             .last_tick_time = 0,
-            .tick_interval_ns = TICK_INTERVAL_NS,
+            .tick_interval_ns = @as(i128, tick_ms) * std.time.ns_per_ms,
             .cdp_client = cdp_client,
             .allocator = allocator,
             .coord_mapper = null,

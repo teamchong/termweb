@@ -12,17 +12,14 @@ const Placement = ui_mod.Placement;
 const ZIndex = ui_mod.ZIndex;
 const cursor_asset = ui_mod.assets.cursor;
 
-/// Get maximum FPS based on viewport resolution
-pub fn getMaxFpsForResolution(viewport_width: u32, viewport_height: u32) u32 {
-    _ = viewport_width;
-    _ = viewport_height;
-    return config.SCREENCAST_FPS; // From config
+/// Get maximum FPS (returns viewer's target_fps)
+pub fn getTargetFps(viewer: anytype) u32 {
+    return viewer.target_fps;
 }
 
-/// Get minimum frame interval based on resolution
-pub fn getMinFrameInterval(viewport_width: u32, viewport_height: u32) i128 {
-    const target_fps = getMaxFpsForResolution(viewport_width, viewport_height);
-    return @divFloor(std.time.ns_per_s, target_fps);
+/// Get minimum frame interval based on target FPS
+pub fn getMinFrameInterval(viewer: anytype) i128 {
+    return @divFloor(std.time.ns_per_s, viewer.target_fps);
 }
 
 /// Try to render latest screencast frame (non-blocking)
@@ -107,10 +104,9 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         else
             0;
         const max_ms = @divFloor(viewer.perf_max_render_ns, @as(i128, std.time.ns_per_ms));
-        const target_fps = getMaxFpsForResolution(viewer.viewport_width, viewer.viewport_height);
 
         viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}, content_id={?}, cursor_id={?}, gen={}\n", .{
-            viewer.perf_frame_count, avg_ms, max_ms, target_fps, viewer.frames_skipped,
+            viewer.perf_frame_count, avg_ms, max_ms, viewer.target_fps, viewer.frames_skipped,
             viewer.last_content_image_id, viewer.cursor_image_id, viewer.last_rendered_generation,
         });
 
