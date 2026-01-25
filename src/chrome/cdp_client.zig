@@ -364,6 +364,7 @@ pub const CdpClient = struct {
         if (self.page_ws) |ws| ws.deinit();
         if (self.browser_ws) |ws| ws.deinit();
         if (self.session_id) |sid| self.allocator.free(sid);
+        if (self.current_target_id) |tid| self.allocator.free(tid);
         if (self.pipe_client) |pc| pc.deinit();
         self.allocator.destroy(self);
     }
