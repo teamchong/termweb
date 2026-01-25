@@ -158,13 +158,13 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             i += 1;
             scale = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, arg, "--profile")) {
-            if (i + 1 >= args.len) {
-                std.debug.print("Error: --profile requires a profile name (e.g., 'Default', 'Profile 1')\n", .{});
-                std.debug.print("Use --list-profiles to see available profiles.\n", .{});
-                std.process.exit(1);
+            // --profile [name] - name is optional, defaults to "Default"
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                clone_profile = args[i];
+            } else {
+                clone_profile = "Default";
             }
-            i += 1;
-            clone_profile = args[i];
         } else if (std.mem.eql(u8, arg, "--browser-path")) {
             if (i + 1 >= args.len) {
                 std.debug.print("Error: --browser-path requires a path to browser executable\n", .{});
@@ -398,7 +398,7 @@ fn printHelp() void {
         \\  termweb open <url> [options]
         \\
         \\Options:
-        \\  --profile <name>      Clone Chrome profile for logged-in sessions
+        \\  --profile [name]      Clone Chrome profile (default: 'Default')
         \\  --no-toolbar          Hide navigation bar (app/kiosk mode)
         \\  --disable-hotkeys     Disable all keyboard shortcuts (except Ctrl+Q)
         \\  --disable-hints       Disable Ctrl+H hint mode
