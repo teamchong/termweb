@@ -28,7 +28,7 @@
       grid-template-columns: repeat(2, 1fr);
       gap: 16px;
       padding: 16px;
-      height: calc(100vh - 36px);
+      height: calc(100vh - 36px - 32px);
       overflow: auto;
     }
     .card {
@@ -87,8 +87,11 @@
       text-align: left;
       padding: 6px 8px;
       background: #1e1e1e;
-      color: #569cd6;
+      color: #888;
       font-weight: 600;
+    }
+    #process-table th.sorted {
+      color: #569cd6;
     }
     #process-table td {
       padding: 4px 8px;
@@ -109,73 +112,175 @@
     }
     .core-item .label { font-size: 10px; color: #888; }
     .core-item .value { font-size: 16px; font-weight: 600; }
+
+    /* Fullscreen views */
+    #process-fullscreen, #detail-fullscreen {
+      display: none;
+      flex-direction: column;
+      height: calc(100vh - 36px - 32px);
+      padding: 16px;
+    }
+    .detail-header {
+      margin-bottom: 16px;
+    }
+    .detail-header h2 {
+      font-size: 16px;
+      color: #569cd6;
+      margin: 0;
+    }
+    .detail-content {
+      flex: 1;
+      overflow: auto;
+    }
+    .detail-chart {
+      height: 200px;
+      margin-bottom: 16px;
+    }
+    .process-header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .process-header h2 {
+      font-size: 14px;
+      color: #569cd6;
+      margin: 0;
+    }
+    .process-header input {
+      flex: 1;
+      max-width: 300px;
+      padding: 6px 12px;
+      background: #1e1e1e;
+      border: 1px solid #3c3c3c;
+      border-radius: 4px;
+      color: #ccc;
+      font-size: 13px;
+    }
+    .process-header input:focus {
+      outline: none;
+      border-color: #569cd6;
+    }
+    .process-table-wrap {
+      flex: 1;
+      overflow: auto;
+    }
+    .process-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .process-table th {
+      text-align: left;
+      padding: 8px 12px;
+      background: #1e1e1e;
+      color: #888;
+      font-weight: 600;
+      position: sticky;
+      top: 0;
+    }
+    .process-table th.sorted { color: #569cd6; }
+    .process-table td {
+      padding: 6px 12px;
+      border-bottom: 1px solid #2d2d2d;
+    }
+    .process-table tr.selected {
+      background: #2a2d2e;
+    }
+    .process-table tr:hover {
+      background: #333;
+    }
+
+    /* Bottom hints bar */
+    #hints {
+      height: 32px;
+      background: #252526;
+      border-top: 1px solid #3c3c3c;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 24px;
+      font-size: 11px;
+      color: #888;
+    }
+    #hints span {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
   </style>
 </head>
-<body>
+<body tabindex="0" autofocus>
   <div id="header">
     <h1>System Dashboard</h1>
     <span class="info" id="system-info">Loading...</span>
   </div>
 
-  <div id="dashboard">
-    <!-- CPU Card -->
-    <div class="card">
-      <h2>CPU</h2>
-      <div id="cpu-info"></div>
-      <div class="chart-container">
-        <canvas id="cpu-chart"></canvas>
+  <div id="main-dashboard">
+    <div id="dashboard">
+      <!-- CPU Card -->
+      <div class="card" id="cpu-card" style="cursor: pointer;">
+        <h2>CPU (click to expand)</h2>
+        <div id="cpu-info"></div>
+        <div class="chart-container">
+          <canvas id="cpu-chart"></canvas>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill cpu" id="cpu-bar" style="width: 0%"></div>
+        </div>
+        <div id="cpu-cores" class="core-grid" style="margin-top: 12px;"></div>
       </div>
-      <div class="progress-bar">
-        <div class="progress-fill cpu" id="cpu-bar" style="width: 0%"></div>
-      </div>
-      <div id="cpu-cores" class="core-grid" style="margin-top: 12px;"></div>
-    </div>
 
-    <!-- Memory Card -->
-    <div class="card">
-      <h2>Memory</h2>
-      <div id="mem-info"></div>
-      <div class="chart-container">
-        <canvas id="mem-chart"></canvas>
+      <!-- Memory Card -->
+      <div class="card" id="memory-card" style="cursor: pointer;">
+        <h2>Memory (click to expand)</h2>
+        <div id="mem-info"></div>
+        <div class="chart-container">
+          <canvas id="mem-chart"></canvas>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill mem" id="mem-bar" style="width: 0%"></div>
+        </div>
       </div>
-      <div class="progress-bar">
-        <div class="progress-fill mem" id="mem-bar" style="width: 0%"></div>
+
+      <!-- Network Card -->
+      <div class="card" id="network-card" style="cursor: pointer;">
+        <h2>Network (click to expand)</h2>
+        <div class="chart-container">
+          <canvas id="net-chart"></canvas>
+        </div>
+        <div id="net-info"></div>
       </div>
-    </div>
 
-    <!-- Network Card -->
-    <div class="card">
-      <h2>Network</h2>
-      <div class="chart-container">
-        <canvas id="net-chart"></canvas>
+      <!-- Disk Card -->
+      <div class="card" id="disk-card" style="cursor: pointer;">
+        <h2>Disk (click to expand)</h2>
+        <div id="disk-info"></div>
       </div>
-      <div id="net-info"></div>
-    </div>
 
-    <!-- Disk Card -->
-    <div class="card">
-      <h2>Disk</h2>
-      <div id="disk-info"></div>
-    </div>
-
-    <!-- Processes Card -->
-    <div class="card full-width">
-      <h2>Top Processes</h2>
-      <table id="process-table">
-        <thead>
-          <tr>
-            <th>PID</th>
-            <th>Name</th>
-            <th>CPU %</th>
-            <th>MEM %</th>
-            <th>State</th>
-            <th>User</th>
-          </tr>
-        </thead>
-        <tbody id="process-tbody"></tbody>
-      </table>
+      <!-- Processes Card -->
+      <div class="card full-width" id="processes" style="cursor: pointer;">
+        <h2>Top Processes (click to expand)</h2>
+        <table id="process-table">
+          <thead>
+            <tr>
+              <th>PID</th>
+              <th>Name</th>
+              <th class="sorted">CPU % ▼</th>
+              <th>MEM %</th>
+              <th>PORT</th>
+            </tr>
+          </thead>
+          <tbody id="process-tbody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
+
+  <div id="process-fullscreen"></div>
+  <div id="detail-fullscreen"></div>
+
+  <div id="hints"></div>
 
   <script src="app.bundle.js"></script>
 </body>

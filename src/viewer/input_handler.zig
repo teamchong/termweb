@@ -56,6 +56,22 @@ pub fn handleInput(viewer: anytype, input: Input) !void {
                 }
             }
 
+            // 2.5. Check for custom key bindings (plain keys without modifiers)
+            if (viewer.key_bindings) |bindings| {
+                if (!event.ctrl and !event.alt and !event.shortcut_mod) {
+                    if (event.base_key.getChar()) |c| {
+                        if (c >= 'a' and c <= 'z') {
+                            const idx = c - 'a';
+                            if (bindings[idx]) |js_code| {
+                                viewer.log("[KEYBIND] Executing JS for '{c}'\n", .{c});
+                                interact_mod.evalJS(viewer.cdp_client, viewer.allocator, js_code);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
             // 3. Mode-specific handling
             switch (viewer.mode) {
                 .normal => try handleNormalModeKey(viewer, event),
@@ -485,11 +501,17 @@ pub fn handleHintModeKey(viewer: anytype, event: NormalizedKeyEvent) !void {
 
 /// Check if an app action is disabled based on viewer settings
 fn isActionDisabled(viewer: anytype, action: AppAction) bool {
-    // Quit is always allowed
-    if (action == .quit) return false;
+    // If allowed_hotkeys is set, only allow actions in the bitmask
+    if (viewer.allowed_hotkeys) |mask| {
+        const action_bit = @as(u32, 1) << @intFromEnum(action);
+        return (mask & action_bit) == 0;
+    }
 
-    // If hotkeys are disabled, block all shortcuts except quit
-    if (viewer.hotkeys_disabled) return true;
+    // Legacy: If hotkeys are disabled, block all shortcuts except quit
+    if (viewer.hotkeys_disabled) {
+        if (action == .quit) return false;
+        return true;
+    }
 
     // If hints are disabled, block hint mode
     if (viewer.hints_disabled and action == .enter_hint_mode) return true;

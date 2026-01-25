@@ -52,7 +52,7 @@ params.set('size', fs.statSync(pdfPath).size.toString());
 
 const url = `file://${htmlPath}?${params.toString()}`;
 
-termweb.open(url, { toolbar: false, verbose })
+termweb.open(url, { toolbar: false, allowedHotkeys: ['quit'], verbose })
   .then(() => process.exit(0))
   .catch(err => {
     console.error('Error:', err.message);

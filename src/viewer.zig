@@ -152,7 +152,9 @@ pub const Viewer = struct {
     // Toolbar renderer (Kitty graphics based)
     toolbar_renderer: ?ui_mod.ToolbarRenderer,
     toolbar_disabled: bool, // --no-toolbar flag
-    hotkeys_disabled: bool, // --disable-hotkeys flag
+    hotkeys_disabled: bool, // --disable-hotkeys flag (legacy, use allowed_hotkeys)
+    allowed_hotkeys: ?u32, // Bitmask of allowed actions when set (null = all allowed)
+    key_bindings: ?*const [26]?[]const u8, // Map a-z to JS code (null = no bindings)
     hints_disabled: bool, // --disable-hints flag
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
     pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
@@ -327,6 +329,8 @@ pub const Viewer = struct {
             .toolbar_renderer = null,
             .toolbar_disabled = false,
             .hotkeys_disabled = false,
+            .allowed_hotkeys = null,
+            .key_bindings = null,
             .hints_disabled = false,
             .single_tab_mode = false,
             .pending_tab_switch = null,
@@ -403,6 +407,17 @@ pub const Viewer = struct {
     /// Disable hotkeys (Ctrl+L, Ctrl+R, etc.)
     pub fn disableHotkeys(self: *Viewer) void {
         self.hotkeys_disabled = true;
+    }
+
+    /// Set allowed hotkeys (bitmask of AppAction). When set, only these actions are allowed.
+    /// Pass null to allow all hotkeys (default).
+    pub fn setAllowedHotkeys(self: *Viewer, mask: ?u32) void {
+        self.allowed_hotkeys = mask;
+    }
+
+    /// Set key bindings (map a-z to JS code to execute)
+    pub fn setKeyBindings(self: *Viewer, bindings: ?*const [26]?[]const u8) void {
+        self.key_bindings = bindings;
     }
 
     /// Disable hint mode (Ctrl+H)

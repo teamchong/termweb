@@ -29,6 +29,18 @@ fn debugLog(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+/// Execute arbitrary JavaScript in the browser (async, fire-and-forget)
+pub fn evalJS(
+    client: *cdp.CdpClient,
+    allocator: std.mem.Allocator,
+    js: []const u8,
+) void {
+    _ = allocator;
+    var params_buf: [4096]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{js}) catch return;
+    client.sendCommandAsync("Runtime.evaluate", params) catch {};
+}
+
 /// Move mouse to coordinates (for hover effects) - fire and forget via dedicated mouse WS
 pub fn mouseMove(
     client: *cdp.CdpClient,

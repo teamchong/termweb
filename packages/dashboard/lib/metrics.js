@@ -2,6 +2,53 @@
  * System metrics collector using systeminformation
  */
 const si = require('systeminformation');
+const { execSync } = require('child_process');
+
+// Cache for port info (expensive to fetch)
+let portCache = new Map();
+let portCacheTime = 0;
+const PORT_CACHE_TTL = 5000; // 5 seconds
+
+/**
+ * Get port info for processes (cached)
+ */
+function getPortInfo() {
+  const now = Date.now();
+  if (now - portCacheTime < PORT_CACHE_TTL && portCache.size > 0) {
+    return portCache;
+  }
+
+  try {
+    // Use lsof to get listening ports (fast query)
+    const output = execSync('lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null || true', {
+      encoding: 'utf-8',
+      timeout: 2000
+    });
+
+    portCache = new Map();
+    const lines = output.split('\n').slice(1); // Skip header
+    for (const line of lines) {
+      const parts = line.split(/\s+/);
+      if (parts.length >= 9) {
+        const pid = parseInt(parts[1], 10);
+        const portMatch = parts[8]?.match(/:(\d+)$/);
+        if (pid && portMatch) {
+          const port = portMatch[1];
+          if (portCache.has(pid)) {
+            portCache.get(pid).push(port);
+          } else {
+            portCache.set(pid, [port]);
+          }
+        }
+      }
+    }
+    portCacheTime = now;
+  } catch (e) {
+    // Ignore errors, return empty cache
+  }
+
+  return portCache;
+}
 
 /**
  * Collect all system metrics
@@ -84,17 +131,21 @@ async function collectMetrics() {
       running: processes.running,
       blocked: processes.blocked,
       sleeping: processes.sleeping,
-      list: processes.list
-        .sort((a, b) => b.cpu - a.cpu)
-        .slice(0, 20)
-        .map(p => ({
-          pid: p.pid,
-          name: p.name,
-          cpu: p.cpu,
-          mem: p.mem,
-          state: p.state,
-          user: p.user
-        }))
+      list: (() => {
+        const ports = getPortInfo();
+        return processes.list
+          .sort((a, b) => b.cpu - a.cpu)
+          .slice(0, 50)
+          .map(p => ({
+            pid: p.pid,
+            name: p.name,
+            cpu: p.cpu,
+            mem: p.mem,
+            state: p.state,
+            user: p.user,
+            ports: ports.get(p.pid) || []
+          }));
+      })()
     },
     temperature: {
       main: temp.main,
@@ -144,7 +195,22 @@ async function collectLightMetrics() {
   };
 }
 
+/**
+ * Kill a process by PID
+ * @param {number} pid - Process ID to kill
+ * @returns {boolean} - true if successful
+ */
+function killProcess(pid) {
+  try {
+    process.kill(pid, 'SIGKILL');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 module.exports = {
   collectMetrics,
-  collectLightMetrics
+  collectLightMetrics,
+  killProcess
 };

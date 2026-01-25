@@ -53,7 +53,7 @@ async function main() {
 
     const url = `file://${htmlPath}?${params.toString()}`;
 
-    await termweb.open(url, { toolbar: false, verbose });
+    await termweb.open(url, { toolbar: false, allowedHotkeys: ['quit'], verbose });
     process.exit(0);
   } catch (err) {
     console.error('Error:', err.message);

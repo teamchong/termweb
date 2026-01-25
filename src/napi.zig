@@ -59,6 +59,9 @@ extern fn napi_get_value_string_utf8(env: napi_env, value: napi_value, buf: ?[*]
 extern fn napi_get_value_bool(env: napi_env, value: napi_value, result: *bool) napi_status;
 extern fn napi_get_value_double(env: napi_env, value: napi_value, result: *f64) napi_status;
 extern fn napi_get_named_property(env: napi_env, object: napi_value, utf8name: [*:0]const u8, result: *napi_value) napi_status;
+extern fn napi_is_array(env: napi_env, value: napi_value, result: *bool) napi_status;
+extern fn napi_get_array_length(env: napi_env, value: napi_value, result: *u32) napi_status;
+extern fn napi_get_element(env: napi_env, object: napi_value, index: u32, result: *napi_value) napi_status;
 extern fn napi_typeof(env: napi_env, value: napi_value, result: *c_uint) napi_status;
 extern fn napi_get_undefined(env: napi_env, result: *napi_value) napi_status;
 extern fn napi_get_boolean(env: napi_env, value: bool, result: *napi_value) napi_status;
@@ -160,12 +163,18 @@ fn messageJsCallback(env: napi_env, js_callback: napi_value, _: ?*anyopaque, dat
 // External N-API function declaration
 extern fn napi_call_function(env: napi_env, recv: napi_value, func: napi_value, argc: usize, argv: [*]const napi_value, result: ?*napi_value) napi_status;
 
+/// Key bindings storage - maps a-z to JS code (static to persist across calls)
+var key_bindings_storage: [26]?[]const u8 = [_]?[]const u8{null} ** 26;
+var key_bindings_buffers: [26][256]u8 = undefined;
+
 /// Data for async open operation
 const AsyncOpenData = struct {
     allocator: std.mem.Allocator,
     url: []u8,
     no_toolbar: bool,
     disable_hotkeys: bool,
+    allowed_hotkeys: ?u32, // Bitmask of allowed actions (null = all allowed)
+    has_key_bindings: bool,
     disable_hints: bool,
     mobile: bool,
     scale: f32,
@@ -182,6 +191,99 @@ const AsyncOpenData = struct {
         if (self.error_msg) |e| self.allocator.free(e);
     }
 };
+
+/// Convert action name string to bitmask bit
+fn actionNameToBit(name: []const u8) ?u32 {
+    const app_shortcuts = @import("app_shortcuts.zig");
+    const AppAction = app_shortcuts.AppAction;
+
+    const action: ?AppAction = if (std.mem.eql(u8, name, "quit")) .quit
+        else if (std.mem.eql(u8, name, "address_bar")) .address_bar
+        else if (std.mem.eql(u8, name, "reload")) .reload
+        else if (std.mem.eql(u8, name, "go_back")) .go_back
+        else if (std.mem.eql(u8, name, "go_forward")) .go_forward
+        else if (std.mem.eql(u8, name, "stop_loading")) .stop_loading
+        else if (std.mem.eql(u8, name, "copy")) .copy
+        else if (std.mem.eql(u8, name, "cut")) .cut
+        else if (std.mem.eql(u8, name, "paste")) .paste
+        else if (std.mem.eql(u8, name, "select_all")) .select_all
+        else if (std.mem.eql(u8, name, "tab_picker")) .tab_picker
+        else if (std.mem.eql(u8, name, "enter_hint_mode")) .enter_hint_mode
+        else if (std.mem.eql(u8, name, "scroll_down")) .scroll_down
+        else if (std.mem.eql(u8, name, "scroll_up")) .scroll_up
+        else if (std.mem.eql(u8, name, "new_tab")) .new_tab
+        else if (std.mem.eql(u8, name, "close_tab")) .close_tab
+        else null;
+
+    if (action) |a| {
+        return @as(u32, 1) << @intFromEnum(a);
+    }
+    return null;
+}
+
+/// Parse allowedHotkeys array from N-API and return bitmask
+fn parseAllowedHotkeys(env: napi_env, arr_val: napi_value) ?u32 {
+    var is_array: bool = false;
+    if (napi_is_array(env, arr_val, &is_array) != .ok or !is_array) {
+        return null;
+    }
+
+    var length: u32 = 0;
+    if (napi_get_array_length(env, arr_val, &length) != .ok) {
+        return null;
+    }
+
+    var mask: u32 = 0;
+    var i: u32 = 0;
+    while (i < length) : (i += 1) {
+        var elem: napi_value = undefined;
+        if (napi_get_element(env, arr_val, i, &elem) != .ok) continue;
+
+        var name_buf: [64]u8 = undefined;
+        var name_len: usize = 0;
+        if (napi_get_value_string_utf8(env, elem, &name_buf, name_buf.len, &name_len) != .ok) continue;
+
+        if (actionNameToBit(name_buf[0..name_len])) |bit| {
+            mask |= bit;
+        }
+    }
+
+    return if (mask > 0) mask else null;
+}
+
+/// Parse keyBindings object from N-API: { f: 'jsCode', g: 'jsCode' }
+/// Stores bindings in static buffers and returns true if any bindings were set
+fn parseKeyBindings(env: napi_env, obj_val: napi_value) bool {
+    var val_type: c_uint = 0;
+    if (napi_typeof(env, obj_val, &val_type) != .ok) return false;
+    if (val_type != @intFromEnum(napi_valuetype.object)) return false;
+
+    // Clear previous bindings
+    for (0..26) |i| {
+        key_bindings_storage[i] = null;
+    }
+
+    var found_any = false;
+    // Check each letter a-z
+    var letter: u8 = 'a';
+    while (letter <= 'z') : (letter += 1) {
+        const key_name: [2]u8 = .{ letter, 0 };
+        var prop_val: napi_value = undefined;
+        if (napi_get_named_property(env, obj_val, @ptrCast(&key_name), &prop_val) == .ok) {
+            var prop_type: c_uint = 0;
+            if (napi_typeof(env, prop_val, &prop_type) == .ok and prop_type == @intFromEnum(napi_valuetype.string)) {
+                const idx = letter - 'a';
+                var js_len: usize = 0;
+                if (napi_get_value_string_utf8(env, prop_val, &key_bindings_buffers[idx], key_bindings_buffers[idx].len, &js_len) == .ok) {
+                    key_bindings_storage[idx] = key_bindings_buffers[idx][0..js_len];
+                    found_any = true;
+                }
+            }
+        }
+    }
+
+    return found_any;
+}
 
 /// Console message callback data
 const ConsoleCallbackData = struct {
@@ -307,6 +409,12 @@ fn runBrowserAsync(async_data: *AsyncOpenData) !void {
     if (async_data.disable_hotkeys) {
         viewer.disableHotkeys();
     }
+    if (async_data.allowed_hotkeys) |mask| {
+        viewer.setAllowedHotkeys(mask);
+    }
+    if (async_data.has_key_bindings) {
+        viewer.setKeyBindings(&key_bindings_storage);
+    }
     if (async_data.disable_hints) {
         viewer.disableHints();
     }
@@ -359,6 +467,8 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
     // Parse options
     var no_toolbar = false;
     var disable_hotkeys = false;
+    var allowed_hotkeys: ?u32 = null;
+    var has_key_bindings = false;
     var disable_hints = false;
     var mobile = false;
     var scale: f32 = 1.0;
@@ -446,6 +556,18 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
                     _ = napi_get_value_bool(env, verbose_val, &verbose);
                 }
             }
+
+            // allowedHotkeys option - array of action names like ['quit', 'copy']
+            var allowed_hotkeys_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "allowedHotkeys", &allowed_hotkeys_val) == .ok) {
+                allowed_hotkeys = parseAllowedHotkeys(env, allowed_hotkeys_val);
+            }
+
+            // keyBindings option - object like { f: 'jsCode()', g: 'jsCode()' }
+            var key_bindings_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "keyBindings", &key_bindings_val) == .ok) {
+                has_key_bindings = parseKeyBindings(env, key_bindings_val);
+            }
         }
     }
 
@@ -478,7 +600,7 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
     }
 
     // Run browser (blocking)
-    runBrowser(allocator, url, no_toolbar, disable_hotkeys, disable_hints, mobile, scale, no_profile, verbose, allowed_path) catch |err| {
+    runBrowser(allocator, url, no_toolbar, disable_hotkeys, allowed_hotkeys, has_key_bindings, disable_hints, mobile, scale, no_profile, verbose, allowed_path) catch |err| {
         // Format error name for debugging
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "{}", .{err}) catch "Unknown error";
@@ -494,7 +616,7 @@ fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
     return undef;
 }
 
-fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, disable_hotkeys: bool, disable_hints: bool, mobile: bool, scale: f32, no_profile: bool, verbose: bool, allowed_path: ?[]const u8) !void {
+fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, disable_hotkeys: bool, allowed_hotkeys: ?u32, has_key_bindings: bool, disable_hints: bool, mobile: bool, scale: f32, no_profile: bool, verbose: bool, allowed_path: ?[]const u8) !void {
     _ = mobile;
     _ = scale;
 
@@ -586,6 +708,12 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     if (disable_hotkeys) {
         viewer.disableHotkeys();
     }
+    if (allowed_hotkeys) |mask| {
+        viewer.setAllowedHotkeys(mask);
+    }
+    if (has_key_bindings) {
+        viewer.setKeyBindings(&key_bindings_storage);
+    }
     if (disable_hints) {
         viewer.disableHints();
     }
@@ -660,6 +788,8 @@ fn napi_openAsync(env: napi_env, info: napi_callback_info) callconv(.c) napi_val
     // Parse options (same as sync version)
     var no_toolbar = false;
     var disable_hotkeys = false;
+    var allowed_hotkeys: ?u32 = null;
+    var has_key_bindings = false;
     var disable_hints = false;
     var mobile = false;
     var scale: f32 = 1.0;
@@ -747,6 +877,18 @@ fn napi_openAsync(env: napi_env, info: napi_callback_info) callconv(.c) napi_val
                     _ = napi_get_value_bool(env, verbose_val, &verbose);
                 }
             }
+
+            // allowedHotkeys option - array of action names like ['quit', 'copy']
+            var allowed_hotkeys_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "allowedHotkeys", &allowed_hotkeys_val) == .ok) {
+                allowed_hotkeys = parseAllowedHotkeys(env, allowed_hotkeys_val);
+            }
+
+            // keyBindings option - object like { f: 'jsCode()', g: 'jsCode()' }
+            var key_bindings_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "keyBindings", &key_bindings_val) == .ok) {
+                has_key_bindings = parseKeyBindings(env, key_bindings_val);
+            }
         }
     }
 
@@ -763,6 +905,8 @@ fn napi_openAsync(env: napi_env, info: napi_callback_info) callconv(.c) napi_val
         .url = url_buf,
         .no_toolbar = no_toolbar,
         .disable_hotkeys = disable_hotkeys,
+        .allowed_hotkeys = allowed_hotkeys,
+        .has_key_bindings = has_key_bindings,
         .disable_hints = disable_hints,
         .mobile = mobile,
         .scale = scale,
