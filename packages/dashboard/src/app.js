@@ -16,6 +16,8 @@ const SORT_COLUMNS = ['pid', 'name', 'cpu', 'mem', 'port'];
 
 // Global key binding handlers called by termweb
 window.__termwebView = function(view) {
+  // c,m,n,d,p only work on main view
+  if (currentView !== 'main') return;
   currentView = view;
   selectedProcessIndex = 0;
   isFiltering = false;
@@ -23,10 +25,25 @@ window.__termwebView = function(view) {
 };
 
 window.__termwebFilter = function() {
-  currentView = 'processes';
+  // f only works on main or processes view
+  if (currentView !== 'main' && currentView !== 'processes') return;
+  if (currentView === 'main') {
+    currentView = 'processes';
+  }
   selectedProcessIndex = 0;
   isFiltering = true;
   renderCurrentView();
+};
+
+window.__termwebEsc = function() {
+  // Esc only works on detail pages (not main)
+  if (currentView === 'main') return;
+  if (isFiltering) {
+    isFiltering = false;
+    renderCurrentView();
+  } else {
+    hideDetailView();
+  }
 };
 
 function renderCurrentView() {

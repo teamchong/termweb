@@ -36,8 +36,11 @@ pub fn evalJS(
     js: []const u8,
 ) void {
     _ = allocator;
-    var params_buf: [4096]u8 = undefined;
-    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":\"{s}\"}}", .{js}) catch return;
+    // Use json.escapeString to properly encode the JS string with quotes
+    var escape_buf: [4096]u8 = undefined;
+    const escaped = json.escapeString(js, &escape_buf) catch return;
+    var params_buf: [8192]u8 = undefined;
+    const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{escaped}) catch return;
     client.sendCommandAsync("Runtime.evaluate", params) catch {};
 }
 
