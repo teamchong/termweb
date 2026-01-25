@@ -819,7 +819,7 @@ pub const Viewer = struct {
                 } else |_| {}
             }
 
-            // Flush pending ACK (throttled to 24fps)
+            // Flush pending ACK (no-op, kept for API compatibility)
             self.cdp_client.flushPendingAck();
 
             // Yield CPU (1ms = 1000Hz max loop rate)
