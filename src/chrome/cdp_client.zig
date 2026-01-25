@@ -594,9 +594,18 @@ pub const CdpClient = struct {
     }
 
     /// Switch to a different target (for tab switching)
-    /// Attaches to the target and updates the session ID
+    /// Detaches from current session and attaches to new target
     pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {
         logToFile("[CDP] Switching to target: {s}\n", .{target_id});
+
+        // Detach from current session first (if any) to allow clean re-attach
+        if (self.session_id) |old_sid| {
+            var detach_buf: [256]u8 = undefined;
+            const detach_params = std.fmt.bufPrint(&detach_buf, "{{\"sessionId\":\"{s}\"}}", .{old_sid}) catch "";
+            if (detach_params.len > 0) {
+                _ = self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params) catch {};
+            }
+        }
 
         // Activate the target in Chrome (brings it to focus)
         var activate_buf: [256]u8 = undefined;
@@ -617,27 +626,26 @@ pub const CdpClient = struct {
         );
         defer self.allocator.free(params);
 
-        // Try to attach - may fail if already attached, that's OK
-        if (self.pipe_client.?.sendCommand("Target.attachToTarget", params)) |attach_response| {
-            defer self.allocator.free(attach_response);
+        const attach_response = self.pipe_client.?.sendCommand("Target.attachToTarget", params) catch |err| {
+            logToFile("[CDP] Target.attachToTarget failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(attach_response);
 
-            // Extract and update session ID
-            if (self.extractSessionId(attach_response)) |new_session_id| {
-                // Free old session ID and set new one
-                if (self.session_id) |old_sid| {
-                    self.allocator.free(old_sid);
-                }
-                self.session_id = new_session_id;
-                logToFile("[CDP] Switched to target, new session: {s}\n", .{new_session_id});
-            } else |_| {
-                logToFile("[CDP] Could not extract session ID, keeping current session\n", .{});
-            }
-        } else |err| {
-            // Already attached or other error - just continue with current session
-            logToFile("[CDP] Target.attachToTarget failed (may be already attached): {}\n", .{err});
+        // Extract and update session ID
+        const new_session_id = self.extractSessionId(attach_response) catch |err| {
+            logToFile("[CDP] Could not extract session ID: {}\n", .{err});
+            return error.InvalidResponse;
+        };
+
+        // Free old session ID and set new one
+        if (self.session_id) |old_sid| {
+            self.allocator.free(old_sid);
         }
+        self.session_id = new_session_id;
+        logToFile("[CDP] Switched to target, new session: {s}\n", .{new_session_id});
 
-        // Re-enable Page domain on the session (for events)
+        // Re-enable Page domain on the new session
         const page_result = self.sendCommand("Page.enable", null) catch |err| {
             logToFile("[CDP] Page.enable failed: {}\n", .{err});
             return err;

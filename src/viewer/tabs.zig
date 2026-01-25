@@ -67,6 +67,11 @@ pub fn switchToTab(viewer: anytype, index: usize) !void {
 
     viewer.log("[TABS] Switching to tab {}: {s} (target={s})\n", .{ index, tab.url, tab.target_id });
 
+    // Stop current screencast before switching
+    screenshot_api.stopScreencast(viewer.cdp_client, viewer.allocator) catch |err| {
+        viewer.log("[TABS] stopScreencast failed: {}\n", .{err});
+    };
+
     viewer.cdp_client.switchToTarget(tab.target_id) catch |err| {
         viewer.log("[TABS] switchToTarget failed: {}, falling back to navigation\n", .{err});
         _ = try screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, tab.url);
