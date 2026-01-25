@@ -224,8 +224,26 @@ pub fn handleTargetInfoChanged(viewer: anytype, payload: []const u8) void {
     const removed_id = viewer.pending_new_targets.orderedRemove(found_index.?);
     viewer.allocator.free(removed_id);
 
+    // In single-tab mode, navigate in same tab instead of creating new tab
+    if (viewer.single_tab_mode) {
+        viewer.log("[TARGET INFO CHANGED] Single-tab mode: navigating to {s}\n", .{url});
+        viewer.cdp_client.closeTarget(target_id) catch {};
+        _ = screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url) catch |err| {
+            viewer.log("[TARGET INFO CHANGED] Navigation failed: {}\n", .{err});
+        };
+        return;
+    }
+
     viewer.addTab(target_id, url, "") catch |err| {
         viewer.log("[TARGET INFO CHANGED] Failed to add tab: {}\n", .{err});
+        return;
+    };
+
+    // Auto-switch to the new tab
+    const new_tab_index = viewer.tabs.items.len - 1;
+    viewer.log("[TARGET INFO CHANGED] Auto-switching to new tab index={}\n", .{new_tab_index});
+    tabs_mod.switchToTab(viewer, new_tab_index) catch |err| {
+        viewer.log("[TARGET INFO CHANGED] switchToTab failed: {}\n", .{err});
     };
 }
 
