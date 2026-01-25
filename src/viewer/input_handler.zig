@@ -226,15 +226,14 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             };
         },
         .dev_console => {
-            // Get DevTools URL and open in Chrome (activates window)
+            // Get DevTools URL and navigate to it
             if (viewer.cdp_client.getDevToolsUrl()) |url| {
                 defer viewer.allocator.free(url);
                 viewer.log("[DEV] Opening DevTools: {s}\n", .{url});
 
-                // Use 'open -a' to open in Chrome and activate it
-                var child = std.process.Child.init(&.{ "open", "-a", "Google Chrome", url }, viewer.allocator);
-                _ = child.spawnAndWait() catch |err| {
-                    viewer.log("[DEV] Failed to open browser: {}\n", .{err});
+                // Navigate to DevTools URL in current tab
+                screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url) catch |err| {
+                    viewer.log("[DEV] Failed to navigate: {}\n", .{err});
                 };
             } else {
                 viewer.log("[DEV] Failed to get DevTools URL\n", .{});
