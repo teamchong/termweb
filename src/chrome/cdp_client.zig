@@ -210,6 +210,7 @@ pub const CdpClient = struct {
     }
 
     /// Discover page WebSocket URL from Chrome's HTTP endpoint
+    /// If current_target_id is set, finds that specific target; otherwise finds any page target
     fn discoverPageWebSocketUrl(self: *CdpClient, allocator: std.mem.Allocator) ![]const u8 {
         // Connect to Chrome's /json/list endpoint to get the page's WebSocket URL
         const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", self.debug_port) catch |err| {
@@ -237,29 +238,49 @@ pub const CdpClient = struct {
         var parsed = json.parse(allocator, body) catch return CdpError.InvalidResponse;
         defer parsed.deinit(allocator);
 
-        // Iterate over targets to find one with type="page"
+        // Iterate over targets to find the correct one
         if (parsed != .array) return CdpError.InvalidResponse;
+
+        var first_page_ws_url: ?[]const u8 = null;
 
         for (parsed.array.items) |target| {
             if (target != .object) continue;
-            
+
             const type_val = target.object.get("type") orelse continue;
             if (type_val != .string or !std.mem.eql(u8, type_val.string, "page")) continue;
 
             const url_val = target.object.get("webSocketDebuggerUrl") orelse continue;
-            if (url_val == .string) {
-                return try allocator.dupe(u8, url_val.string);
+            if (url_val != .string) continue;
+
+            // If we have a current_target_id, look for that specific target
+            if (self.current_target_id) |target_id| {
+                const id_val = target.object.get("id") orelse continue;
+                if (id_val == .string and std.mem.eql(u8, id_val.string, target_id)) {
+                    logToFile("[CDP] Found WebSocket URL for target {s}\n", .{target_id});
+                    return try allocator.dupe(u8, url_val.string);
+                }
+            }
+
+            // Track first page target as fallback
+            if (first_page_ws_url == null) {
+                first_page_ws_url = url_val.string;
             }
         }
-        
-        // Return first target if no page found (fallback)
+
+        // If we didn't find the specific target, fall back to first page
+        if (first_page_ws_url) |ws_url| {
+            logToFile("[CDP] Using fallback WebSocket URL (first page target)\n", .{});
+            return try allocator.dupe(u8, ws_url);
+        }
+
+        // Return first target of any type as last resort
         if (parsed.array.items.len > 0) {
             const target = parsed.array.items[0];
-             if (target == .object) {
-                 if (target.object.get("webSocketDebuggerUrl")) |url_val| {
-                     if (url_val == .string) return try allocator.dupe(u8, url_val.string);
-                 }
-             }
+            if (target == .object) {
+                if (target.object.get("webSocketDebuggerUrl")) |url_val| {
+                    if (url_val == .string) return try allocator.dupe(u8, url_val.string);
+                }
+            }
         }
 
         return CdpError.NoPageTarget;
@@ -459,31 +480,39 @@ pub const CdpClient = struct {
     /// Reconnect page WebSocket to current page target
     /// Cross-origin navigation creates new page target, invalidating connections
     fn reconnectPageWebSocket(self: *CdpClient) !void {
-        logToFile("[CDP] Reconnecting page WebSocket...\n", .{});
+        logToFile("[CDP reconnectWS] Starting...\n", .{});
 
         // Close old connection
         if (self.page_ws) |ws| {
+            logToFile("[CDP reconnectWS] Closing old WebSocket...\n", .{});
             ws.deinit();
             self.page_ws = null;
+            logToFile("[CDP reconnectWS] Old WebSocket closed\n", .{});
         }
 
         // Discover new page WebSocket URL
+        logToFile("[CDP reconnectWS] Discovering WebSocket URL...\n", .{});
         const ws_url = try self.discoverPageWebSocketUrl(self.allocator);
         defer self.allocator.free(ws_url);
+        logToFile("[CDP reconnectWS] Got URL: {s}\n", .{ws_url});
 
         // Connect page WebSocket
+        logToFile("[CDP reconnectWS] Connecting...\n", .{});
         self.page_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, ws_url);
         try self.page_ws.?.startReaderThread();
+        logToFile("[CDP reconnectWS] Connected\n", .{});
 
         // Re-enable Runtime domain for console events
+        logToFile("[CDP reconnectWS] Enabling Runtime domain...\n", .{});
         const runtime_result = try self.page_ws.?.sendCommand("Runtime.enable", null);
         self.allocator.free(runtime_result);
 
         // Re-enable Page domain for navigation events
+        logToFile("[CDP reconnectWS] Enabling Page domain...\n", .{});
         const page_result = try self.page_ws.?.sendCommand("Page.enable", null);
         self.allocator.free(page_result);
 
-        logToFile("[CDP] Page WebSocket reconnected successfully\n", .{});
+        logToFile("[CDP reconnectWS] Done\n", .{});
     }
 
     /// Send CDP command and wait for response - uses session
@@ -600,27 +629,34 @@ pub const CdpClient = struct {
     /// Switch to a different target (for tab switching)
     /// Detaches from current session and attaches to new target
     pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {
-        logToFile("[CDP] Switching to target: {s}\n", .{target_id});
+        logToFile("[CDP switchToTarget] START target={s}\n", .{target_id});
 
         // Detach from current session first (if any) to allow clean re-attach
         if (self.session_id) |old_sid| {
+            logToFile("[CDP switchToTarget] Detaching from session: {s}\n", .{old_sid});
             var detach_buf: [256]u8 = undefined;
             const detach_params = std.fmt.bufPrint(&detach_buf, "{{\"sessionId\":\"{s}\"}}", .{old_sid}) catch "";
             if (detach_params.len > 0) {
-                _ = self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params) catch {};
+                _ = self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params) catch |err| {
+                    logToFile("[CDP switchToTarget] Detach failed (continuing): {}\n", .{err});
+                };
             }
+            logToFile("[CDP switchToTarget] Detach done\n", .{});
         }
 
         // Activate the target in Chrome (brings it to focus)
+        logToFile("[CDP switchToTarget] Activating target...\n", .{});
         var activate_buf: [256]u8 = undefined;
         const activate_params = std.fmt.bufPrint(&activate_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
         const activate_result = self.pipe_client.?.sendCommand("Target.activateTarget", activate_params) catch |err| {
-            logToFile("[CDP] Target.activateTarget failed: {}\n", .{err});
+            logToFile("[CDP switchToTarget] Target.activateTarget FAILED: {}\n", .{err});
             return err;
         };
         self.allocator.free(activate_result);
+        logToFile("[CDP switchToTarget] Activate done\n", .{});
 
         // Attach to the target to get a new session
+        logToFile("[CDP switchToTarget] Attaching to target...\n", .{});
         var escape_buf: [512]u8 = undefined;
         const escaped_id = json_utils.escapeContents(target_id, &escape_buf) catch return error.OutOfMemory;
         const params = try std.fmt.allocPrint(
@@ -631,10 +667,11 @@ pub const CdpClient = struct {
         defer self.allocator.free(params);
 
         const attach_response = self.pipe_client.?.sendCommand("Target.attachToTarget", params) catch |err| {
-            logToFile("[CDP] Target.attachToTarget failed: {}\n", .{err});
+            logToFile("[CDP switchToTarget] Target.attachToTarget FAILED: {}\n", .{err});
             return err;
         };
         defer self.allocator.free(attach_response);
+        logToFile("[CDP switchToTarget] Attach done\n", .{});
 
         // Extract and update session ID
         const new_session_id = self.extractSessionId(attach_response) catch |err| {
@@ -654,14 +691,24 @@ pub const CdpClient = struct {
         }
         self.current_target_id = try self.allocator.dupe(u8, target_id);
 
-        logToFile("[CDP] Switched to target, new session: {s}\n", .{new_session_id});
+        logToFile("[CDP switchToTarget] Switched to target, new session: {s}\n", .{new_session_id});
 
         // Re-enable Page domain on the new session
+        logToFile("[CDP switchToTarget] Enabling Page domain...\n", .{});
         const page_result = self.sendCommand("Page.enable", null) catch |err| {
-            logToFile("[CDP] Page.enable failed: {}\n", .{err});
+            logToFile("[CDP switchToTarget] Page.enable FAILED: {}\n", .{err});
             return err;
         };
         self.allocator.free(page_result);
+        logToFile("[CDP switchToTarget] Page.enable done\n", .{});
+
+        // Reconnect WebSocket to new target (page_ws is still pointing to old page)
+        // This is non-critical - screencast works via pipe, WebSocket is for input
+        logToFile("[CDP switchToTarget] Reconnecting WebSocket...\n", .{});
+        self.reconnectPageWebSocket() catch |err| {
+            logToFile("[CDP switchToTarget] reconnectPageWebSocket failed: {} (continuing anyway)\n", .{err});
+        };
+        logToFile("[CDP switchToTarget] END success\n", .{});
     }
 
     /// Get the current target ID
