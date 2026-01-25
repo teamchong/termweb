@@ -226,9 +226,20 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             };
         },
         .dev_console => {
-            // Send F12 to Chrome to toggle DevTools
-            viewer.log("[DEV] Opening DevTools (F12)\n", .{});
-            interact_mod.sendSpecialKeyWithModifiers(viewer.cdp_client, "F12", 123, 0);
+            // Get DevTools URL and open in system browser
+            if (viewer.cdp_client.getDevToolsUrl()) |url| {
+                defer viewer.allocator.free(url);
+                viewer.log("[DEV] Opening DevTools: {s}\n", .{url});
+
+                // Use 'open' command on macOS to open in browser
+                var child = std.process.Child.init(&.{ "open", url }, viewer.allocator);
+                child.spawn() catch |err| {
+                    viewer.log("[DEV] Failed to open browser: {}\n", .{err});
+                };
+                // Don't wait - let it run in background
+            } else {
+                viewer.log("[DEV] Failed to get DevTools URL\n", .{});
+            }
         },
     }
 }

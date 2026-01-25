@@ -650,4 +650,34 @@ pub const CdpClient = struct {
         };
         self.allocator.free(result);
     }
+
+    /// Get DevTools frontend URL for the current page
+    /// Returns URL like: devtools://devtools/bundled/inspector.html?ws=...
+    pub fn getDevToolsUrl(self: *CdpClient) ?[]const u8 {
+        // Connect to Chrome's /json/list endpoint
+        const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", self.debug_port) catch return null;
+        defer stream.close();
+
+        var request_buf: [128]u8 = undefined;
+        const request = std.fmt.bufPrint(&request_buf, "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", .{self.debug_port}) catch return null;
+        _ = stream.write(request) catch return null;
+
+        var buf: [8192]u8 = undefined;
+        const n = stream.read(&buf) catch return null;
+        const response = buf[0..n];
+
+        // Find devtoolsFrontendUrl in response
+        const marker = "\"devtoolsFrontendUrl\":\"";
+        const start = std.mem.indexOf(u8, response, marker) orelse return null;
+        const url_start = start + marker.len;
+        const url_end = std.mem.indexOfPos(u8, response, url_start, "\"") orelse return null;
+        const relative_url = response[url_start..url_end];
+
+        // Convert relative URL to absolute
+        // Chrome returns: /devtools/inspector.html?ws=...
+        // We need: http://127.0.0.1:PORT/devtools/inspector.html?ws=...
+        var url_buf: [512]u8 = undefined;
+        const full_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ self.debug_port, relative_url }) catch return null;
+        return self.allocator.dupe(u8, full_url) catch return null;
+    }
 };

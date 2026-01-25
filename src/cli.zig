@@ -436,7 +436,7 @@ fn printHelp() void {
         \\  Ctrl+X                Cut selection
         \\  Ctrl+V                Paste
         \\  Ctrl+A                Select all
-        \\  Ctrl+I                Open DevTools (F12)
+        \\  Ctrl+I                Open DevTools in browser
         \\
         \\Hint Mode:
         \\  Press Ctrl+H to show clickable element labels.
