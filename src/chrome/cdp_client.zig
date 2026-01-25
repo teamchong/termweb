@@ -617,25 +617,31 @@ pub const CdpClient = struct {
         );
         defer self.allocator.free(params);
 
-        const attach_response = self.pipe_client.?.sendCommand("Target.attachToTarget", params) catch |err| {
-            logToFile("[CDP] Target.attachToTarget failed: {}\n", .{err});
+        // Try to attach - may fail if already attached, that's OK
+        if (self.pipe_client.?.sendCommand("Target.attachToTarget", params)) |attach_response| {
+            defer self.allocator.free(attach_response);
+
+            // Extract and update session ID
+            if (self.extractSessionId(attach_response)) |new_session_id| {
+                // Free old session ID and set new one
+                if (self.session_id) |old_sid| {
+                    self.allocator.free(old_sid);
+                }
+                self.session_id = new_session_id;
+                logToFile("[CDP] Switched to target, new session: {s}\n", .{new_session_id});
+            } else |_| {
+                logToFile("[CDP] Could not extract session ID, keeping current session\n", .{});
+            }
+        } else |err| {
+            // Already attached or other error - just continue with current session
+            logToFile("[CDP] Target.attachToTarget failed (may be already attached): {}\n", .{err});
+        }
+
+        // Re-enable Page domain on the session (for events)
+        const page_result = self.sendCommand("Page.enable", null) catch |err| {
+            logToFile("[CDP] Page.enable failed: {}\n", .{err});
             return err;
         };
-        defer self.allocator.free(attach_response);
-
-        // Extract and update session ID
-        const new_session_id = try self.extractSessionId(attach_response);
-
-        // Free old session ID and set new one
-        if (self.session_id) |old_sid| {
-            self.allocator.free(old_sid);
-        }
-        self.session_id = new_session_id;
-
-        logToFile("[CDP] Switched to target, new session: {s}\n", .{new_session_id});
-
-        // Re-enable Page domain on the new session (for events)
-        const page_result = try self.sendCommand("Page.enable", null);
         self.allocator.free(page_result);
     }
 
