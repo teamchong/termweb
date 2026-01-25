@@ -142,6 +142,7 @@ pub const Viewer = struct {
     hints_disabled: bool, // --disable-hints flag
     devtools_disabled: bool, // --disable-devtools flag
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
+    pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
 
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
@@ -310,6 +311,7 @@ pub const Viewer = struct {
             .hints_disabled = false,
             .devtools_disabled = false,
             .single_tab_mode = false,
+            .pending_tab_switch = null,
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -381,6 +383,11 @@ pub const Viewer = struct {
     /// Disable DevTools hotkey (Ctrl+I)
     pub fn disableDevtools(self: *Viewer) void {
         self.devtools_disabled = true;
+    }
+
+    /// Request a deferred tab switch (processed in main loop to avoid re-entrancy)
+    pub fn requestTabSwitch(self: *Viewer, index: usize) void {
+        self.pending_tab_switch = index;
     }
 
     /// Enable single-tab mode (navigate in same tab instead of opening new tabs)
@@ -717,6 +724,15 @@ pub const Viewer = struct {
 
             // CDP events handled by CDP thread
             time_after_events = std.time.nanoTimestamp();
+
+            // Process pending tab switch (deferred from event handlers to avoid re-entrancy)
+            if (self.pending_tab_switch) |tab_index| {
+                self.pending_tab_switch = null;
+                self.log("[TABS] Processing deferred tab switch to index {}\n", .{tab_index});
+                viewer_mod.switchToTab(self, tab_index) catch |err| {
+                    self.log("[TABS] Deferred switchToTab failed: {}\n", .{err});
+                };
+            }
 
             // Flush pending ACK (throttled to 24fps)
             self.cdp_client.flushPendingAck();

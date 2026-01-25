@@ -175,12 +175,10 @@ pub fn handleNewTarget(viewer: anytype, payload: []const u8) void {
         return;
     };
 
-    // Auto-switch to the new tab
+    // Request deferred tab switch (processed in main loop to avoid re-entrancy)
     const new_tab_index = viewer.tabs.items.len - 1;
-    viewer.log("[NEW TARGET] Auto-switching to new tab index={}\n", .{new_tab_index});
-    tabs_mod.switchToTab(viewer, new_tab_index) catch |err| {
-        viewer.log("[NEW TARGET] switchToTab failed: {}\n", .{err});
-    };
+    viewer.log("[NEW TARGET] Requesting deferred switch to tab index={}\n", .{new_tab_index});
+    viewer.requestTabSwitch(new_tab_index);
 }
 
 /// Handle Target.targetInfoChanged - URL may now be available for pending targets
@@ -239,12 +237,10 @@ pub fn handleTargetInfoChanged(viewer: anytype, payload: []const u8) void {
         return;
     };
 
-    // Auto-switch to the new tab
+    // Request deferred tab switch (processed in main loop to avoid re-entrancy)
     const new_tab_index = viewer.tabs.items.len - 1;
-    viewer.log("[TARGET INFO CHANGED] Auto-switching to new tab index={}\n", .{new_tab_index});
-    tabs_mod.switchToTab(viewer, new_tab_index) catch |err| {
-        viewer.log("[TARGET INFO CHANGED] switchToTab failed: {}\n", .{err});
-    };
+    viewer.log("[TARGET INFO CHANGED] Requesting deferred switch to tab index={}\n", .{new_tab_index});
+    viewer.requestTabSwitch(new_tab_index);
 }
 
 /// Handle Browser.downloadWillBegin event
