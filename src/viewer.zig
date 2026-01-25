@@ -181,6 +181,7 @@ pub const Viewer = struct {
     last_nav_state_update: i128,
     loading_started_at: i128, // When loading started (for minimum display time)
     frames_skipped: u32,  // Counter for monitoring
+    showing_blank_placeholder: bool, // True when showing "New Tab" placeholder (skip screencast)
 
     // Debug flags
     debug_input: bool,
@@ -351,6 +352,7 @@ pub const Viewer = struct {
             .last_nav_state_update = 0,
             .loading_started_at = 0,
             .frames_skipped = 0,
+            .showing_blank_placeholder = false,
             .debug_input = enable_input_debug,
             .ui_dirty = true,
             .needs_nav_state_update = false,

@@ -239,6 +239,22 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
                 viewer.log("[DEV] Failed to get DevTools URL\n", .{});
             }
         },
+        .new_tab => {
+            const tabs_mod = @import("tabs.zig");
+            tabs_mod.createNewTab(viewer) catch |err| {
+                viewer.log("[TAB] Failed to create new tab: {}\n", .{err});
+            };
+        },
+        .close_tab => {
+            const tabs_mod = @import("tabs.zig");
+            const should_quit = tabs_mod.closeCurrentTab(viewer) catch |err| {
+                viewer.log("[TAB] Failed to close tab: {}\n", .{err});
+                return;
+            };
+            if (should_quit) {
+                viewer.running = false;
+            }
+        },
     }
 }
 
@@ -411,6 +427,10 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
                 viewer.ui_dirty = true;
 
                 viewer.log("[URL] Navigating to: {s}\n", .{url_copy});
+
+                // Clear blank page placeholder if showing (allow screencast rendering)
+                viewer.showing_blank_placeholder = false;
+
                 screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url_copy) catch |err| {
                     viewer.log("[URL] Navigation failed: {}\n", .{err});
                     viewer.allocator.free(url_copy);

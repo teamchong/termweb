@@ -33,6 +33,8 @@ pub const AppAction = enum {
     scroll_down,
     scroll_up,
     dev_console,
+    new_tab,
+    close_tab,
 };
 
 /// Key type for shortcuts - can be a character or special key
@@ -83,6 +85,10 @@ pub const app_shortcuts = [_]ShortcutDef{
 
     // Developer tools
     .{ .key = .{ .char = 'i' }, .shortcut_mod = false, .ctrl = true, .action = .dev_console },
+
+    // Tab management
+    .{ .key = .{ .char = 'n' }, .shortcut_mod = false, .ctrl = true, .action = .new_tab },
+    .{ .key = .{ .char = 'w' }, .shortcut_mod = false, .ctrl = true, .action = .close_tab },
 };
 
 /// Find an app action for a key event.

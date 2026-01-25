@@ -167,6 +167,7 @@ pub fn listProfiles(allocator: std.mem.Allocator) ![][]const u8 {
 /// Clone a Chrome profile to a temporary directory (minimal for fast startup)
 /// Copies only essential session data: Cookies, Local Storage, IndexedDB
 /// Skips: Extensions, History, Bookmarks, etc. (not needed for session auth)
+/// Uses COW (copy-on-write) cloning on macOS APFS for instant copies
 fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir: []const u8, verbose: bool) !void {
     const user_data_dir = try getChromeUserDataDir(allocator);
     defer allocator.free(user_data_dir);
@@ -183,11 +184,21 @@ fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir
         return error.CloneFailed;
     };
 
+    // Try fast COW clone first (instant on APFS/Btrfs)
+    if (tryFastClone(allocator, source_profile, dest_profile, verbose)) {
+        return;
+    }
+
+    // Fallback: manual file-by-file copy
+    if (verbose) {
+        std.debug.print("Fast clone unavailable, using file copy...\n", .{});
+    }
+
     // Minimal files to copy (only what's needed for login sessions)
     const files_to_copy = [_][]const u8{
-        "Cookies",      // Session cookies for auth
-        "Login Data",   // Saved passwords
-        "Preferences",  // Basic settings (minimal, fast to copy)
+        "Cookies", // Session cookies for auth
+        "Login Data", // Saved passwords
+        "Preferences", // Basic settings (minimal, fast to copy)
     };
 
     var source_dir = std.fs.cwd().openDir(source_profile, .{}) catch |err| {
@@ -207,9 +218,9 @@ fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir
 
     // Copy directories for web app data (Local Storage, IndexedDB)
     const dirs_to_copy = [_][]const u8{
-        "Local Storage",   // localStorage API data
-        "IndexedDB",       // IndexedDB data
-        "File System",     // OPFS data
+        "Local Storage", // localStorage API data
+        "IndexedDB", // IndexedDB data
+        "File System", // OPFS data
     };
 
     for (dirs_to_copy) |dir_name| {
@@ -219,6 +230,56 @@ fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir
     if (verbose) {
         std.debug.print("Cloned profile '{s}' ({} files copied)\n", .{ profile_name, copied });
     }
+}
+
+/// Try fast COW (copy-on-write) clone using system commands
+/// Returns true if successful, false to fall back to manual copy
+fn tryFastClone(allocator: std.mem.Allocator, source: []const u8, dest: []const u8, verbose: bool) bool {
+    // Items to clone (files and directories)
+    const items_to_clone = [_][]const u8{
+        "Cookies",
+        "Login Data",
+        "Preferences",
+        "Local Storage",
+        "IndexedDB",
+        "File System",
+    };
+
+    var cloned: u32 = 0;
+
+    for (items_to_clone) |item| {
+        var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+        const src_path = std.fmt.bufPrint(&src_path_buf, "{s}/{s}", .{ source, item }) catch continue;
+        const dst_path = std.fmt.bufPrint(&dst_path_buf, "{s}/{s}", .{ dest, item }) catch continue;
+
+        // Check if source exists
+        std.fs.cwd().access(src_path, .{}) catch continue;
+
+        // Use cp -c (clone) on macOS, cp --reflink=auto on Linux
+        const argv = if (builtin.os.tag == .macos)
+            [_][]const u8{ "cp", "-cR", src_path, dst_path }
+        else
+            [_][]const u8{ "cp", "-r", "--reflink=auto", src_path, dst_path };
+
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch continue;
+        const result = child.wait() catch continue;
+
+        if (result.Exited == 0) {
+            cloned += 1;
+        }
+    }
+
+    if (cloned > 0 and verbose) {
+        std.debug.print("Fast-cloned profile ({} items via COW)\n", .{cloned});
+    }
+
+    return cloned > 0;
 }
 
 /// Recursively copy a directory

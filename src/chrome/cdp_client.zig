@@ -69,6 +69,7 @@ pub const CdpClient = struct {
     // WebSocket clients (pipe is ONLY for screencast frames)
     page_ws: ?*websocket_cdp.WebSocketCdpClient, // All page-level commands
     browser_ws: ?*websocket_cdp.WebSocketCdpClient, // Browser-level for downloads
+    page_ws_mutex: std.Thread.Mutex, // Protects page_ws reconnection
 
     /// Initialize CDP client from pipe file descriptors
     /// read_fd: FD to read from Chrome (Chrome's FD 4)
@@ -84,6 +85,7 @@ pub const CdpClient = struct {
             .debug_port = debug_port,
             .page_ws = null,
             .browser_ws = null,
+            .page_ws_mutex = .{},
         };
 
         // Attach to page target to enable page-level commands
@@ -491,8 +493,18 @@ pub const CdpClient = struct {
     }
 
     /// Ensure page WebSocket is connected (lazy recovery)
+    /// Thread-safe: uses mutex to prevent multiple simultaneous reconnections
     fn ensurePageWsConnected(self: *CdpClient) !void {
+        // Quick check without mutex (common case - ws is alive)
         if (self.isPageWsAlive()) return;
+
+        // Take mutex before reconnecting to prevent race condition
+        self.page_ws_mutex.lock();
+        defer self.page_ws_mutex.unlock();
+
+        // Double-check after acquiring mutex (another thread may have reconnected)
+        if (self.isPageWsAlive()) return;
+
         logToFile("[CDP] page_ws dead, attempting lazy recovery...\n", .{});
         try self.reconnectPageWebSocket();
     }
@@ -772,18 +784,125 @@ pub const CdpClient = struct {
         self.allocator.free(page_result);
         logToFile("[CDP switchToTarget] Page.enable done\n", .{});
 
-        // Reconnect WebSocket to new target (page_ws is still pointing to old page)
-        // This is non-critical - screencast works via pipe, WebSocket is for input
-        logToFile("[CDP switchToTarget] Reconnecting WebSocket...\n", .{});
-        self.reconnectPageWebSocket() catch |err| {
-            logToFile("[CDP switchToTarget] reconnectPageWebSocket failed: {} (continuing anyway)\n", .{err});
-        };
-        logToFile("[CDP switchToTarget] END success\n", .{});
+        // WebSocket reconnection is deferred - lazy recovery will handle it when input is needed
+        // This avoids blocking tab switch on slow WebSocket handshake (~200-500ms)
+        // Screencast works via pipe, so display is immediate
+        {
+            self.page_ws_mutex.lock();
+            defer self.page_ws_mutex.unlock();
+            if (self.page_ws) |ws| {
+                ws.deinit();
+                self.page_ws = null;
+            }
+        }
+        logToFile("[CDP switchToTarget] END success (ws reconnect deferred)\n", .{});
     }
 
     /// Get the current target ID
     pub fn getCurrentTargetId(self: *CdpClient) ?[]const u8 {
         return self.current_target_id;
+    }
+
+    /// Create a new target (tab) with the given URL
+    /// Returns the new target ID
+    pub fn createTarget(self: *CdpClient, url: []const u8) ![]const u8 {
+        logToFile("[CDP] Creating new target: {s}\n", .{url});
+        var buf: [512]u8 = undefined;
+        const params = std.fmt.bufPrint(&buf, "{{\"url\":\"{s}\"}}", .{url}) catch return error.OutOfMemory;
+        const result = self.pipe_client.?.sendCommand("Target.createTarget", params) catch |err| {
+            logToFile("[CDP] Target.createTarget failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(result);
+
+        // Parse targetId from response: {"result":{"targetId":"..."}}
+        const marker = "\"targetId\":\"";
+        const start = std.mem.indexOf(u8, result, marker) orelse return error.InvalidResponse;
+        const id_start = start + marker.len;
+        const id_end = std.mem.indexOfPos(u8, result, id_start, "\"") orelse return error.InvalidResponse;
+        return try self.allocator.dupe(u8, result[id_start..id_end]);
+    }
+
+    /// Create and immediately attach to a new target (optimized for new tab)
+    /// Skips activation step since new targets are already focused
+    /// Returns the new target ID (caller owns)
+    pub fn createAndAttachTarget(self: *CdpClient, url: []const u8) ![]const u8 {
+        logToFile("[CDP createAndAttach] START url={s}\n", .{url});
+
+        // Create target
+        var create_buf: [512]u8 = undefined;
+        const create_params = std.fmt.bufPrint(&create_buf, "{{\"url\":\"{s}\"}}", .{url}) catch return error.OutOfMemory;
+        const create_result = self.pipe_client.?.sendCommand("Target.createTarget", create_params) catch |err| {
+            logToFile("[CDP createAndAttach] createTarget failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(create_result);
+
+        // Parse targetId
+        const marker = "\"targetId\":\"";
+        const start = std.mem.indexOf(u8, create_result, marker) orelse return error.InvalidResponse;
+        const id_start = start + marker.len;
+        const id_end = std.mem.indexOfPos(u8, create_result, id_start, "\"") orelse return error.InvalidResponse;
+        const target_id = create_result[id_start..id_end];
+        logToFile("[CDP createAndAttach] Created target: {s}\n", .{target_id});
+
+        // Detach from current session (if any)
+        if (self.session_id) |old_sid| {
+            var detach_buf: [256]u8 = undefined;
+            const detach_params = std.fmt.bufPrint(&detach_buf, "{{\"sessionId\":\"{s}\"}}", .{old_sid}) catch "";
+            if (detach_params.len > 0) {
+                if (self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params)) |r| {
+                    self.allocator.free(r);
+                } else |_| {}
+            }
+            self.allocator.free(old_sid);
+            self.session_id = null;
+        }
+
+        // Attach to new target (skip activateTarget - new tabs are already focused)
+        var escape_buf: [512]u8 = undefined;
+        const escaped_id = json_utils.escapeContents(target_id, &escape_buf) catch return error.OutOfMemory;
+        const attach_params = try std.fmt.allocPrint(self.allocator, "{{\"targetId\":\"{s}\",\"flatten\":true}}", .{escaped_id});
+        defer self.allocator.free(attach_params);
+
+        const attach_response = self.pipe_client.?.sendCommand("Target.attachToTarget", attach_params) catch |err| {
+            logToFile("[CDP createAndAttach] attachToTarget failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(attach_response);
+
+        // Extract session ID
+        const new_session_id = self.extractSessionId(attach_response) catch |err| {
+            logToFile("[CDP createAndAttach] extractSessionId failed: {}\n", .{err});
+            return error.InvalidResponse;
+        };
+        self.session_id = new_session_id;
+
+        // Update current target ID
+        if (self.current_target_id) |old_tid| {
+            self.allocator.free(old_tid);
+        }
+        self.current_target_id = try self.allocator.dupe(u8, target_id);
+
+        // Enable Page domain
+        const page_result = self.sendCommand("Page.enable", null) catch |err| {
+            logToFile("[CDP createAndAttach] Page.enable failed: {}\n", .{err});
+            return err;
+        };
+        self.allocator.free(page_result);
+
+        // Clear old WebSocket (lazy recovery will handle reconnection when needed)
+        {
+            self.page_ws_mutex.lock();
+            defer self.page_ws_mutex.unlock();
+            if (self.page_ws) |ws| {
+                ws.deinit();
+                self.page_ws = null;
+            }
+        }
+
+        logToFile("[CDP createAndAttach] END success\n", .{});
+        return try self.allocator.dupe(u8, target_id);
     }
 
     /// Close a target (for single-tab mode - close unwanted popups)

@@ -12,6 +12,91 @@ const Placement = ui_mod.Placement;
 const ZIndex = ui_mod.ZIndex;
 const cursor_asset = ui_mod.assets.cursor;
 
+/// Render a placeholder for blank pages (about:blank, new tab, etc.)
+/// Shows centered help with keyboard shortcuts
+pub fn renderBlankPage(viewer: anytype) void {
+    const stdout = std.fs.File.stdout();
+    const size = viewer.terminal.getSize() catch return;
+
+    // Help text - shortcuts aligned in two columns
+    const title = "New Tab";
+    const help_lines = [_]struct { key: []const u8, desc: []const u8 }{
+        .{ .key = "Ctrl+L", .desc = "Address bar" },
+        .{ .key = "Ctrl+N", .desc = "New tab" },
+        .{ .key = "Ctrl+W", .desc = "Close tab" },
+        .{ .key = "Ctrl+T", .desc = "Tab picker" },
+        .{ .key = "Ctrl+R", .desc = "Reload" },
+        .{ .key = "Ctrl+[", .desc = "Back" },
+        .{ .key = "Ctrl+]", .desc = "Forward" },
+        .{ .key = "Ctrl+H", .desc = "Link hints" },
+        .{ .key = "Ctrl+J/K", .desc = "Scroll" },
+        .{ .key = "Ctrl+Q", .desc = "Quit" },
+    };
+
+    // Calculate vertical center
+    const total_lines = 1 + 1 + help_lines.len; // title + gap + help
+    const start_row = if (size.rows > total_lines) (size.rows - @as(u16, @intCast(total_lines))) / 2 else 2;
+
+    var buf: [2048]u8 = undefined;
+    var offset: usize = 0;
+
+    // Delete content image by ID=100 (use uppercase I to delete all placements)
+    const delete_cmd = "\x1b_Ga=d,d=I,i=100\x1b\\";
+    @memcpy(buf[offset..][0..delete_cmd.len], delete_cmd);
+    offset += delete_cmd.len;
+
+    // Move to row 2, column 1 and set dark gray background
+    const bg_seq = "\x1b[2;1H\x1b[48;5;234m";
+    @memcpy(buf[offset..][0..bg_seq.len], bg_seq);
+    offset += bg_seq.len;
+
+    // Clear from cursor to end of screen (fills with current background)
+    const clear_seq = "\x1b[J";
+    @memcpy(buf[offset..][0..clear_seq.len], clear_seq);
+    offset += clear_seq.len;
+
+    // Print title (bold white on dark bg)
+    const title_col = if (size.cols > title.len) (size.cols - @as(u16, @intCast(title.len))) / 2 else 1;
+    const title_seq = std.fmt.bufPrint(buf[offset..], "\x1b[{d};{d}H\x1b[1;97;48;5;234m{s}", .{
+        start_row,
+        title_col,
+        title,
+    }) catch return;
+    offset += title_seq.len;
+
+    // Print help lines (key in bright white, desc in gray)
+    // Format: "Ctrl+L   Address bar" - key padded to 8 chars
+    const line_width = 24; // Total line width
+    const base_col = if (size.cols > line_width) (size.cols - line_width) / 2 else 1;
+
+    for (help_lines, 0..) |item, i| {
+        const row = start_row + 2 + @as(u16, @intCast(i));
+
+        // Format: key (8 chars padded) + "  " + desc
+        const line_seq = std.fmt.bufPrint(buf[offset..], "\x1b[{d};{d}H\x1b[1;97;48;5;234m{s: <8}\x1b[0;38;5;250;48;5;234m  {s}", .{
+            row,
+            base_col,
+            item.key,
+            item.desc,
+        }) catch break;
+        offset += line_seq.len;
+    }
+
+    // Reset attributes at end
+    const reset_seq = "\x1b[0m";
+    @memcpy(buf[offset..][0..reset_seq.len], reset_seq);
+    offset += reset_seq.len;
+
+    // Write all at once
+    _ = stdout.write(buf[0..offset]) catch {};
+
+    viewer.last_content_image_id = null;
+    viewer.last_rendered_generation = 0;
+
+    // Mark as showing blank page placeholder to prevent screencast overwrite
+    viewer.showing_blank_placeholder = true;
+}
+
 /// Get maximum FPS (returns viewer's target_fps)
 pub fn getTargetFps(viewer: anytype) u32 {
     return viewer.target_fps;
@@ -25,6 +110,16 @@ pub fn getMinFrameInterval(viewer: anytype) i128 {
 /// Try to render latest screencast frame (non-blocking)
 /// Returns true if frame was rendered, false if no new frame
 pub fn tryRenderScreencast(viewer: anytype) !bool {
+    // Skip rendering if showing blank page placeholder
+    if (viewer.showing_blank_placeholder) {
+        // Still consume frames to keep queue clear, but don't render
+        if (screenshot_api.getLatestScreencastFrame(viewer.cdp_client)) |f| {
+            var frame = f;
+            frame.deinit();
+        }
+        return false;
+    }
+
     const now = std.time.nanoTimestamp();
 
     // Get frame with proper ownership - MUST call deinit when done

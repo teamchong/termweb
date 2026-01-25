@@ -428,6 +428,8 @@ fn printHelp() void {
         \\  Ctrl+[                Go back
         \\  Ctrl+]                Go forward
         \\  Ctrl+.                Stop loading
+        \\  Ctrl+N                New tab (about:blank)
+        \\  Ctrl+W                Close tab (quit if last tab)
         \\  Ctrl+T                Show tab picker
         \\  Ctrl+H                Enter hint mode (Vimium-style click navigation)
         \\  Ctrl+J                Scroll down

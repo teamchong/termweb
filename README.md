@@ -144,6 +144,8 @@ Extensions can provide:
 | `Ctrl+[` | Go back |
 | `Ctrl+]` | Go forward |
 | `Ctrl+.` | Stop loading |
+| `Ctrl+N` | New tab (about:blank) |
+| `Ctrl+W` | Close tab (quit if last tab) |
 | `Ctrl+T` | Show tab picker |
 | `Ctrl+C` | Copy selection |
 | `Ctrl+X` | Cut selection |

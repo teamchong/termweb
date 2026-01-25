@@ -39,6 +39,7 @@ pub const renderCursor = render.renderCursor;
 pub const renderToolbar = render.renderToolbar;
 pub const getMaxFpsForResolution = render.getMaxFpsForResolution;
 pub const getMinFrameInterval = render.getMinFrameInterval;
+pub const renderBlankPage = render.renderBlankPage;
 
 // Re-export input handler functions
 pub const handleInput = input_handler.handleInput;
@@ -68,3 +69,5 @@ pub const addTab = tabs.addTab;
 pub const showTabPicker = tabs.showTabPicker;
 pub const switchToTab = tabs.switchToTab;
 pub const launchInNewTerminal = tabs.launchInNewTerminal;
+pub const createNewTab = tabs.createNewTab;
+pub const closeCurrentTab = tabs.closeCurrentTab;
