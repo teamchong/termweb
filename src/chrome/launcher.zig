@@ -432,7 +432,11 @@ pub fn launchChromePipe(
     // Memory optimization: reduce process count for single-page rendering
     try args_list.append(allocator, "--renderer-process-limit=1");
     try args_list.append(allocator, "--disable-site-isolation-trials");
-    try args_list.append(allocator, "--no-zygote");
+    // --no-zygote saves memory but requires --no-sandbox on Linux (security risk)
+    // Only use on macOS where sandbox works differently
+    if (builtin.os.tag == .macos) {
+        try args_list.append(allocator, "--no-zygote");
+    }
     // Extension loading - load termweb extension (WebSocket mode supports extensions)
     // Defer free: dupeZ in argv conversion creates copies, original can be freed
     const load_ext_arg = if (options.extension_path) |user_ext|

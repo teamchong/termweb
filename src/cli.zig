@@ -97,11 +97,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    // Check terminal support first
-    if (!try checkTerminalSupport(allocator)) {
-        std.process.exit(1);
-    }
-
     var url = args[0];
     var normalized_url: ?[]const u8 = null;
     defer if (normalized_url) |u| allocator.free(u);
@@ -358,32 +353,6 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     try viewer.run();
-}
-
-/// Check if terminal supports Kitty graphics protocol
-fn checkTerminalSupport(allocator: std.mem.Allocator) !bool {
-    const term_program = std.process.getEnvVarOwned(allocator, "TERM_PROGRAM") catch null;
-    defer if (term_program) |t| allocator.free(t);
-
-    if (term_program) |tp| {
-        if (std.mem.eql(u8, tp, "ghostty") or
-            std.mem.eql(u8, tp, "kitty") or
-            std.mem.eql(u8, tp, "WezTerm"))
-        {
-            return true;
-        }
-    }
-
-    std.debug.print("Error: Unsupported terminal\n", .{});
-    std.debug.print("termweb requires a terminal that supports the Kitty graphics protocol.\n\n", .{});
-    std.debug.print("Detected terminal: {s}\n\n", .{term_program orelse "unknown"});
-    std.debug.print("Supported terminals:\n", .{});
-    std.debug.print("  • Ghostty - https://ghostty.org/\n", .{});
-    std.debug.print("  • Kitty   - https://sw.kovidgoyal.net/kitty/\n", .{});
-    std.debug.print("  • WezTerm - https://wezterm.org/\n\n", .{});
-    std.debug.print("Please install one of these terminals and try again.\n", .{});
-
-    return false;
 }
 
 fn cmdVersion() !void {

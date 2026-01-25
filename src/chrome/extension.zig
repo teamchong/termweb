@@ -55,7 +55,7 @@ pub fn setupExtension(allocator: std.mem.Allocator, verbose: bool) ![]const u8 {
     });
     errdefer allocator.free(ext_dir_path);
 
-    // Create directory with restrictive permissions
+    // Create directory
     std.fs.cwd().makePath(ext_dir_path) catch |err| {
         if (verbose) {
             std.debug.print("Failed to create extension dir: {}\n", .{err});
@@ -63,14 +63,15 @@ pub fn setupExtension(allocator: std.mem.Allocator, verbose: bool) ![]const u8 {
         return err;
     };
 
-    // Open the directory
+    // Set restrictive permissions (owner only: rwx) - works on both macOS and Linux
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{ext_dir_path}) catch return error.OutOfMemory;
+    _ = std.c.chmod(path_z.ptr, 0o700);
+
+    // Open the directory and write extension files
     var dir = try std.fs.cwd().openDir(ext_dir_path, .{});
     defer dir.close();
 
-    // Set directory permissions (owner only: rwx)
-    std.posix.fchmod(dir.fd, 0o700) catch {};
-
-    // Write extension files
     try writeFile(dir, "manifest.json", manifest_json);
     try writeFile(dir, "content.js", content_js);
     try writeFile(dir, "termweb-bridge.js", bridge_js);
