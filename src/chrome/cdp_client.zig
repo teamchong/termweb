@@ -12,42 +12,21 @@ const websocket_cdp = @import("websocket_cdp.zig");
 const json = @import("json");
 const json_utils = @import("../utils/json.zig");
 
-/// Debug logging - disabled by default for performance
-/// Set TERMWEB_CDP_DEBUG=1 to enable (truncates log on startup)
-var cdp_debug_enabled: ?bool = null;
-var cdp_debug_file: ?std.fs.File = null;
-var cdp_debug_bytes: usize = 0;
-const CDP_DEBUG_MAX_SIZE: usize = 10 * 1024 * 1024; // 10MB max, then truncate
-
+/// Debug logging - always enabled, appends to cdp_debug.log
 fn logToFile(comptime fmt: []const u8, args: anytype) void {
-    // Check if debug is enabled (cached after first check)
-    if (cdp_debug_enabled == null) {
-        cdp_debug_enabled = if (std.posix.getenv("TERMWEB_CDP_DEBUG")) |v|
-            std.mem.eql(u8, v, "1")
-        else
-            false;
-
-        // Truncate on startup for fresh log each run
-        if (cdp_debug_enabled.?) {
-            cdp_debug_file = std.fs.cwd().createFile("cdp_debug.log", .{ .truncate = true }) catch null;
-        }
-    }
-
-    if (!cdp_debug_enabled.?) return;
-
-    const file = cdp_debug_file orelse return;
-
-    // Auto-truncate if log gets too large
-    if (cdp_debug_bytes > CDP_DEBUG_MAX_SIZE) {
-        file.seekTo(0) catch {};
-        file.setEndPos(0) catch {};
-        cdp_debug_bytes = 0;
-        _ = file.write("--- LOG TRUNCATED (exceeded 10MB) ---\n") catch {};
-    }
-
+    // Always log to cdp_debug.log (append mode like websocket_cdp.zig)
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    cdp_debug_bytes += file.write(slice) catch 0;
+
+    const file = std.fs.cwd().openFile("cdp_debug.log", .{ .mode = .read_write }) catch |err| blk: {
+        if (err == error.FileNotFound) {
+            break :blk std.fs.cwd().createFile("cdp_debug.log", .{ .read = true }) catch return;
+        }
+        return;
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(slice) catch return;
 }
 
 pub const CdpError = error{
@@ -254,10 +233,16 @@ pub const CdpClient = struct {
 
             // If we have a current_target_id, look for that specific target
             if (self.current_target_id) |target_id| {
-                const id_val = target.object.get("id") orelse continue;
-                if (id_val == .string and std.mem.eql(u8, id_val.string, target_id)) {
-                    logToFile("[CDP] Found WebSocket URL for target {s}\n", .{target_id});
-                    return try allocator.dupe(u8, url_val.string);
+                const id_val = target.object.get("id") orelse {
+                    logToFile("[CDP discoverWS] target has no 'id' field\n", .{});
+                    continue;
+                };
+                if (id_val == .string) {
+                    logToFile("[CDP discoverWS] comparing target_id={s} with json id={s}\n", .{ target_id, id_val.string });
+                    if (std.mem.eql(u8, id_val.string, target_id)) {
+                        logToFile("[CDP discoverWS] MATCH! Found WebSocket URL for target {s}\n", .{target_id});
+                        return try allocator.dupe(u8, url_val.string);
+                    }
                 }
             }
 
@@ -628,6 +613,7 @@ pub const CdpClient = struct {
 
     /// Switch to a different target (for tab switching)
     /// Detaches from current session and attaches to new target
+    /// Uses pipe for Target.* commands (session must be on same transport as Page.*)
     pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {
         logToFile("[CDP switchToTarget] START target={s}\n", .{target_id});
 
@@ -637,9 +623,11 @@ pub const CdpClient = struct {
             var detach_buf: [256]u8 = undefined;
             const detach_params = std.fmt.bufPrint(&detach_buf, "{{\"sessionId\":\"{s}\"}}", .{old_sid}) catch "";
             if (detach_params.len > 0) {
-                _ = self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params) catch |err| {
+                if (self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params)) |detach_result| {
+                    self.allocator.free(detach_result);
+                } else |err| {
                     logToFile("[CDP switchToTarget] Detach failed (continuing): {}\n", .{err});
-                };
+                }
             }
             logToFile("[CDP switchToTarget] Detach done\n", .{});
         }

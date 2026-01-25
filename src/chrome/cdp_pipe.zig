@@ -158,17 +158,12 @@ pub const PipeCdpClient = struct {
 
         self.frame_pool.deinit();
 
-        // Free response queue entries - lock just in case
-        self.response_mutex.lock();
-        const queue_len = self.response_queue.items.len;
-        // Free each entry's payload before deiniting the ArrayList
+        // Free any remaining response queue entries (in case stopReaderThread wasn't called)
         for (self.response_queue.items) |*entry| {
             self.allocator.free(entry.payload);
         }
         self.response_queue.deinit(self.allocator);
-        self.response_mutex.unlock();
-
-        logToFile("[PIPE deinit] Freed {} response queue entries\n", .{queue_len});
+        logToFile("[PIPE deinit] Response queue deinit done\n", .{});
 
         self.allocator.free(self.read_buffer);
         self.allocator.destroy(self);
@@ -398,6 +393,14 @@ pub const PipeCdpClient = struct {
             // Now we can safely wait for thread to finish
             thread.join();
             self.reader_thread = null;
+
+            // Clean up any responses added between unlock and join (race window)
+            self.response_mutex.lock();
+            for (self.response_queue.items) |*entry| {
+                self.allocator.free(entry.payload);
+            }
+            self.response_queue.clearRetainingCapacity();
+            self.response_mutex.unlock();
         }
     }
 
