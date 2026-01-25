@@ -1,11 +1,12 @@
 {
   "name": "@termweb/notebook",
   "version": "0.1.0",
-  "description": "Terminal-based Jupyter notebook viewer and executor powered by JupyterLab and termweb",
+  "description": "Terminal-based Jupyter notebook viewer/editor powered by termweb",
   "bin": {
     "termweb-notebook": "bin/cli.js"
   },
   "scripts": {
+    "build": "esbuild src/app.js --bundle --minify --outfile=dist/app.bundle.js",
     "start": "node bin/cli.js"
   },
   "files": [
@@ -17,8 +18,7 @@
     "terminal",
     "jupyter",
     "notebook",
-    "python",
-    "ipython",
+    "ipynb",
     "cli"
   ],
   "author": "teamchong",
@@ -32,9 +32,10 @@
     "access": "public"
   },
   "dependencies": {
-    "@termweb/shared": "workspace:*",
-    "termweb": "workspace:*",
-    "ws": "^8.14.0",
-    "uuid": "^9.0.0"
+    "marked": "^11.1.0",
+    "termweb": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.19.0"
   }
 }

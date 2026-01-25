@@ -50,15 +50,28 @@ async function collectMetrics() {
       swapTotal: mem.swaptotal,
       swapUsed: mem.swapused
     },
-    disk: disk.map(d => ({
-      fs: d.fs,
-      mount: d.mount,
-      type: d.type,
-      size: d.size,
-      used: d.used,
-      available: d.available,
-      usePercent: d.use
-    })),
+    disk: disk
+      // Filter out macOS system volumes and invalid entries
+      .filter(d => {
+        // Skip if size is invalid
+        if (!d.size || isNaN(d.size) || d.size <= 0) return false;
+        // Skip macOS system volumes
+        if (d.mount.startsWith('/System/Volumes/')) return false;
+        // Skip snapshot/private volumes
+        if (d.mount.includes('/private/var/folders/')) return false;
+        // Skip tiny volumes (< 1GB)
+        if (d.size < 1024 * 1024 * 1024) return false;
+        return true;
+      })
+      .map(d => ({
+        fs: d.fs,
+        mount: d.mount,
+        type: d.type,
+        size: d.size,
+        used: d.used,
+        available: d.available,
+        usePercent: d.use
+      })),
     network: networkStats.map(n => ({
       iface: n.iface,
       rx_bytes: n.rx_bytes,

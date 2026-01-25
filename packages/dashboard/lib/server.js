@@ -14,24 +14,36 @@ const { collectMetrics, collectLightMetrics } = require('./metrics');
  */
 function startServer(port = 0) {
   return new Promise((resolve, reject) => {
+    const distPath = path.join(__dirname, '..', 'dist');
+
+    const mimeTypes = {
+      '.html': 'text/html',
+      '.js': 'application/javascript',
+      '.css': 'text/css',
+      '.json': 'application/json',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.svg': 'image/svg+xml'
+    };
+
     // Create HTTP server for static files
     const server = http.createServer((req, res) => {
-      const distPath = path.join(__dirname, '..', 'dist');
+      let filePath = req.url === '/' ? '/index.html' : req.url;
+      // Remove query string
+      filePath = filePath.split('?')[0];
+      const fullPath = path.join(distPath, filePath);
+      const ext = path.extname(fullPath);
+      const contentType = mimeTypes[ext] || 'application/octet-stream';
 
-      if (req.url === '/' || req.url === '/index.html') {
-        fs.readFile(path.join(distPath, 'index.html'), (err, data) => {
-          if (err) {
-            res.writeHead(500);
-            res.end('Error loading page');
-            return;
-          }
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(data);
-        });
-      } else {
-        res.writeHead(404);
-        res.end('Not found');
-      }
+      fs.readFile(fullPath, (err, data) => {
+        if (err) {
+          res.writeHead(404);
+          res.end('Not found');
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': contentType });
+        res.end(data);
+      });
     });
 
     // Create WebSocket server

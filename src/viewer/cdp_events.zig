@@ -10,6 +10,14 @@ const tabs_mod = @import("tabs.zig");
 
 const extractUrlFromNavEvent = helpers.extractUrlFromNavEvent;
 
+/// Global IPC callback - set by napi.zig when running as Node.js module
+var ipc_callback: ?*const fn ([]const u8) void = null;
+
+/// Register a callback to receive IPC messages from the browser
+pub fn setIpcCallback(callback: ?*const fn ([]const u8) void) void {
+    ipc_callback = callback;
+}
+
 /// Handle CDP event - dispatches to specific handlers
 pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
     viewer.log("[CDP EVENT] method={s}\n", .{event.method});
@@ -302,6 +310,28 @@ pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
     if (std.mem.indexOf(u8, payload, fs_marker)) |fs_pos| {
         viewer.log("[CONSOLE MSG] Found FS marker at {d}\n", .{fs_pos});
         try handleFsRequest(viewer, payload, fs_pos + fs_marker.len);
+        return;
+    }
+
+    // Check for IPC message marker - forward to registered callback (if any)
+    const ipc_marker = "__TERMWEB_IPC__:";
+    if (std.mem.indexOf(u8, payload, ipc_marker)) |ipc_pos| {
+        const message_start = ipc_pos + ipc_marker.len;
+        if (message_start < payload.len) {
+            // Find end of message (look for closing quote or end of line)
+            var message_end = message_start;
+            while (message_end < payload.len) : (message_end += 1) {
+                const c = payload[message_end];
+                if (c == '"' or c == '\n' or c == '\r') break;
+            }
+            if (message_end > message_start) {
+                viewer.log("[CONSOLE MSG] Found IPC marker, forwarding message\n", .{});
+                // Call the global IPC callback if registered
+                if (ipc_callback) |callback| {
+                    callback(payload[message_start..message_end]);
+                }
+            }
+        }
         return;
     }
 

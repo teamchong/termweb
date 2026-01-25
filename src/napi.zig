@@ -9,6 +9,7 @@ const screenshot_api = @import("chrome/screenshot.zig");
 const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 const toolbar_mod = @import("ui/toolbar.zig");
+const cdp_events = @import("viewer/cdp_events.zig");
 
 const VERSION = build_options.version;
 
@@ -16,6 +17,9 @@ const VERSION = build_options.version;
 const napi_env = *opaque {};
 const napi_value = *opaque {};
 const napi_callback_info = *opaque {};
+const napi_async_work = *opaque {};
+const napi_threadsafe_function = *opaque {};
+const napi_ref = *opaque {};
 
 const napi_status = enum(c_int) {
     ok = 0,
@@ -60,6 +64,23 @@ extern fn napi_get_undefined(env: napi_env, result: *napi_value) napi_status;
 extern fn napi_get_boolean(env: napi_env, value: bool, result: *napi_value) napi_status;
 extern fn napi_throw_error(env: napi_env, code: ?[*:0]const u8, msg: [*:0]const u8) napi_status;
 
+// Async work APIs
+extern fn napi_create_async_work(env: napi_env, async_resource: ?napi_value, async_resource_name: napi_value, execute: *const fn (?napi_env, ?*anyopaque) callconv(.c) void, complete: *const fn (napi_env, napi_status, ?*anyopaque) callconv(.c) void, data: ?*anyopaque, result: *napi_async_work) napi_status;
+extern fn napi_delete_async_work(env: napi_env, work: napi_async_work) napi_status;
+extern fn napi_queue_async_work(env: napi_env, work: napi_async_work) napi_status;
+
+// Threadsafe function APIs
+const napi_threadsafe_function_call_mode = enum(c_int) { nonblocking = 0, blocking = 1 };
+extern fn napi_create_threadsafe_function(env: napi_env, func: ?napi_value, async_resource: ?napi_value, async_resource_name: napi_value, max_queue_size: usize, initial_thread_count: usize, thread_finalize_data: ?*anyopaque, thread_finalize_cb: ?*const fn (napi_env, ?*anyopaque, ?*anyopaque) callconv(.c) void, context: ?*anyopaque, call_js_cb: ?*const fn (napi_env, napi_value, ?*anyopaque, ?*anyopaque) callconv(.c) void, result: *napi_threadsafe_function) napi_status;
+extern fn napi_call_threadsafe_function(func: napi_threadsafe_function, data: ?*anyopaque, mode: napi_threadsafe_function_call_mode) napi_status;
+extern fn napi_release_threadsafe_function(func: napi_threadsafe_function, mode: c_int) napi_status;
+extern fn napi_acquire_threadsafe_function(func: napi_threadsafe_function) napi_status;
+
+// Reference APIs
+extern fn napi_create_reference(env: napi_env, value: napi_value, initial_refcount: u32, result: *napi_ref) napi_status;
+extern fn napi_delete_reference(env: napi_env, ref: napi_ref) napi_status;
+extern fn napi_get_reference_value(env: napi_env, ref: napi_ref, result: *napi_value) napi_status;
+
 const napi_valuetype = enum(c_uint) {
     undefined = 0,
     null = 1,
@@ -74,6 +95,238 @@ const napi_valuetype = enum(c_uint) {
 };
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+// Global viewer instance for async mode (only one viewer at a time)
+var active_viewer: ?*viewer_mod.Viewer = null;
+var viewer_mutex = std.Thread.Mutex{};
+var console_callback: ?napi_threadsafe_function = null;
+var close_callback: ?napi_threadsafe_function = null;
+var message_callback: ?napi_threadsafe_function = null;
+
+// Message callback data for IPC
+const MessageCallbackData = struct {
+    message: []u8,
+    allocator: std.mem.Allocator,
+};
+
+// Internal IPC handler called by cdp_events
+fn ipcMessageHandler(message: []const u8) void {
+    if (message_callback) |cb| {
+        const allocator = gpa.allocator();
+        const data = allocator.create(MessageCallbackData) catch return;
+        data.* = .{
+            .message = allocator.dupe(u8, message) catch {
+                allocator.destroy(data);
+                return;
+            },
+            .allocator = allocator,
+        };
+        _ = napi_call_threadsafe_function(cb, data, .nonblocking);
+    }
+}
+
+// Public function to register the IPC callback with cdp_events
+pub fn registerIpcCallback() void {
+    cdp_events.setIpcCallback(&ipcMessageHandler);
+}
+
+// Public function to unregister the IPC callback
+pub fn unregisterIpcCallback() void {
+    cdp_events.setIpcCallback(null);
+}
+
+// JS callback for message
+fn messageJsCallback(env: napi_env, js_callback: napi_value, _: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const msg_data: *MessageCallbackData = @ptrCast(@alignCast(data orelse return));
+    defer {
+        msg_data.allocator.free(msg_data.message);
+        msg_data.allocator.destroy(msg_data);
+    }
+
+    // Create string argument
+    var msg_str: napi_value = undefined;
+    if (napi_create_string_utf8(env, msg_data.message.ptr, msg_data.message.len, &msg_str) != .ok) {
+        return;
+    }
+
+    // Call the JS callback with the message
+    var global: napi_value = undefined;
+    _ = napi_get_undefined(env, &global);
+
+    var args = [_]napi_value{msg_str};
+    _ = napi_call_function(env, global, js_callback, 1, &args, null);
+}
+
+// External N-API function declaration
+extern fn napi_call_function(env: napi_env, recv: napi_value, func: napi_value, argc: usize, argv: [*]const napi_value, result: ?*napi_value) napi_status;
+
+/// Data for async open operation
+const AsyncOpenData = struct {
+    allocator: std.mem.Allocator,
+    url: []u8,
+    no_toolbar: bool,
+    disable_hotkeys: bool,
+    disable_hints: bool,
+    mobile: bool,
+    scale: f32,
+    no_profile: bool,
+    verbose: bool,
+    allowed_path: ?[]u8,
+    work: napi_async_work,
+    error_msg: ?[]u8,
+    viewer: ?*viewer_mod.Viewer,
+
+    fn deinit(self: *AsyncOpenData) void {
+        self.allocator.free(self.url);
+        if (self.allowed_path) |p| self.allocator.free(p);
+        if (self.error_msg) |e| self.allocator.free(e);
+    }
+};
+
+/// Console message callback data
+const ConsoleCallbackData = struct {
+    message: [4096]u8,
+    len: usize,
+};
+
+/// Execute async work (runs on worker thread)
+fn asyncOpenExecute(_: ?napi_env, data: ?*anyopaque) callconv(.c) void {
+    const async_data: *AsyncOpenData = @ptrCast(@alignCast(data orelse return));
+
+    // Run the viewer (this blocks until viewer closes)
+    runBrowserAsync(async_data) catch |err| {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "{}", .{err}) catch "Unknown error";
+        async_data.error_msg = async_data.allocator.dupe(u8, err_msg) catch null;
+    };
+}
+
+/// Complete async work (runs on main thread)
+fn asyncOpenComplete(env: napi_env, status: napi_status, data: ?*anyopaque) callconv(.c) void {
+    _ = status;
+    const async_data: *AsyncOpenData = @ptrCast(@alignCast(data orelse return));
+
+    // Clean up viewer reference
+    viewer_mutex.lock();
+    active_viewer = null;
+    viewer_mutex.unlock();
+
+    // Call close callback if registered
+    if (close_callback) |cb| {
+        _ = napi_call_threadsafe_function(cb, null, .nonblocking);
+    }
+
+    // Clean up async work
+    _ = napi_delete_async_work(env, async_data.work);
+    async_data.deinit();
+    async_data.allocator.destroy(async_data);
+}
+
+/// Run browser with async support (can be interrupted)
+fn runBrowserAsync(async_data: *AsyncOpenData) !void {
+    const allocator = async_data.allocator;
+
+    // Get terminal size
+    var term = terminal_mod.Terminal.init();
+    const size = term.getSize() catch terminal_mod.TerminalSize{
+        .cols = 80,
+        .rows = 24,
+        .width_px = 1280,
+        .height_px = 720,
+    };
+
+    const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
+
+    var dpr: u32 = 1;
+    const cell_width: u32 = if (size.width_px > 0 and size.cols > 0)
+        size.width_px / size.cols
+    else
+        14;
+    const cell_height: u32 = if (size.height_px > 0 and size.rows > 0)
+        size.height_px / size.rows
+    else
+        20;
+    if (cell_width > 14) {
+        dpr = 2;
+    }
+
+    const toolbar_height = toolbar_mod.getToolbarHeight(cell_width);
+    const available_height: u32 = if (size.height_px > toolbar_height)
+        size.height_px - toolbar_height
+    else
+        size.height_px;
+    const content_rows: u32 = available_height / cell_height;
+    const content_pixel_height: u32 = content_rows * cell_height;
+
+    const original_viewport_width: u32 = raw_width / dpr;
+    const original_viewport_height: u32 = content_pixel_height / dpr;
+
+    var viewport_width: u32 = original_viewport_width;
+    var viewport_height: u32 = original_viewport_height;
+
+    const MAX_PIXELS = config.MAX_PIXELS;
+    const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
+    if (total_pixels > MAX_PIXELS) {
+        const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
+        viewport_width = @intFromFloat(@as(f64, @floatFromInt(viewport_width)) * pixel_scale);
+        viewport_height = @intFromFloat(@as(f64, @floatFromInt(viewport_height)) * pixel_scale);
+    }
+
+    // Launch Chrome
+    var launch_opts = launcher.LaunchOptions{
+        .viewport_width = viewport_width,
+        .viewport_height = viewport_height,
+        .verbose = async_data.verbose,
+    };
+    if (async_data.no_profile) {
+        launch_opts.clone_profile = null;
+    }
+
+    var chrome_instance = try launcher.launchChromePipe(allocator, launch_opts);
+    defer chrome_instance.deinit();
+
+    var client = try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
+    defer client.deinit();
+
+    try screenshot_api.setViewport(client, allocator, viewport_width, viewport_height, dpr);
+    try screenshot_api.navigateToUrl(client, allocator, async_data.url);
+
+    var actual_viewport_width = viewport_width;
+    var actual_viewport_height = viewport_height;
+    if (screenshot_api.getActualViewport(client, allocator)) |actual_vp| {
+        if (actual_vp.width > 0) actual_viewport_width = actual_vp.width;
+        if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
+    } else |_| {}
+
+    var viewer = try viewer_mod.Viewer.init(allocator, client, async_data.url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, config.DEFAULT_FPS);
+    defer viewer.deinit();
+
+    if (async_data.no_toolbar) {
+        viewer.disableToolbar();
+    }
+    if (async_data.disable_hotkeys) {
+        viewer.disableHotkeys();
+    }
+    if (async_data.disable_hints) {
+        viewer.disableHints();
+    }
+
+    if (async_data.allowed_path) |path| {
+        try viewer.addAllowedPath(path);
+    }
+
+    // Store viewer reference for external access
+    viewer_mutex.lock();
+    active_viewer = &viewer;
+    async_data.viewer = &viewer;
+    viewer_mutex.unlock();
+
+    // Register IPC callback for this session
+    registerIpcCallback();
+    defer unregisterIpcCallback();
+
+    try viewer.run();
+}
 
 /// napi_open(url: string, options?: { toolbar?: boolean, mobile?: boolean, scale?: number, ... }) -> void
 fn napi_open(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
@@ -376,12 +629,387 @@ fn napi_isSupported(env: napi_env, info: napi_callback_info) callconv(.c) napi_v
     return result;
 }
 
+/// napi_openAsync(url: string, options?: { toolbar?: boolean, ... }) -> void
+/// Non-blocking version of open - returns immediately, viewer runs in background
+fn napi_openAsync(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    const allocator = gpa.allocator();
+
+    var argc: usize = 2;
+    var argv: [2]napi_value = undefined;
+    _ = napi_get_cb_info(env, info, &argc, &argv, null, null);
+
+    if (argc < 1) {
+        _ = napi_throw_error(env, null, "URL argument required");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    // Get URL string
+    var url_len: usize = 0;
+    _ = napi_get_value_string_utf8(env, argv[0], null, 0, &url_len);
+    const url_buf = allocator.alloc(u8, url_len) catch {
+        _ = napi_throw_error(env, null, "Memory allocation failed");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    };
+    var actual_len: usize = 0;
+    _ = napi_get_value_string_utf8(env, argv[0], url_buf.ptr, url_len + 1, &actual_len);
+
+    // Parse options (same as sync version)
+    var no_toolbar = false;
+    var disable_hotkeys = false;
+    var disable_hints = false;
+    var mobile = false;
+    var scale: f32 = 1.0;
+    var no_profile = false;
+    var verbose = false;
+
+    if (argc >= 2) {
+        var val_type: c_uint = 0;
+        _ = napi_typeof(env, argv[1], &val_type);
+        if (val_type == @intFromEnum(napi_valuetype.object)) {
+            // toolbar option
+            var toolbar_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "toolbar", &toolbar_val) == .ok) {
+                var toolbar_type: c_uint = 0;
+                _ = napi_typeof(env, toolbar_val, &toolbar_type);
+                if (toolbar_type == @intFromEnum(napi_valuetype.boolean)) {
+                    var toolbar: bool = true;
+                    _ = napi_get_value_bool(env, toolbar_val, &toolbar);
+                    no_toolbar = !toolbar;
+                }
+            }
+
+            // hotkeys option
+            var hotkeys_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "hotkeys", &hotkeys_val) == .ok) {
+                var hotkeys_type: c_uint = 0;
+                _ = napi_typeof(env, hotkeys_val, &hotkeys_type);
+                if (hotkeys_type == @intFromEnum(napi_valuetype.boolean)) {
+                    var hotkeys: bool = true;
+                    _ = napi_get_value_bool(env, hotkeys_val, &hotkeys);
+                    disable_hotkeys = !hotkeys;
+                }
+            }
+
+            // hints option
+            var hints_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "hints", &hints_val) == .ok) {
+                var hints_type: c_uint = 0;
+                _ = napi_typeof(env, hints_val, &hints_type);
+                if (hints_type == @intFromEnum(napi_valuetype.boolean)) {
+                    var hints: bool = true;
+                    _ = napi_get_value_bool(env, hints_val, &hints);
+                    disable_hints = !hints;
+                }
+            }
+
+            // mobile option
+            var mobile_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "mobile", &mobile_val) == .ok) {
+                var mobile_type: c_uint = 0;
+                _ = napi_typeof(env, mobile_val, &mobile_type);
+                if (mobile_type == @intFromEnum(napi_valuetype.boolean)) {
+                    _ = napi_get_value_bool(env, mobile_val, &mobile);
+                }
+            }
+
+            // scale option
+            var scale_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "scale", &scale_val) == .ok) {
+                var scale_type: c_uint = 0;
+                _ = napi_typeof(env, scale_val, &scale_type);
+                if (scale_type == @intFromEnum(napi_valuetype.number)) {
+                    var scale_f64: f64 = 1.0;
+                    _ = napi_get_value_double(env, scale_val, &scale_f64);
+                    scale = @floatCast(scale_f64);
+                }
+            }
+
+            // noProfile option
+            var no_profile_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "noProfile", &no_profile_val) == .ok) {
+                var no_profile_type: c_uint = 0;
+                _ = napi_typeof(env, no_profile_val, &no_profile_type);
+                if (no_profile_type == @intFromEnum(napi_valuetype.boolean)) {
+                    _ = napi_get_value_bool(env, no_profile_val, &no_profile);
+                }
+            }
+
+            // verbose option
+            var verbose_val: napi_value = undefined;
+            if (napi_get_named_property(env, argv[1], "verbose", &verbose_val) == .ok) {
+                var verbose_type: c_uint = 0;
+                _ = napi_typeof(env, verbose_val, &verbose_type);
+                if (verbose_type == @intFromEnum(napi_valuetype.boolean)) {
+                    _ = napi_get_value_bool(env, verbose_val, &verbose);
+                }
+            }
+        }
+    }
+
+    // Create async data
+    const async_data = allocator.create(AsyncOpenData) catch {
+        allocator.free(url_buf);
+        _ = napi_throw_error(env, null, "Memory allocation failed");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    };
+    async_data.* = .{
+        .allocator = allocator,
+        .url = url_buf,
+        .no_toolbar = no_toolbar,
+        .disable_hotkeys = disable_hotkeys,
+        .disable_hints = disable_hints,
+        .mobile = mobile,
+        .scale = scale,
+        .no_profile = no_profile,
+        .verbose = verbose,
+        .allowed_path = null,
+        .work = undefined,
+        .error_msg = null,
+        .viewer = null,
+    };
+
+    // Create async resource name
+    var resource_name: napi_value = undefined;
+    _ = napi_create_string_utf8(env, "termweb:open", 12, &resource_name);
+
+    // Create and queue async work
+    var work: napi_async_work = undefined;
+    if (napi_create_async_work(env, null, resource_name, &asyncOpenExecute, &asyncOpenComplete, async_data, &work) != .ok) {
+        async_data.deinit();
+        allocator.destroy(async_data);
+        _ = napi_throw_error(env, null, "Failed to create async work");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+    async_data.work = work;
+
+    if (napi_queue_async_work(env, work) != .ok) {
+        _ = napi_delete_async_work(env, work);
+        async_data.deinit();
+        allocator.destroy(async_data);
+        _ = napi_throw_error(env, null, "Failed to queue async work");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    var undef: napi_value = undefined;
+    _ = napi_get_undefined(env, &undef);
+    return undef;
+}
+
+/// napi_evalJS(script: string) -> boolean
+/// Evaluate JavaScript in the active viewer. Returns true if successful.
+fn napi_evalJS(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    const allocator = gpa.allocator();
+
+    var argc: usize = 1;
+    var argv: [1]napi_value = undefined;
+    _ = napi_get_cb_info(env, info, &argc, &argv, null, null);
+
+    if (argc < 1) {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    // Get script string
+    var script_len: usize = 0;
+    _ = napi_get_value_string_utf8(env, argv[0], null, 0, &script_len);
+    const script_buf = allocator.alloc(u8, script_len + 1) catch {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    };
+    defer allocator.free(script_buf);
+    _ = napi_get_value_string_utf8(env, argv[0], script_buf.ptr, script_len + 1, &script_len);
+    const script = script_buf[0..script_len];
+
+    // Try to eval on the active viewer
+    viewer_mutex.lock();
+    defer viewer_mutex.unlock();
+
+    if (active_viewer) |viewer| {
+        viewer.evalJavaScript(script) catch {
+            var result: napi_value = undefined;
+            _ = napi_get_boolean(env, false, &result);
+            return result;
+        };
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, true, &result);
+        return result;
+    }
+
+    var result: napi_value = undefined;
+    _ = napi_get_boolean(env, false, &result);
+    return result;
+}
+
+/// napi_close() -> boolean
+/// Close the active viewer. Returns true if there was a viewer to close.
+fn napi_close(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    _ = info;
+
+    viewer_mutex.lock();
+    defer viewer_mutex.unlock();
+
+    if (active_viewer) |viewer| {
+        viewer.requestQuit();
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, true, &result);
+        return result;
+    }
+
+    var result: napi_value = undefined;
+    _ = napi_get_boolean(env, false, &result);
+    return result;
+}
+
+/// napi_isOpen() -> boolean
+/// Check if a viewer is currently open.
+fn napi_isOpen(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    _ = info;
+
+    viewer_mutex.lock();
+    defer viewer_mutex.unlock();
+
+    var result: napi_value = undefined;
+    _ = napi_get_boolean(env, active_viewer != null, &result);
+    return result;
+}
+
+/// napi_onClose(callback: function) -> void
+/// Register a callback to be called when the viewer closes.
+fn napi_onClose(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    var argc: usize = 1;
+    var argv: [1]napi_value = undefined;
+    _ = napi_get_cb_info(env, info, &argc, &argv, null, null);
+
+    if (argc < 1) {
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    // Check if it's a function
+    var val_type: c_uint = 0;
+    _ = napi_typeof(env, argv[0], &val_type);
+    if (val_type != @intFromEnum(napi_valuetype.function)) {
+        _ = napi_throw_error(env, null, "Callback must be a function");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    // Release old callback if exists
+    if (close_callback) |cb| {
+        _ = napi_release_threadsafe_function(cb, 0);
+        close_callback = null;
+    }
+
+    // Create async resource name
+    var resource_name: napi_value = undefined;
+    _ = napi_create_string_utf8(env, "termweb:onClose", 15, &resource_name);
+
+    // Create threadsafe function for callback
+    var tsfn: napi_threadsafe_function = undefined;
+    if (napi_create_threadsafe_function(env, argv[0], null, resource_name, 0, 1, null, null, null, null, &tsfn) == .ok) {
+        close_callback = tsfn;
+    }
+
+    var undef: napi_value = undefined;
+    _ = napi_get_undefined(env, &undef);
+    return undef;
+}
+
+/// napi_onMessage(callback: function) -> void
+/// Register a callback to receive IPC messages from the browser.
+/// Messages with __TERMWEB_IPC__: prefix will trigger this callback.
+fn napi_onMessage(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    var argc: usize = 1;
+    var argv: [1]napi_value = undefined;
+    _ = napi_get_cb_info(env, info, &argc, &argv, null, null);
+
+    if (argc < 1) {
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    // Check if it's a function
+    var val_type: c_uint = 0;
+    _ = napi_typeof(env, argv[0], &val_type);
+    if (val_type != @intFromEnum(napi_valuetype.function)) {
+        _ = napi_throw_error(env, null, "Callback must be a function");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    // Release old callback if exists
+    if (message_callback) |cb| {
+        _ = napi_release_threadsafe_function(cb, 0);
+        message_callback = null;
+    }
+
+    // Create async resource name
+    var resource_name: napi_value = undefined;
+    _ = napi_create_string_utf8(env, "termweb:onMessage", 17, &resource_name);
+
+    // Create threadsafe function for callback with custom JS callback handler
+    var tsfn: napi_threadsafe_function = undefined;
+    if (napi_create_threadsafe_function(env, argv[0], null, resource_name, 0, 1, null, null, null, &messageJsCallback, &tsfn) == .ok) {
+        message_callback = tsfn;
+    }
+
+    var undef: napi_value = undefined;
+    _ = napi_get_undefined(env, &undef);
+    return undef;
+}
+
 /// Module initialization
 export fn napi_register_module_v1(env: napi_env, exports: napi_value) napi_value {
-    // open function
+    // open function (blocking)
     var open_fn: napi_value = undefined;
     _ = napi_create_function(env, "open", 4, &napi_open, null, &open_fn);
     _ = napi_set_named_property(env, exports, "open", open_fn);
+
+    // openAsync function (non-blocking)
+    var open_async_fn: napi_value = undefined;
+    _ = napi_create_function(env, "openAsync", 9, &napi_openAsync, null, &open_async_fn);
+    _ = napi_set_named_property(env, exports, "openAsync", open_async_fn);
+
+    // evalJS function
+    var eval_js_fn: napi_value = undefined;
+    _ = napi_create_function(env, "evalJS", 6, &napi_evalJS, null, &eval_js_fn);
+    _ = napi_set_named_property(env, exports, "evalJS", eval_js_fn);
+
+    // close function
+    var close_fn: napi_value = undefined;
+    _ = napi_create_function(env, "close", 5, &napi_close, null, &close_fn);
+    _ = napi_set_named_property(env, exports, "close", close_fn);
+
+    // isOpen function
+    var is_open_fn: napi_value = undefined;
+    _ = napi_create_function(env, "isOpen", 6, &napi_isOpen, null, &is_open_fn);
+    _ = napi_set_named_property(env, exports, "isOpen", is_open_fn);
+
+    // onClose function
+    var on_close_fn: napi_value = undefined;
+    _ = napi_create_function(env, "onClose", 7, &napi_onClose, null, &on_close_fn);
+    _ = napi_set_named_property(env, exports, "onClose", on_close_fn);
+
+    // onMessage function
+    var on_message_fn: napi_value = undefined;
+    _ = napi_create_function(env, "onMessage", 9, &napi_onMessage, null, &on_message_fn);
+    _ = napi_set_named_property(env, exports, "onMessage", on_message_fn);
 
     // version function
     var version_fn: napi_value = undefined;

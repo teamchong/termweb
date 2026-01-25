@@ -1,18 +1,11 @@
 #!/usr/bin/env node
 
+const path = require('path');
 const termweb = require('termweb');
-const { startServer } = require('../lib/server');
-const { resolveDisplayMode } = require('@termweb/shared');
+const { collectMetrics, collectLightMetrics } = require('../lib/metrics');
 
 const args = process.argv.slice(2);
 const verbose = args.includes('--verbose') || args.includes('-v');
-
-// Parse mode flag
-let requestedMode = 'auto';
-const modeIdx = args.indexOf('--mode');
-if (modeIdx !== -1 && args[modeIdx + 1]) {
-  requestedMode = args[modeIdx + 1];
-}
 
 if (args.includes('--help') || args.includes('-h')) {
   console.log(`
@@ -21,33 +14,65 @@ if (args.includes('--help') || args.includes('-h')) {
 Usage: termweb-dashboard [options]
 
 Options:
-  --mode <mode>   Display mode: auto, embedded, standalone
   -v, --verbose   Debug output
   -h, --help      Show help
 
-Displays real-time system metrics:
+Displays system metrics:
   - CPU usage (overall and per-core)
   - Memory usage (RAM and swap)
   - Disk usage
   - Network I/O
   - Process list
-  - Temperature sensors
 `);
   process.exit(0);
 }
 
 async function main() {
   try {
-    // Start the metrics server
-    const { port } = await startServer(0);
+    const htmlPath = path.join(__dirname, '..', 'dist', 'index.html');
+    const url = `file://${htmlPath}`;
 
-    const url = `http://127.0.0.1:${port}`;
+    // Register message handler for metrics requests
+    termweb.onMessage(async (message) => {
+      if (verbose) console.log('[IPC] Received:', message);
 
-    // Resolve mode and open
-    const mode = resolveDisplayMode(requestedMode);
+      // Parse message: id:type
+      const parts = message.split(':');
+      if (parts.length < 2) return;
 
-    await termweb.open(url, { toolbar: false, verbose, mode });
-    process.exit(0);
+      const id = parts[0];
+      const type = parts[1];
+
+      try {
+        let metrics;
+        if (type === 'full') {
+          metrics = await collectMetrics();
+        } else {
+          metrics = await collectLightMetrics();
+        }
+
+        // Send metrics back to browser via evalJS
+        const script = `window.__termwebMetricsResponse(${id}, ${JSON.stringify(metrics)})`;
+        termweb.evalJS(script);
+      } catch (err) {
+        if (verbose) console.error('[IPC] Error collecting metrics:', err);
+      }
+    });
+
+    // Register close handler
+    termweb.onClose(() => {
+      if (verbose) console.log('[Dashboard] Viewer closed');
+      process.exit(0);
+    });
+
+    // Open viewer asynchronously (non-blocking)
+    termweb.openAsync(url, { toolbar: false, verbose });
+
+    if (verbose) console.log('[Dashboard] Started, press Ctrl+Q to quit...');
+
+    // Keep process alive
+    process.stdin.resume();
+
   } catch (err) {
     console.error('Error:', err.message);
     process.exit(1);

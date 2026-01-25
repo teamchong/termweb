@@ -7,40 +7,32 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      overflow: hidden;
       background: #1e1e1e;
+      color: #cccccc;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      overflow: hidden;
     }
     #header {
       height: 36px;
       background: #252526;
       display: flex;
       align-items: center;
-      padding: 0 12px;
+      padding: 0 16px;
       border-bottom: 1px solid #3c3c3c;
     }
-    #filename { color: #cccccc; font-size: 13px; flex: 1; }
-    #validation {
-      font-size: 12px;
-      margin-right: 12px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    #validation.valid { color: #6a9955; }
-    #validation.invalid { color: #f14c4c; }
-    #validation .icon { font-size: 14px; }
-    #status { color: #6a9955; font-size: 12px; margin-left: 12px; }
-    #status.modified { color: #dcdcaa; }
-    #status.saving { color: #569cd6; }
-    #status.error { color: #f14c4c; }
+    #header h1 { font-size: 14px; font-weight: 500; flex: 1; }
+    #header .status { font-size: 12px; }
+    #header .status.saved { color: #6a9955; }
+    #header .status.modified { color: #dcdcaa; }
+    #header .status.error { color: #f14c4c; }
 
     #toolbar {
-      height: 32px;
+      height: 36px;
       background: #2d2d2d;
       display: flex;
       align-items: center;
-      padding: 0 12px;
+      padding: 0 16px;
       gap: 8px;
       border-bottom: 1px solid #3c3c3c;
     }
@@ -54,24 +46,28 @@
       cursor: pointer;
     }
     #toolbar button:hover { background: #1177bb; }
-    #toolbar button:disabled { background: #3c3c3c; color: #888; cursor: not-allowed; }
-    #toolbar button.active { background: #1177bb; box-shadow: inset 0 0 0 1px #fff; }
-    #toolbar .separator { width: 1px; height: 20px; background: #3c3c3c; margin: 0 4px; }
 
-    #editor-container { width: 100vw; height: calc(100vh - 92px); }
+    #error-bar {
+      display: none;
+      background: #5a1d1d;
+      color: #f14c4c;
+      padding: 8px 16px;
+      font-size: 12px;
+    }
+    #error-bar.visible { display: block; }
 
-    /* vanilla-jsoneditor dark theme overrides */
-    .jse-main,
-    .jse-contents,
-    .jse-tree-mode,
-    .jse-text-mode {
-      --jse-background-color: #1e1e1e !important;
-      --jse-text-color: #cccccc !important;
-      --jse-panel-background: #252526 !important;
-      --jse-selection-background-color: #264f78 !important;
+    #editor-container {
+      height: calc(100vh - 96px);
     }
 
-    #shortcuts {
+    /* vanilla-jsoneditor styles will be loaded from the bundled JS */
+    .jse-theme-dark {
+      --jse-theme-color: #569cd6;
+      --jse-background-color: #1e1e1e;
+      --jse-text-color: #cccccc;
+    }
+
+    #footer {
       position: fixed;
       bottom: 0;
       left: 0;
@@ -84,249 +80,24 @@
       font-size: 11px;
       color: white;
     }
-    #shortcuts span { margin-right: 16px; }
-    #shortcuts kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
+    #footer span { margin-right: 16px; }
+    #footer kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
   </style>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vanilla-jsoneditor@0.23.8/themes/jse-theme-dark.css">
 </head>
 <body>
   <div id="header">
-    <span id="filename">Loading...</span>
-    <span id="validation" class="valid">
-      <span class="icon"></span>
-      <span class="text">Valid JSON</span>
-    </span>
-    <span id="status">Saved</span>
+    <h1 id="filename">data.json</h1>
+    <span class="status saved" id="status">Saved</span>
   </div>
   <div id="toolbar">
-    <button id="btn-tree" class="active">Tree</button>
-    <button id="btn-text">Text</button>
-    <div class="separator"></div>
-    <button id="btn-format">Format</button>
-    <button id="btn-minify">Minify</button>
-    <div class="separator"></div>
-    <button id="btn-sort">Sort Keys</button>
-    <button id="btn-expand">Expand All</button>
-    <button id="btn-collapse">Collapse All</button>
+    <button id="btn-save">Save</button>
   </div>
+  <div id="error-bar"></div>
   <div id="editor-container"></div>
-  <div id="shortcuts">
+  <div id="footer">
     <span><kbd>Ctrl+S</kbd> Save</span>
-    <span><kbd>Ctrl+\\</kbd> Format</span>
     <span><kbd>Ctrl+Q</kbd> Quit</span>
   </div>
-
-  <script type="module">
-    import { JSONEditor } from 'https://cdn.jsdelivr.net/npm/vanilla-jsoneditor@0.23.8/standalone.js';
-
-    // termweb FS IPC
-    const pendingFS = new Map();
-    let fsId = 0;
-
-    window.__termwebFSResponse = (id, success, data) => {
-      const resolve = pendingFS.get(id);
-      if (resolve) {
-        pendingFS.delete(id);
-        resolve({ success, data });
-      }
-    };
-
-    function fsCall(op, path, data = '') {
-      return new Promise(resolve => {
-        const id = ++fsId;
-        pendingFS.set(id, resolve);
-        const msg = data ? `__TERMWEB_FS__:${id}:${op}:${path}:${data}` : `__TERMWEB_FS__:${id}:${op}:${path}`;
-        console.log(msg);
-        setTimeout(() => {
-          if (pendingFS.has(id)) {
-            pendingFS.delete(id);
-            resolve({ success: false, data: 'Timeout' });
-          }
-        }, 5000);
-      });
-    }
-
-    let editor;
-    let originalContent = '';
-    let isModified = false;
-    let currentError = null;
-    let currentFile = null;
-    let currentMode = 'tree';
-
-    const params = new URLSearchParams(location.search);
-    const filePath = params.get('path') || '';
-    const initContent = params.get('content');
-
-    function init() {
-      const fileName = filePath.split('/').pop();
-      const content = initContent ? atob(initContent) : '{}';
-
-      currentFile = filePath;
-      document.getElementById('filename').textContent = fileName;
-      document.title = `${fileName} - termweb-json`;
-      originalContent = content;
-
-      let initialJson;
-      try {
-        initialJson = JSON.parse(content);
-        updateValidation(true);
-      } catch (err) {
-        initialJson = {};
-        updateValidation(false, err.message);
-      }
-
-      editor = new JSONEditor({
-        target: document.getElementById('editor-container'),
-        props: {
-          content: { json: initialJson },
-          mode: 'tree',
-          mainMenuBar: false,
-          navigationBar: true,
-          statusBar: true,
-          onChange: (updatedContent, previousContent, { contentErrors }) => {
-            if (contentErrors) {
-              currentError = contentErrors;
-              updateValidation(false, contentErrors.parseError?.message || 'Invalid JSON');
-            } else {
-              currentError = null;
-              updateValidation(true);
-            }
-
-            // Check if modified
-            try {
-              const currentText = editor.get().text || JSON.stringify(editor.get().json);
-              isModified = currentText !== originalContent;
-              updateStatus();
-            } catch (e) {
-              isModified = true;
-              updateStatus();
-            }
-          }
-        }
-      });
-
-      // Keyboard shortcuts
-      document.addEventListener('keydown', (e) => {
-        if (e.ctrlKey && e.key === 's') {
-          e.preventDefault();
-          saveFile();
-        } else if (e.ctrlKey && e.key === '\\') {
-          e.preventDefault();
-          formatJson();
-        }
-      });
-
-      // Toolbar buttons
-      document.getElementById('btn-tree').addEventListener('click', () => switchMode('tree'));
-      document.getElementById('btn-text').addEventListener('click', () => switchMode('text'));
-      document.getElementById('btn-format').addEventListener('click', formatJson);
-      document.getElementById('btn-minify').addEventListener('click', minifyJson);
-      document.getElementById('btn-sort').addEventListener('click', sortKeys);
-      document.getElementById('btn-expand').addEventListener('click', () => editor.expand(() => true));
-      document.getElementById('btn-collapse').addEventListener('click', () => editor.collapse(() => true));
-    }
-
-    function switchMode(mode) {
-      currentMode = mode;
-      editor.updateProps({ mode });
-      document.getElementById('btn-tree').classList.toggle('active', mode === 'tree');
-      document.getElementById('btn-text').classList.toggle('active', mode === 'text');
-    }
-
-    function updateValidation(valid, errorMsg = '') {
-      const validation = document.getElementById('validation');
-      if (valid) {
-        validation.className = 'valid';
-        validation.querySelector('.icon').textContent = '\u2713';
-        validation.querySelector('.text').textContent = 'Valid JSON';
-      } else {
-        validation.className = 'invalid';
-        validation.querySelector('.icon').textContent = '\u2717';
-        validation.querySelector('.text').textContent = errorMsg.slice(0, 50);
-      }
-    }
-
-    function formatJson() {
-      try {
-        const content = editor.get();
-        if (content.json) {
-          editor.set({ json: content.json });
-        } else if (content.text) {
-          const parsed = JSON.parse(content.text);
-          editor.set({ json: parsed });
-        }
-      } catch (err) {}
-    }
-
-    function minifyJson() {
-      try {
-        const content = editor.get();
-        const json = content.json || JSON.parse(content.text);
-        editor.set({ text: JSON.stringify(json) });
-      } catch (err) {}
-    }
-
-    function sortKeys() {
-      try {
-        const content = editor.get();
-        const json = content.json || JSON.parse(content.text);
-        editor.set({ json: sortObject(json) });
-      } catch (err) {}
-    }
-
-    function sortObject(obj) {
-      if (Array.isArray(obj)) return obj.map(sortObject);
-      if (obj !== null && typeof obj === 'object') {
-        const sorted = {};
-        Object.keys(obj).sort().forEach(key => sorted[key] = sortObject(obj[key]));
-        return sorted;
-      }
-      return obj;
-    }
-
-    function updateStatus() {
-      const status = document.getElementById('status');
-      status.textContent = isModified ? 'Modified' : 'Saved';
-      status.className = isModified ? 'modified' : '';
-    }
-
-    async function saveFile() {
-      if (currentError) {
-        const status = document.getElementById('status');
-        status.textContent = 'Fix errors first';
-        status.className = 'error';
-        setTimeout(updateStatus, 2000);
-        return;
-      }
-
-      const status = document.getElementById('status');
-      status.textContent = 'Saving...';
-      status.className = 'saving';
-
-      try {
-        const content = editor.get();
-        const text = content.text || JSON.stringify(content.json, null, 2);
-        const encoded = btoa(unescape(encodeURIComponent(text)));
-        const res = await fsCall('writefile', currentFile, encoded);
-
-        if (res.success) {
-          originalContent = text;
-          isModified = false;
-          status.textContent = 'Saved';
-          status.className = '';
-        } else {
-          status.textContent = 'Error: ' + res.data;
-          status.className = 'error';
-          setTimeout(updateStatus, 3000);
-        }
-      } catch (err) {
-        status.textContent = 'Error: ' + err.message;
-        status.className = 'error';
-        setTimeout(updateStatus, 3000);
-      }
-    }
-
-    init();
-  </script>
+  <script src="app.bundle.js"></script>
 </body>
 </html>

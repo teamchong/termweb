@@ -60,7 +60,6 @@
       background: #252526;
     }
     .cell.selected { border-color: #569cd6; }
-    .cell.running { border-color: #dcdcaa; }
 
     .cell-toolbar {
       display: flex;
@@ -121,9 +120,16 @@
     .cell.markdown.editing .cell-rendered { display: none; }
 
     .cell-rendered h1, .cell-rendered h2, .cell-rendered h3 { color: #569cd6; margin: 16px 0 8px; }
+    .cell-rendered h1 { font-size: 1.5em; }
+    .cell-rendered h2 { font-size: 1.3em; }
+    .cell-rendered h3 { font-size: 1.1em; }
     .cell-rendered p { margin-bottom: 12px; }
-    .cell-rendered code { background: #2d2d2d; padding: 2px 6px; border-radius: 4px; }
+    .cell-rendered code { background: #2d2d2d; padding: 2px 6px; border-radius: 4px; font-family: 'Fira Code', Consolas, monospace; }
     .cell-rendered pre { background: #2d2d2d; padding: 12px; border-radius: 4px; overflow-x: auto; }
+    .cell-rendered ul, .cell-rendered ol { margin-left: 20px; margin-bottom: 12px; }
+    .cell-rendered li { margin-bottom: 4px; }
+    .cell-rendered strong { font-weight: 600; }
+    .cell-rendered em { font-style: italic; }
 
     #shortcuts {
       position: fixed;
@@ -151,12 +157,9 @@
 <body>
   <div id="header">
     <h1 id="filename">New Notebook</h1>
-    <span class="status" id="status">Ready</span>
+    <span class="status" id="status">View/Edit Mode</span>
   </div>
   <div id="toolbar">
-    <button id="btn-run">Run Cell</button>
-    <button id="btn-run-all">Run All</button>
-    <div class="separator"></div>
     <button id="btn-add-code">+ Code</button>
     <button id="btn-add-md">+ Markdown</button>
     <div class="separator"></div>
@@ -164,245 +167,9 @@
   </div>
   <div id="notebook"></div>
   <div id="shortcuts">
-    <span><kbd>Shift+Enter</kbd> Run cell</span>
-    <span><kbd>Ctrl+Enter</kbd> Run & stay</span>
     <span><kbd>Ctrl+S</kbd> Save</span>
     <span><kbd>Ctrl+Q</kbd> Quit</span>
   </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script>
-    let notebook = { cells: [] };
-    let notebookPath = null;
-    let pythonAvailable = false;
-    let selectedCell = null;
-    let executionCount = 0;
-
-    // WebSocket connection
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${location.host}`);
-
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-
-      if (msg.type === 'result' || msg.type === 'error') {
-        const cell = document.querySelector(`[data-cell-id="${msg.cellId}"]`);
-        if (cell) {
-          cell.classList.remove('running');
-          const output = cell.querySelector('.cell-output');
-          if (msg.error) {
-            output.className = 'cell-output error';
-            output.textContent = msg.error;
-          } else {
-            output.className = 'cell-output stream';
-            output.textContent = msg.output || '';
-          }
-
-          // Update notebook data
-          const idx = parseInt(msg.cellId.replace('cell-', ''));
-          if (notebook.cells[idx]) {
-            notebook.cells[idx].outputs = [{
-              output_type: msg.error ? 'error' : 'stream',
-              text: msg.error || msg.output
-            }];
-          }
-        }
-      } else if (msg.type === 'status') {
-        const cell = document.querySelector(`[data-cell-id="${msg.cellId}"]`);
-        if (cell) {
-          cell.classList.add('running');
-        }
-        document.getElementById('status').textContent = 'Running...';
-      } else if (msg.type === 'saved') {
-        document.getElementById('status').textContent = 'Saved';
-        setTimeout(() => {
-          document.getElementById('status').textContent = 'Ready';
-        }, 2000);
-      }
-    };
-
-    // Load notebook
-    async function init() {
-      try {
-        const res = await fetch('/notebook.json');
-        const data = await res.json();
-        notebook = data.notebook;
-        notebookPath = data.path;
-        pythonAvailable = data.pythonAvailable;
-
-        if (notebookPath) {
-          document.getElementById('filename').textContent = notebookPath.split('/').pop();
-        }
-
-        if (!pythonAvailable) {
-          document.getElementById('status').textContent = 'Python not found';
-        }
-
-        renderNotebook();
-      } catch (err) {
-        console.error('Error loading notebook:', err);
-      }
-    }
-
-    function renderNotebook() {
-      const container = document.getElementById('notebook');
-      container.innerHTML = '';
-
-      if (!notebook.cells || notebook.cells.length === 0) {
-        notebook.cells = [{
-          cell_type: 'code',
-          source: ['# Start writing Python code here\n'],
-          outputs: [],
-          execution_count: null
-        }];
-      }
-
-      notebook.cells.forEach((cell, idx) => {
-        const cellEl = createCellElement(cell, idx);
-        container.appendChild(cellEl);
-      });
-    }
-
-    function createCellElement(cell, idx) {
-      const div = document.createElement('div');
-      div.className = `cell ${cell.cell_type}`;
-      div.dataset.cellId = `cell-${idx}`;
-
-      const source = Array.isArray(cell.source) ? cell.source.join('') : cell.source || '';
-      const outputs = cell.outputs || [];
-
-      div.innerHTML = `
-        <div class="cell-toolbar">
-          <span class="type">${cell.cell_type === 'code' ? 'Python' : 'Markdown'}</span>
-          ${cell.execution_count ? `<span class="execution-count">[${cell.execution_count}]</span>` : ''}
-          <div class="actions">
-            <button onclick="runCell(${idx})">Run</button>
-            <button onclick="deleteCell(${idx})">Delete</button>
-          </div>
-        </div>
-        <div class="cell-input">
-          <textarea rows="${Math.max(3, source.split('\n').length)}" oninput="updateCell(${idx}, this.value)">${escapeHtml(source)}</textarea>
-        </div>
-        ${cell.cell_type === 'markdown' ? `<div class="cell-rendered">${marked.parse(source)}</div>` : ''}
-        <div class="cell-output ${outputs[0]?.output_type === 'error' ? 'error' : 'stream'}">${formatOutput(outputs)}</div>
-      `;
-
-      div.onclick = (e) => {
-        if (!e.target.matches('button, textarea')) {
-          selectCell(div);
-        }
-      };
-
-      return div;
-    }
-
-    function escapeHtml(str) {
-      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    }
-
-    function formatOutput(outputs) {
-      if (!outputs || outputs.length === 0) return '';
-      return outputs.map(o => {
-        if (o.text) return Array.isArray(o.text) ? o.text.join('') : o.text;
-        if (o.data && o.data['text/plain']) return o.data['text/plain'].join('');
-        return '';
-      }).join('\n');
-    }
-
-    function selectCell(cellEl) {
-      document.querySelectorAll('.cell.selected').forEach(c => c.classList.remove('selected'));
-      cellEl.classList.add('selected');
-      selectedCell = cellEl;
-    }
-
-    function updateCell(idx, value) {
-      notebook.cells[idx].source = value.split('\n').map((l, i, arr) => i < arr.length - 1 ? l + '\n' : l);
-    }
-
-    function runCell(idx) {
-      const cell = notebook.cells[idx];
-      if (cell.cell_type !== 'code') return;
-
-      executionCount++;
-      cell.execution_count = executionCount;
-
-      const source = Array.isArray(cell.source) ? cell.source.join('') : cell.source;
-
-      ws.send(JSON.stringify({
-        type: 'execute',
-        cellId: `cell-${idx}`,
-        code: source
-      }));
-
-      // Update execution count display
-      const cellEl = document.querySelector(`[data-cell-id="cell-${idx}"]`);
-      const countEl = cellEl.querySelector('.execution-count');
-      if (countEl) {
-        countEl.textContent = `[${executionCount}]`;
-      } else {
-        cellEl.querySelector('.cell-toolbar .type').insertAdjacentHTML('afterend',
-          `<span class="execution-count">[${executionCount}]</span>`);
-      }
-    }
-
-    function deleteCell(idx) {
-      if (notebook.cells.length <= 1) return;
-      notebook.cells.splice(idx, 1);
-      renderNotebook();
-    }
-
-    function addCell(type) {
-      notebook.cells.push({
-        cell_type: type,
-        source: type === 'code' ? [''] : ['# New markdown cell\n'],
-        outputs: [],
-        execution_count: null
-      });
-      renderNotebook();
-    }
-
-    function saveNotebook() {
-      ws.send(JSON.stringify({
-        type: 'save',
-        notebook: notebook
-      }));
-    }
-
-    function runAllCells() {
-      notebook.cells.forEach((cell, idx) => {
-        if (cell.cell_type === 'code') {
-          runCell(idx);
-        }
-      });
-    }
-
-    // Event listeners
-    document.getElementById('btn-run').onclick = () => {
-      if (selectedCell) {
-        const idx = parseInt(selectedCell.dataset.cellId.replace('cell-', ''));
-        runCell(idx);
-      }
-    };
-    document.getElementById('btn-run-all').onclick = runAllCells;
-    document.getElementById('btn-add-code').onclick = () => addCell('code');
-    document.getElementById('btn-add-md').onclick = () => addCell('markdown');
-    document.getElementById('btn-save').onclick = saveNotebook;
-
-    // Keyboard shortcuts
-    document.addEventListener('keydown', (e) => {
-      if (e.ctrlKey && e.key === 's') {
-        e.preventDefault();
-        saveNotebook();
-      } else if (e.shiftKey && e.key === 'Enter') {
-        e.preventDefault();
-        if (selectedCell) {
-          const idx = parseInt(selectedCell.dataset.cellId.replace('cell-', ''));
-          runCell(idx);
-        }
-      }
-    });
-
-    init();
-  </script>
+  <script src="app.bundle.js"></script>
 </body>
 </html>

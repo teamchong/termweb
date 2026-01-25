@@ -410,6 +410,11 @@ pub const Viewer = struct {
         self.hints_disabled = true;
     }
 
+    /// Request the viewer to quit (for external control)
+    pub fn requestQuit(self: *Viewer) void {
+        self.running = false;
+    }
+
     /// Request a deferred tab switch (processed in main loop to avoid re-entrancy)
     pub fn requestTabSwitch(self: *Viewer, index: usize) void {
         self.pending_tab_switch = index;

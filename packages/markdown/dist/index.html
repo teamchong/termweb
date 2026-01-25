@@ -7,123 +7,101 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      overflow: hidden;
       background: #1e1e1e;
+      color: #cccccc;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      overflow: hidden;
     }
     #header {
       height: 36px;
       background: #252526;
       display: flex;
       align-items: center;
-      padding: 0 12px;
+      padding: 0 16px;
       border-bottom: 1px solid #3c3c3c;
     }
-    #filename { color: #cccccc; font-size: 13px; flex: 1; }
-    #status { color: #6a9955; font-size: 12px; margin-left: 12px; }
-    #status.modified { color: #dcdcaa; }
-    #status.saving { color: #569cd6; }
-    #status.error { color: #f14c4c; }
+    #header h1 { font-size: 14px; font-weight: 500; flex: 1; }
+    #header .status { font-size: 12px; }
+    #header .status.saved { color: #6a9955; }
+    #header .status.modified { color: #dcdcaa; }
 
     #toolbar {
-      height: 32px;
+      height: 36px;
       background: #2d2d2d;
       display: flex;
       align-items: center;
-      padding: 0 12px;
-      gap: 4px;
+      padding: 0 16px;
+      gap: 8px;
       border-bottom: 1px solid #3c3c3c;
     }
     #toolbar button {
-      background: transparent;
-      color: #cccccc;
+      background: #3c3c3c;
+      color: white;
       border: none;
-      padding: 4px 8px;
-      font-size: 14px;
+      padding: 4px 12px;
+      font-size: 12px;
       border-radius: 3px;
       cursor: pointer;
     }
-    #toolbar button:hover { background: #3c3c3c; }
-    #toolbar .separator { width: 1px; height: 20px; background: #3c3c3c; margin: 0 8px; }
+    #toolbar button:hover { background: #4c4c4c; }
+    #toolbar button.active { background: #0e639c; }
+    #toolbar .separator { width: 1px; height: 20px; background: #3c3c3c; }
 
-    #editor-container {
-      width: 100vw;
-      height: calc(100vh - 92px);
-      overflow: auto;
-      padding: 20px 40px;
+    #container {
+      display: flex;
+      height: calc(100vh - 96px);
     }
 
-    /* Milkdown dark theme */
-    .milkdown {
+    #editor-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid #3c3c3c;
+    }
+    #editor {
+      flex: 1;
       background: #1e1e1e;
+      border: none;
       color: #d4d4d4;
+      font-family: 'Fira Code', Consolas, monospace;
+      font-size: 14px;
+      line-height: 1.6;
+      padding: 16px;
+      resize: none;
+      outline: none;
+      tab-size: 2;
+    }
+
+    #preview-pane {
+      flex: 1;
+      overflow: auto;
+      padding: 16px;
+      background: #1e1e1e;
+    }
+    #preview {
+      max-width: 800px;
       line-height: 1.6;
     }
-    .milkdown .editor {
-      padding: 0;
-      outline: none;
-    }
-    .milkdown h1, .milkdown h2, .milkdown h3, .milkdown h4, .milkdown h5, .milkdown h6 {
-      color: #569cd6;
-      margin-top: 24px;
-      margin-bottom: 16px;
-      font-weight: 600;
-    }
-    .milkdown h1 { font-size: 2em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
-    .milkdown h2 { font-size: 1.5em; border-bottom: 1px solid #3c3c3c; padding-bottom: 0.3em; }
-    .milkdown p { margin-bottom: 16px; }
-    .milkdown a { color: #4ec9b0; text-decoration: none; }
-    .milkdown a:hover { text-decoration: underline; }
-    .milkdown code {
-      background: #2d2d2d;
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-family: 'Fira Code', Consolas, monospace;
-      font-size: 0.9em;
-    }
-    .milkdown pre {
-      background: #2d2d2d;
-      padding: 16px;
-      border-radius: 6px;
-      overflow-x: auto;
-      margin-bottom: 16px;
-    }
-    .milkdown pre code { background: transparent; padding: 0; }
-    .milkdown ul, .milkdown ol { margin-bottom: 16px; padding-left: 2em; }
-    .milkdown li { margin-bottom: 4px; }
-    .milkdown blockquote {
-      border-left: 4px solid #569cd6;
-      padding-left: 16px;
-      color: #9cdcfe;
-      margin-bottom: 16px;
-      margin-left: 0;
-    }
-    .milkdown table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
-    .milkdown th, .milkdown td { border: 1px solid #3c3c3c; padding: 8px 12px; text-align: left; }
-    .milkdown th { background: #252526; }
-    .milkdown img { max-width: 100%; height: auto; }
-    .milkdown hr { border: none; border-top: 1px solid #3c3c3c; margin: 24px 0; }
-    .milkdown .task-list-item { list-style: none; margin-left: -1.5em; }
-    .milkdown .task-list-item input { margin-right: 0.5em; }
+    #preview h1, #preview h2, #preview h3 { color: #569cd6; margin: 20px 0 10px; }
+    #preview h1 { font-size: 2em; border-bottom: 1px solid #3c3c3c; padding-bottom: 8px; }
+    #preview h2 { font-size: 1.5em; }
+    #preview h3 { font-size: 1.2em; }
+    #preview p { margin-bottom: 16px; }
+    #preview code { background: #2d2d2d; padding: 2px 6px; border-radius: 4px; font-family: 'Fira Code', Consolas, monospace; font-size: 0.9em; }
+    #preview pre { background: #2d2d2d; padding: 16px; border-radius: 6px; overflow-x: auto; margin-bottom: 16px; }
+    #preview pre code { background: none; padding: 0; }
+    #preview ul, #preview ol { margin: 0 0 16px 24px; }
+    #preview li { margin-bottom: 6px; }
+    #preview blockquote { border-left: 4px solid #569cd6; margin: 16px 0; padding-left: 16px; color: #888; }
+    #preview strong { font-weight: 600; }
+    #preview em { font-style: italic; }
+    #preview a { color: #569cd6; }
+    #preview hr { border: none; border-top: 1px solid #3c3c3c; margin: 24px 0; }
+    #preview table { border-collapse: collapse; width: 100%; margin-bottom: 16px; }
+    #preview th, #preview td { border: 1px solid #3c3c3c; padding: 8px 12px; text-align: left; }
+    #preview th { background: #252526; }
 
-    /* Slash menu */
-    .milkdown-menu {
-      background: #252526;
-      border: 1px solid #3c3c3c;
-      border-radius: 6px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-      padding: 4px;
-    }
-    .milkdown-menu-item {
-      padding: 8px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    .milkdown-menu-item:hover, .milkdown-menu-item.active {
-      background: #3c3c3c;
-    }
-
-    #shortcuts {
+    #footer {
       position: fixed;
       bottom: 0;
       left: 0;
@@ -136,185 +114,34 @@
       font-size: 11px;
       color: white;
     }
-    #shortcuts span { margin-right: 16px; }
-    #shortcuts kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
+    #footer span { margin-right: 16px; }
+    #footer kbd { background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 2px; margin-right: 4px; }
   </style>
 </head>
 <body>
   <div id="header">
-    <span id="filename">Loading...</span>
-    <span id="status">Saved</span>
+    <h1 id="filename">document.md</h1>
+    <span class="status saved" id="status">Saved</span>
   </div>
   <div id="toolbar">
-    <button id="btn-h1" title="Heading 1">H1</button>
-    <button id="btn-h2" title="Heading 2">H2</button>
-    <button id="btn-h3" title="Heading 3">H3</button>
+    <button id="btn-edit" class="active">Edit</button>
+    <button id="btn-preview">Preview</button>
+    <button id="btn-split">Split</button>
     <div class="separator"></div>
-    <button id="btn-bold" title="Bold (Ctrl+B)"><b>B</b></button>
-    <button id="btn-italic" title="Italic (Ctrl+I)"><i>I</i></button>
-    <button id="btn-code" title="Code">&lt;/&gt;</button>
-    <div class="separator"></div>
-    <button id="btn-ul" title="Bullet List">&#8226; List</button>
-    <button id="btn-ol" title="Numbered List">1. List</button>
-    <button id="btn-quote" title="Quote">&ldquo;</button>
-    <div class="separator"></div>
-    <button id="btn-link" title="Link">Link</button>
-    <button id="btn-image" title="Image">Image</button>
-    <button id="btn-table" title="Table">Table</button>
+    <button id="btn-save">Save</button>
   </div>
-  <div id="editor-container">
-    <div id="editor"></div>
+  <div id="container">
+    <div id="editor-pane">
+      <textarea id="editor" spellcheck="false" placeholder="Start writing markdown..."></textarea>
+    </div>
+    <div id="preview-pane">
+      <div id="preview"></div>
+    </div>
   </div>
-  <div id="shortcuts">
+  <div id="footer">
     <span><kbd>Ctrl+S</kbd> Save</span>
-    <span><kbd>Ctrl+B</kbd> Bold</span>
-    <span><kbd>Ctrl+I</kbd> Italic</span>
-    <span><kbd>/</kbd> Slash Commands</span>
     <span><kbd>Ctrl+Q</kbd> Quit</span>
   </div>
-
-  <script type="module">
-    import { Editor, rootCtx, defaultValueCtx } from 'https://esm.sh/@milkdown/core@7.3.6';
-    import { commonmark } from 'https://esm.sh/@milkdown/preset-commonmark@7.3.6';
-    import { gfm } from 'https://esm.sh/@milkdown/preset-gfm@7.3.6';
-    import { listener, listenerCtx } from 'https://esm.sh/@milkdown/plugin-listener@7.3.6';
-    import { history } from 'https://esm.sh/@milkdown/plugin-history@7.3.6';
-    import { clipboard } from 'https://esm.sh/@milkdown/plugin-clipboard@7.3.6';
-    import { getMarkdown, replaceAll } from 'https://esm.sh/@milkdown/utils@7.3.6';
-
-    // termweb FS IPC
-    const pendingFS = new Map();
-    let fsId = 0;
-
-    window.__termwebFSResponse = (id, success, data) => {
-      const resolve = pendingFS.get(id);
-      if (resolve) {
-        pendingFS.delete(id);
-        resolve({ success, data });
-      }
-    };
-
-    function fsCall(op, path, data = '') {
-      return new Promise(resolve => {
-        const id = ++fsId;
-        pendingFS.set(id, resolve);
-        const msg = data ? `__TERMWEB_FS__:${id}:${op}:${path}:${data}` : `__TERMWEB_FS__:${id}:${op}:${path}`;
-        console.log(msg);
-        setTimeout(() => {
-          if (pendingFS.has(id)) {
-            pendingFS.delete(id);
-            resolve({ success: false, data: 'Timeout' });
-          }
-        }, 5000);
-      });
-    }
-
-    let editor;
-    let originalContent = '';
-    let isModified = false;
-    let currentFile = null;
-
-    const params = new URLSearchParams(location.search);
-    const filePath = params.get('path') || '';
-    const initContent = params.get('content');
-
-    async function init() {
-      const fileName = filePath.split('/').pop();
-      const content = initContent ? atob(initContent) : '# New Document\n\nStart writing here...\n';
-
-      currentFile = filePath;
-      document.getElementById('filename').textContent = fileName;
-      document.title = `${fileName} - termweb-markdown`;
-      originalContent = content;
-
-      editor = await Editor.make()
-        .config((ctx) => {
-          ctx.set(rootCtx, document.getElementById('editor'));
-          ctx.set(defaultValueCtx, content);
-          ctx.get(listenerCtx).markdownUpdated((ctx, markdown) => {
-            isModified = markdown !== originalContent;
-            updateStatus();
-          });
-        })
-        .use(commonmark)
-        .use(gfm)
-        .use(listener)
-        .use(history)
-        .use(clipboard)
-        .create();
-
-      // Keyboard shortcuts
-      document.addEventListener('keydown', (e) => {
-        if (e.ctrlKey && e.key === 's') {
-          e.preventDefault();
-          saveFile();
-        }
-      });
-
-      // Toolbar buttons
-      setupToolbar();
-    }
-
-    function setupToolbar() {
-      document.getElementById('btn-h1').onclick = () => insertMarkdown('# ');
-      document.getElementById('btn-h2').onclick = () => insertMarkdown('## ');
-      document.getElementById('btn-h3').onclick = () => insertMarkdown('### ');
-      document.getElementById('btn-bold').onclick = () => wrapMarkdown('**');
-      document.getElementById('btn-italic').onclick = () => wrapMarkdown('*');
-      document.getElementById('btn-code').onclick = () => wrapMarkdown('`');
-      document.getElementById('btn-ul').onclick = () => insertMarkdown('- ');
-      document.getElementById('btn-ol').onclick = () => insertMarkdown('1. ');
-      document.getElementById('btn-quote').onclick = () => insertMarkdown('> ');
-      document.getElementById('btn-link').onclick = () => insertMarkdown('[link text](url)');
-      document.getElementById('btn-image').onclick = () => insertMarkdown('![alt text](image-url)');
-      document.getElementById('btn-table').onclick = () => insertMarkdown('\n| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |\n');
-    }
-
-    function getMarkdownContent() {
-      if (!editor) return '';
-      return editor.action(getMarkdown());
-    }
-
-    function insertMarkdown(text) {
-      // Get current markdown and append
-      const current = getMarkdownContent();
-      const newContent = current + '\n' + text;
-      editor.action(replaceAll(newContent));
-    }
-
-    function wrapMarkdown(wrapper) {
-      // For now, append wrapped placeholder
-      insertMarkdown(wrapper + 'text' + wrapper);
-    }
-
-    function updateStatus() {
-      const status = document.getElementById('status');
-      status.textContent = isModified ? 'Modified' : 'Saved';
-      status.className = isModified ? 'modified' : '';
-    }
-
-    async function saveFile() {
-      const status = document.getElementById('status');
-      status.textContent = 'Saving...';
-      status.className = 'saving';
-
-      const content = getMarkdownContent();
-      const encoded = btoa(unescape(encodeURIComponent(content)));
-      const res = await fsCall('writefile', currentFile, encoded);
-
-      if (res.success) {
-        originalContent = content;
-        isModified = false;
-        status.textContent = 'Saved';
-        status.className = '';
-      } else {
-        status.textContent = 'Error: ' + res.data;
-        status.className = 'error';
-        setTimeout(updateStatus, 3000);
-      }
-    }
-
-    init();
-  </script>
+  <script src="app.bundle.js"></script>
 </body>
 </html>

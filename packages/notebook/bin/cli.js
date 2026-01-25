@@ -4,26 +4,15 @@ const path = require('path');
 const fs = require('fs');
 const termweb = require('termweb');
 const { startServer } = require('../lib/server');
-const { resolveDisplayMode } = require('@termweb/shared');
 
 const args = process.argv.slice(2);
 const verbose = args.includes('--verbose') || args.includes('-v');
 
-// Parse mode flag
-let requestedMode = 'auto';
-const modeIdx = args.indexOf('--mode');
-if (modeIdx !== -1 && args[modeIdx + 1]) {
-  requestedMode = args[modeIdx + 1];
-}
-
-const filteredArgs = args.filter((a, i) =>
-  a !== '--verbose' && a !== '-v' &&
-  a !== '--mode' && args[i - 1] !== '--mode'
-);
+const filteredArgs = args.filter(a => a !== '--verbose' && a !== '-v');
 
 if (filteredArgs[0] === '--help' || filteredArgs[0] === '-h') {
   console.log(`
-@termweb/notebook - Terminal Jupyter Notebook
+@termweb/notebook - Terminal Jupyter Notebook Viewer/Editor
 
 Usage: termweb-notebook [file.ipynb] [options]
 
@@ -31,13 +20,10 @@ Arguments:
   file.ipynb    Notebook file to open (optional)
 
 Options:
-  --mode <mode>   Display mode: auto, embedded, standalone
   -v, --verbose   Debug output
   -h, --help      Show help
 
-Requirements:
-  - Python 3
-  - ipykernel (pip install ipykernel)
+Note: This is a view/edit mode only. Code execution is not supported.
 `);
   process.exit(0);
 }
@@ -51,15 +37,23 @@ if (notebookPath && !notebookPath.endsWith('.ipynb')) {
 
 async function main() {
   try {
-    // Start the notebook server
-    const { port } = await startServer(notebookPath, 0);
+    // Read notebook content if file exists
+    let notebookContent = '{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}';
+    if (notebookPath && fs.existsSync(notebookPath)) {
+      notebookContent = fs.readFileSync(notebookPath, 'utf-8');
+    }
 
-    const url = `http://127.0.0.1:${port}`;
+    // Use file:// URL with notebook content as parameter
+    const htmlPath = path.join(__dirname, '..', 'dist', 'index.html');
+    const params = new URLSearchParams();
+    params.set('content', Buffer.from(notebookContent).toString('base64'));
+    if (notebookPath) {
+      params.set('path', notebookPath);
+    }
 
-    // Resolve mode and open
-    const mode = resolveDisplayMode(requestedMode);
+    const url = `file://${htmlPath}?${params.toString()}`;
 
-    await termweb.open(url, { toolbar: false, verbose, mode });
+    await termweb.open(url, { toolbar: false, verbose });
     process.exit(0);
   } catch (err) {
     console.error('Error:', err.message);
