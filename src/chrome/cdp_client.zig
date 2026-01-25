@@ -397,13 +397,16 @@ pub const CdpClient = struct {
         }
     }
 
-    /// Send mouse command (fire-and-forget) - uses dedicated mouse WebSocket
+    /// Send mouse command (fire-and-forget) - uses page WebSocket with lazy recovery
     /// Silently ignores errors - safe during shutdown
     pub fn sendMouseCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
+        // Lazy recovery: try to reconnect if dead
+        self.ensurePageWsConnected() catch {};
+
         if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
             return;
@@ -418,13 +421,16 @@ pub const CdpClient = struct {
         }
     }
 
-    /// Send keyboard command (fire-and-forget) - uses page WebSocket
+    /// Send keyboard command (fire-and-forget) - uses page WebSocket with lazy recovery
     /// Silently ignores errors - safe during shutdown
     pub fn sendKeyboardCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
+        // Lazy recovery: try to reconnect if dead
+        self.ensurePageWsConnected() catch {};
+
         if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
             return;
@@ -439,27 +445,94 @@ pub const CdpClient = struct {
         }
     }
 
-    /// Send navigation command and wait for response - uses page WebSocket
+    /// Send navigation command and wait for response - uses page WebSocket with lazy recovery
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
+        // Lazy recovery: try to reconnect if dead
+        try self.ensurePageWsConnected();
+
         if (self.page_ws) |ws| {
             return ws.sendCommand(method, params);
         }
         return CdpError.WebSocketConnectionFailed;
     }
 
-    /// Send navigation command (fire-and-forget) - uses page WebSocket
+    /// Send navigation command (fire-and-forget) - uses page WebSocket with lazy recovery
     pub fn sendNavCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
+        // Lazy recovery: try to reconnect if dead
+        self.ensurePageWsConnected() catch {};
+
         if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
         }
+    }
+
+    /// Check if page WebSocket is alive
+    fn isPageWsAlive(self: *CdpClient) bool {
+        if (self.page_ws) |ws| {
+            return ws.running.load(.acquire);
+        }
+        return false;
+    }
+
+    /// Check if browser WebSocket is alive
+    fn isBrowserWsAlive(self: *CdpClient) bool {
+        if (self.browser_ws) |ws| {
+            return ws.running.load(.acquire);
+        }
+        return false;
+    }
+
+    /// Ensure page WebSocket is connected (lazy recovery)
+    fn ensurePageWsConnected(self: *CdpClient) !void {
+        if (self.isPageWsAlive()) return;
+        logToFile("[CDP] page_ws dead, attempting lazy recovery...\n", .{});
+        try self.reconnectPageWebSocket();
+    }
+
+    /// Ensure browser WebSocket is connected (lazy recovery)
+    fn ensureBrowserWsConnected(self: *CdpClient) !void {
+        if (self.isBrowserWsAlive()) return;
+        logToFile("[CDP] browser_ws dead, attempting lazy recovery...\n", .{});
+        try self.reconnectBrowserWebSocket();
+    }
+
+    /// Reconnect browser WebSocket
+    fn reconnectBrowserWebSocket(self: *CdpClient) !void {
+        logToFile("[CDP reconnectBrowserWS] Starting...\n", .{});
+
+        // Close old connection
+        if (self.browser_ws) |ws| {
+            ws.deinit();
+            self.browser_ws = null;
+        }
+
+        // Discover browser WebSocket URL
+        const browser_url = try self.discoverBrowserWebSocketUrl(self.allocator);
+        defer self.allocator.free(browser_url);
+        logToFile("[CDP reconnectBrowserWS] Got URL: {s}\n", .{browser_url});
+
+        // Connect browser WebSocket
+        self.browser_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, browser_url);
+        try self.browser_ws.?.startReaderThread();
+
+        // Re-enable download behavior
+        const download_params = "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}";
+        const download_result = try self.browser_ws.?.sendCommand("Browser.setDownloadBehavior", download_params);
+        self.allocator.free(download_result);
+
+        // Re-enable target discovery
+        const target_result = try self.browser_ws.?.sendCommand("Target.setDiscoverTargets", "{\"discover\":true}");
+        self.allocator.free(target_result);
+
+        logToFile("[CDP reconnectBrowserWS] Done\n", .{});
     }
 
     /// Reconnect page WebSocket to current page target
@@ -589,8 +662,13 @@ pub const CdpClient = struct {
 
     /// Get next event from WebSockets
     /// Pipe is ONLY for screencast frames - all events come from WebSockets
+    /// Uses lazy recovery: reconnects dead WebSockets on demand
     pub fn nextEvent(self: *CdpClient, allocator: std.mem.Allocator) !?CdpEvent {
         _ = allocator;
+
+        // Lazy recovery for browser_ws (download events)
+        self.ensureBrowserWsConnected() catch {};
+
         // Check browser_ws for download events
         if (self.browser_ws) |bws| {
             if (bws.nextEvent()) |raw| {
@@ -601,6 +679,10 @@ pub const CdpClient = struct {
                 };
             }
         }
+
+        // Lazy recovery for page_ws (page events)
+        self.ensurePageWsConnected() catch {};
+
         // Check page_ws for page events
         const ws = self.page_ws orelse return null;
         const raw = ws.nextEvent() orelse return null;
