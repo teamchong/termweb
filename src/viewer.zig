@@ -526,13 +526,7 @@ pub const Viewer = struct {
         try writer.flush();  // Force flush after hiding cursor
         defer Screen.showCursor(writer) catch {};
 
-        // Clear screen once at startup
-        self.log("[DEBUG] Initial screen clear...\n", .{});
-        try Screen.clear(writer);
-        try self.kitty.clearAll(writer);
-        try writer.flush();
-
-        // Initialize toolbar renderer with terminal pixel width (unless disabled)
+        // Initialize toolbar renderer BEFORE clearing screen (to avoid flash)
         const term_size = try self.terminal.getSize();
         const cell_width = if (term_size.cols > 0) term_size.width_px / term_size.cols else 10;
         if (!self.toolbar_disabled) {
@@ -571,13 +565,20 @@ pub const Viewer = struct {
                 std.Thread.sleep(5 * std.time.ns_per_ms);
             }
             self.log("[DEBUG] Toolbar ready after {} waits\n", .{wait_count});
-
-            // Display toolbar immediately (before screencast starts)
-            if (self.toolbar_rgba_ready.load(.acquire)) {
-                self.displayToolbar(writer);
-                try writer.flush();
-            }
         }
+
+        // Set black background and clear screen to prevent white flash
+        // Must be done BEFORE any content is displayed
+        self.log("[DEBUG] Setting black background and clearing screen...\n", .{});
+        try writer.writeAll("\x1b[0m\x1b[40m\x1b[2J\x1b[H"); // Reset, black bg, clear screen, home
+        try writer.flush();
+
+        // Display toolbar first
+        self.log("[DEBUG] Displaying initial toolbar...\n", .{});
+        if (self.toolbar_rgba_ready.load(.acquire)) {
+            self.displayToolbar(writer);
+        }
+        try writer.flush();
 
         // Start screencast streaming with viewport dimensions
         // Note: cli.zig already scales viewport for High-DPI displays
@@ -1147,6 +1148,11 @@ pub const Viewer = struct {
         while (self.toolbar_thread_running.load(.acquire)) {
             // Check if re-render requested
             if (self.toolbar_render_requested.swap(false, .acq_rel)) {
+                // Wait if previous buffer not yet consumed (prevents tearing)
+                var wait_tries: u32 = 0;
+                while (self.toolbar_rgba_ready.load(.acquire) and wait_tries < 10) : (wait_tries += 1) {
+                    std.Thread.sleep(2 * std.time.ns_per_ms);
+                }
                 if (self.toolbar_renderer) |*renderer| {
                     // Update nav state before compositing
                     renderer.setNavState(self.ui_state.can_go_back, self.ui_state.can_go_forward, self.ui_state.is_loading);
