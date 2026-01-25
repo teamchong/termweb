@@ -78,12 +78,13 @@ pub fn build(b: *std.Build) void {
             exe.addObjectFile(.{ .cwd_relative = "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.a" });
         }
     } else if (target.result.os.tag == .linux) {
-        // Linux: static link from system path
-        exe.addIncludePath(.{ .cwd_relative = "/usr/include" });
+        // Linux: use -fPIC build from /usr/local (built from source)
         if (target.result.cpu.arch == .aarch64) {
-            exe.addObjectFile(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu/libturbojpeg.a" });
+            exe.addIncludePath(.{ .cwd_relative = "/usr/local/aarch64-linux-gnu/include" });
+            exe.addObjectFile(.{ .cwd_relative = "/usr/local/aarch64-linux-gnu/lib/libturbojpeg.a" });
         } else {
-            exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libturbojpeg.a" });
+            exe.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
+            exe.addObjectFile(.{ .cwd_relative = "/usr/local/lib/libturbojpeg.a" });
         }
     }
 
@@ -135,11 +136,13 @@ pub fn build(b: *std.Build) void {
             napi.addObjectFile(.{ .cwd_relative = "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.a" });
         }
     } else if (target.result.os.tag == .linux) {
-        napi.addIncludePath(.{ .cwd_relative = "/usr/include" });
+        // Linux: use -fPIC build from /usr/local (built from source)
         if (target.result.cpu.arch == .aarch64) {
-            napi.addObjectFile(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu/libturbojpeg.a" });
+            napi.addIncludePath(.{ .cwd_relative = "/usr/local/aarch64-linux-gnu/include" });
+            napi.addObjectFile(.{ .cwd_relative = "/usr/local/aarch64-linux-gnu/lib/libturbojpeg.a" });
         } else {
-            napi.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libturbojpeg.a" });
+            napi.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
+            napi.addObjectFile(.{ .cwd_relative = "/usr/local/lib/libturbojpeg.a" });
         }
     }
 

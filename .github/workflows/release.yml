@@ -89,29 +89,33 @@ jobs:
           sudo mkdir -p /usr/local/opt/jpeg-turbo
           sudo cmake --install build
 
-      - name: Install libjpeg-turbo (Linux x86_64)
+      - name: Build libjpeg-turbo with -fPIC (Linux x86_64)
         if: runner.os == 'Linux' && matrix.arch == 'x86_64'
-        run: sudo apt-get update && sudo apt-get install -y libturbojpeg0-dev
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake nasm
+          curl -L https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.0/libjpeg-turbo-3.1.0.tar.gz | tar xz
+          cd libjpeg-turbo-3.1.0
+          cmake -B build -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build -j$(nproc)
+          sudo cmake --install build
 
-      - name: Install libjpeg-turbo (Linux aarch64 cross-compile)
+      - name: Build libjpeg-turbo with -fPIC (Linux aarch64 cross-compile)
         if: runner.os == 'Linux' && matrix.arch == 'aarch64'
         run: |
-          sudo dpkg --add-architecture arm64
-          sudo rm -f /etc/apt/sources.list
-          sudo rm -f /etc/apt/sources.list.d/*
-          sudo tee /etc/apt/sources.list << 'EOF'
-          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
-          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
-          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ noble main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ noble-updates main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ noble-security main restricted universe multiverse
-          EOF
-          sudo apt-get update
-          sudo apt-get install -y libturbojpeg0-dev:arm64
+          sudo apt-get update && sudo apt-get install -y cmake gcc-aarch64-linux-gnu
+          curl -L https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.0/libjpeg-turbo-3.1.0.tar.gz | tar xz
+          cd libjpeg-turbo-3.1.0
+          cmake -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/aarch64-linux-gnu
+          cmake --build build -j$(nproc)
+          sudo cmake --install build
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dskip-napi=true
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
 
       - name: Rename binary
         run: mv zig-out/bin/termweb ${{ matrix.name }}

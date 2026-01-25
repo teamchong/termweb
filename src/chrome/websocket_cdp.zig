@@ -76,7 +76,22 @@ const ParsedUrl = struct {
     path: []const u8,
 };
 
+/// Check if debug logging is enabled (cached)
+fn isDebugEnabled() bool {
+    const State = struct {
+        var checked: bool = false;
+        var enabled: bool = false;
+    };
+    if (!State.checked) {
+        State.enabled = std.posix.getenv("TERMWEB_DEBUG") != null;
+        State.checked = true;
+    }
+    return State.enabled;
+}
+
 fn logToFile(comptime fmt: []const u8, args: anytype) void {
+    if (!isDebugEnabled()) return;
+
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
 
@@ -247,31 +262,33 @@ pub const WebSocketCdpClient = struct {
                     return error.TimeoutWaitingForResponse;
                 }
 
-                // Try to find response in queue
-                self.response_mutex.lock();
-                defer self.response_mutex.unlock();
+                // Try to find response in queue (explicit scope to release mutex before sleep)
+                {
+                    self.response_mutex.lock();
+                    defer self.response_mutex.unlock();
 
-                var i: usize = 0;
-                while (i < self.response_queue.items.len) : (i += 1) {
-                    const entry = self.response_queue.items[i];
-                    if (entry.id == id) {
-                        const response = entry.payload;
-                        _ = self.response_queue.swapRemove(i);
+                    var i: usize = 0;
+                    while (i < self.response_queue.items.len) : (i += 1) {
+                        const entry = self.response_queue.items[i];
+                        if (entry.id == id) {
+                            const response = entry.payload;
+                            _ = self.response_queue.swapRemove(i);
 
-                        logToFile("[WS] got response for id={} len={}\n", .{ id, response.len });
+                            logToFile("[WS] got response for id={} len={}\n", .{ id, response.len });
 
-                        // Check for error in response
-                        if (std.mem.indexOf(u8, response, "\"error\":")) |_| {
-                            logToFile("[WS] response has error\n", .{});
-                            self.allocator.free(response);
-                            return WebSocketError.ProtocolError;
+                            // Check for error in response
+                            if (std.mem.indexOf(u8, response, "\"error\":")) |_| {
+                                logToFile("[WS] response has error\n", .{});
+                                self.allocator.free(response);
+                                return WebSocketError.ProtocolError;
+                            }
+
+                            return response;
                         }
-
-                        return response;
                     }
                 }
 
-                // Sleep briefly before retry
+                // Sleep briefly before retry (mutex released)
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         } else {
@@ -326,10 +343,11 @@ pub const WebSocketCdpClient = struct {
 
     /// Background thread main function - continuously reads WebSocket frames
     fn readerThreadMain(self: *WebSocketCdpClient) void {
-        logToFile("[WS] Reader thread started\n", .{});
+        logToFile("[WS] Reader thread started, running={}\n", .{self.running.load(.acquire)});
 
         var last_activity = std.time.nanoTimestamp();
         const keepalive_interval_ns = 15 * std.time.ns_per_s; // Send ping every 15 seconds of inactivity
+        var frame_count: u32 = 0;
 
         while (self.running.load(.acquire)) {
             // Check if we need to send keepalive ping
@@ -364,20 +382,36 @@ pub const WebSocketCdpClient = struct {
             };
             // Update last activity on successful frame receive
             last_activity = std.time.nanoTimestamp();
+            frame_count += 1;
             defer frame.deinit();
+
+            // Log frame receipt for debugging
+            if (frame_count <= 20 or frame_count % 100 == 0) {
+                logToFile("[WS] Frame #{} received, len={}\n", .{ frame_count, frame.payload.len });
+            }
 
             // Check if we should stop before processing
             if (!self.running.load(.acquire)) break;
 
             // Route message based on type
-            if (std.mem.indexOf(u8, frame.payload, "\"method\":")) |_| {
-                // EVENT (unsolicited message from Chrome)
+            // Check for "id" first - responses have "id" but no "method"
+            // Events have "method" (and may have "id" for session-based events)
+            const has_id = std.mem.indexOf(u8, frame.payload, "\"id\":") != null;
+            const has_method = std.mem.indexOf(u8, frame.payload, "\"method\":") != null;
+
+            // Debug: log routing decision
+            logToFile("[WS] Routing: has_id={} has_method={} payload={s}\n", .{ has_id, has_method, frame.payload[0..@min(100, frame.payload.len)] });
+
+            if (has_id and !has_method) {
+                // RESPONSE (reply to our command) - has id but no method
+                self.handleResponse(frame.payload) catch |err| {
+                    logToFile("[WS] handleResponse error: {}\n", .{err});
+                };
+            } else if (has_method) {
+                // EVENT (unsolicited message from Chrome) - has method
                 self.handleEvent(frame.payload) catch {};
-            } else if (std.mem.indexOf(u8, frame.payload, "\"id\":")) |_| {
-                // RESPONSE (reply to our command)
-                // Log response processing
-                // std.debug.print("[WS] Processing response\n", .{});
-                self.handleResponse(frame.payload) catch {};
+            } else {
+                logToFile("[WS] Unknown message type: {s}\n", .{frame.payload[0..@min(200, frame.payload.len)]});
             }
         }
         // std.debug.print("[WS] Reader thread exiting\n", .{});
@@ -391,9 +425,12 @@ pub const WebSocketCdpClient = struct {
         const method_end = std.mem.indexOfPos(u8, payload, method_value_start, "\"") orelse return;
         const method = payload[method_value_start..method_end];
 
-        // Debug: Log all Browser.* and Page.fileChooser* events
+        // Debug: Log all Browser.* and Page.screencast* events
         if (std.mem.startsWith(u8, method, "Browser.")) {
             logToFile("[WS] Browser event: {s}\n", .{method});
+        }
+        if (std.mem.startsWith(u8, method, "Page.screencast")) {
+            logToFile("[WS] Screencast event: {s}\n", .{method});
         }
         if (std.mem.startsWith(u8, method, "Page.fileChooser")) {
             logToFile("[WS] FileChooser event: {s}\n", .{method});
@@ -401,7 +438,10 @@ pub const WebSocketCdpClient = struct {
 
         // Handle screencast frames directly (high-bandwidth, not queued)
         if (std.mem.eql(u8, method, "Page.screencastFrame")) {
-            self.handleScreencastFrame(payload) catch {};
+            logToFile("[WS] GOT SCREENCAST FRAME! len={}\n", .{payload.len});
+            self.handleScreencastFrame(payload) catch |err| {
+                logToFile("[WS] handleScreencastFrame error: {}\n", .{err});
+            };
             return;
         }
 

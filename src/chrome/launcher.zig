@@ -455,6 +455,12 @@ pub fn launchChromePipe(
         try args_list.append(allocator, "--disable-software-rasterizer");
     }
 
+    // Linux headless: disable GPU to force software rendering for screencast
+    if (builtin.os.tag == .linux and options.headless) {
+        try args_list.append(allocator, "--disable-gpu");
+        try args_list.append(allocator, "--disable-dev-shm-usage");
+    }
+
     const window_size = try std.fmt.allocPrint(allocator, "--window-size={d},{d}", .{ options.viewport_width, options.viewport_height });
     defer allocator.free(window_size);
     try args_list.append(allocator, window_size);
