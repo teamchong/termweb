@@ -35,12 +35,36 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     var frame = screenshot_api.getLatestScreencastFrame(viewer.cdp_client) orelse return false;
     defer frame.deinit(); // Proper cleanup!
 
-    // NOTE: FPS throttling is now done via ACK throttling in cdp_pipe.zig
-    // Don't throttle here - we want to render every frame we receive
+    // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
+    // Chrome may send different size than requested viewport
+    // IMPORTANT: Always update these, even if we skip rendering, so coord mapping stays current
+    const frame_width = if (frame.device_width > 0) frame.device_width else viewer.viewport_width;
+    const frame_height = if (frame.device_height > 0) frame.device_height else viewer.viewport_height;
+
+    // Detect frame dimension change and skip first changed frame to avoid visual glitch
+    const frame_changed = viewer.last_frame_width > 0 and
+        (frame_width != viewer.last_frame_width or frame_height != viewer.last_frame_height);
+
+    // Update stored frame dimensions
+    viewer.last_frame_width = frame_width;
+    viewer.last_frame_height = frame_height;
+
+    // On dimension change, delete old image to avoid visual artifacts
+    if (frame_changed) {
+        viewer.log("[RENDER] Frame dimensions changed {}x{} -> {}x{}\n", .{
+            viewer.last_frame_width, viewer.last_frame_height, frame_width, frame_height,
+        });
+        // Delete old content image by ID using escape sequence
+        if (viewer.last_content_image_id != null) {
+            // Kitty delete image: \x1b_Ga=d,d=I,i=<id>\x1b\\
+            const stdout = std.fs.File.stdout();
+            _ = stdout.write("\x1b_Ga=d,d=I,i=100\x1b\\") catch {};
+            viewer.last_content_image_id = null;
+        }
+    }
 
     // Throttle: Don't re-render the same frame multiple times
     if (viewer.last_rendered_generation > 0 and frame.generation <= viewer.last_rendered_generation) {
-        viewer.log("[RENDER] Gen throttle: skipping frame gen={} (already rendered {})\n", .{ frame.generation, viewer.last_rendered_generation });
         return false;
     }
 
@@ -56,28 +80,18 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     }
     viewer.last_rendered_generation = frame.generation;
 
-    // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
-    // Chrome may send different size than requested viewport
-    const frame_width = if (frame.device_width > 0) frame.device_width else viewer.viewport_width;
-    const frame_height = if (frame.device_height > 0) frame.device_height else viewer.viewport_height;
-
-    // NOTE: Do NOT use frame dimensions for coordinate mapping!
-    // Screencast frames may be smaller than Chrome's actual viewport due to DPI scaling.
-    // Mouse events must map to Chrome's window.innerWidth/Height (from refreshChromeViewport).
-    // Frame: 886x980 (what we display) vs Chrome viewport: 984x1088 (where clicks go)
-
-    // Debug: Log actual frame dimensions from Chrome
+    // Debug: Log frame dimensions (source of truth for coordinates)
     if (viewer.perf_frame_count < 5) {
-        viewer.log("[FRAME] device={}x{} (raw={}x{}), chrome={}x{}\n", .{
+        viewer.log("[FRAME] frame={}x{} (device={}x{})\n", .{
             frame_width, frame_height, frame.device_width, frame.device_height,
-            viewer.chrome_actual_width, viewer.chrome_actual_height,
         });
     }
 
     // Profile render time
     const render_start = std.time.nanoTimestamp();
 
-    try displayFrameWithDimensions(viewer, frame.data, frame_width, frame_height);
+    // Use stored dimensions (single source of truth, already updated above)
+    try displayFrameWithDimensions(viewer, frame.data);
 
     const render_elapsed = std.time.nanoTimestamp() - render_start;
     viewer.perf_frame_count += 1;
@@ -111,9 +125,13 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     return true;
 }
 
-/// Display a base64 PNG frame with specific dimensions for coordinate mapping
-pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame_width: u32, frame_height: u32) !void {
+/// Display a base64 PNG frame using stored dimensions (single source of truth)
+pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void {
     const render_t0 = std.time.nanoTimestamp();
+
+    // Use stored frame dimensions (updated in tryRenderScreencast)
+    const frame_width = viewer.last_frame_width;
+    const frame_height = viewer.last_frame_height;
 
     // Larger buffer reduces write syscalls (frames can be 300KB+)
     var stdout_buf: [262144]u8 = undefined; // 256KB buffer
@@ -125,39 +143,95 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame
     const size = try viewer.terminal.getSize();
     const display_cols: u16 = if (size.cols > 0) size.cols else 80;
 
-    // Calculate cell height and toolbar rows
+    // Calculate cell dimensions
+    const cell_width: u32 = if (size.cols > 0) size.width_px / size.cols else 14;
     const cell_height: u32 = if (size.rows > 0) size.height_px / size.rows else 20;
     const toolbar_h: u32 = if (viewer.toolbar_renderer) |tr| tr.toolbar_height else cell_height;
+
+    // Chrome coords: Use Chrome's actual window.innerWidth/Height (queried via JS)
+    // This is the true coordinate space for Input.dispatchMouseEvent
+    // Query if not yet available (first frame or after page change)
+    if (viewer.chrome_inner_width == 0 or viewer.chrome_inner_height == 0) {
+        if (screenshot_api.getActualViewport(viewer.cdp_client, viewer.allocator)) |vp| {
+            if (vp.width > 0 and vp.height > 0) {
+                viewer.chrome_inner_width = vp.width;
+                viewer.chrome_inner_height = vp.height;
+                // Save frame dimensions at time of query for change detection
+                viewer.chrome_inner_frame_width = frame_width;
+                viewer.chrome_inner_frame_height = frame_height;
+            }
+        } else |_| {}
+    }
+
+    // Adjust chrome dimensions if frame changed (e.g., download bar appeared)
+    // Apply ratio: new_chrome = old_chrome * new_frame / old_frame
+    var chrome_width: u32 = if (viewer.chrome_inner_width > 0) viewer.chrome_inner_width else frame_width;
+    var chrome_height: u32 = if (viewer.chrome_inner_height > 0) viewer.chrome_inner_height else frame_height;
+    if (viewer.chrome_inner_frame_width > 0 and viewer.chrome_inner_frame_height > 0) {
+        if (frame_width != viewer.chrome_inner_frame_width or frame_height != viewer.chrome_inner_frame_height) {
+            chrome_width = (viewer.chrome_inner_width * frame_width) / viewer.chrome_inner_frame_width;
+            chrome_height = (viewer.chrome_inner_height * frame_height) / viewer.chrome_inner_frame_height;
+        }
+    }
 
     // Content starts at row 2, with y_offset to align with toolbar bottom
     // This avoids gaps between toolbar and content
     const row_start_pixel = cell_height; // Row 2 starts at 1 * cell_height
     const y_offset: u32 = if (toolbar_h > row_start_pixel) toolbar_h - row_start_pixel else 0;
 
-    // Calculate content rows (account for toolbar pixel height, not row count)
-    const content_pixel_start = row_start_pixel + y_offset; // = toolbar_h
-    const content_pixel_height = if (size.height_px > content_pixel_start)
-        size.height_px - content_pixel_start
+    // Calculate content rows based on FRAME aspect ratio to avoid stretching
+    // When frame height changes (download bar), we adjust rows proportionally
+    const display_pixel_width: u32 = @as(u32, display_cols) * cell_width;
+    const aspect_pixel_height: u32 = if (frame_width > 0)
+        (display_pixel_width * frame_height) / frame_width
+    else
+        frame_height;
+
+    // Cap content to what fits in actual terminal (prevent rendering beyond terminal)
+    const max_content_height: u32 = if (size.height_px > toolbar_h)
+        size.height_px - @as(u16, @intCast(toolbar_h))
     else
         size.height_px;
-    const content_rows: u32 = content_pixel_height / cell_height;
+    const capped_content_height = @min(aspect_pixel_height, max_content_height);
+    const content_rows: u32 = if (cell_height > 0) capped_content_height / cell_height else 1;
 
-    // Update coordinate mapper with Chrome's ACTUAL viewport (source of truth)
-    // Chrome's window.innerWidth/Height is where mouse events are dispatched
-    viewer.coord_mapper = CoordinateMapper.initWithToolbar(
-        size.width_px,
+    // Debug: log to file - compare all dimensions
+    if (std.fs.createFileAbsolute("/tmp/render_debug.log", .{ .truncate = false })) |f| {
+        defer f.close();
+        f.seekFromEnd(0) catch {};
+        var buf: [512]u8 = undefined;
+        const actual_content_h = content_rows * cell_height;
+        const msg = std.fmt.bufPrint(&buf, "term={}x{} display_w={} frame={}x{} chrome={}x{} inner={}x{} content_h={}\n", .{
+            size.width_px, size.height_px,
+            display_pixel_width,
+            frame_width, frame_height,
+            chrome_width, chrome_height,
+            viewer.chrome_inner_width, viewer.chrome_inner_height,
+            actual_content_h,
+        }) catch "";
+        _ = f.write(msg) catch {};
+    } else |_| {}
+
+    // Update coordinate mapper using DISPLAY dimensions (where content is actually shown)
+    // Content width = display_cols * cell_width (may be less than terminal width)
+    // Content height = content_rows * cell_height (calculated from frame aspect ratio)
+    const mapper_content_h: u16 = @intCast(content_rows * cell_height);
+    viewer.coord_mapper = CoordinateMapper.initFull(
+        @intCast(display_pixel_width), // Display width, not terminal width
         size.height_px,
         size.cols,
         size.rows,
-        viewer.chrome_actual_width, // Chrome's actual viewport, not frame size
-        viewer.chrome_actual_height,
+        frame_width,
+        frame_height,
+        chrome_width,
+        chrome_height,
         @intCast(toolbar_h),
-        null, // auto-detect pixel mode
+        null,
+        mapper_content_h, // Pass actual content height instead of calculating from terminal
     );
 
     viewer.log("[RENDER] displayFrame: base64={} bytes, term={}x{}, display={}x{}, frame={}x{}, chrome={}x{}, y_off={}\n", .{
-        base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height,
-        viewer.chrome_actual_width, viewer.chrome_actual_height, y_offset,
+        base64_png.len, size.cols, size.rows, display_cols, content_rows, frame_width, frame_height, chrome_width, chrome_height, y_offset,
     });
 
     // Move cursor to row 2
@@ -221,9 +295,9 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8, frame
     });
 }
 
-/// Display a base64 PNG frame (legacy, uses viewport dimensions)
+/// Display a base64 PNG frame (legacy wrapper)
 pub fn displayFrame(viewer: anytype, base64_png: []const u8) !void {
-    try displayFrameWithDimensions(viewer, base64_png, viewer.viewport_width, viewer.viewport_height);
+    try displayFrameWithDimensions(viewer, base64_png);
 }
 
 /// Render mouse cursor at current mouse position

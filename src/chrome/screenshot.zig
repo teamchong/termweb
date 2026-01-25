@@ -138,12 +138,15 @@ pub fn captureScreenshot(
 }
 
 /// Set viewport size
+/// dpr: device pixel ratio (passed for compatibility but we use 1 to avoid Chrome scaling issues)
 pub fn setViewport(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
     width: u32,
     height: u32,
+    dpr: u32,
 ) !void {
+    _ = dpr; // Chrome's deviceScaleFactor causes viewport mismatch - use 1 instead
     const params = try std.fmt.allocPrint(
         allocator,
         "{{\"width\":{d},\"height\":{d},\"deviceScaleFactor\":1,\"mobile\":false}}",
@@ -169,7 +172,7 @@ pub fn getActualViewport(
     defer allocator.free(result);
 
     // Debug: log raw response
-    if (std.fs.cwd().openFile("/tmp/viewport_debug.log", .{ .mode = .write_only })) |f| {
+    if (std.fs.createFileAbsolute("/tmp/viewport_debug.log", .{ .truncate = false })) |f| {
         f.seekFromEnd(0) catch {};
         _ = f.write(result) catch {};
         _ = f.write("\n") catch {};

@@ -43,12 +43,13 @@ pub fn showTabPicker(viewer: anytype) !void {
         for (tab_titles.items) |t| viewer.allocator.free(t);
     }
 
-    viewer.log("[TABS] Showing picker with {} tabs\n", .{tab_titles.items.len});
+    viewer.log("[TABS] Showing picker with {} tabs, current={}\n", .{ tab_titles.items.len, viewer.active_tab_index });
 
     const selected = try dialog_mod.showNativeListPicker(
         viewer.allocator,
         "Select Tab",
         tab_titles.items,
+        viewer.active_tab_index, // Pre-select current tab
     );
 
     if (selected) |index| {
@@ -69,6 +70,11 @@ pub fn switchToTab(viewer: anytype, index: usize) !void {
     viewer.cdp_client.switchToTarget(tab.target_id) catch |err| {
         viewer.log("[TABS] switchToTarget failed: {}, falling back to navigation\n", .{err});
         _ = try screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, tab.url);
+    };
+
+    // Set viewport on new tab to ensure consistent resolution
+    screenshot_api.setViewport(viewer.cdp_client, viewer.allocator, viewer.viewport_width, viewer.viewport_height, viewer.dpr) catch |err| {
+        viewer.log("[TABS] setViewport failed: {}\n", .{err});
     };
 
     const tab_total_pixels: u64 = @as(u64, viewer.viewport_width) * @as(u64, viewer.viewport_height);

@@ -6,6 +6,7 @@ const screenshot_api = @import("../chrome/screenshot.zig");
 const download_mod = @import("../chrome/download.zig");
 const ui_mod = @import("../ui/mod.zig");
 const helpers = @import("helpers.zig");
+const tabs_mod = @import("tabs.zig");
 
 const extractUrlFromNavEvent = helpers.extractUrlFromNavEvent;
 
@@ -31,6 +32,24 @@ pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
         viewer.forceUpdateNavigationState();
         viewer.ui_state.is_loading = false;
         viewer.ui_dirty = true;
+        // Reset baseline - next frame will set it for this page
+        viewer.baseline_frame_width = 0;
+        viewer.baseline_frame_height = 0;
+        // Query Chrome's actual viewport now that page is fully loaded
+        // This is the authoritative value - different pages may have different viewports
+        if (screenshot_api.getActualViewport(viewer.cdp_client, viewer.allocator)) |vp| {
+            if (vp.width > 0 and vp.height > 0) {
+                viewer.chrome_inner_width = vp.width;
+                viewer.chrome_inner_height = vp.height;
+                viewer.log("[NAV] Chrome viewport after load: {}x{}\n", .{ vp.width, vp.height });
+            }
+        } else |_| {
+            // Query failed - reset to 0 so it will be re-queried on next frame
+            viewer.chrome_inner_width = 0;
+            viewer.chrome_inner_height = 0;
+            viewer.chrome_inner_frame_width = 0;
+            viewer.chrome_inner_frame_height = 0;
+        }
     } else if (std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
         handleNavigatedWithinDocument(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
@@ -38,6 +57,8 @@ pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
     } else if (std.mem.eql(u8, event.method, "Target.targetInfoChanged")) {
         handleTargetInfoChanged(viewer, event.payload);
     }
+    // NOTE: Frame changes (download bar, etc.) are detected by comparing current frame
+    // dimensions to chrome_inner_frame_width/height and applying ratio adjustment
 }
 
 /// Handle Page.frameNavigated - actual page load, show loading for main frame
@@ -48,6 +69,12 @@ pub fn handleFrameNavigated(viewer: anytype, payload: []const u8) void {
     viewer.log("[FRAME NAV] URL: {s} (main_frame={})\n", .{ url, is_main_frame });
 
     if (!is_main_frame) return;
+
+    // Reset viewport cache on main frame navigation - different pages may have different viewports
+    viewer.chrome_inner_width = 0;
+    viewer.chrome_inner_height = 0;
+    viewer.chrome_inner_frame_width = 0;
+    viewer.chrome_inner_frame_height = 0;
 
     if (!viewer.ui_state.is_loading) {
         viewer.ui_state.is_loading = true;
@@ -131,8 +158,28 @@ pub fn handleNewTarget(viewer: anytype, payload: []const u8) void {
     }
 
     viewer.log("[NEW TARGET] New tab requested: id={s} url={s}\n", .{ target_id, url });
+
+    // In single-tab mode, navigate in same tab instead of creating new tab
+    if (viewer.single_tab_mode) {
+        viewer.log("[NEW TARGET] Single-tab mode: navigating to {s}\n", .{url});
+        // Close the new target and navigate in current tab
+        viewer.cdp_client.closeTarget(target_id) catch {};
+        _ = screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url) catch |err| {
+            viewer.log("[NEW TARGET] Navigation failed: {}\n", .{err});
+        };
+        return;
+    }
+
     viewer.addTab(target_id, url, "") catch |err| {
         viewer.log("[NEW TARGET] Failed to add tab: {}\n", .{err});
+        return;
+    };
+
+    // Auto-switch to the new tab
+    const new_tab_index = viewer.tabs.items.len - 1;
+    viewer.log("[NEW TARGET] Auto-switching to new tab index={}\n", .{new_tab_index});
+    tabs_mod.switchToTab(viewer, new_tab_index) catch |err| {
+        viewer.log("[NEW TARGET] switchToTab failed: {}\n", .{err});
     };
 }
 
@@ -188,6 +235,8 @@ pub fn handleDownloadWillBegin(viewer: anytype, payload: []const u8) !void {
 
     if (download_mod.parseDownloadWillBegin(payload)) |info| {
         viewer.log("[DOWNLOAD] guid={s} filename={s}\n", .{ info.guid, info.suggested_filename });
+        // Frame dimensions from screencast handle download bar automatically
+
         try viewer.download_manager.handleDownloadWillBegin(
             info.guid,
             info.url,
@@ -209,12 +258,8 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
             info.total_bytes,
         );
 
-        if (std.mem.eql(u8, info.state, "completed")) {
-            viewer.log("[DOWNLOAD] Complete - resetting viewport to fix layout\n", .{});
-            screenshot_api.setViewport(viewer.cdp_client, viewer.allocator, viewer.viewport_width, viewer.viewport_height) catch |err| {
-                viewer.log("[DOWNLOAD] Viewport reset failed: {}\n", .{err});
-            };
-            viewer.refreshChromeViewport();
+        if (std.mem.eql(u8, info.state, "completed") or std.mem.eql(u8, info.state, "canceled")) {
+            viewer.log("[DOWNLOAD] {s}\n", .{info.state});
         }
     }
 }

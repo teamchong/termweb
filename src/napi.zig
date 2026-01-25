@@ -277,8 +277,12 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     const content_rows: u32 = available_height / cell_height;
     const content_pixel_height: u32 = content_rows * cell_height;
 
-    var viewport_width: u32 = raw_width / dpr;
-    var viewport_height: u32 = content_pixel_height / dpr;
+    // Original viewport (before any limits) - used for coordinate ratio calculation
+    const original_viewport_width: u32 = raw_width / dpr;
+    const original_viewport_height: u32 = content_pixel_height / dpr;
+
+    var viewport_width: u32 = original_viewport_width;
+    var viewport_height: u32 = original_viewport_height;
 
     const MAX_PIXELS = config.MAX_PIXELS;
     const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
@@ -305,8 +309,8 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     var client = try cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port);
     defer client.deinit();
 
-    // Set viewport
-    try screenshot_api.setViewport(client, allocator, viewport_width, viewport_height);
+    // Set viewport with matching DPR
+    try screenshot_api.setViewport(client, allocator, viewport_width, viewport_height, dpr);
 
     // Navigate
     try screenshot_api.navigateToUrl(client, allocator, url);
@@ -319,8 +323,8 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
         if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
     } else |_| {}
 
-    // Run viewer
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height);
+    // Run viewer with original (pre-MAX_PIXELS) dimensions for coordinate ratio
+    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height);
     defer viewer.deinit();
 
     if (no_toolbar) {

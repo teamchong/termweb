@@ -107,10 +107,15 @@ pub const Viewer = struct {
     tabs: std.ArrayList(ui_mod.Tab),
     active_tab_index: usize,
 
-    viewport_width: u32,  // Requested viewport (for screencast)
+    viewport_width: u32,  // Viewport after MAX_PIXELS limit (what we send to Chrome)
     viewport_height: u32,
-    chrome_actual_width: u32,  // Chrome's actual window.innerWidth (for coordinate mapping)
-    chrome_actual_height: u32, // Chrome's actual window.innerHeight
+    original_viewport_width: u32,  // Viewport BEFORE MAX_PIXELS limit (for coord ratio)
+    original_viewport_height: u32,
+    chrome_inner_width: u32,  // Chrome's actual window.innerWidth (queried from JS)
+    chrome_inner_height: u32, // Chrome's actual window.innerHeight (queried from JS)
+    chrome_inner_frame_width: u32,  // Frame dimensions when chrome_inner was captured
+    chrome_inner_frame_height: u32, // Used to detect frame changes (download bar)
+    // Note: For coordinate mapping, use last_frame_width/height (the actual rendered frame)
     coord_mapper: ?CoordinateMapper,
     last_click: ?struct { term_x: u16, term_y: u16, browser_x: u32, browser_y: u32 },
 
@@ -118,6 +123,10 @@ pub const Viewer = struct {
     screencast_mode: bool,
     screencast_format: screenshot_api.ScreenshotFormat,
     last_frame_time: i128,
+    last_frame_width: u32,  // Current frame width from screencast
+    last_frame_height: u32, // Current frame height from screencast
+    baseline_frame_width: u32,  // Frame size after navigate/resize (for coord scaling)
+    baseline_frame_height: u32, // Used to detect and compensate for frame changes (download bar)
 
     // UI state for layered rendering
     ui_state: UIState,
@@ -130,6 +139,7 @@ pub const Viewer = struct {
     toolbar_disabled: bool, // --no-toolbar flag
     hotkeys_disabled: bool, // --disable-hotkeys flag
     hints_disabled: bool, // --disable-hints flag
+    single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
 
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
@@ -198,6 +208,9 @@ pub const Viewer = struct {
     // Terminal type detection (Ghostty uses cell-based mouse coords, not pixel)
     is_ghostty: bool,
 
+    // Device pixel ratio (1 for standard displays, 2 for HiDPI/Retina)
+    dpr: u32,
+
     // Performance profiling
     perf_frame_count: u64,
     perf_total_render_ns: i128,
@@ -220,6 +233,8 @@ pub const Viewer = struct {
         url: []const u8,
         viewport_width: u32,
         viewport_height: u32,
+        original_viewport_width: u32,
+        original_viewport_height: u32,
     ) !Viewer {
         // Set allocator for turbojpeg fast decoding
         decode_mod.setAllocator(allocator);
@@ -249,14 +264,8 @@ pub const Viewer = struct {
         const shm_buffer = ShmBuffer.init(shm_size) catch null;
         const screencast_format: screenshot_api.ScreenshotFormat = if (shm_buffer == null) .png else .jpeg;
 
-        // Query Chrome's ACTUAL viewport (may differ from requested due to DPI scaling)
-        // This is the source of truth for coordinate mapping
-        var chrome_actual_w = viewport_width;
-        var chrome_actual_h = viewport_height;
-        if (screenshot_api.getActualViewport(cdp_client, allocator)) |actual_vp| {
-            if (actual_vp.width > 0) chrome_actual_w = actual_vp.width;
-            if (actual_vp.height > 0) chrome_actual_h = actual_vp.height;
-        } else |_| {}
+        // Frame dimensions from screencast are the source of truth for coordinate mapping
+        // (initialized to viewport, updated when frames arrive)
 
         return Viewer{
             .allocator = allocator,
@@ -274,19 +283,28 @@ pub const Viewer = struct {
             .active_tab_index = 0,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
-            .chrome_actual_width = chrome_actual_w,
-            .chrome_actual_height = chrome_actual_h,
+            .original_viewport_width = original_viewport_width,
+            .original_viewport_height = original_viewport_height,
+            .chrome_inner_width = 0, // Will be queried from Chrome after page load
+            .chrome_inner_height = 0,
+            .chrome_inner_frame_width = 0,
+            .chrome_inner_frame_height = 0,
             .coord_mapper = null,
             .last_click = null,
             .screencast_mode = false,
             .screencast_format = screencast_format,
             .last_frame_time = 0,
+            .last_frame_width = viewport_width,
+            .last_frame_height = viewport_height,
+            .baseline_frame_width = 0,  // Will be set from first screencast frame
+            .baseline_frame_height = 0,
             .ui_state = UIState{},
             .hint_grid = null,
             .toolbar_renderer = null,
             .toolbar_disabled = false,
             .hotkeys_disabled = false,
             .hints_disabled = false,
+            .single_tab_mode = false,
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -328,6 +346,7 @@ pub const Viewer = struct {
             .shm_buffer = shm_buffer,
             .natural_scroll = isNaturalScrollEnabled(),
             .is_ghostty = isGhosttyTerminal(allocator),
+            .dpr = 2, // Default to HiDPI, will be updated on first resize
             .perf_frame_count = 0,
             .perf_total_render_ns = 0,
             .perf_max_render_ns = 0,
@@ -349,9 +368,14 @@ pub const Viewer = struct {
         self.hotkeys_disabled = true;
     }
 
-    /// Disable hint mode (Ctrl+J)
+    /// Disable hint mode (Ctrl+H)
     pub fn disableHints(self: *Viewer) void {
         self.hints_disabled = true;
+    }
+
+    /// Enable single-tab mode (navigate in same tab instead of opening new tabs)
+    pub fn enableSingleTabMode(self: *Viewer) void {
+        self.single_tab_mode = true;
     }
 
     /// Calculate max FPS based on viewport resolution
@@ -502,11 +526,6 @@ pub const Viewer = struct {
         if (retries >= 300) {
             return error.ScreencastTimeout;
         }
-
-        // Refresh Chrome's actual viewport - critical for coordinate mapping!
-        // Chrome may use different dimensions than what we requested (due to DPI, scrollbars, etc.)
-        self.refreshChromeViewport();
-        self.log("[DEBUG] Chrome actual viewport: {}x{}\n", .{ self.chrome_actual_width, self.chrome_actual_height });
 
         // Get initial navigation state (after page has loaded)
         self.updateNavigationState();
@@ -750,6 +769,7 @@ pub const Viewer = struct {
         else
             20;
         const dpr: u32 = if (cell_width > 14) 2 else 1;
+        self.dpr = dpr; // Store for use in other functions
 
         // Get actual toolbar height (accounts for DPR)
         const toolbar = @import("ui/toolbar.zig");
@@ -764,10 +784,13 @@ pub const Viewer = struct {
         const content_rows: u32 = available_height / cell_height;
         const content_pixel_height: u32 = content_rows * cell_height;
 
+        // Original viewport (before limits) - for coordinate ratio calculation
+        const original_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
+        const original_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
+
         // Scale by DPR for browser viewport
-        // Use content_pixel_height (cell-aligned) to ensure aspect ratio matches terminal
-        var new_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
-        var new_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
+        var new_width: u32 = original_width;
+        var new_height: u32 = original_height;
 
         // Cap total pixels to improve performance on large displays
         const MAX_PIXELS = config.MAX_PIXELS;
@@ -778,6 +801,10 @@ pub const Viewer = struct {
             new_height = @max(MIN_HEIGHT, @as(u32, @intFromFloat(@as(f64, @floatFromInt(new_height)) * pixel_scale)));
             self.log("[RESIZE] Viewport capped to {}x{} (max {} pixels)\n", .{ new_width, new_height, MAX_PIXELS });
         }
+
+        // Update original viewport (for coordinate ratio)
+        self.original_viewport_width = original_width;
+        self.original_viewport_height = original_height;
 
         self.log("[RESIZE] New size: {}x{} px, {}x{} cells, toolbar={}px, dpr={} -> viewport {}x{}\n", .{
             size.width_px, size.height_px, size.cols, size.rows, toolbar_height, dpr, new_width, new_height,
@@ -827,14 +854,21 @@ pub const Viewer = struct {
         Screen.moveCursor(writer, 1, 1) catch {};
         writer.flush() catch {};
 
-        // Update Chrome viewport
-        screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height) catch |err| {
+        // Update Chrome viewport with matching DPR
+        screenshot_api.setViewport(self.cdp_client, self.allocator, new_width, new_height, dpr) catch |err| {
             self.log("[RESIZE] setViewport failed: {}\n", .{err});
             return;
         };
 
         // Small yield to let Chrome process viewport change before starting screencast
         std.Thread.sleep(20 * std.time.ns_per_ms);
+
+        // Reset chrome viewport cache - will be re-queried on next frame render
+        // This lazy-cache approach avoids blocking resize on viewport query
+        self.chrome_inner_width = 0;
+        self.chrome_inner_height = 0;
+        self.chrome_inner_frame_width = 0;
+        self.chrome_inner_frame_height = 0;
 
         // Restart screencast with new dimensions and adaptive quality
         const resize_total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);
@@ -855,6 +889,10 @@ pub const Viewer = struct {
         self.last_frame_time = 0;
         self.last_content_image_id = null; // Force new image ID after resize
         self.cursor_image_id = null; // Reset cursor image ID as well
+
+        // Reset baseline - first frame after resize will set it
+        self.baseline_frame_width = 0;
+        self.baseline_frame_height = 0;
 
         self.log("[RESIZE] Viewport updated to {}x{} (quality={})\n", .{ new_width, new_height, resize_quality });
     }
@@ -934,29 +972,12 @@ pub const Viewer = struct {
         self.log("[RESET] Screencast reset complete (quality={})\n", .{reset_quality});
     }
 
-    /// Refresh Chrome's actual viewport dimensions (source of truth for coordinate mapping)
-    pub fn refreshChromeViewport(self: *Viewer) void {
-        if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |actual_vp| {
-            self.log("[VIEWPORT] Query returned: {}x{} (current: {}x{})\n", .{
-                actual_vp.width, actual_vp.height,
-                self.chrome_actual_width, self.chrome_actual_height,
-            });
-            if (actual_vp.width > 0 and actual_vp.height > 0) {
-                // Always update - Chrome's actual viewport is the source of truth
-                self.chrome_actual_width = actual_vp.width;
-                self.chrome_actual_height = actual_vp.height;
-            }
-        } else |err| {
-            self.log("[VIEWPORT] Query failed: {}\n", .{err});
-        }
+    /// Display a base64 PNG frame using stored dimensions (single source of truth)
+    fn displayFrameWithDimensions(self: *Viewer, base64_png: []const u8) !void {
+        return render_mod.displayFrameWithDimensions(self, base64_png);
     }
 
-    /// Display a base64 PNG frame with specific dimensions for coordinate mapping
-    fn displayFrameWithDimensions(self: *Viewer, base64_png: []const u8, frame_width: u32, frame_height: u32) !void {
-        return render_mod.displayFrameWithDimensions(self, base64_png, frame_width, frame_height);
-    }
-
-    /// Display a base64 PNG frame (legacy, uses viewport dimensions)
+    /// Display a base64 PNG frame (legacy wrapper)
     fn displayFrame(self: *Viewer, base64_png: []const u8) !void {
         return render_mod.displayFrame(self, base64_png);
     }
@@ -1369,7 +1390,7 @@ pub const Viewer = struct {
         // JavaScript to find all clickable elements and get their bounding boxes
         const script =
             \\(function() {
-            \\  const clickable = document.querySelectorAll('a, button, input, select, textarea, [onclick], [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])');
+            \\  const clickable = document.querySelectorAll('a, button, input, select, textarea, [onclick], [role="button"], [role="link"], [role="option"], [role="listitem"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="tab"], [role="treeitem"], li[data-ved], [data-ved], [tabindex]:not([tabindex="-1"])');
             \\  const results = [];
             \\  const seen = new Set();
             \\  for (const el of clickable) {
@@ -1474,6 +1495,8 @@ pub const Viewer = struct {
         const content_rows = size.rows - toolbar_rows - 1;
 
         const grid = try self.allocator.create(ui_mod.HintGrid);
+        // Use stored frame dimensions (single source of truth) for hint positioning
+        // Element coords from DOM are in frame space (what Chrome is actually rendering)
         grid.* = try ui_mod.HintGrid.generateFromElements(
             self.allocator,
             elements,
@@ -1482,8 +1505,8 @@ pub const Viewer = struct {
             content_rows,
             cell_width,
             cell_height,
-            self.chrome_actual_width,
-            self.chrome_actual_height,
+            self.last_frame_width,
+            self.last_frame_height,
         );
 
         self.hint_grid = grid;
@@ -1560,11 +1583,10 @@ pub const Viewer = struct {
             // Reset viewport after download completes to fix Chrome's layout
             if (std.mem.eql(u8, info.state, "completed")) {
                 self.log("[DOWNLOAD] Complete - resetting viewport to fix layout\n", .{});
-                screenshot_api.setViewport(self.cdp_client, self.allocator, self.viewport_width, self.viewport_height) catch |err| {
+                screenshot_api.setViewport(self.cdp_client, self.allocator, self.viewport_width, self.viewport_height, self.dpr) catch |err| {
                     self.log("[DOWNLOAD] Viewport reset failed: {}\n", .{err});
                 };
-                // Re-query actual viewport after reset
-                self.refreshChromeViewport();
+                // Frame dimensions from screencast will update automatically
             }
         }
     }
@@ -2121,6 +2143,7 @@ pub const Viewer = struct {
     /// Show file chooser (native OS picker)
     pub fn showFileChooser(self: *Viewer, payload: []const u8) !void {
         self.log("[DIALOG] showFileChooser payload={s}\n", .{payload});
+        // NOTE: Don't refresh viewport here - Chrome UI changes don't affect screencast
 
         // Parse file chooser mode
         const mode = parseFileChooserMode(payload);

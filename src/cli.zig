@@ -230,8 +230,12 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const content_rows: u32 = available_height / cell_height;
     const content_pixel_height: u32 = content_rows * cell_height;
 
-    var viewport_width: u32 = raw_width / dpr;
-    var viewport_height: u32 = content_pixel_height / dpr;
+    // Original viewport (before any limits) - used for coordinate ratio calculation
+    const original_viewport_width: u32 = raw_width / dpr;
+    const original_viewport_height: u32 = content_pixel_height / dpr;
+
+    var viewport_width: u32 = original_viewport_width;
+    var viewport_height: u32 = original_viewport_height;
 
     // Cap total pixels to improve performance on large displays
     // 1.5M pixels ≈ 1920x780 or 1600x937 - good balance of quality and speed
@@ -242,6 +246,9 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
         viewport_width = @intFromFloat(@as(f64, @floatFromInt(viewport_width)) * pixel_scale);
         viewport_height = @intFromFloat(@as(f64, @floatFromInt(viewport_height)) * pixel_scale);
+        std.debug.print("Viewport reduced: {}x{} -> {}x{} (MAX_PIXELS={})\n", .{
+            original_viewport_width, original_viewport_height, viewport_width, viewport_height, MAX_PIXELS,
+        });
     }
 
     // Launch Chrome with Pipe transport
@@ -293,7 +300,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer client.deinit();
 
     // Set viewport size explicitly (ensures Chrome uses exact dimensions for coordinate mapping)
-    screenshot_api.setViewport(client, allocator, viewport_width, viewport_height) catch |err| {
+    // Pass DPR so Chrome's deviceScaleFactor matches our terminal's actual density
+    screenshot_api.setViewport(client, allocator, viewport_width, viewport_height, dpr) catch |err| {
         std.debug.print("Error setting viewport: {}\n", .{err});
         std.process.exit(1);
     };
@@ -324,7 +332,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Run viewer with Chrome's actual viewport for accurate coordinate mapping
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height);
+    // Also pass original (pre-MAX_PIXELS) dimensions for coordinate ratio calculation
+    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height);
     defer viewer.deinit();
 
     // Apply options

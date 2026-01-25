@@ -102,8 +102,8 @@ pub fn main() !void {
 
                 std.debug.print("  {s}/{s}...", .{ theme_dir, filename });
 
-                // Set viewport
-                screenshot.setViewport(&client, allocator, asset.width, asset.height) catch |err| {
+                // Set viewport (DPR=1 for asset generation)
+                screenshot.setViewport(&client, allocator, asset.width, asset.height, 1) catch |err| {
                     std.debug.print(" FAILED (viewport): {}\n", .{err});
                     continue;
                 };
