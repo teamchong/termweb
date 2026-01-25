@@ -35,6 +35,7 @@ pub const Terminal = struct {
     original_termios: ?std.posix.termios,
     mouse_enabled: bool,
     sigwinch_installed: bool,
+    no_input_mode: bool, // True when stdin is not a TTY (view-only mode)
 
     pub fn init() Terminal {
         return .{
@@ -42,7 +43,13 @@ pub const Terminal = struct {
             .original_termios = null,
             .mouse_enabled = false,
             .sigwinch_installed = false,
+            .no_input_mode = false,
         };
+    }
+
+    /// Check if running in no-input mode (stdin not a TTY)
+    pub fn isNoInputMode(self: *Terminal) bool {
+        return self.no_input_mode;
     }
 
     /// Install SIGWINCH handler for terminal resize detection
@@ -70,12 +77,15 @@ pub const Terminal = struct {
     }
 
     /// Enter raw mode (disable line buffering, echo)
+    /// If stdin is not a TTY, enters no-input mode (view-only) instead of failing
     pub fn enterRawMode(self: *Terminal) !void {
         // Check if stdin is a TTY
         if (!std.posix.isatty(self.stdin_fd)) {
-            std.debug.print("Error: stdin is not a terminal\n", .{});
-            std.debug.print("termweb requires an interactive terminal (TTY) to run.\n", .{});
-            return error.NotATty;
+            // No TTY on stdin - enter view-only mode (no keyboard/mouse input)
+            // But we can still render if stdout is a TTY
+            self.no_input_mode = true;
+            std.debug.print("Note: stdin is not a TTY, running in view-only mode (no keyboard/mouse input)\n", .{});
+            return; // Skip raw mode setup
         }
 
         // Save original settings
@@ -221,13 +231,28 @@ pub const Terminal = struct {
     }
 
     /// Get terminal size with pixel dimensions
+    /// In no-input mode, tries stdout for size (stdin may not be a TTY)
     pub fn getSize(self: *Terminal) !TerminalSize {
         var ws: std.posix.winsize = undefined;
 
-        const result = std.c.ioctl(self.stdin_fd, std.posix.T.IOCGWINSZ, &ws);
+        // Try stdin first
+        var fd = self.stdin_fd;
+        var result = std.c.ioctl(fd, std.posix.T.IOCGWINSZ, &ws);
+
+        // In no-input mode, stdin isn't a TTY - try stdout instead
+        if (result != 0 and self.no_input_mode) {
+            fd = std.posix.STDOUT_FILENO;
+            result = std.c.ioctl(fd, std.posix.T.IOCGWINSZ, &ws);
+        }
 
         if (result != 0) {
-            return error.IoctlFailed;
+            // Last resort: return defaults
+            return TerminalSize{
+                .cols = 80,
+                .rows = 24,
+                .width_px = 1280,
+                .height_px = 720,
+            };
         }
 
         return TerminalSize{

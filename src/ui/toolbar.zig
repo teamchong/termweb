@@ -85,6 +85,7 @@ pub const ToolbarRenderer = struct {
     prev_is_loading: bool = false,  // Track previous state to avoid re-render
     prev_refresh_hover: bool = false,
     tab_count: u32 = 1,
+    hide_buttons: bool = false, // Hide nav buttons (no-input mode indicator)
 
     // URL state
     current_url: []const u8 = "",
@@ -652,78 +653,81 @@ pub const ToolbarRenderer = struct {
         var x_offset: u32 = self.button_padding;
         const y_offset: u32 = (self.toolbar_height - self.button_size) / 2;
 
-        // Close button (red traffic light)
-        const close_rgba = try self.svg_cache.getButtonScaled(.close, false, self.close_hover, self.button_size);
-        _ = try self.kitty.displayRawRGBA(writer, close_rgba, self.button_size, self.button_size, .{
-            .placement_id = Placement.CLOSE_BTN,
-            .z = 51,
-            .x_offset = x_offset,
-            .y_offset = y_offset,
-        });
-        x_offset += self.button_size + self.button_padding;
-
-        // Back button
-        const back_rgba = try self.svg_cache.getButtonScaled(.back, self.can_go_back, self.back_hover, self.button_size);
-        _ = try self.kitty.displayRawRGBA(writer, back_rgba, self.button_size, self.button_size, .{
-            .placement_id = Placement.BACK_BTN,
-            .z = 51,
-            .x_offset = x_offset,
-            .y_offset = y_offset,
-        });
-        x_offset += self.button_size + self.button_padding;
-
-        // Forward button
-        const forward_rgba = try self.svg_cache.getButtonScaled(.forward, self.can_go_forward, self.forward_hover, self.button_size);
-        _ = try self.kitty.displayRawRGBA(writer, forward_rgba, self.button_size, self.button_size, .{
-            .placement_id = Placement.FWD_BTN,
-            .z = 51,
-            .x_offset = x_offset,
-            .y_offset = y_offset,
-        });
-        x_offset += self.button_size + self.button_padding;
-
-        // Refresh/Stop button (shows stop icon when loading)
-        // Only re-render if state changed to avoid flashing
-        const refresh_state_changed = self.is_loading != self.prev_is_loading or
-                                       self.refresh_hover != self.prev_refresh_hover or
-                                       self.refresh_image_id == null;
-
-        if (refresh_state_changed) {
-            const refresh_rgba = if (self.is_loading)
-                try self.svg_cache.getButtonScaled(.stop, true, self.refresh_hover, self.button_size)
-            else
-                try self.svg_cache.getButtonScaled(.refresh, true, self.refresh_hover, self.button_size);
-
-            // Delete old image by ID to avoid overlap
-            if (self.refresh_image_id) |old_id| {
-                try self.kitty.deleteImage(writer, old_id);
-            }
-
-            self.refresh_image_id = try self.kitty.displayRawRGBA(writer, refresh_rgba, self.button_size, self.button_size, .{
-                .placement_id = Placement.REFRESH_BTN,
+        // Skip buttons in no-input mode (view-only indicator)
+        if (!self.hide_buttons) {
+            // Close button (red traffic light)
+            const close_rgba = try self.svg_cache.getButtonScaled(.close, false, self.close_hover, self.button_size);
+            _ = try self.kitty.displayRawRGBA(writer, close_rgba, self.button_size, self.button_size, .{
+                .placement_id = Placement.CLOSE_BTN,
                 .z = 51,
                 .x_offset = x_offset,
                 .y_offset = y_offset,
             });
+            x_offset += self.button_size + self.button_padding;
 
-            self.prev_is_loading = self.is_loading;
-            self.prev_refresh_hover = self.refresh_hover;
+            // Back button
+            const back_rgba = try self.svg_cache.getButtonScaled(.back, self.can_go_back, self.back_hover, self.button_size);
+            _ = try self.kitty.displayRawRGBA(writer, back_rgba, self.button_size, self.button_size, .{
+                .placement_id = Placement.BACK_BTN,
+                .z = 51,
+                .x_offset = x_offset,
+                .y_offset = y_offset,
+            });
+            x_offset += self.button_size + self.button_padding;
+
+            // Forward button
+            const forward_rgba = try self.svg_cache.getButtonScaled(.forward, self.can_go_forward, self.forward_hover, self.button_size);
+            _ = try self.kitty.displayRawRGBA(writer, forward_rgba, self.button_size, self.button_size, .{
+                .placement_id = Placement.FWD_BTN,
+                .z = 51,
+                .x_offset = x_offset,
+                .y_offset = y_offset,
+            });
+            x_offset += self.button_size + self.button_padding;
+
+            // Refresh/Stop button (shows stop icon when loading)
+            // Only re-render if state changed to avoid flashing
+            const refresh_state_changed = self.is_loading != self.prev_is_loading or
+                                           self.refresh_hover != self.prev_refresh_hover or
+                                           self.refresh_image_id == null;
+
+            if (refresh_state_changed) {
+                const refresh_rgba = if (self.is_loading)
+                    try self.svg_cache.getButtonScaled(.stop, true, self.refresh_hover, self.button_size)
+                else
+                    try self.svg_cache.getButtonScaled(.refresh, true, self.refresh_hover, self.button_size);
+
+                // Delete old image by ID to avoid overlap
+                if (self.refresh_image_id) |old_id| {
+                    try self.kitty.deleteImage(writer, old_id);
+                }
+
+                self.refresh_image_id = try self.kitty.displayRawRGBA(writer, refresh_rgba, self.button_size, self.button_size, .{
+                    .placement_id = Placement.REFRESH_BTN,
+                    .z = 51,
+                    .x_offset = x_offset,
+                    .y_offset = y_offset,
+                });
+
+                self.prev_is_loading = self.is_loading;
+                self.prev_refresh_hover = self.refresh_hover;
+            }
+            x_offset += self.button_size + self.button_padding;
+
+            // Tab button (shows tab count)
+            self.tab_btn_x = x_offset;
+            self.tab_btn_width = self.button_size + self.button_padding; // Slightly wider for text
+            const tab_rgba = try self.generateTabButton(self.tab_btn_width, self.button_size);
+            defer self.allocator.free(tab_rgba);
+
+            _ = try self.kitty.displayRawRGBA(writer, tab_rgba, self.tab_btn_width, self.button_size, .{
+                .placement_id = 106, // TAB_BTN placement ID
+                .z = 51,
+                .x_offset = x_offset,
+                .y_offset = y_offset,
+            });
+            x_offset += self.tab_btn_width + self.button_padding;
         }
-        x_offset += self.button_size + self.button_padding;
-
-        // Tab button (shows tab count)
-        self.tab_btn_x = x_offset;
-        self.tab_btn_width = self.button_size + self.button_padding; // Slightly wider for text
-        const tab_rgba = try self.generateTabButton(self.tab_btn_width, self.button_size);
-        defer self.allocator.free(tab_rgba);
-
-        _ = try self.kitty.displayRawRGBA(writer, tab_rgba, self.tab_btn_width, self.button_size, .{
-            .placement_id = 106, // TAB_BTN placement ID
-            .z = 51,
-            .x_offset = x_offset,
-            .y_offset = y_offset,
-        });
-        x_offset += self.tab_btn_width + self.button_padding;
 
         // URL bar (remaining width)
         self.url_bar_x = x_offset;

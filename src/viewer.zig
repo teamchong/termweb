@@ -506,10 +506,16 @@ pub const Viewer = struct {
         try self.terminal.installResizeHandler();
         self.log("[DEBUG] Resize handler installed\n", .{});
 
-        self.log("[DEBUG] Enabling mouse...\n", .{});
-        try self.terminal.enableMouse();
-        self.input.mouse_enabled = true;
-        self.log("[DEBUG] Mouse enabled, input.mouse_enabled={}\n", .{self.input.mouse_enabled});
+        // Skip mouse/input setup in no-input mode (stdin not a TTY)
+        const no_input_mode = self.terminal.isNoInputMode();
+        if (!no_input_mode) {
+            self.log("[DEBUG] Enabling mouse...\n", .{});
+            try self.terminal.enableMouse();
+            self.input.mouse_enabled = true;
+            self.log("[DEBUG] Mouse enabled, input.mouse_enabled={}\n", .{self.input.mouse_enabled});
+        } else {
+            self.log("[DEBUG] No-input mode: skipping mouse setup\n", .{});
+        }
 
         self.log("[DEBUG] Hiding cursor...\n", .{});
         try Screen.hideCursor(writer);
@@ -534,6 +540,10 @@ pub const Viewer = struct {
                 self.log("[DEBUG] Toolbar initialized, font_renderer={}\n", .{renderer.font_renderer != null});
                 renderer.setUrl(self.current_url);
                 renderer.setTabCount(1); // Initial tab
+                // Hide buttons in no-input mode (visual indicator of view-only)
+                if (no_input_mode) {
+                    renderer.hide_buttons = true;
+                }
                 self.startToolbarThread();
             } else {
                 self.log("[DEBUG] Toolbar is null\n", .{});
@@ -606,7 +616,9 @@ pub const Viewer = struct {
         self.log("[DEBUG] self.running = {}\n", .{self.running});
 
         // Start worker threads
-        self.startInputThread();
+        if (!self.terminal.isNoInputMode()) {
+            self.startInputThread();
+        }
         self.startCdpThread();
         self.log("[DEBUG] Worker threads started\n", .{});
 
