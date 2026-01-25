@@ -225,6 +225,11 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
                 viewer.log("[SCROLL] Up failed: {}\n", .{err});
             };
         },
+        .dev_console => {
+            // Send F12 to Chrome to toggle DevTools
+            viewer.log("[DEV] Opening DevTools (F12)\n", .{});
+            interact_mod.sendSpecialKeyWithModifiers(viewer.cdp_client, "F12", 123, 0);
+        },
     }
 }
 
@@ -473,6 +478,9 @@ fn isActionDisabled(viewer: anytype, action: AppAction) bool {
 
     // If hints are disabled, block hint mode
     if (viewer.hints_disabled and action == .enter_hint_mode) return true;
+
+    // If devtools is disabled, block dev_console
+    if (viewer.devtools_disabled and action == .dev_console) return true;
 
     // If toolbar is disabled, block navigation actions
     if (viewer.toolbar_disabled) {

@@ -140,6 +140,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var no_toolbar = false;
     var disable_hotkeys = false;
     var disable_hints = false;
+    var disable_devtools = false;
     var browser_path: ?[]const u8 = null;
     var disable_gpu = false;
     var fps: u32 = config.DEFAULT_FPS;
@@ -180,6 +181,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
             disable_hotkeys = true;
         } else if (std.mem.eql(u8, arg, "--disable-hints")) {
             disable_hints = true;
+        } else if (std.mem.eql(u8, arg, "--disable-devtools")) {
+            disable_devtools = true;
         } else if (std.mem.eql(u8, arg, "--disable-gpu")) {
             disable_gpu = true;
         } else if (std.mem.eql(u8, arg, "--fps")) {
@@ -360,6 +363,9 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (disable_hints) {
         viewer.disableHints();
     }
+    if (disable_devtools) {
+        viewer.disableDevtools();
+    }
 
     try viewer.run();
 }
@@ -407,6 +413,7 @@ fn printHelp() void {
         \\  --no-toolbar          Hide navigation bar (app/kiosk mode)
         \\  --disable-hotkeys     Disable all keyboard shortcuts (except Ctrl+Q)
         \\  --disable-hints       Disable Ctrl+H hint mode
+        \\  --disable-devtools    Disable Ctrl+I DevTools hotkey
         \\  --browser-path <path> Path to browser executable
         \\  --fps <N>             Set frame rate 1-60 (default: 30, use 12 for SSH)
         \\  --list-profiles       Show available Chrome profiles
@@ -429,6 +436,7 @@ fn printHelp() void {
         \\  Ctrl+X                Cut selection
         \\  Ctrl+V                Paste
         \\  Ctrl+A                Select all
+        \\  Ctrl+I                Open DevTools (F12)
         \\
         \\Hint Mode:
         \\  Press Ctrl+H to show clickable element labels.

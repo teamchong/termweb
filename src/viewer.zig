@@ -140,6 +140,7 @@ pub const Viewer = struct {
     toolbar_disabled: bool, // --no-toolbar flag
     hotkeys_disabled: bool, // --disable-hotkeys flag
     hints_disabled: bool, // --disable-hints flag
+    devtools_disabled: bool, // --disable-devtools flag
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
 
     // Mouse cursor tracking (pixel coordinates)
@@ -307,6 +308,7 @@ pub const Viewer = struct {
             .toolbar_disabled = false,
             .hotkeys_disabled = false,
             .hints_disabled = false,
+            .devtools_disabled = false,
             .single_tab_mode = false,
             .mouse_x = 0,
             .mouse_y = 0,
@@ -374,6 +376,11 @@ pub const Viewer = struct {
     /// Disable hint mode (Ctrl+H)
     pub fn disableHints(self: *Viewer) void {
         self.hints_disabled = true;
+    }
+
+    /// Disable DevTools hotkey (Ctrl+I)
+    pub fn disableDevtools(self: *Viewer) void {
+        self.devtools_disabled = true;
     }
 
     /// Enable single-tab mode (navigate in same tab instead of opening new tabs)
