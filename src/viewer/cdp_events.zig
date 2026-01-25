@@ -28,28 +28,18 @@ pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
     } else if (std.mem.eql(u8, event.method, "Page.frameNavigated")) {
         handleFrameNavigated(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Page.loadEventFired")) {
-        // Page fully loaded - update navigation state (history is now available)
-        viewer.forceUpdateNavigationState();
+        // Page fully loaded - mark for nav state update (done in main loop to avoid blocking CDP thread)
         viewer.ui_state.is_loading = false;
         viewer.ui_dirty = true;
+        viewer.needs_nav_state_update = true; // Deferred to main loop
         // Reset baseline - next frame will set it for this page
         viewer.baseline_frame_width = 0;
         viewer.baseline_frame_height = 0;
-        // Query Chrome's actual viewport now that page is fully loaded
-        // This is the authoritative value - different pages may have different viewports
-        if (screenshot_api.getActualViewport(viewer.cdp_client, viewer.allocator)) |vp| {
-            if (vp.width > 0 and vp.height > 0) {
-                viewer.chrome_inner_width = vp.width;
-                viewer.chrome_inner_height = vp.height;
-                viewer.log("[NAV] Chrome viewport after load: {}x{}\n", .{ vp.width, vp.height });
-            }
-        } else |_| {
-            // Query failed - reset to 0 so it will be re-queried on next frame
-            viewer.chrome_inner_width = 0;
-            viewer.chrome_inner_height = 0;
-            viewer.chrome_inner_frame_width = 0;
-            viewer.chrome_inner_frame_height = 0;
-        }
+        // Reset viewport cache - will be re-queried from main loop
+        viewer.chrome_inner_width = 0;
+        viewer.chrome_inner_height = 0;
+        viewer.chrome_inner_frame_width = 0;
+        viewer.chrome_inner_frame_height = 0;
     } else if (std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
         handleNavigatedWithinDocument(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
@@ -93,7 +83,8 @@ pub fn handleFrameNavigated(viewer: anytype, payload: []const u8) void {
         }
     }
 
-    viewer.forceUpdateNavigationState();
+    // Defer nav state update to main loop (avoid blocking CDP thread)
+    viewer.needs_nav_state_update = true;
 }
 
 /// Handle Page.navigatedWithinDocument - SPA navigation (pushState/hash change)
@@ -113,7 +104,8 @@ pub fn handleNavigatedWithinDocument(viewer: anytype, payload: []const u8) void 
         }
     }
 
-    viewer.forceUpdateNavigationState();
+    // Defer nav state update to main loop (avoid blocking CDP thread)
+    viewer.needs_nav_state_update = true;
 }
 
 /// Handle Target.targetCreated event

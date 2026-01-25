@@ -72,6 +72,7 @@ const CRLF = "\r\n";
 
 /// Pending tab add - stored for deferred processing to avoid data races
 /// CDP thread sets this, main loop processes it
+/// Uses atomic ready flag to ensure safe cross-thread access
 const PendingTabAdd = struct {
     target_id: [128]u8,
     target_id_len: u8,
@@ -79,7 +80,8 @@ const PendingTabAdd = struct {
     url_len: u16,
     title: [256]u8,
     title_len: u8,
-    auto_switch: bool, // Whether to switch to this tab after adding
+    auto_switch: bool,
+    ready: std.atomic.Value(bool), // Set AFTER all other fields are written
 };
 
 // Use helper functions from viewer module
@@ -155,7 +157,7 @@ pub const Viewer = struct {
     devtools_disabled: bool, // --disable-devtools flag
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
     pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
-    pending_tab_add: ?PendingTabAdd, // Deferred tab add (thread-safe)
+    pending_tab_add: PendingTabAdd, // Deferred tab add (uses atomic ready flag)
 
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
@@ -183,6 +185,7 @@ pub const Viewer = struct {
     // Debug flags
     debug_input: bool,
     ui_dirty: bool, // Track if UI needs re-rendering
+    needs_nav_state_update: bool, // Deferred nav state update (avoid blocking CDP thread)
     last_toolbar_render: i128, // Throttle toolbar renders (expensive)
 
     // Background toolbar rendering - composites to single RGBA image
@@ -325,7 +328,16 @@ pub const Viewer = struct {
             .devtools_disabled = false,
             .single_tab_mode = false,
             .pending_tab_switch = null,
-            .pending_tab_add = null,
+            .pending_tab_add = .{
+                .target_id = undefined,
+                .target_id_len = 0,
+                .url = undefined,
+                .url_len = 0,
+                .title = undefined,
+                .title_len = 0,
+                .auto_switch = false,
+                .ready = std.atomic.Value(bool).init(false),
+            },
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -341,6 +353,7 @@ pub const Viewer = struct {
             .frames_skipped = 0,
             .debug_input = enable_input_debug,
             .ui_dirty = true,
+            .needs_nav_state_update = false,
             .last_toolbar_render = 0,
             .toolbar_thread = null,
             .toolbar_rgba = try allocator.alloc(u8, 8192 * 100 * 4), // Max 8192px wide, 100px tall, RGBA (supports 8K/HiDPI)
@@ -406,20 +419,23 @@ pub const Viewer = struct {
 
     /// Request a deferred tab add (processed in main loop to avoid data races)
     /// CDP thread calls this, main loop processes it
+    /// Uses release/acquire ordering to ensure data is visible before ready flag
     pub fn requestTabAdd(self: *Viewer, target_id: []const u8, url: []const u8, title: []const u8, auto_switch: bool) void {
-        var pending = PendingTabAdd{
-            .target_id = undefined,
-            .target_id_len = @intCast(@min(target_id.len, 128)),
-            .url = undefined,
-            .url_len = @intCast(@min(url.len, 2048)),
-            .title = undefined,
-            .title_len = @intCast(@min(title.len, 256)),
-            .auto_switch = auto_switch,
-        };
-        @memcpy(pending.target_id[0..pending.target_id_len], target_id[0..pending.target_id_len]);
-        @memcpy(pending.url[0..pending.url_len], url[0..pending.url_len]);
-        @memcpy(pending.title[0..pending.title_len], title[0..pending.title_len]);
-        self.pending_tab_add = pending;
+        // Write all data fields first
+        const tid_len: u8 = @intCast(@min(target_id.len, 128));
+        const url_len: u16 = @intCast(@min(url.len, 2048));
+        const title_len: u8 = @intCast(@min(title.len, 256));
+
+        @memcpy(self.pending_tab_add.target_id[0..tid_len], target_id[0..tid_len]);
+        self.pending_tab_add.target_id_len = tid_len;
+        @memcpy(self.pending_tab_add.url[0..url_len], url[0..url_len]);
+        self.pending_tab_add.url_len = url_len;
+        @memcpy(self.pending_tab_add.title[0..title_len], title[0..title_len]);
+        self.pending_tab_add.title_len = title_len;
+        self.pending_tab_add.auto_switch = auto_switch;
+
+        // Release fence ensures all writes above are visible before setting ready
+        self.pending_tab_add.ready.store(true, .release);
     }
 
     /// Enable single-tab mode (navigate in same tab instead of opening new tabs)
@@ -758,16 +774,21 @@ pub const Viewer = struct {
             time_after_events = std.time.nanoTimestamp();
 
             // Process pending tab add (deferred from CDP thread to avoid data races)
-            if (self.pending_tab_add) |pending| {
-                self.pending_tab_add = null;
-                const tid = pending.target_id[0..pending.target_id_len];
-                const url = pending.url[0..pending.url_len];
-                const title = pending.title[0..pending.title_len];
+            // Acquire fence ensures we see all writes made before the ready flag was set
+            if (self.pending_tab_add.ready.load(.acquire)) {
+                // Clear ready flag first to allow new requests
+                self.pending_tab_add.ready.store(false, .release);
+
+                const tid = self.pending_tab_add.target_id[0..self.pending_tab_add.target_id_len];
+                const url = self.pending_tab_add.url[0..self.pending_tab_add.url_len];
+                const title = self.pending_tab_add.title[0..self.pending_tab_add.title_len];
+                const auto_switch = self.pending_tab_add.auto_switch;
+
                 self.log("[TABS] Processing deferred tab add: url={s}\n", .{url});
                 self.addTab(tid, url, title) catch |err| {
                     self.log("[TABS] Deferred addTab failed: {}\n", .{err});
                 };
-                if (pending.auto_switch) {
+                if (auto_switch) {
                     self.pending_tab_switch = self.tabs.items.len - 1;
                 }
             }
@@ -779,6 +800,20 @@ pub const Viewer = struct {
                 viewer_mod.switchToTab(self, tab_index) catch |err| {
                     self.log("[TABS] Deferred switchToTab failed: {}\n", .{err});
                 };
+            }
+
+            // Process deferred nav state update (moved from CDP thread to avoid blocking)
+            if (self.needs_nav_state_update) {
+                self.needs_nav_state_update = false;
+                self.forceUpdateNavigationState();
+                // Also update viewport
+                if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |vp| {
+                    if (vp.width > 0 and vp.height > 0) {
+                        self.chrome_inner_width = vp.width;
+                        self.chrome_inner_height = vp.height;
+                        self.log("[NAV] Chrome viewport after load: {}x{}\n", .{ vp.width, vp.height });
+                    }
+                } else |_| {}
             }
 
             // Flush pending ACK (throttled to 24fps)
