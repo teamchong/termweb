@@ -337,6 +337,9 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
         .y_offset = @intCast(y_offset),
         .image_id = 100, // Fixed ID for content
         .z = z_index,
+        // Explicit dimensions for PNG (required for some terminals over SSH)
+        .width = frame_width,
+        .height = frame_height,
     };
 
     const render_t1 = std.time.nanoTimestamp();

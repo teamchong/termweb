@@ -136,6 +136,7 @@ pub const Viewer = struct {
 
     // Screencast streaming
     screencast_mode: bool,
+    screenshot_polling_mode: bool, // Fallback when screencast doesn't work (Linux headless)
     screencast_format: screenshot_api.ScreenshotFormat,
     last_frame_time: i128,
     last_frame_width: u32,  // Current frame width from screencast
@@ -281,8 +282,10 @@ pub const Viewer = struct {
 
         // Initialize SHM buffer for zero-copy Kitty rendering
         // Size: max viewport * 4 bytes (RGBA)
+        // Disable SHM over SSH - remote SHM can't be read by local terminal
+        const is_ssh = std.posix.getenv("SSH_CONNECTION") != null or std.posix.getenv("SSH_CLIENT") != null;
         const shm_size = viewport_width * viewport_height * 4;
-        const shm_buffer = ShmBuffer.init(shm_size) catch null;
+        const shm_buffer = if (is_ssh) null else ShmBuffer.init(shm_size) catch null;
         const screencast_format: screenshot_api.ScreenshotFormat = if (shm_buffer == null) .png else .jpeg;
 
         // Frame dimensions from screencast are the source of truth for coordinate mapping
@@ -314,6 +317,7 @@ pub const Viewer = struct {
             .coord_mapper = null,
             .last_click = null,
             .screencast_mode = false,
+            .screenshot_polling_mode = false,
             .screencast_format = screencast_format,
             .last_frame_time = 0,
             .last_frame_width = viewport_width,

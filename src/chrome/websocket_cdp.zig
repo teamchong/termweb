@@ -520,15 +520,23 @@ pub const WebSocketCdpClient = struct {
 
     /// Handle Page.screencastFrame event
     fn handleScreencastFrame(self: *WebSocketCdpClient, payload: []const u8) !void {
-        const pool = self.frame_pool orelse return; // No pool = not initialized
+        const pool = self.frame_pool orelse {
+            logToFile("[WS] handleScreencastFrame: frame_pool is null!\n", .{});
+            return; // No pool = not initialized
+        };
 
         const frame_sid = try self.extractFrameSessionId(payload);
         const data = try self.extractScreencastData(payload);
         const device_width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
         const device_height = self.extractMetadataInt(payload, "deviceHeight") catch 0;
 
+        logToFile("[WS] handleScreencastFrame: writing frame sid={} data_len={} {}x{}\n", .{ frame_sid, data.len, device_width, device_height });
+
         if (try pool.writeFrame(data, frame_sid, device_width, device_height)) |_| {
             _ = self.frame_count.fetchAdd(1, .monotonic);
+            logToFile("[WS] handleScreencastFrame: frame written, count={}\n", .{self.frame_count.load(.monotonic)});
+        } else {
+            logToFile("[WS] handleScreencastFrame: writeFrame returned null\n", .{});
         }
 
         // ACK immediately - don't block reader thread
