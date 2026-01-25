@@ -70,6 +70,18 @@ const dialog_mod = ui_mod.dialog;
 /// Line ending for raw terminal mode (carriage return + line feed)
 const CRLF = "\r\n";
 
+/// Pending tab add - stored for deferred processing to avoid data races
+/// CDP thread sets this, main loop processes it
+const PendingTabAdd = struct {
+    target_id: [128]u8,
+    target_id_len: u8,
+    url: [2048]u8,
+    url_len: u16,
+    title: [256]u8,
+    title_len: u8,
+    auto_switch: bool, // Whether to switch to this tab after adding
+};
+
 // Use helper functions from viewer module
 const envVarTruthy = viewer_helpers.envVarTruthy;
 const isGhosttyTerminal = viewer_helpers.isGhosttyTerminal;
@@ -143,6 +155,7 @@ pub const Viewer = struct {
     devtools_disabled: bool, // --disable-devtools flag
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
     pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
+    pending_tab_add: ?PendingTabAdd, // Deferred tab add (thread-safe)
 
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
@@ -312,6 +325,7 @@ pub const Viewer = struct {
             .devtools_disabled = false,
             .single_tab_mode = false,
             .pending_tab_switch = null,
+            .pending_tab_add = null,
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -388,6 +402,24 @@ pub const Viewer = struct {
     /// Request a deferred tab switch (processed in main loop to avoid re-entrancy)
     pub fn requestTabSwitch(self: *Viewer, index: usize) void {
         self.pending_tab_switch = index;
+    }
+
+    /// Request a deferred tab add (processed in main loop to avoid data races)
+    /// CDP thread calls this, main loop processes it
+    pub fn requestTabAdd(self: *Viewer, target_id: []const u8, url: []const u8, title: []const u8, auto_switch: bool) void {
+        var pending = PendingTabAdd{
+            .target_id = undefined,
+            .target_id_len = @intCast(@min(target_id.len, 128)),
+            .url = undefined,
+            .url_len = @intCast(@min(url.len, 2048)),
+            .title = undefined,
+            .title_len = @intCast(@min(title.len, 256)),
+            .auto_switch = auto_switch,
+        };
+        @memcpy(pending.target_id[0..pending.target_id_len], target_id[0..pending.target_id_len]);
+        @memcpy(pending.url[0..pending.url_len], url[0..pending.url_len]);
+        @memcpy(pending.title[0..pending.title_len], title[0..pending.title_len]);
+        self.pending_tab_add = pending;
     }
 
     /// Enable single-tab mode (navigate in same tab instead of opening new tabs)
@@ -724,6 +756,21 @@ pub const Viewer = struct {
 
             // CDP events handled by CDP thread
             time_after_events = std.time.nanoTimestamp();
+
+            // Process pending tab add (deferred from CDP thread to avoid data races)
+            if (self.pending_tab_add) |pending| {
+                self.pending_tab_add = null;
+                const tid = pending.target_id[0..pending.target_id_len];
+                const url = pending.url[0..pending.url_len];
+                const title = pending.title[0..pending.title_len];
+                self.log("[TABS] Processing deferred tab add: url={s}\n", .{url});
+                self.addTab(tid, url, title) catch |err| {
+                    self.log("[TABS] Deferred addTab failed: {}\n", .{err});
+                };
+                if (pending.auto_switch) {
+                    self.pending_tab_switch = self.tabs.items.len - 1;
+                }
+            }
 
             // Process pending tab switch (deferred from event handlers to avoid re-entrancy)
             if (self.pending_tab_switch) |tab_index| {

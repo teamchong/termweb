@@ -170,15 +170,9 @@ pub fn handleNewTarget(viewer: anytype, payload: []const u8) void {
         return;
     }
 
-    viewer.addTab(target_id, url, "") catch |err| {
-        viewer.log("[NEW TARGET] Failed to add tab: {}\n", .{err});
-        return;
-    };
-
-    // Request deferred tab switch (processed in main loop to avoid re-entrancy)
-    const new_tab_index = viewer.tabs.items.len - 1;
-    viewer.log("[NEW TARGET] Requesting deferred switch to tab index={}\n", .{new_tab_index});
-    viewer.requestTabSwitch(new_tab_index);
+    // Request deferred tab add (processed in main loop to avoid data races)
+    viewer.log("[NEW TARGET] Requesting deferred tab add: url={s}\n", .{url});
+    viewer.requestTabAdd(target_id, url, "", true); // auto_switch=true
 }
 
 /// Handle Target.targetInfoChanged - URL may now be available for pending targets
@@ -232,15 +226,9 @@ pub fn handleTargetInfoChanged(viewer: anytype, payload: []const u8) void {
         return;
     }
 
-    viewer.addTab(target_id, url, "") catch |err| {
-        viewer.log("[TARGET INFO CHANGED] Failed to add tab: {}\n", .{err});
-        return;
-    };
-
-    // Request deferred tab switch (processed in main loop to avoid re-entrancy)
-    const new_tab_index = viewer.tabs.items.len - 1;
-    viewer.log("[TARGET INFO CHANGED] Requesting deferred switch to tab index={}\n", .{new_tab_index});
-    viewer.requestTabSwitch(new_tab_index);
+    // Request deferred tab add (processed in main loop to avoid data races)
+    viewer.log("[TARGET INFO CHANGED] Requesting deferred tab add: url={s}\n", .{url});
+    viewer.requestTabAdd(target_id, url, "", true); // auto_switch=true
 }
 
 /// Handle Browser.downloadWillBegin event
