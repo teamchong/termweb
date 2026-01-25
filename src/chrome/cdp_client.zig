@@ -84,6 +84,7 @@ pub const CdpClient = struct {
     allocator: std.mem.Allocator,
     pipe_client: ?*cdp_pipe.PipeCdpClient,
     session_id: ?[]const u8, // Session ID for page-level commands
+    current_target_id: ?[]const u8, // Current target ID (for tab switching)
     debug_port: u16, // Chrome's debugging port for WebSocket connections
 
     // WebSocket clients (pipe is ONLY for screencast frames)
@@ -100,6 +101,7 @@ pub const CdpClient = struct {
             .allocator = allocator,
             .pipe_client = try cdp_pipe.PipeCdpClient.init(allocator, read_fd, write_fd),
             .session_id = null,
+            .current_target_id = null,
             .debug_port = debug_port,
             .page_ws = null,
             .browser_ws = null,
@@ -302,7 +304,8 @@ pub const CdpClient = struct {
         // Parse targetId from response - look for type "page"
         // Format: {"id":N,"result":{"targetInfos":[{"targetId":"XXX","type":"page",...}]}}
         const target_id = try self.extractPageTargetId(targets_response);
-        defer self.allocator.free(target_id);
+        // Store target_id (don't free - we keep it)
+        self.current_target_id = target_id;
 
         // Step 2: Attach to the page target with flatten mode
         // Escape target_id for JSON (handles any special chars)
@@ -643,6 +646,13 @@ pub const CdpClient = struct {
             self.allocator.free(old_sid);
         }
         self.session_id = new_session_id;
+
+        // Update current target ID
+        if (self.current_target_id) |old_tid| {
+            self.allocator.free(old_tid);
+        }
+        self.current_target_id = try self.allocator.dupe(u8, target_id);
+
         logToFile("[CDP] Switched to target, new session: {s}\n", .{new_session_id});
 
         // Re-enable Page domain on the new session
@@ -651,6 +661,11 @@ pub const CdpClient = struct {
             return err;
         };
         self.allocator.free(page_result);
+    }
+
+    /// Get the current target ID
+    pub fn getCurrentTargetId(self: *CdpClient) ?[]const u8 {
+        return self.current_target_id;
     }
 
     /// Close a target (for single-tab mode - close unwanted popups)

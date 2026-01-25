@@ -540,8 +540,9 @@ pub const Viewer = struct {
             self.log("[DEBUG] Toolbar disabled (--no-toolbar)\n", .{});
         }
 
-        // Add initial tab for current URL
-        self.addTab("initial", self.current_url, "") catch |err| {
+        // Add initial tab for current URL with real target_id
+        const initial_target_id = self.cdp_client.getCurrentTargetId() orelse "unknown";
+        self.addTab(initial_target_id, self.current_url, "") catch |err| {
             self.log("[DEBUG] Failed to add initial tab: {}\n", .{err});
         };
 
