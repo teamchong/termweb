@@ -251,24 +251,83 @@ pub fn showNativeFilePickerWithName(
 }
 
 fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: ?[]const u8) !?[]const u8 {
-    // Build script based on mode
+    // Get frontmost app before showing dialog so we can restore focus
+    const front_app_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "osascript", "-e", "tell application \"System Events\" to get name of first application process whose frontmost is true" },
+    }) catch null;
+    var front_app: ?[]const u8 = null;
+    if (front_app_result) |r| {
+        defer allocator.free(r.stderr);
+        if (r.term.Exited == 0 and r.stdout.len > 0) {
+            var end: usize = r.stdout.len;
+            while (end > 0 and (r.stdout[end - 1] == '\n' or r.stdout[end - 1] == '\r')) {
+                end -= 1;
+            }
+            if (end > 0) {
+                front_app = r.stdout[0..end];
+            } else {
+                allocator.free(r.stdout);
+            }
+        } else {
+            allocator.free(r.stdout);
+        }
+    }
+    defer if (front_app_result) |r| {
+        if (front_app != null) allocator.free(r.stdout);
+    };
+
+    // Build script based on mode - use "Finder" to show dialogs (it handles them well and gets focus)
     var script_buf: [512]u8 = undefined;
     const script: []const u8 = switch (mode) {
-        .single => "POSIX path of (choose file)",
-        .folder => "POSIX path of (choose folder)",
+        .single =>
+            \\tell application "Finder"
+            \\    activate
+            \\    set theFile to choose file
+            \\    return POSIX path of (theFile as text)
+            \\end tell
+        ,
+        .folder =>
+            \\tell application "Finder"
+            \\    activate
+            \\    set theFolder to choose folder
+            \\    return POSIX path of (theFolder as text)
+            \\end tell
+        ,
         .multiple =>
-            \\set f to (choose file with multiple selections allowed)
-            \\set out to ""
-            \\repeat with i in f
-            \\set out to out & POSIX path of i & "\n"
-            \\end repeat
-            \\out
+            \\tell application "Finder"
+            \\    activate
+            \\    set f to (choose file with multiple selections allowed)
+            \\    set out to ""
+            \\    repeat with i in f
+            \\        set out to out & POSIX path of (i as text) & "\n"
+            \\    end repeat
+            \\    return out
+            \\end tell
         ,
         .save => blk: {
             if (default_name) |name| {
-                break :blk std.fmt.bufPrint(&script_buf, "POSIX path of (choose file name with prompt \"Save As\" default name \"{s}\")", .{name}) catch "POSIX path of (choose file name with prompt \"Save As\")";
+                break :blk std.fmt.bufPrint(&script_buf,
+                    \\tell application "Finder"
+                    \\    activate
+                    \\    set theFile to choose file name with prompt "Save As" default name "{s}"
+                    \\    return POSIX path of (theFile as text)
+                    \\end tell
+                , .{name}) catch
+                    \\tell application "Finder"
+                    \\    activate
+                    \\    set theFile to choose file name with prompt "Save As"
+                    \\    return POSIX path of (theFile as text)
+                    \\end tell
+                ;
             } else {
-                break :blk "POSIX path of (choose file name with prompt \"Save As\")";
+                break :blk
+                    \\tell application "Finder"
+                    \\    activate
+                    \\    set theFile to choose file name with prompt "Save As"
+                    \\    return POSIX path of (theFile as text)
+                    \\end tell
+                ;
             }
         },
     };
@@ -276,8 +335,29 @@ fn showMacOSFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode, defau
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "osascript", "-e", script },
-    }) catch return null;
+    }) catch {
+        // Restore focus even on error
+        if (front_app) |app| {
+            var refocus_buf: [256]u8 = undefined;
+            if (std.fmt.bufPrint(&refocus_buf, "tell application \"{s}\" to activate", .{app})) |s| {
+                var refocus = std.process.Child.init(&.{ "osascript", "-e", s }, allocator);
+                refocus.spawn() catch {};
+            } else |_| {}
+        }
+        return null;
+    };
     defer allocator.free(result.stderr);
+
+    // Restore focus to original app after dialog closes
+    defer {
+        if (front_app) |app| {
+            var refocus_buf: [256]u8 = undefined;
+            if (std.fmt.bufPrint(&refocus_buf, "tell application \"{s}\" to activate", .{app})) |s| {
+                var refocus = std.process.Child.init(&.{ "osascript", "-e", s }, allocator);
+                refocus.spawn() catch {};
+            } else |_| {}
+        }
+    }
 
     // Check if cancelled (non-zero exit)
     if (result.term.Exited != 0) {
@@ -453,21 +533,26 @@ fn tryKdialog(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: 
 
 /// Show native OS list picker dialog
 /// Returns the selected item index (0-based) or null if cancelled
+/// default_index: pre-select this item (0-based), null for first item
 pub fn showNativeListPicker(
     allocator: std.mem.Allocator,
     title: []const u8,
     items: []const []const u8,
+    default_index: ?usize,
 ) !?usize {
     if (builtin.os.tag == .macos) {
-        return showMacOSListPicker(allocator, title, items);
+        return showMacOSListPicker(allocator, title, items, default_index);
     } else if (builtin.os.tag == .linux) {
         return showLinuxListPicker(allocator, title, items);
     }
     return null;
 }
 
-fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: []const []const u8) !?usize {
+fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: []const []const u8, default_index: ?usize) !?usize {
     if (items.len == 0) return null;
+
+    // AppleScript uses 1-based indexing
+    const default_item = if (default_index) |idx| idx + 1 else 1;
 
     // Get frontmost app before showing dialog so we can restore focus
     const front_app_result = std.process.Child.run(.{
@@ -524,14 +609,14 @@ fn showMacOSListPicker(allocator: std.mem.Allocator, title: []const u8, items: [
         \\tell application "System Events"
         \\    activate
         \\    set theList to {s}
-        \\    set theChoice to choose from list theList with prompt "{s}" default items {{item 1 of theList}}
+        \\    set theChoice to choose from list theList with prompt "{s}" default items {{item {d} of theList}}
         \\    if theChoice is false then
         \\        return ""
         \\    else
         \\        return item 1 of theChoice
         \\    end if
         \\end tell
-    , .{ list_buf.items, title }) catch return null;
+    , .{ list_buf.items, title, default_item }) catch return null;
 
     const result = std.process.Child.run(.{
         .allocator = allocator,

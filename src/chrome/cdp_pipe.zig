@@ -114,13 +114,6 @@ pub const PipeCdpClient = struct {
     read_file_closed: bool,
     write_file_closed: bool,
 
-    // ACK throttling - limit frame rate to 24fps
-    last_ack_time: i128,
-    pending_ack_session: u32,
-    pending_ack_routing: [256]u8,
-    pending_ack_routing_len: usize,
-    has_pending_ack: bool,
-
     pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
         const frame_pool = try FramePool.init(allocator);
 
@@ -144,11 +137,6 @@ pub const PipeCdpClient = struct {
             .read_pos = 0,
             .read_file_closed = false,
             .write_file_closed = false,
-            .last_ack_time = 0,
-            .pending_ack_session = 0,
-            .pending_ack_routing = undefined,
-            .pending_ack_routing_len = 0,
-            .has_pending_ack = false,
         };
 
         return client;
@@ -471,63 +459,38 @@ pub const PipeCdpClient = struct {
         const routing_sid = self.extractRoutingSessionId(payload) catch null;
         const frame_sid = try self.extractFrameSessionId(payload);
         const data = try self.extractScreencastData(payload);
-        const width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
-        const height = self.extractMetadataInt(payload, "deviceHeight") catch 0;
+        const device_width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
+        const device_height = self.extractMetadataInt(payload, "deviceHeight") catch 0;
 
-        // Debug: log first few frames' metadata dimensions
-        const frame_count = self.frame_count.load(.monotonic);
-        if (frame_count < 3) {
-            var buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "[PIPE] Frame {}: device={}x{}\n", .{ frame_count, width, height }) catch "";
-            if (std.fs.cwd().openFile("/tmp/pipe_debug.log", .{ .mode = .write_only })) |f| {
-                f.seekFromEnd(0) catch {};
-                _ = f.write(msg) catch {};
-                f.close();
-            } else |_| {}
+        // Debug: log raw metadata JSON
+        {
+            // Find metadata object in payload
+            if (std.mem.indexOf(u8, payload, "\"metadata\":{")) |start| {
+                const meta_start = start + 11; // skip "metadata":{
+                if (std.mem.indexOfPos(u8, payload, meta_start, "}")) |end| {
+                    const metadata = payload[meta_start .. end + 1];
+                    if (std.fs.createFileAbsolute("/tmp/screencast_raw.log", .{ .truncate = false })) |f| {
+                        defer f.close();
+                        f.seekFromEnd(0) catch {};
+                        _ = f.write(metadata) catch {};
+                        _ = f.write("\n") catch {};
+                    } else |_| {}
+                }
+            }
         }
 
-        if (try self.frame_pool.writeFrame(data, frame_sid, width, height)) |_| {
+        if (try self.frame_pool.writeFrame(data, frame_sid, device_width, device_height)) |_| {
             _ = self.frame_count.fetchAdd(1, .monotonic);
         }
 
-        // Throttle ACKs to 24fps - Chrome only sends new frame after ACK
-        // Store pending ACK and flush when interval expires
-        const now = std.time.nanoTimestamp();
-        const min_interval = 41 * std.time.ns_per_ms; // 24fps
-
-        // Store this frame for ACK (always keep latest)
-        self.pending_ack_session = frame_sid;
-        if (routing_sid) |rsid| {
-            const len = @min(rsid.len, self.pending_ack_routing.len);
-            @memcpy(self.pending_ack_routing[0..len], rsid[0..len]);
-            self.pending_ack_routing_len = len;
-        } else {
-            self.pending_ack_routing_len = 0;
-        }
-        self.has_pending_ack = true;
-
-        // ACK if enough time has passed
-        if (now - self.last_ack_time >= min_interval) {
-            self.flushPendingAck();
-        }
+        // ACK immediately - don't block reader thread
+        // Chrome throttles on its side, we just acknowledge receipt
+        self.acknowledgeFrame(routing_sid, frame_sid) catch {};
     }
 
-    /// Flush pending ACK if interval has passed
+    /// Flush pending ACK (no-op now, kept for API compatibility)
     pub fn flushPendingAck(self: *PipeCdpClient) void {
-        if (!self.has_pending_ack) return;
-
-        const now = std.time.nanoTimestamp();
-        const min_interval = 41 * std.time.ns_per_ms;
-
-        if (now - self.last_ack_time >= min_interval) {
-            self.last_ack_time = now;
-            const rsid: ?[]const u8 = if (self.pending_ack_routing_len > 0)
-                self.pending_ack_routing[0..self.pending_ack_routing_len]
-            else
-                null;
-            self.acknowledgeFrame(rsid, self.pending_ack_session) catch {};
-            self.has_pending_ack = false;
-        }
+        _ = self;
     }
 
     fn handleResponse(self: *PipeCdpClient, payload: []const u8) !void {

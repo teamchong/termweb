@@ -194,7 +194,7 @@ pub const CdpClient = struct {
             client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch null;
             if (client.browser_ws) |bws| {
                 try bws.startReaderThread();
-                const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allow\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
+                const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
                 defer allocator.free(download_params);
                 const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
                 allocator.free(download_result);
@@ -637,5 +637,17 @@ pub const CdpClient = struct {
         // Re-enable Page domain on the new session (for events)
         const page_result = try self.sendCommand("Page.enable", null);
         self.allocator.free(page_result);
+    }
+
+    /// Close a target (for single-tab mode - close unwanted popups)
+    pub fn closeTarget(self: *CdpClient, target_id: []const u8) !void {
+        logToFile("[CDP] Closing target: {s}\n", .{target_id});
+        var buf: [256]u8 = undefined;
+        const params = std.fmt.bufPrint(&buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
+        const result = self.pipe_client.?.sendCommand("Target.closeTarget", params) catch |err| {
+            logToFile("[CDP] Target.closeTarget failed: {}\n", .{err});
+            return err;
+        };
+        self.allocator.free(result);
     }
 };

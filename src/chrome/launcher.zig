@@ -164,9 +164,9 @@ pub fn listProfiles(allocator: std.mem.Allocator) ![][]const u8 {
     return try profiles.toOwnedSlice(allocator);
 }
 
-/// Clone a Chrome profile to a temporary directory
-/// Copies: Bookmarks, Cookies, History, Login Data, Preferences, Extensions
-/// Skips: Sessions, Current Session, Current Tabs (to avoid lock conflicts)
+/// Clone a Chrome profile to a temporary directory (minimal for fast startup)
+/// Copies only essential session data: Cookies, Local Storage, IndexedDB
+/// Skips: Extensions, History, Bookmarks, etc. (not needed for session auth)
 fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir: []const u8, verbose: bool) !void {
     const user_data_dir = try getChromeUserDataDir(allocator);
     defer allocator.free(user_data_dir);
@@ -183,17 +183,11 @@ fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir
         return error.CloneFailed;
     };
 
-    // Files to copy (essential for preserving user data)
+    // Minimal files to copy (only what's needed for login sessions)
     const files_to_copy = [_][]const u8{
-        "Preferences",
-        "Bookmarks",
-        "Cookies",
-        "History",
-        "Login Data",
-        "Web Data",
-        "Favicons",
-        "Top Sites",
-        "Shortcuts",
+        "Cookies",      // Session cookies for auth
+        "Login Data",   // Saved passwords
+        "Preferences",  // Basic settings (minimal, fast to copy)
     };
 
     var source_dir = std.fs.cwd().openDir(source_profile, .{}) catch |err| {
@@ -211,8 +205,16 @@ fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir
         copied += 1;
     }
 
-    // Copy Extensions directory if it exists
-    copyDirRecursive(allocator, source_dir, dest_dir_handle, "Extensions") catch {};
+    // Copy directories for web app data (Local Storage, IndexedDB)
+    const dirs_to_copy = [_][]const u8{
+        "Local Storage",   // localStorage API data
+        "IndexedDB",       // IndexedDB data
+        "File System",     // OPFS data
+    };
+
+    for (dirs_to_copy) |dir_name| {
+        copyDirRecursive(allocator, source_dir, dest_dir_handle, dir_name) catch continue;
+    }
 
     if (verbose) {
         std.debug.print("Cloned profile '{s}' ({} files copied)\n", .{ profile_name, copied });
@@ -344,10 +346,10 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--no-default-browser-check");
     try args_list.append(allocator, "--allow-file-access-from-files");
     try args_list.append(allocator, "--enable-features=FileSystemAccessAPI,FileSystemAccessLocal");
-    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts,DownloadBubble,DownloadBubbleV2,TabHoverCardImages,TabSearch,SidePanel");
-    try args_list.append(allocator, "--disable-infobars"); // Disable download shelf/bar
-    try args_list.append(allocator, "--hide-scrollbars"); // Hide scrollbars in viewport
-    try args_list.append(allocator, "--disable-translate"); // Disable translate bar
+    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts,DownloadBubble,DownloadBubbleV2");
+    try args_list.append(allocator, "--disable-infobars");
+    try args_list.append(allocator, "--hide-scrollbars");
+    try args_list.append(allocator, "--disable-translate");
     // Extension loading - if custom extension provided, enable extensions
     if (options.extension_path) |ext_path| {
         const load_ext_arg = try std.fmt.allocPrint(allocator, "--load-extension={s}", .{ext_path});
@@ -358,8 +360,7 @@ pub fn launchChromePipe(
         try args_list.append(allocator, "--disable-extensions"); // Disable all extensions
         try args_list.append(allocator, "--disable-component-extensions-with-background-pages");
     }
-    try args_list.append(allocator, "--disable-background-networking"); // Prevent background updates
-    try args_list.append(allocator, "--enable-features=DownloadShelfInToolbar:hidden/true"); // Hide download shelf
+    try args_list.append(allocator, "--disable-background-networking");
 
     if (options.disable_gpu) {
         try args_list.append(allocator, "--disable-gpu");

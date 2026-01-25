@@ -171,7 +171,7 @@ pub fn enableDownloads(client: *cdp.CdpClient, allocator: std.mem.Allocator, dow
     // Browser.setDownloadBehavior
     const params = try std.fmt.allocPrint(
         allocator,
-        "{{\"behavior\":\"allow\",\"downloadPath\":\"{s}\",\"eventsEnabled\":true}}",
+        "{{\"behavior\":\"allowAndName\",\"downloadPath\":\"{s}\",\"eventsEnabled\":true}}",
         .{download_path},
     );
     defer allocator.free(params);
