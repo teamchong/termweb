@@ -243,7 +243,15 @@
       const handle = isDirectory
         ? createDirectoryHandle(path, name)
         : createFileHandle(path, name);
-      pending.resolve(pending.multiple ? [handle] : handle);
+      // Per Web API spec:
+      // - showOpenFilePicker() always returns array (even for single selection)
+      // - showDirectoryPicker() returns single handle
+      // - showSaveFilePicker() returns single handle
+      if (pending.isDirectory || pending.isSave) {
+        pending.resolve(handle);
+      } else {
+        pending.resolve([handle]); // showOpenFilePicker always returns array
+      }
     } else {
       pending.reject(new DOMException('User cancelled', 'AbortError'));
     }
@@ -252,21 +260,21 @@
   // Override File System Access API
   window.showDirectoryPicker = function(options) {
     return new Promise((resolve, reject) => {
-      window.__termwebPendingPicker = { resolve, reject, multiple: false };
+      window.__termwebPendingPicker = { resolve, reject, isDirectory: true };
       console.log('__TERMWEB_PICKER__:directory:single');
     });
   };
 
   window.showOpenFilePicker = function(options) {
     return new Promise((resolve, reject) => {
-      window.__termwebPendingPicker = { resolve, reject, multiple: options?.multiple || false };
+      window.__termwebPendingPicker = { resolve, reject, isDirectory: false, isSave: false };
       console.log('__TERMWEB_PICKER__:file:' + (options?.multiple ? 'multiple' : 'single'));
     });
   };
 
   window.showSaveFilePicker = function(options) {
     return new Promise((resolve, reject) => {
-      window.__termwebPendingPicker = { resolve, reject, multiple: false };
+      window.__termwebPendingPicker = { resolve, reject, isDirectory: false, isSave: true };
       console.log('__TERMWEB_PICKER__:save:' + (options?.suggestedName || 'file'));
     });
   };
