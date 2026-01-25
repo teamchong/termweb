@@ -161,8 +161,9 @@ pub const PipeCdpClient = struct {
         // Free response queue entries - lock just in case
         self.response_mutex.lock();
         const queue_len = self.response_queue.items.len;
+        // Free each entry's payload before deiniting the ArrayList
         for (self.response_queue.items) |*entry| {
-            entry.deinit();
+            self.allocator.free(entry.payload);
         }
         self.response_queue.deinit(self.allocator);
         self.response_mutex.unlock();
