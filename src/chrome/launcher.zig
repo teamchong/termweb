@@ -346,7 +346,7 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--no-default-browser-check");
     try args_list.append(allocator, "--allow-file-access-from-files");
     try args_list.append(allocator, "--enable-features=FileSystemAccessAPI,FileSystemAccessLocal");
-    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts,DownloadBubble,DownloadBubbleV2");
+    try args_list.append(allocator, "--disable-features=FileSystemAccessPermissionPrompts,DownloadBubble,DownloadBubbleV2,site-per-process");
     try args_list.append(allocator, "--disable-infobars");
     try args_list.append(allocator, "--hide-scrollbars");
     try args_list.append(allocator, "--disable-translate");
@@ -354,6 +354,10 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--disable-background-timer-throttling");
     try args_list.append(allocator, "--disable-client-side-phishing-detection");
     try args_list.append(allocator, "--disable-component-update");
+    // Memory optimization: reduce process count for single-page rendering
+    try args_list.append(allocator, "--renderer-process-limit=1");
+    try args_list.append(allocator, "--disable-site-isolation-trials");
+    try args_list.append(allocator, "--no-zygote");
     // Extension loading - if custom extension provided, enable extensions
     if (options.extension_path) |ext_path| {
         const load_ext_arg = try std.fmt.allocPrint(allocator, "--load-extension={s}", .{ext_path});
@@ -370,7 +374,6 @@ pub fn launchChromePipe(
         try args_list.append(allocator, "--disable-gpu");
         // Headless-friendly flags for server/SSH environments (only with --disable-gpu)
         try args_list.append(allocator, "--no-sandbox");
-        try args_list.append(allocator, "--disable-dev-shm-usage");
         try args_list.append(allocator, "--disable-software-rasterizer");
     }
 
