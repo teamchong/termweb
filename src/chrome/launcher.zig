@@ -350,6 +350,10 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--disable-infobars");
     try args_list.append(allocator, "--hide-scrollbars");
     try args_list.append(allocator, "--disable-translate");
+    try args_list.append(allocator, "--disable-sync");
+    try args_list.append(allocator, "--disable-background-timer-throttling");
+    try args_list.append(allocator, "--disable-client-side-phishing-detection");
+    try args_list.append(allocator, "--disable-component-update");
     // Extension loading - if custom extension provided, enable extensions
     if (options.extension_path) |ext_path| {
         const load_ext_arg = try std.fmt.allocPrint(allocator, "--load-extension={s}", .{ext_path});
