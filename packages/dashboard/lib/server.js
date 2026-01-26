@@ -5,7 +5,7 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const WebSocket = require('ws');
-const { collectMetrics, collectLightMetrics, getMetricsCached, startBackgroundPolling, killProcess, getConnections, getFolderSizes } = require('./metrics');
+const { collectMetrics, collectLightMetrics, getMetricsCached, startBackgroundPolling, killProcess, deleteFolder, getConnections, getFolderSizes } = require('./metrics');
 
 /**
  * Start the metrics server
@@ -106,18 +106,27 @@ function startServer(port = 0) {
           } else if (cmd.type === 'kill' && cmd.pid) {
             const success = killProcess(cmd.pid);
             ws.send(JSON.stringify({ type: 'kill', success, pid: cmd.pid }));
+          } else if (cmd.type === 'delete' && cmd.path) {
+            const success = deleteFolder(cmd.path);
+            ws.send(JSON.stringify({ type: 'delete', success, path: cmd.path }));
           } else if (cmd.type === 'connections') {
             const connections = await getConnections();
             ws.send(JSON.stringify({ type: 'connections', data: connections }));
           } else if (cmd.type === 'folderSizes' && cmd.path) {
+            // Resolve ~ to home directory
+            let resolvedPath = cmd.path;
+            if (resolvedPath.startsWith('~')) {
+              const home = process.env.HOME || process.env.USERPROFILE || '/';
+              resolvedPath = resolvedPath.replace(/^~/, home);
+            }
             // Progressive scanning - returns estimates immediately, pushes updates
             const onUpdate = (path, data) => {
               if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'folderSizes', path, data }));
+                ws.send(JSON.stringify({ type: 'folderSizes', path: resolvedPath, data }));
               }
             };
-            const sizes = await getFolderSizes(cmd.path, onUpdate);
-            ws.send(JSON.stringify({ type: 'folderSizes', path: cmd.path, data: sizes }));
+            const sizes = await getFolderSizes(resolvedPath, onUpdate);
+            ws.send(JSON.stringify({ type: 'folderSizes', path: resolvedPath, data: sizes }));
           }
         } catch (err) {
           // Ignore invalid messages

@@ -29,15 +29,26 @@ Opens a real-time system monitoring dashboard in your terminal with:
 
 ## Keyboard Controls
 
+**Main view:**
+- `c` - CPU details
+- `m` - Memory details
+- `n` - Network details
+- `d` - Disk details
+- `p` - Process list
+
 **Disk view:**
-- `Arrow keys` - Navigate folders
-- `Enter` - Drill into folder
-- `Backspace` - Go up one level
+- `Tab/Shift+Tab` - Select folder in treemap
+- `Enter` - Navigate to path in textbox
+- `Ctrl+Enter` - Drill into selected folder
+- `Ctrl+Backspace` - Go up one directory level
+- `Ctrl+D` - Delete selected folder (with Y/N confirmation)
+- `Escape` - Return to main view
 
 **Process view:**
 - `Arrow keys` - Select process
-- `Tab` - Change sort column
-- `Ctrl+K` - Kill selected process
+- `Tab/Shift+Tab` - Change sort column
+- `Ctrl+K` - Kill selected process (with Y/N confirmation)
+- Search box filters by name, PID, or port
 
 **General:**
 - `Escape` - Return to main view

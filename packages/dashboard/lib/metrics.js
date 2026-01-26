@@ -1,15 +1,37 @@
 /**
- * System metrics collector using systeminformation
+ * System metrics collector using systeminformation + native Zig addon
+ * Native addon provides fastest path (direct OS API calls via Zig)
+ * Falls back to systeminformation when native is unavailable
  */
 const si = require('systeminformation');
 const { exec } = require('child_process');
-const { Worker, isMainThread, parentPort } = require('worker_threads');
-const path = require('path');
 
-// Cache for port info (expensive to fetch)
+// Load native metrics from prebuilt binaries (platform-specific)
+let nativeMetrics = null;
+try {
+  const os = require('os');
+  const path = require('path');
+  const platform = process.platform; // darwin, linux
+  const arch = process.arch; // arm64, x64
+  const binaryName = `metrics-${platform}-${arch}.node`;
+
+  // Try prebuilt binary first (from npm package)
+  const prebuiltPath = path.join(__dirname, '..', 'native', 'prebuilt', binaryName);
+  try {
+    nativeMetrics = require(prebuiltPath);
+  } catch (e) {
+    // Try local dev build (zig-out)
+    const devPath = path.join(__dirname, '..', 'native', 'zig-out', 'lib', 'metrics.node');
+    nativeMetrics = require(devPath);
+  }
+} catch (e) {
+  // Native metrics not available, will use systeminformation fallback
+}
+
+// Cache for port info (expensive to fetch on macOS)
 let portCache = new Map();
 let portCacheTime = 0;
-const PORT_CACHE_TTL = 5000; // 5 seconds
+const PORT_CACHE_TTL = process.platform === 'linux' ? 5000 : 30000; // Linux: 5s, macOS: 30s (lsof is slow)
 
 // Cache for heavy metrics (collected in background)
 let metricsCache = null;
@@ -18,49 +40,211 @@ let metricsRefreshing = false;
 const METRICS_CACHE_TTL = 500; // 500ms - return cached data quickly
 
 /**
- * Get port info for processes (cached, async)
+ * Get port info for processes (cached, non-blocking on macOS)
+ * Linux: uses ss (fast, ~10ms)
+ * macOS: uses lsof which is very slow (5-20s), so we fetch in background
  */
 async function getPortInfo() {
   const now = Date.now();
+
+  // Return cache if fresh
   if (now - portCacheTime < PORT_CACHE_TTL && portCache.size > 0) {
     return portCache;
   }
 
+  const isLinux = process.platform === 'linux';
+
+  // On macOS, return stale cache and refresh in background (non-blocking)
+  // lsof is too slow (5-20 seconds) to block on every call
+  if (!isLinux) {
+    // Start background refresh if not already running
+    if (!portRefreshing) {
+      portRefreshing = true;
+      exec('lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null || true', {
+        encoding: 'utf-8',
+        timeout: 30000
+      }, (err, output) => {
+        portRefreshing = false;
+        if (!err && output) {
+          const newCache = new Map();
+          const lines = output.split('\n').slice(1);
+          for (const line of lines) {
+            const parts = line.split(/\s+/);
+            if (parts.length >= 9) {
+              const pid = parseInt(parts[1], 10);
+              const portMatch = parts[8]?.match(/:(\d+)$/);
+              if (pid && portMatch) {
+                const port = portMatch[1];
+                if (newCache.has(pid)) {
+                  newCache.get(pid).push(port);
+                } else {
+                  newCache.set(pid, [port]);
+                }
+              }
+            }
+          }
+          if (newCache.size > 0) {
+            portCache = newCache;
+            portCacheTime = Date.now();
+          }
+        }
+      });
+    }
+    return portCache; // Return immediately (may be stale or empty)
+  }
+
+  // Linux: ss is fast enough to wait for
   return new Promise((resolve) => {
-    exec('lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null || true', {
+    exec('ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null', {
       encoding: 'utf-8',
       timeout: 2000
     }, (err, output) => {
-      if (err) {
-        resolve(portCache); // Return old cache on error
+      if (err || !output) {
+        resolve(portCache);
         return;
       }
 
-      portCache = new Map();
-      const lines = output.split('\n').slice(1); // Skip header
+      const newCache = new Map();
+      const lines = output.split('\n').slice(1);
       for (const line of lines) {
-        const parts = line.split(/\s+/);
-        if (parts.length >= 9) {
-          const pid = parseInt(parts[1], 10);
-          const portMatch = parts[8]?.match(/:(\d+)$/);
-          if (pid && portMatch) {
-            const port = portMatch[1];
-            if (portCache.has(pid)) {
-              portCache.get(pid).push(port);
-            } else {
-              portCache.set(pid, [port]);
-            }
+        const portMatch = line.match(/:(\d+)\s/);
+        const pidMatch = line.match(/pid=(\d+)/);
+        if (portMatch && pidMatch) {
+          const port = portMatch[1];
+          const pid = parseInt(pidMatch[1], 10);
+          if (newCache.has(pid)) {
+            newCache.get(pid).push(port);
+          } else {
+            newCache.set(pid, [port]);
           }
         }
       }
-      portCacheTime = now;
+
+      if (newCache.size > 0) {
+        portCache = newCache;
+        portCacheTime = Date.now();
+      }
       resolve(portCache);
     });
   });
 }
 
+let portRefreshing = false;
+
+/**
+ * Get fast disk stats using native addon or fallback to systeminformation
+ */
+async function getFastDisk() {
+  if (nativeMetrics) {
+    try {
+      const disks = nativeMetrics.getDiskStats();
+      return disks.map(d => ({
+        fs: d.fs,
+        mount: d.mount,
+        type: 'disk',
+        size: d.total,
+        used: d.used,
+        available: d.available,
+        usePercent: d.total > 0 ? (d.used / d.total) * 100 : 0
+      }));
+    } catch (e) {
+      // Fall through
+    }
+  }
+  const disk = await si.fsSize();
+  return disk
+    .filter(d => {
+      if (!d.size || isNaN(d.size) || d.size <= 0) return false;
+      if (d.mount.startsWith('/System/Volumes/')) return false;
+      if (d.mount.includes('/private/var/folders/')) return false;
+      if (d.size < 1024 * 1024 * 1024) return false;
+      return true;
+    })
+    .map(d => ({
+      fs: d.fs,
+      mount: d.mount,
+      type: d.type,
+      size: d.size,
+      used: d.used,
+      available: d.available,
+      usePercent: d.use
+    }));
+}
+
+/**
+ * Get fast network stats using native addon or fallback to systeminformation
+ */
+let prevNetStats = null;
+let prevNetTime = 0;
+
+async function getFastNetwork() {
+  if (nativeMetrics) {
+    try {
+      const nets = nativeMetrics.getNetStats();
+      const now = Date.now();
+      const elapsed = prevNetTime > 0 ? (now - prevNetTime) / 1000 : 1;
+
+      const result = nets.map(n => {
+        const prev = prevNetStats?.find(p => p.iface === n.iface);
+        const rx_sec = prev ? Math.max(0, (n.rxBytes - prev.rxBytes) / elapsed) : 0;
+        const tx_sec = prev ? Math.max(0, (n.txBytes - prev.txBytes) / elapsed) : 0;
+        return {
+          iface: n.iface,
+          rx_bytes: n.rxBytes,
+          tx_bytes: n.txBytes,
+          rx_sec: Math.round(rx_sec),
+          tx_sec: Math.round(tx_sec)
+        };
+      });
+
+      prevNetStats = nets;
+      prevNetTime = now;
+      return result;
+    } catch (e) {
+      // Fall through
+    }
+  }
+  const networkStats = await si.networkStats();
+  return networkStats.map(n => ({
+    iface: n.iface,
+    rx_bytes: n.rx_bytes,
+    tx_bytes: n.tx_bytes,
+    rx_sec: n.rx_sec,
+    tx_sec: n.tx_sec
+  }));
+}
+
+/**
+ * Get process stats using systeminformation
+ * Native addon has permission issues on macOS, so we use si.processes() which handles this correctly
+ */
+async function getFastProcesses() {
+  const ports = await getPortInfo();
+
+  const processes = await si.processes();
+  return {
+    all: processes.all,
+    running: processes.running,
+    blocked: processes.blocked,
+    sleeping: processes.sleeping,
+    list: processes.list
+      .sort((a, b) => b.cpu - a.cpu)
+      .slice(0, 50)
+      .map(p => ({
+        pid: p.pid,
+        name: p.name,
+        cpu: p.cpu,
+        mem: p.mem,
+        state: p.state,
+        user: p.user,
+        ports: ports.get(p.pid) || []
+      }))
+  };
+}
+
 /**
  * Collect all system metrics
+ * Uses native Zig addon when available for maximum performance
  * @returns {Promise<Object>} System metrics
  */
 async function collectMetrics() {
@@ -69,18 +253,18 @@ async function collectMetrics() {
     cpuLoad,
     mem,
     disk,
-    networkStats,
+    network,
     processes,
     temp,
     system,
     osInfo
   ] = await Promise.all([
     si.cpu(),
-    si.currentLoad(),
-    si.mem(),
-    si.fsSize(),
-    si.networkStats(),
-    si.processes(),
+    getFastCpuLoad(),
+    getFastMemory(),
+    getFastDisk(),
+    getFastNetwork(),
+    getFastProcesses(),
     si.cpuTemperature().catch(() => ({ main: null, cores: [] })),
     si.system(),
     si.osInfo()
@@ -94,8 +278,8 @@ async function collectMetrics() {
       cores: cpu.cores,
       physicalCores: cpu.physicalCores,
       speed: cpu.speed,
-      load: cpuLoad.currentLoad,
-      loadPerCore: cpuLoad.cpus.map(c => c.load)
+      load: cpuLoad.load,
+      loadPerCore: cpuLoad.loadPerCore
     },
     memory: {
       total: mem.total,
@@ -103,59 +287,12 @@ async function collectMetrics() {
       free: mem.free,
       active: mem.active,
       available: mem.available,
-      swapTotal: mem.swaptotal,
-      swapUsed: mem.swapused
+      swapTotal: mem.swapTotal || 0,
+      swapUsed: mem.swapUsed || 0
     },
-    disk: disk
-      // Filter out macOS system volumes and invalid entries
-      .filter(d => {
-        // Skip if size is invalid
-        if (!d.size || isNaN(d.size) || d.size <= 0) return false;
-        // Skip macOS system volumes
-        if (d.mount.startsWith('/System/Volumes/')) return false;
-        // Skip snapshot/private volumes
-        if (d.mount.includes('/private/var/folders/')) return false;
-        // Skip tiny volumes (< 1GB)
-        if (d.size < 1024 * 1024 * 1024) return false;
-        return true;
-      })
-      .map(d => ({
-        fs: d.fs,
-        mount: d.mount,
-        type: d.type,
-        size: d.size,
-        used: d.used,
-        available: d.available,
-        usePercent: d.use
-      })),
-    network: networkStats.map(n => ({
-      iface: n.iface,
-      rx_bytes: n.rx_bytes,
-      tx_bytes: n.tx_bytes,
-      rx_sec: n.rx_sec,
-      tx_sec: n.tx_sec
-    })),
-    processes: await (async () => {
-      const ports = await getPortInfo();
-      return {
-        all: processes.all,
-        running: processes.running,
-        blocked: processes.blocked,
-        sleeping: processes.sleeping,
-        list: processes.list
-          .sort((a, b) => b.cpu - a.cpu)
-          .slice(0, 50)
-          .map(p => ({
-            pid: p.pid,
-            name: p.name,
-            cpu: p.cpu,
-            mem: p.mem,
-            state: p.state,
-            user: p.user,
-            ports: ports.get(p.pid) || []
-          }))
-      };
-    })(),
+    disk,
+    network,
+    processes,
     temperature: {
       main: temp.main,
       cores: temp.cores
@@ -174,29 +311,173 @@ async function collectMetrics() {
   };
 }
 
+// Fast CPU load reading - stores previous values for delta calculation
+let prevCpuTimes = null;
+let prevCoresTimes = null;
+
+/**
+ * Fast CPU load using native termweb SDK or /proc/stat fallback
+ */
+async function getFastCpuLoad() {
+  // Use native termweb SDK if available (fastest - direct Mach/proc calls)
+  if (nativeMetrics) {
+    try {
+      const stats = nativeMetrics.getCpuStats();
+      const cores = nativeMetrics.getCoreStats();
+
+      // Calculate load from delta (need previous sample)
+      const total = stats.user + stats.nice + stats.system + stats.idle + stats.iowait;
+      const busy = stats.user + stats.nice + stats.system;
+
+      let load = 0;
+      if (prevCpuTimes) {
+        const deltaTotal = total - prevCpuTimes.total;
+        const deltaBusy = busy - prevCpuTimes.busy;
+        load = deltaTotal > 0 ? (deltaBusy / deltaTotal) * 100 : 0;
+      }
+      prevCpuTimes = { total, busy };
+
+      // Per-core loads
+      const loadPerCore = cores.map((c, i) => {
+        const coreTotal = c.user + c.nice + c.system + c.idle + c.iowait;
+        const coreBusy = c.user + c.nice + c.system;
+        let coreLoad = 0;
+        if (prevCoresTimes && prevCoresTimes[i]) {
+          const prev = prevCoresTimes[i];
+          const deltaTotal = coreTotal - prev.total;
+          const deltaBusy = coreBusy - prev.busy;
+          coreLoad = deltaTotal > 0 ? (deltaBusy / deltaTotal) * 100 : 0;
+        }
+        return { total: coreTotal, busy: coreBusy, load: coreLoad };
+      });
+      prevCoresTimes = loadPerCore.map(c => ({ total: c.total, busy: c.busy }));
+
+      return { load, loadPerCore: loadPerCore.map(c => c.load) };
+    } catch (e) {
+      // Fall through to other methods
+    }
+  }
+
+  // Linux fallback: read /proc/stat directly
+  if (process.platform === 'linux') {
+    const fs = require('fs');
+    try {
+      const stat = fs.readFileSync('/proc/stat', 'utf8');
+      const lines = stat.split('\n');
+      const cpus = [];
+      let totalLoad = 0;
+
+      for (const line of lines) {
+        if (line.startsWith('cpu')) {
+          const parts = line.split(/\s+/);
+          const name = parts[0];
+          const times = parts.slice(1, 8).map(Number);
+          const [user, nice, system, idle, iowait, irq, softirq] = times;
+          const total = user + nice + system + idle + iowait + irq + softirq;
+          const busy = user + nice + system + irq + softirq;
+
+          if (prevCpuTimes && prevCpuTimes[name]) {
+            const prev = prevCpuTimes[name];
+            const deltaTotal = total - prev.total;
+            const deltaBusy = busy - prev.busy;
+            const load = deltaTotal > 0 ? (deltaBusy / deltaTotal) * 100 : 0;
+
+            if (name === 'cpu') {
+              totalLoad = load;
+            } else {
+              cpus.push(load);
+            }
+          }
+
+          if (!prevCpuTimes) prevCpuTimes = {};
+          prevCpuTimes[name] = { total, busy };
+        }
+      }
+
+      if (cpus.length > 0) {
+        return { load: totalLoad, loadPerCore: cpus };
+      }
+    } catch (e) {}
+  }
+
+  // Fallback to systeminformation
+  const cpuLoad = await si.currentLoad();
+  return { load: cpuLoad.currentLoad, loadPerCore: cpuLoad.cpus.map(c => c.load) };
+}
+
+/**
+ * Fast memory reading using native termweb SDK or /proc/meminfo fallback
+ */
+async function getFastMemory() {
+  // Use native termweb SDK if available (fastest - direct Mach/proc calls)
+  if (nativeMetrics) {
+    try {
+      const stats = nativeMetrics.getMemStats();
+      return {
+        total: stats.total,
+        free: stats.free,
+        used: stats.used,
+        active: stats.used, // Use 'used' as approximation for 'active'
+        available: stats.available,
+        swapTotal: stats.swapTotal,
+        swapUsed: stats.swapUsed
+      };
+    } catch (e) {
+      // Fall through to other methods
+    }
+  }
+
+  // Linux fallback: read /proc/meminfo directly
+  if (process.platform === 'linux') {
+    const fs = require('fs');
+    try {
+      const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+      const values = {};
+      for (const line of meminfo.split('\n')) {
+        const match = line.match(/^(\w+):\s+(\d+)/);
+        if (match) {
+          values[match[1]] = parseInt(match[2], 10) * 1024; // Convert KB to bytes
+        }
+      }
+      return {
+        total: values.MemTotal || 0,
+        free: values.MemFree || 0,
+        used: (values.MemTotal || 0) - (values.MemAvailable || values.MemFree || 0),
+        active: values.Active || 0,
+        available: values.MemAvailable || values.MemFree || 0
+      };
+    } catch (e) {}
+  }
+
+  // Fallback to systeminformation
+  const mem = await si.mem();
+  return { total: mem.total, free: mem.free, used: mem.used, active: mem.active, available: mem.available };
+}
+
 /**
  * Collect lightweight metrics for frequent updates
+ * Uses native addon when available for maximum performance
  * @returns {Promise<Object>} Lightweight metrics
  */
 async function collectLightMetrics() {
-  const [cpuLoad, mem, networkStats] = await Promise.all([
-    si.currentLoad(),
-    si.mem(),
-    si.networkStats()
+  const [cpu, mem, network] = await Promise.all([
+    getFastCpuLoad(),
+    getFastMemory(),
+    getFastNetwork()
   ]);
 
   return {
     timestamp: Date.now(),
     cpu: {
-      load: cpuLoad.currentLoad,
-      loadPerCore: cpuLoad.cpus.map(c => c.load)
+      load: cpu.load,
+      loadPerCore: cpu.loadPerCore
     },
     memory: {
       used: mem.used,
       free: mem.free,
       active: mem.active
     },
-    network: networkStats.map(n => ({
+    network: network.map(n => ({
       iface: n.iface,
       rx_sec: n.rx_sec,
       tx_sec: n.tx_sec
@@ -283,6 +564,16 @@ function killProcess(pid) {
   }
 }
 
+function deleteFolder(folderPath) {
+  try {
+    const fs = require('fs');
+    fs.rmSync(folderPath, { recursive: true, force: true });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // Cache for connections
 let connectionsCache = [];
 let connectionsCacheTime = 0;
@@ -301,9 +592,15 @@ const dnsCache = new Map();
 const DNS_CACHE_TTL = 300000; // 5 minutes
 
 /**
- * Get per-process network bytes using nettop (macOS)
+ * Get per-process network bytes using nettop (macOS only)
+ * On Linux, returns empty map (falls back to proportional distribution)
  */
 async function getProcessBytes() {
+  // nettop is macOS only
+  if (process.platform !== 'darwin') {
+    return new Map();
+  }
+
   const now = Date.now();
   if (now - processBytesTime < 2000 && processBytes.size > 0) {
     return processBytes;
@@ -397,125 +694,134 @@ async function getConnections() {
     return connectionsCache;
   }
 
-  // Get per-process bytes first
-  const procBytes = await getProcessBytes();
+  // Use netstat (fast, works on Linux and macOS) instead of lsof (slow)
+  const isLinux = process.platform === 'linux';
+  const netstatCmd = isLinux
+    ? 'ss -tn state established 2>/dev/null || netstat -tn 2>/dev/null | grep ESTABLISHED'
+    : 'netstat -an 2>/dev/null | grep ESTABLISHED';
 
-  return new Promise((resolve) => {
-    // Use lsof to get TCP connections with PID
-    exec('lsof -i -n -P 2>/dev/null | grep -E "TCP|UDP" || true', {
-      encoding: 'utf-8',
-      timeout: 3000,
-      maxBuffer: 1024 * 1024
-    }, async (err, output) => {
-      if (err) {
-        resolve(connectionsCache);
-        return;
+  const [procBytes, netstatOutput] = await Promise.all([
+    getProcessBytes(),
+    new Promise((res) => {
+      exec(netstatCmd, {
+        encoding: 'utf-8',
+        timeout: 2000,
+        maxBuffer: 512 * 1024
+      }, (err, output) => res(err ? '' : output));
+    })
+  ]);
+
+  if (!netstatOutput) {
+    return connectionsCache;
+  }
+
+  const hostMap = new Map();
+  const lines = netstatOutput.split('\n');
+
+  // Parse netstat output for established connections
+  for (const line of lines) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 4) continue;
+
+    let remoteAddr;
+    if (isLinux) {
+      // Linux ss: State Recv-Q Send-Q Local:Port Peer:Port
+      // Linux netstat: Proto Recv-Q Send-Q Local Addr Foreign Addr State
+      remoteAddr = parts[4] || parts[3];
+    } else {
+      // macOS netstat: Proto Recv-Q Send-Q Local Addr Foreign Addr (state)
+      // tcp4  0  0  192.168.2.46.53397  160.79.104.10.443  ESTABLISHED
+      remoteAddr = parts[4];
+    }
+
+    if (!remoteAddr) continue;
+
+    // Parse remote address - handle both IP.port and IP:port formats
+    let remoteHost, remotePort;
+
+    // IPv6 with brackets: [::1]:443
+    const ipv6Match = remoteAddr.match(/^\[([^\]]+)\][.:](\d+)$/);
+    if (ipv6Match) {
+      remoteHost = ipv6Match[1];
+      remotePort = ipv6Match[2];
+    } else {
+      // macOS uses IP.port, Linux uses IP:port
+      const lastDot = remoteAddr.lastIndexOf('.');
+      const lastColon = remoteAddr.lastIndexOf(':');
+      const sep = lastColon > lastDot ? lastColon : lastDot;
+      if (sep > 0) {
+        remoteHost = remoteAddr.substring(0, sep);
+        remotePort = remoteAddr.substring(sep + 1);
       }
+    }
 
-      const hostMap = new Map();
-      const pidConnections = new Map(); // pid -> array of { host, port }
-      const lines = output.split('\n');
+    if (remoteHost && remotePort) {
+      // Skip localhost and link-local
+      if (remoteHost === '127.0.0.1' || remoteHost === '::1' || remoteHost === 'localhost') continue;
+      if (remoteHost.startsWith('fe80:') || remoteHost.startsWith('::ffff:127.')) continue;
 
-      // First pass: collect all connections
-      for (const line of lines) {
-        // Parse lsof output: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-        const parts = line.trim().split(/\s+/);
-        if (parts.length < 9) continue;
-
-        const process = parts[0];
-        const pid = parseInt(parts[1], 10);
-        const name = parts[parts.length - 1]; // Last column is NAME (connection info)
-
-        // Parse connection: local->remote or *:port (LISTEN)
-        const match = name.match(/->([^:]+):(\d+)/);
-        if (match) {
-          const remoteHost = match[1];
-          const remotePort = match[2];
-
-          // Skip localhost
-          if (remoteHost === '127.0.0.1' || remoteHost === '::1' || remoteHost === 'localhost') continue;
-
-          // Track per-host
-          const key = remoteHost;
-          if (!hostMap.has(key)) {
-            hostMap.set(key, { host: remoteHost, bytes: 0, count: 0, ports: new Set(), processes: new Set() });
-          }
-          const entry = hostMap.get(key);
-          entry.count++;
-          entry.ports.add(remotePort);
-          entry.processes.add(process);
-
-          // Track per-pid connections
-          if (!pidConnections.has(pid)) {
-            pidConnections.set(pid, []);
-          }
-          pidConnections.get(pid).push(remoteHost);
-        }
+      const key = remoteHost;
+      if (!hostMap.has(key)) {
+        hostMap.set(key, { host: remoteHost, bytes: 0, count: 0, ports: new Set(), processes: new Set() });
       }
+      const entry = hostMap.get(key);
+      entry.count++;
+      entry.ports.add(remotePort);
+    }
+  }
 
-      // Second pass: distribute process bytes proportionally among hosts
-      for (const [pid, hosts] of pidConnections) {
-        const pb = procBytes.get(pid);
-        if (!pb || pb.total === 0) continue;
+  // Note: netstat doesn't give us PID, so we can't map bytes to hosts accurately
+  // Just distribute total bytes proportionally by connection count
+  const totalBytes = Array.from(procBytes.values()).reduce((sum, p) => sum + p.total, 0);
+  const totalConns = Array.from(hostMap.values()).reduce((sum, h) => sum + h.count, 0);
+  if (totalConns > 0 && totalBytes > 0) {
+    for (const entry of hostMap.values()) {
+      entry.bytes = Math.floor((totalBytes * entry.count) / totalConns);
+    }
+  }
 
-        // Count connections per host for this pid
-        const hostCounts = new Map();
-        for (const host of hosts) {
-          hostCounts.set(host, (hostCounts.get(host) || 0) + 1);
-        }
+  // Add current sample to history
+  const currentSample = new Map();
+  hostMap.forEach((v, k) => currentSample.set(k, { bytes: v.bytes, count: v.count }));
+  connectionHistory.push({ time: now, hosts: currentSample });
 
-        // Distribute bytes proportionally
-        const totalConns = hosts.length;
-        for (const [host, count] of hostCounts) {
-          const share = Math.floor((pb.total * count) / totalConns);
-          const entry = hostMap.get(host);
-          if (entry) {
-            entry.bytes += share;
-          }
-        }
-      }
+  // Remove old samples (older than 1 minute)
+  while (connectionHistory.length > 0 && now - connectionHistory[0].time > CONNECTION_HISTORY_TTL) {
+    connectionHistory.shift();
+  }
 
-      // Add current sample to history (with bytes)
-      const currentSample = new Map();
-      hostMap.forEach((v, k) => currentSample.set(k, { bytes: v.bytes, count: v.count }));
-      connectionHistory.push({ time: now, hosts: currentSample });
-
-      // Remove old samples (older than 1 minute)
-      while (connectionHistory.length > 0 && now - connectionHistory[0].time > CONNECTION_HISTORY_TTL) {
-        connectionHistory.shift();
-      }
-
-      // Aggregate bytes over last 1 minute (use max seen, not sum, since bytes are cumulative)
-      const bytesMap = new Map();
-      for (const sample of connectionHistory) {
-        sample.hosts.forEach((data, ip) => {
-          const current = bytesMap.get(ip) || 0;
-          bytesMap.set(ip, Math.max(current, data.bytes));
-        });
-      }
-
-      // Merge with current hostMap data
-      const results = Array.from(hostMap.values())
-        .map(h => ({
-          host: h.host,
-          bytes: bytesMap.get(h.host) || h.bytes,
-          count: h.count,
-          ports: Array.from(h.ports).slice(0, 5),
-          processes: Array.from(h.processes).slice(0, 5)
-        }))
-        .sort((a, b) => b.bytes - a.bytes)
-        .slice(0, 20);
-
-      // Resolve hostnames in parallel (cached)
-      await Promise.all(results.map(async (r) => {
-        r.hostname = await reverseDns(r.host);
-      }));
-
-      connectionsCache = results;
-      connectionsCacheTime = now;
-      resolve(connectionsCache);
+  // Aggregate bytes over last 1 minute
+  const bytesMap = new Map();
+  for (const sample of connectionHistory) {
+    sample.hosts.forEach((data, ip) => {
+      const current = bytesMap.get(ip) || 0;
+      bytesMap.set(ip, Math.max(current, data.bytes));
     });
-  });
+  }
+
+  // Build results - use cached hostname or IP
+  const results = Array.from(hostMap.values())
+    .map(h => ({
+      host: h.host,
+      hostname: dnsCache.get(h.host)?.hostname || h.host,
+      bytes: bytesMap.get(h.host) || h.bytes,
+      count: h.count,
+      ports: Array.from(h.ports).slice(0, 5),
+      processes: Array.from(h.processes).slice(0, 5)
+    }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 20);
+
+  // Start DNS lookups in background (non-blocking)
+  for (const r of results) {
+    if (!dnsCache.has(r.host)) {
+      reverseDns(r.host);
+    }
+  }
+
+  connectionsCache = results;
+  connectionsCacheTime = now;
+  return connectionsCache;
 }
 
 // Cache for folder sizes (progressive scanning)
@@ -576,44 +882,51 @@ async function getFolderSizes(dir, onUpdate) {
       folderSizeCache.set(dir, { items: [...items], scanning: true, lastUpdate: Date.now() });
       resolve(items);
 
-      // Step 2: Scan actual sizes in background (batch of 5 at a time)
+      // Step 2: Scan actual sizes in parallel (multiple batches concurrently)
       const batchSize = 5;
+      const maxParallel = 4; // Run up to 4 du commands in parallel
+      const batches = [];
       for (let i = 0; i < items.length; i += batchSize) {
-        const batch = items.slice(i, i + batchSize);
-        const paths = batch.map(item => `"${item.path.replace(/"/g, '\\"')}"`).join(' ');
+        batches.push(items.slice(i, i + batchSize));
+      }
 
-        try {
-          const result = await new Promise((res) => {
+      // Process batches in parallel groups
+      for (let g = 0; g < batches.length; g += maxParallel) {
+        const parallelBatches = batches.slice(g, g + maxParallel);
+
+        await Promise.all(parallelBatches.map(batch => {
+          const paths = batch.map(item => `"${item.path.replace(/"/g, '\\"')}"`).join(' ');
+          return new Promise((res) => {
             exec(`du -sk ${paths} 2>/dev/null || true`, {
               encoding: 'utf-8',
               timeout: 15000
-            }, (err, out) => res(err ? '' : out));
-          });
-
-          // Parse results and update items
-          const sizeLines = result.trim().split('\n');
-          for (const line of sizeLines) {
-            const match = line.match(/^(\d+)\s+(.+)$/);
-            if (match) {
-              const sizeKB = parseInt(match[1], 10);
-              const path = match[2];
-              const item = items.find(it => it.path === path);
-              if (item) {
-                item.size = sizeKB * 1024;
-                item.confirmed = true;
+            }, (err, out) => {
+              if (!err && out) {
+                const sizeLines = out.trim().split('\n');
+                for (const line of sizeLines) {
+                  const match = line.match(/^(\d+)\s+(.+)$/);
+                  if (match) {
+                    const sizeKB = parseInt(match[1], 10);
+                    const path = match[2];
+                    const item = items.find(it => it.path === path);
+                    if (item) {
+                      item.size = sizeKB * 1024;
+                      item.confirmed = true;
+                    }
+                  }
+                }
               }
-            }
-          }
+              res();
+            });
+          });
+        }));
 
-          // Update cache and notify
-          const sortedItems = [...items].sort((a, b) => b.size - a.size);
-          folderSizeCache.set(dir, { items: sortedItems, scanning: i + batchSize < items.length, lastUpdate: Date.now() });
+        // Update cache and notify after each parallel group
+        const sortedItems = [...items].sort((a, b) => b.size - a.size);
+        folderSizeCache.set(dir, { items: sortedItems, scanning: g + maxParallel < batches.length, lastUpdate: Date.now() });
 
-          if (onUpdate) {
-            onUpdate(dir, sortedItems);
-          }
-        } catch (e) {
-          // Continue with next batch
+        if (onUpdate) {
+          onUpdate(dir, sortedItems);
         }
       }
 
@@ -634,6 +947,7 @@ module.exports = {
   getMetricsCached,
   startBackgroundPolling,
   killProcess,
+  deleteFolder,
   getConnections,
   getFolderSizes
 };

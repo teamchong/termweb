@@ -78,6 +78,16 @@ async function main() {
             if (verbose) console.log('[Kill] Cancel mode');
             termweb.removeKeyBinding('y');
             termweb.removeKeyBinding('n');
+          } else if (msg.type === 'deleteConfirm') {
+            // Add y/n bindings for delete confirmation
+            if (verbose) console.log('[Delete] Confirm mode');
+            termweb.addKeyBinding('y', 'delete:confirm');
+            termweb.addKeyBinding('n', 'delete:cancel');
+          } else if (msg.type === 'deleteCancel') {
+            // Remove y/n bindings
+            if (verbose) console.log('[Delete] Cancel mode');
+            termweb.removeKeyBinding('y');
+            termweb.removeKeyBinding('n');
           }
         } catch (e) {}
       });
@@ -91,7 +101,7 @@ async function main() {
 
     termweb.openAsync(url, {
       toolbar: false,
-      allowedHotkeys: ['quit', 'select_all', 'copy', 'cut', 'paste'],
+      allowedHotkeys: ['quit', 'copy', 'cut', 'paste'],
       singleTab: true,
       keyBindings: mainBindings,
       verbose

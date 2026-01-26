@@ -33,8 +33,11 @@ let lastDetailData = null; // Cache last data for detail views
 let pendingKill = null; // { pid, name } when waiting for kill confirmation
 let connectionsData = []; // Network connections by host
 let currentDiskPath = '/'; // Current folder path for disk drill-down
+let previousDiskPath = '/'; // Previous path to revert on error
+let pendingDiskPath = null; // Path being loaded (before confirmation)
 let folderData = []; // Folder sizes for current path
 let selectedFolderIndex = 0; // Selected folder in disk treemap
+let pendingDelete = null; // { path, size } pending delete confirmation
 
 // Persistent stats history (collected continuously, survives view changes)
 // 1 minute at 5s interval = 12 data points
@@ -75,6 +78,18 @@ function notifyKillCancel() {
   }
 }
 
+function notifyDeleteConfirm() {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'deleteConfirm' }));
+  }
+}
+
+function notifyDeleteCancel() {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'deleteCancel' }));
+  }
+}
+
 // View change handler (called from SDK IPC and click handlers)
 function switchView(view) {
   if (currentView !== 'main') return;
@@ -103,6 +118,7 @@ async function renderCurrentView() {
     if (currentView === 'network') {
       requestConnections();
     } else if (currentView === 'disk') {
+      initDiskSelectedPath();
       folderData = [];
       requestFolderSizes(currentDiskPath);
     }
@@ -515,8 +531,11 @@ function renderDetailView(type) {
     `;
   } else if (type === 'disk') {
     content = `
-      <div id="detail-disk-path" class="disk-path"></div>
-      <div id="detail-disk-treemap" class="distribution-chart" style="flex:1;"></div>
+      <div id="detail-disk-path" class="disk-path" tabindex="-1"></div>
+      <div id="detail-disk-treemap" class="distribution-chart" style="flex:1;" tabindex="-1"></div>
+      <div style="margin-top:8px;" tabindex="-1">
+        <input type="text" id="disk-selected-path" value="" tabindex="0" autofocus style="width:100%;background:#2d2d2d;border:1px solid #444;color:#fff;padding:6px 10px;border-radius:4px;font-family:monospace;font-size:12px;">
+      </div>
     `;
   }
 
@@ -844,6 +863,9 @@ function renderFolderTreemap(containerId) {
       }
     });
   });
+
+  // Update selected path textbox
+  updateSelectedPath();
 }
 
 // Drill into a folder
@@ -867,6 +889,7 @@ function updateFolderSelection() {
     cell.style.outlineOffset = isSelected ? '-3px' : '';
     cell.style.zIndex = isSelected ? '10' : '';
   });
+  updateSelectedPath();
 }
 
 // Update disk path breadcrumb
@@ -875,7 +898,6 @@ function updateDiskPath() {
   if (!pathEl) return;
 
   const parts = currentDiskPath.split('/').filter(p => p);
-  // Format: / opt/ homebrew/ proto/
   let html = '<span class="path-item" data-path="/">/</span> ';
   let accumulated = '';
   for (const part of parts) {
@@ -884,7 +906,6 @@ function updateDiskPath() {
   }
   pathEl.innerHTML = html.trim();
 
-  // Add click handlers for breadcrumb navigation
   pathEl.querySelectorAll('.path-item').forEach(item => {
     item.addEventListener('click', () => {
       const path = item.dataset.path;
@@ -899,6 +920,60 @@ function updateDiskPath() {
   });
 }
 
+// Update selected folder path in textbox
+function updateSelectedPath() {
+  const input = document.getElementById('disk-selected-path');
+  if (!input) return;
+  const folder = folderData[selectedFolderIndex];
+  input.value = folder ? folder.path : currentDiskPath;
+}
+
+// Initialize selected path input with Enter handler
+function initDiskSelectedPath() {
+  const input = document.getElementById('disk-selected-path');
+  if (!input) return;
+
+  input.focus();
+
+  // Prevent clicks outside input from stealing focus
+  const container = document.getElementById('detail-fullscreen');
+  if (container) {
+    container.addEventListener('mousedown', (e) => {
+      if (e.target !== input) e.preventDefault();
+    });
+  }
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      let path = input.value.trim();
+      if (!path) return;
+
+      // Allow ~ paths, otherwise ensure starts with /
+      if (!path.startsWith('/') && !path.startsWith('~')) {
+        path = '/' + path;
+      }
+
+      // Remove trailing slash
+      if (path.length > 1 && path.endsWith('/')) {
+        path = path.slice(0, -1);
+      }
+
+      if (path !== currentDiskPath) {
+        // Store current as previous for reverting on error
+        previousDiskPath = currentDiskPath;
+        pendingDiskPath = path;
+        folderData = [];
+        selectedFolderIndex = 0;
+        // Don't update breadcrumb yet - wait for server response
+        renderFolderTreemap('detail-disk-treemap');
+        requestFolderSizes(path);
+      }
+    }
+  });
+}
+
 // Navigate up one directory level
 function navigateUp() {
   if (currentDiskPath === '/') return;
@@ -906,6 +981,7 @@ function navigateUp() {
   parts.pop();
   currentDiskPath = parts.length === 0 ? '/' : '/' + parts.join('/');
   folderData = [];
+  selectedFolderIndex = 0;
   updateDiskPath();
   renderFolderTreemap('detail-disk-treemap');
   requestFolderSizes(currentDiskPath);
@@ -1071,7 +1147,11 @@ function updateHints() {
       `;
     }
   } else if (currentView === 'disk') {
-    hints.innerHTML = '<span>←→↑↓: Select</span><span>Enter: Drill in</span><span>Backspace: Up</span><span>Esc: Back</span>';
+    if (pendingDelete) {
+      hints.innerHTML = `<span style="color: #f14c4c;">Delete "${pendingDelete.path}" (${formatBytes(pendingDelete.size)}) ? Y: Confirm, N: Cancel</span>`;
+    } else {
+      hints.innerHTML = '<span>Tab/Shift+Tab: Select</span><span>Enter: Go to path</span><span>Ctrl+Enter: Drill in</span><span>Ctrl+⌫: Up</span><span>Ctrl+D: Delete</span><span>Esc: Back</span>';
+    }
   } else {
     hints.innerHTML = '<span>Esc: Back</span>';
   }
@@ -1325,13 +1405,57 @@ function connectWebSocket() {
         updateUI(msg.data, false);
       } else if (msg.type === 'kill') {
         ws.send(JSON.stringify({ type: 'refresh' }));
+      } else if (msg.type === 'delete') {
+        if (msg.success && msg.path) {
+          // Remove deleted folder from cache and update display
+          folderData = folderData.filter(f => f.path !== msg.path);
+          if (selectedFolderIndex >= folderData.length) {
+            selectedFolderIndex = Math.max(0, folderData.length - 1);
+          }
+          if (currentView === 'disk') {
+            renderFolderTreemap('detail-disk-treemap');
+            updateSelectedPath();
+          }
+        }
       } else if (msg.type === 'connections') {
         connectionsData = msg.data || [];
         if (currentView === 'network') {
           renderConnectionsTreemap('detail-net-connections');
         }
       } else if (msg.type === 'folderSizes') {
-        folderData = msg.data || [];
+        const data = msg.data || [];
+
+        // Check if this is a response for a pending navigation
+        if (pendingDiskPath) {
+          // Check if response matches pending path (resolved or not)
+          const isForPending = msg.path === pendingDiskPath ||
+            (pendingDiskPath.startsWith('~') && msg.path && !msg.path.startsWith('~'));
+
+          if (isForPending) {
+            if (data.length === 0) {
+              // Path not found - revert to previous
+              currentDiskPath = previousDiskPath;
+              pendingDiskPath = null;
+              // Restore previous view
+              requestFolderSizes(currentDiskPath);
+              return;
+            }
+            // Success - update to resolved path
+            currentDiskPath = msg.path;
+            pendingDiskPath = null;
+            updateDiskPath();
+          } else {
+            // Response for different path - ignore
+            return;
+          }
+        } else {
+          // Normal update (not from textbox navigation)
+          if (msg.path && msg.path !== currentDiskPath) {
+            return; // Ignore stale responses
+          }
+        }
+
+        folderData = data;
         if (currentView === 'disk') {
           renderFolderTreemap('detail-disk-treemap');
         }
@@ -1353,6 +1477,26 @@ function killProcess(pid) {
   if (ws && wsConnected) {
     ws.send(JSON.stringify({ type: 'kill', pid }));
   }
+}
+
+function deleteFolder(path) {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'delete', path }));
+  }
+}
+
+function showToast(message) {
+  // Create or reuse toast element
+  let toast = document.getElementById('toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'toast';
+    toast.style.cssText = 'position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:8px 16px;border-radius:4px;z-index:9999;opacity:0;transition:opacity 0.3s;';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.style.opacity = '1';
+  setTimeout(() => { toast.style.opacity = '0'; }, 2000);
 }
 
 // Request fresh metrics from server (returns promise)
@@ -1468,31 +1612,39 @@ window.addEventListener('keydown', (e) => {
 
   // State 3: Detail views (cpu, memory, network, disk)
   if (['cpu', 'memory', 'network', 'disk'].includes(currentView)) {
-    if (key === 'Escape') {
-      hideDetailView();
-      return;
-    }
-
-    // Disk view keyboard navigation
-    if (currentView === 'disk' && folderData.length > 0) {
-      if (key === 'Backspace') {
+    // Disk view keyboard navigation (textbox always focused)
+    if (currentView === 'disk') {
+      // Escape: back to main
+      if (key === 'Escape') {
         e.preventDefault();
-        navigateUp();
+        hideDetailView();
         return;
       }
-      if (key === 'ArrowUp' || key === 'ArrowLeft') {
+      // Tab/Shift+Tab: select folder
+      if (key === 'Tab') {
         e.preventDefault();
-        selectedFolderIndex = Math.max(0, selectedFolderIndex - 1);
-        updateFolderSelection();
+        if (folderData.length > 0) {
+          if (e.shiftKey) {
+            selectedFolderIndex = Math.max(0, selectedFolderIndex - 1);
+          } else {
+            selectedFolderIndex = Math.min(folderData.length - 1, selectedFolderIndex + 1);
+          }
+          updateFolderSelection();
+        }
         return;
       }
-      if (key === 'ArrowDown' || key === 'ArrowRight') {
-        e.preventDefault();
-        selectedFolderIndex = Math.min(folderData.length - 1, selectedFolderIndex + 1);
-        updateFolderSelection();
+      // Ctrl+A or Cmd+A: Select all text in textbox
+      if (key === 'a' && (e.ctrlKey || e.metaKey)) {
+        const input = document.getElementById('disk-selected-path');
+        if (input) {
+          e.preventDefault();
+          e.stopPropagation();
+          input.select();
+        }
         return;
       }
-      if (key === 'Enter') {
+      // Ctrl+Enter: Drill into selected folder
+      if (key === 'Enter' && e.ctrlKey) {
         e.preventDefault();
         const folder = folderData[selectedFolderIndex];
         if (folder) {
@@ -1500,6 +1652,31 @@ window.addEventListener('keydown', (e) => {
         }
         return;
       }
+      // Ctrl+Backspace: Go up one level
+      if (key === 'Backspace' && e.ctrlKey) {
+        e.preventDefault();
+        navigateUp();
+        return;
+      }
+      // Ctrl+D: Delete selected folder (with confirmation)
+      if (key === 'd' && e.ctrlKey) {
+        e.preventDefault();
+        const folder = folderData[selectedFolderIndex];
+        if (folder) {
+          pendingDelete = { path: folder.path, size: folder.size };
+          notifyDeleteConfirm();
+          updateHints();
+        }
+        return;
+      }
+      // Let Enter and other keys pass through to textbox
+      return;
+    }
+
+    // Other detail views (cpu, memory, network)
+    if (key === 'Escape') {
+      hideDetailView();
+      return;
     }
   }
 }, true); // Capture phase - runs before input element receives event
@@ -1586,6 +1763,18 @@ document.addEventListener('DOMContentLoaded', () => {
       } else if (action === 'kill:cancel' && pendingKill) {
         pendingKill = null;
         notifyKillCancel();
+        updateHints();
+      }
+      // Delete confirmation via SDK (y/n keys)
+      else if (action === 'delete:confirm' && pendingDelete) {
+        const pathToDelete = pendingDelete.path;
+        pendingDelete = null;
+        notifyDeleteCancel();
+        updateHints();
+        deleteFolder(pathToDelete);
+      } else if (action === 'delete:cancel' && pendingDelete) {
+        pendingDelete = null;
+        notifyDeleteCancel();
         updateHints();
       }
     }
