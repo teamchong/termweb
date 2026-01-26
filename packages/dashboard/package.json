@@ -1,6 +1,6 @@
 {
   "name": "termweb-dashboard",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Terminal-based system monitoring dashboard powered by termweb",
   "bin": {
     "termweb-dashboard": "bin/cli.js"
@@ -36,7 +36,7 @@
   "dependencies": {
     "chart.js": "^4.4.1",
     "systeminformation": "^5.21.0",
-    "termweb": "workspace:*",
+    "termweb": "^0.9.6",
     "ws": "^8.14.0"
   },
   "devDependencies": {

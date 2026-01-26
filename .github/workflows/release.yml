@@ -168,6 +168,41 @@ jobs:
       - name: Publish to npm (OIDC)
         run: npm publish --provenance --access public
 
+  update-dashboard-dep:
+    needs: [auto-tag, publish-npm]
+    if: needs.auto-tag.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update termweb version in dashboard
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          cd packages/dashboard
+          # Update termweb dependency version
+          sed -i 's/"termweb": "[^"]*"/"termweb": "^'"$VERSION"'"/' package.json
+          # Check if changed
+          if git diff --quiet package.json; then
+            echo "No changes needed"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Updated termweb to ^$VERSION"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+        id: update
+
+      - name: Commit and push
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/dashboard/package.json
+          git commit -m "chore(dashboard): update termweb to ^$(node -p "require('./package.json').version")"
+          git push
+
   publish-dashboard:
     runs-on: ubuntu-latest
     permissions:
