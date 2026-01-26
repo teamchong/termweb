@@ -176,31 +176,39 @@ Press `Ctrl+H` to enter hint mode. Yellow labels appear on all clickable element
 
 Pre-built terminal applications powered by termweb:
 
-### @termweb/code
+### termweb-dashboard
+
+System monitoring dashboard with CPU, memory, disk, network, and process views.
+
+```bash
+npx termweb-dashboard
+```
+
+### termweb-code
 
 Full-featured code editor with syntax highlighting for 20+ languages.
 
 ```bash
-npx @termweb/code ./src/index.js
-npx @termweb/code ~/projects/app/main.py
+npx termweb-code ./src/index.js
+npx termweb-code ~/projects/app/main.py
 ```
 
-### @termweb/markdown
+### termweb-markdown
 
 Markdown editor with live preview pane.
 
 ```bash
-npx @termweb/markdown ./README.md
-npx @termweb/markdown ~/docs/notes.md
+npx termweb-markdown ./README.md
+npx termweb-markdown ~/docs/notes.md
 ```
 
-### @termweb/json
+### termweb-json
 
 JSON editor with validation, formatting, and key sorting.
 
 ```bash
-npx @termweb/json ./package.json
-npx @termweb/json ~/config/settings.json
+npx termweb-json ./package.json
+npx termweb-json ~/config/settings.json
 ```
 
 ## Documentation
