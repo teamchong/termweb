@@ -224,14 +224,16 @@ function getLoadClass(load) {
 function getFilteredProcesses() {
   let list = [...processList];
 
-  // Filter
+  // Filter (case-insensitive, ignore spaces)
   if (filterText) {
-    const lower = filterText.toLowerCase();
-    list = list.filter(p =>
-      p.name.toLowerCase().includes(lower) ||
-      p.pid.toString().includes(lower) ||
-      (p.ports && p.ports.some(port => port.includes(lower)))
-    );
+    const normalized = filterText.toLowerCase().replace(/\s+/g, '');
+    list = list.filter(p => {
+      const nameNorm = p.name.toLowerCase().replace(/\s+/g, '');
+      const pidStr = p.pid.toString();
+      return nameNorm.includes(normalized) ||
+        pidStr.includes(normalized) ||
+        (p.ports && p.ports.some(port => port.includes(normalized)));
+    });
   }
 
   // Sort using smoothed values for cpu/mem to prevent jumping
