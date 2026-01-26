@@ -188,7 +188,7 @@ jobs:
         run: |
           cd packages/dashboard
           LOCAL_VERSION=$(node -p "require('./package.json').version")
-          NPM_VERSION=$(npm view @termweb/dashboard version 2>/dev/null || echo "0.0.0")
+          NPM_VERSION=$(npm view termweb-dashboard version 2>/dev/null || echo "0.0.0")
           echo "Local: $LOCAL_VERSION, npm: $NPM_VERSION"
           if [ "$LOCAL_VERSION" != "$NPM_VERSION" ]; then
             echo "should_publish=true" >> $GITHUB_OUTPUT

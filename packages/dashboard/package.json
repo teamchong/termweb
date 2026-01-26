@@ -1,5 +1,5 @@
 {
-  "name": "@termweb/dashboard",
+  "name": "termweb-dashboard",
   "version": "0.2.1",
   "description": "Terminal-based system monitoring dashboard powered by termweb",
   "bin": {
