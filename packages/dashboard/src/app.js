@@ -419,7 +419,7 @@ function renderProcessView() {
     applySortOrder();
   });
 
-  // Arrow keys and Escape work even when search focused
+  // Navigation keys work even when search focused
   input.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowUp') {
       e.preventDefault();
@@ -432,7 +432,7 @@ function renderProcessView() {
       const oldIndex = selectedProcessIndex;
       selectedProcessIndex = Math.min(filtered.length - 1, selectedProcessIndex + 1);
       updateSelectionFast(oldIndex, selectedProcessIndex);
-    } else if (e.key === 'ArrowLeft') {
+    } else if (e.key === 'Tab' && e.shiftKey) {
       e.preventDefault();
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length];
@@ -442,7 +442,7 @@ function renderProcessView() {
       applySortOrder();
       updateHints();
       requestMetrics('full').then(data => { if (data) updateUI(data, true); });
-    } else if (e.key === 'ArrowRight') {
+    } else if (e.key === 'Tab' && !e.shiftKey) {
       e.preventDefault();
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
@@ -626,7 +626,7 @@ function updateHints() {
     hints.innerHTML = '<span>c: CPU</span><span>m: Memory</span><span>n: Network</span><span>d: Disk</span><span>p: Processes</span><span>Ctrl+Q: Quit</span>';
   } else if (currentView === 'processes') {
     hints.innerHTML = `
-      <span>←→: Sort (${sortColumn})</span>
+      <span>Tab: Sort (${sortColumn})</span>
       <span>↑↓: Select</span>
       <span>Ctrl+K: Kill</span>
       <span>Esc: Back</span>
@@ -877,29 +877,25 @@ window.addEventListener('keydown', async (e) => {
       if (!updateSelectionFast(oldIndex, selectedProcessIndex)) {
         renderProcessView();
       }
-    } else if (e.key === 'ArrowLeft') {
+    } else if (e.key === 'Tab' && e.shiftKey) {
       e.preventDefault();
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length];
       selectedProcessIndex = 0;
-      // Instant: update header + apply CSS order
       const thead = document.querySelector('.process-table thead tr');
       if (thead) thead.innerHTML = buildTableHeader();
       if (!applySortOrder()) renderProcessView();
       updateHints();
-      // Background: fetch fresh data
       requestMetrics('full').then(data => { if (data) updateUI(data, true); });
-    } else if (e.key === 'ArrowRight') {
+    } else if (e.key === 'Tab' && !e.shiftKey) {
       e.preventDefault();
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
       selectedProcessIndex = 0;
-      // Instant: update header + apply CSS order
       const thead = document.querySelector('.process-table thead tr');
       if (thead) thead.innerHTML = buildTableHeader();
       if (!applySortOrder()) renderProcessView();
       updateHints();
-      // Background: fetch fresh data
       requestMetrics('full').then(data => { if (data) updateUI(data, true); });
     } else if (e.key === '/' || e.key === 'f') {
       // Focus search box
