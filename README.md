@@ -13,7 +13,8 @@ https://github.com/user-attachments/assets/70b86b29-19b4-458b-8d5d-683f5e139908
 
 ## Demo: SDK: building apps with termweb as render engine
 
-https://github.com/user-attachments/assets/12183bb7-de8b-4e44-b884-216e304ab8ce
+https://github.com/user-attachments/assets/50e068bd-4aa4-463e-bd7f-73e81ae51e93
+
 
 ## Features
 
