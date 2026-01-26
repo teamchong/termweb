@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'package.json'
+      - 'packages/dashboard/package.json'
 
 jobs:
   auto-tag:
@@ -166,3 +167,43 @@ jobs:
 
       - name: Publish to npm (OIDC)
         run: npm publish --provenance --access public
+
+  publish-dashboard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Check if dashboard needs publishing
+        id: check
+        run: |
+          cd packages/dashboard
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          NPM_VERSION=$(npm view @termweb/dashboard version 2>/dev/null || echo "0.0.0")
+          echo "Local: $LOCAL_VERSION, npm: $NPM_VERSION"
+          if [ "$LOCAL_VERSION" != "$NPM_VERSION" ]; then
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.should_publish == 'true'
+        run: npm install
+
+      - name: Build dashboard
+        if: steps.check.outputs.should_publish == 'true'
+        run: cd packages/dashboard && npm run build
+
+      - name: Publish dashboard to npm
+        if: steps.check.outputs.should_publish == 'true'
+        run: cd packages/dashboard && npm publish --provenance --access public
