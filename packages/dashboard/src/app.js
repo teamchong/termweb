@@ -80,14 +80,15 @@ window.__termwebView = function(view) {
 };
 
 window.__termwebFilter = function() {
-  // f only works on main or processes view
-  if (currentView !== 'main' && currentView !== 'processes') return;
+  // Open processes view and focus search
   if (currentView === 'main') {
     currentView = 'processes';
+    renderCurrentView();
   }
-  selectedProcessIndex = 0;
-  isFiltering = true;
-  renderCurrentView();
+  setTimeout(() => {
+    const input = document.getElementById('filter-input');
+    if (input) input.focus();
+  }, 0);
 };
 
 window.__termwebEsc = function() {
@@ -391,8 +392,8 @@ function renderProcessView() {
 
   container.innerHTML = `
     <div class="process-header">
-      <h2>Processes${filterText ? ` (filter: "${filterText}")` : ''}</h2>
-      ${isFiltering ? `<input type="text" id="filter-input" value="${filterText}" placeholder="Filter by name or port..." autofocus>` : ''}
+      <h2>Processes</h2>
+      <input type="text" id="filter-input" value="${filterText}" placeholder="Search by name, pid, or port...">
     </div>
     <div class="process-table-wrap">
       <table class="process-table">
@@ -402,8 +403,15 @@ function renderProcessView() {
     </div>
   `;
 
+  // Setup search input handler
+  const input = document.getElementById('filter-input');
+  input.addEventListener('input', (e) => {
+    filterText = e.target.value;
+    selectedProcessIndex = 0;
+    applySortOrder();
+  });
+
   if (isFiltering) {
-    const input = document.getElementById('filter-input');
     input.focus();
     input.selectionStart = input.selectionEnd = input.value.length;
   }
@@ -570,13 +578,10 @@ function updateHints() {
   const hints = document.getElementById('hints');
   if (currentView === 'main') {
     hints.innerHTML = '<span>c: CPU</span><span>m: Memory</span><span>n: Network</span><span>d: Disk</span><span>p: Processes</span><span>Ctrl+Q: Quit</span>';
-  } else if (currentView === 'processes' && isFiltering) {
-    hints.innerHTML = '<span>Type to filter</span><span>Enter: Apply</span><span>Esc: Cancel</span>';
   } else if (currentView === 'processes') {
     hints.innerHTML = `
       <span>←→: Sort (${sortColumn})</span>
       <span>↑↓: Select</span>
-      <span>f: Filter</span>
       <span>Ctrl+K: Kill</span>
       <span>Esc: Back</span>
     `;
@@ -798,15 +803,16 @@ function requestMetrics(type = 'full') {
 // Main view keys (p, c, m, n, d, f) are handled by SDK via WebSocket
 window.addEventListener('keydown', async (e) => {
   if (currentView === 'processes') {
-    if (isFiltering) {
-      if (e.key === 'Escape') {
-        isFiltering = false;
-        renderProcessView();
-      } else if (e.key === 'Enter') {
-        isFiltering = false;
-        renderProcessView();
+    const searchInput = document.getElementById('filter-input');
+    const isSearchFocused = document.activeElement === searchInput;
+
+    // When search is focused, Escape/Enter blur it
+    if (isSearchFocused) {
+      if (e.key === 'Escape' || e.key === 'Enter') {
+        searchInput.blur();
+        e.preventDefault();
       }
-      return;
+      return; // Let other keys go to input
     }
 
     if (e.key === 'Escape') {
@@ -851,9 +857,10 @@ window.addEventListener('keydown', async (e) => {
       // Background: fetch fresh data
       requestMetrics('full').then(data => { if (data) updateUI(data, true); });
     } else if (e.key === '/' || e.key === 'f') {
+      // Focus search box
       e.preventDefault();
-      isFiltering = true;
-      renderProcessView();
+      const input = document.getElementById('filter-input');
+      if (input) input.focus();
     } else if (e.key === 'k' && e.ctrlKey) {
       e.preventDefault();
       if (filtered[selectedProcessIndex]) {
@@ -869,14 +876,6 @@ window.addEventListener('keydown', async (e) => {
     if (e.key === 'Escape') {
       hideDetailView();
     }
-  }
-});
-
-// Filter input handling
-document.addEventListener('input', (e) => {
-  if (e.target.id === 'filter-input') {
-    filterText = e.target.value;
-    selectedProcessIndex = 0;
   }
 });
 
