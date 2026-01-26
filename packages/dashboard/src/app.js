@@ -272,30 +272,39 @@ function getFilteredProcesses() {
   return list;
 }
 
-// Fast selection update - just moves the selected class without re-rendering
+// Fast selection update - works with CSS-ordered rows
 function updateSelectionFast(oldIndex, newIndex) {
   const tbody = document.querySelector('.process-table tbody');
   if (!tbody) return false;
 
-  const rows = tbody.querySelectorAll('tr');
-  if (oldIndex >= 0 && oldIndex < rows.length) {
-    rows[oldIndex].classList.remove('selected');
+  const filtered = getFilteredProcesses();
+  if (newIndex < 0 || newIndex >= filtered.length) return false;
+
+  // Find rows by PID (since visual order is via CSS)
+  const oldPid = filtered[oldIndex]?.pid;
+  const newPid = filtered[newIndex]?.pid;
+
+  if (oldPid !== undefined) {
+    const oldRow = tbody.querySelector(`tr[data-pid="${oldPid}"]`);
+    if (oldRow) oldRow.classList.remove('selected');
   }
-  if (newIndex >= 0 && newIndex < rows.length) {
-    rows[newIndex].classList.add('selected');
-    // Scroll into view if needed
-    rows[newIndex].scrollIntoView({ block: 'nearest' });
-    return true;
+  if (newPid !== undefined) {
+    const newRow = tbody.querySelector(`tr[data-pid="${newPid}"]`);
+    if (newRow) {
+      newRow.classList.add('selected');
+      newRow.scrollIntoView({ block: 'nearest' });
+      return true;
+    }
   }
   return false;
 }
 
-// Build table rows HTML from filtered process list
+// Build table rows HTML from filtered process list (with data-pid for CSS order)
 function buildTableRows(filtered) {
   return filtered.map((p, i) => {
     const selected = i === selectedProcessIndex;
     const ports = p.ports?.join(', ') || '-';
-    return `<tr class="${selected ? 'selected' : ''}">
+    return `<tr data-pid="${p.pid}" style="order: ${i}" class="${selected ? 'selected' : ''}">
       <td>${p.pid}</td>
       <td>${p.name}</td>
       <td class="${getLoadClass(p.cpu)}">${p.cpu.toFixed(1)}%</td>
@@ -305,6 +314,45 @@ function buildTableRows(filtered) {
       <td>${p.user}</td>
     </tr>`;
   }).join('');
+}
+
+// Apply sort order via CSS (no DOM rebuild)
+function applySortOrder() {
+  const tbody = document.querySelector('.process-table tbody');
+  if (!tbody) return false;
+
+  const filtered = getFilteredProcesses();
+  const rows = tbody.querySelectorAll('tr');
+
+  // Build pid -> new order map
+  const orderMap = new Map();
+  filtered.forEach((p, i) => orderMap.set(p.pid, i));
+
+  // Apply CSS order to each row
+  rows.forEach(row => {
+    const pid = parseInt(row.dataset.pid, 10);
+    const order = orderMap.get(pid);
+    if (order !== undefined) {
+      row.style.order = order;
+      row.style.display = '';
+    } else {
+      // Hide rows not in filtered list
+      row.style.display = 'none';
+    }
+  });
+
+  // Update selection
+  rows.forEach(row => row.classList.remove('selected'));
+  if (filtered[selectedProcessIndex]) {
+    const selectedPid = filtered[selectedProcessIndex].pid;
+    const selectedRow = tbody.querySelector(`tr[data-pid="${selectedPid}"]`);
+    if (selectedRow) {
+      selectedRow.classList.add('selected');
+      selectedRow.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  return true;
 }
 
 // Build table header HTML
@@ -706,6 +754,33 @@ function killProcess(pid) {
   }
 }
 
+// Request fresh metrics from server (returns promise)
+function requestMetrics(type = 'full') {
+  return new Promise((resolve) => {
+    if (!ws || !wsConnected) {
+      resolve(null);
+      return;
+    }
+    // One-time listener for response
+    const handler = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'full') {
+          ws.removeEventListener('message', handler);
+          resolve(msg.data);
+        }
+      } catch (e) {}
+    };
+    ws.addEventListener('message', handler);
+    ws.send(JSON.stringify({ type: 'refresh' }));
+    // Timeout after 2 seconds
+    setTimeout(() => {
+      ws.removeEventListener('message', handler);
+      resolve(null);
+    }, 2000);
+  });
+}
+
 // Keyboard handling - only for process view navigation (arrow keys, etc.)
 // Main view keys (p, c, m, n, d, f) are handled by SDK via WebSocket
 window.addEventListener('keydown', async (e) => {
@@ -743,15 +818,25 @@ window.addEventListener('keydown', async (e) => {
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length];
       selectedProcessIndex = 0;
-      if (!updateTable()) renderProcessView();
+      // Instant: update header + apply CSS order
+      const thead = document.querySelector('.process-table thead tr');
+      if (thead) thead.innerHTML = buildTableHeader();
+      if (!applySortOrder()) renderProcessView();
       updateHints();
+      // Background: fetch fresh data
+      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
     } else if (e.key === 'ArrowRight') {
       e.preventDefault();
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
       selectedProcessIndex = 0;
-      if (!updateTable()) renderProcessView();
+      // Instant: update header + apply CSS order
+      const thead = document.querySelector('.process-table thead tr');
+      if (thead) thead.innerHTML = buildTableHeader();
+      if (!applySortOrder()) renderProcessView();
       updateHints();
+      // Background: fetch fresh data
+      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
     } else if (e.key === '/' || e.key === 'f') {
       e.preventDefault();
       isFiltering = true;
