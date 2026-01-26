@@ -1,5 +1,5 @@
 {
-  "name": "@termweb/editor",
+  "name": "termweb-editor",
   "version": "0.1.0",
   "description": "Terminal-based code editor powered by termweb",
   "bin": {
@@ -19,7 +19,7 @@
     "code",
     "cli"
   ],
-  "author": "teamchong",
+  "author": "teamch",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -44,7 +44,7 @@
     "@codemirror/theme-one-dark": "^6.1.2",
     "@codemirror/view": "^6.23.1",
     "codemirror": "^6.0.1",
-    "termweb": "workspace:*"
+    "termweb": "^0.9.6"
   },
   "devDependencies": {
     "esbuild": "^0.19.0"

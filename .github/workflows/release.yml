@@ -121,11 +121,20 @@ jobs:
       - name: Rename binary
         run: mv zig-out/bin/termweb ${{ matrix.name }}
 
-      - name: Upload artifact
+      - name: Rename node addon
+        run: mv zig-out/lib/termweb.node ${{ matrix.name }}.node
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
+
+      - name: Upload node addon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}.node
+          path: ${{ matrix.name }}.node
 
   release:
     needs: [auto-tag, build]
@@ -147,9 +156,13 @@ jobs:
             termweb-macos-x86_64/termweb-macos-x86_64
             termweb-linux-x86_64/termweb-linux-x86_64
             termweb-linux-aarch64/termweb-linux-aarch64
+            termweb-macos-aarch64.node/termweb-macos-aarch64.node
+            termweb-macos-x86_64.node/termweb-macos-x86_64.node
+            termweb-linux-x86_64.node/termweb-linux-x86_64.node
+            termweb-linux-aarch64.node/termweb-linux-aarch64.node
 
   publish-npm:
-    needs: [auto-tag, release]
+    needs: [auto-tag, build]
     if: needs.auto-tag.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -158,6 +171,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Bundle native modules and binaries
+        run: |
+          mkdir -p native
+          # Copy .node addons
+          for f in artifacts/*.node/*.node; do
+            cp "$f" native/
+          done
+          # Copy binaries
+          for name in termweb-macos-aarch64 termweb-macos-x86_64 termweb-linux-x86_64 termweb-linux-aarch64; do
+            cp "artifacts/$name/$name" "native/$name"
+          done
+          ls -la native/
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

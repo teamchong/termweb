@@ -27,11 +27,11 @@ if (!platformName || !archName) {
 }
 
 const binaryName = `termweb-${platformName}-${archName}`;
-const binaryPath = path.join(__dirname, '..', 'binaries', binaryName);
+const binaryPath = path.join(__dirname, '..', 'native', binaryName);
 
 if (!fs.existsSync(binaryPath)) {
   console.error(`Binary not found: ${binaryPath}`);
-  console.error('Run `npm run postinstall` to download the binary.');
+  console.error('Please reinstall: npm install termweb');
   process.exit(1);
 }
 

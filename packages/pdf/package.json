@@ -1,5 +1,5 @@
 {
-  "name": "@termweb/pdf",
+  "name": "termweb-pdf",
   "version": "0.1.0",
   "description": "Terminal-based PDF viewer powered by termweb",
   "bin": {
@@ -19,7 +19,7 @@
     "viewer",
     "cli"
   ],
-  "author": "teamchong",
+  "author": "teamch",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -31,7 +31,7 @@
   },
   "dependencies": {
     "pdfjs-dist": "^4.0.379",
-    "termweb": "workspace:*"
+    "termweb": "^0.9.6"
   },
   "devDependencies": {
     "esbuild": "^0.19.0"

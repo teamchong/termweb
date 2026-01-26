@@ -1,5 +1,5 @@
 {
-  "name": "@termweb/code",
+  "name": "termweb-code",
   "version": "0.1.0",
   "description": "Terminal-based code editor powered by Monaco Editor and termweb",
   "bin": {
@@ -19,7 +19,7 @@
     "code",
     "cli"
   ],
-  "author": "teamchong",
+  "author": "teamch",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -30,6 +30,6 @@
     "access": "public"
   },
   "dependencies": {
-    "termweb": "workspace:*"
+    "termweb": "^0.9.6"
   }
 }
