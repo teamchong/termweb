@@ -177,6 +177,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -198,11 +203,11 @@ jobs:
 
       - name: Install dependencies
         if: steps.check.outputs.should_publish == 'true'
-        run: npm install
+        run: pnpm install
 
       - name: Build dashboard
         if: steps.check.outputs.should_publish == 'true'
-        run: cd packages/dashboard && npm run build
+        run: cd packages/dashboard && pnpm run build
 
       - name: Publish dashboard to npm
         if: steps.check.outputs.should_publish == 'true'
