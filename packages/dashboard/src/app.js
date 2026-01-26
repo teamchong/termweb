@@ -411,10 +411,47 @@ function renderProcessView() {
     applySortOrder();
   });
 
-  if (isFiltering) {
-    input.focus();
-    input.selectionStart = input.selectionEnd = input.value.length;
-  }
+  // Arrow keys and Escape work even when search focused
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      const oldIndex = selectedProcessIndex;
+      selectedProcessIndex = Math.max(0, selectedProcessIndex - 1);
+      updateSelectionFast(oldIndex, selectedProcessIndex);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      const filtered = getFilteredProcesses();
+      const oldIndex = selectedProcessIndex;
+      selectedProcessIndex = Math.min(filtered.length - 1, selectedProcessIndex + 1);
+      updateSelectionFast(oldIndex, selectedProcessIndex);
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      const idx = SORT_COLUMNS.indexOf(sortColumn);
+      sortColumn = SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length];
+      selectedProcessIndex = 0;
+      const thead = document.querySelector('.process-table thead tr');
+      if (thead) thead.innerHTML = buildTableHeader();
+      applySortOrder();
+      updateHints();
+      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      const idx = SORT_COLUMNS.indexOf(sortColumn);
+      sortColumn = SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
+      selectedProcessIndex = 0;
+      const thead = document.querySelector('.process-table thead tr');
+      if (thead) thead.innerHTML = buildTableHeader();
+      applySortOrder();
+      updateHints();
+      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      hideDetailView();
+    }
+  });
+
+  // Always focus search box
+  input.focus();
 
   container.style.display = 'flex';
   document.getElementById('main-dashboard').style.display = 'none';
