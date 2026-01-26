@@ -2,7 +2,7 @@
 
 const path = require('path');
 const termweb = require('termweb');
-const { collectMetrics, collectLightMetrics, killProcess } = require('../lib/metrics');
+const { startServer } = require('../lib/server');
 
 const args = process.argv.slice(2);
 const verbose = args.includes('--verbose') || args.includes('-v');
@@ -29,72 +29,41 @@ Displays system metrics:
 
 async function main() {
   try {
-    const htmlPath = path.join(__dirname, '..', 'dist', 'index.html');
-    const url = `file://${htmlPath}`;
+    // Start WebSocket server (random port)
+    const { port, wss } = await startServer(0);
+    if (verbose) console.log(`[Dashboard] WebSocket server on port ${port}`);
 
-    // Register message handler for metrics requests
-    termweb.onMessage(async (message) => {
-      if (verbose) console.log('[IPC] Received:', message);
+    // Open page with WebSocket port
+    const url = `http://127.0.0.1:${port}/`;
 
-      // Parse message: id:type or id:kill:pid
-      const parts = message.split(':');
-      if (parts.length < 2) return;
-
-      const id = parts[0];
-      const type = parts[1];
-
-      try {
-        if (type === 'kill' && parts.length >= 3) {
-          // Kill process: id:kill:pid
-          const pid = parseInt(parts[2], 10);
-          const success = killProcess(pid);
-          const script = `window.__termwebKillResponse(${id}, ${success})`;
-          termweb.evalJS(script);
-        } else {
-          // Metrics request
-          let metrics;
-          if (type === 'full') {
-            metrics = await collectMetrics();
-          } else {
-            metrics = await collectLightMetrics();
-          }
-
-          // Send metrics back to browser via evalJS
-          const script = `window.__termwebMetricsResponse(${id}, ${JSON.stringify(metrics)})`;
-          termweb.evalJS(script);
-        }
-      } catch (err) {
-        if (verbose) console.error('[IPC] Error:', err);
-      }
-    });
-
-    // Register close handler
     termweb.onClose(() => {
       if (verbose) console.log('[Dashboard] Viewer closed');
       process.exit(0);
     });
 
-    // Open viewer asynchronously (non-blocking)
-    // allowedHotkeys: only allow Ctrl+Q to quit, disable all other termweb shortcuts
-    // keyBindings: map keys to JS functions (handled by termweb, works across page navigations)
+    // SDK handles keys, sends action to page via SDK IPC
+    termweb.onKeyBinding((key, action) => {
+      if (verbose) console.log(`[KeyBinding] ${key} -> ${action}`);
+      // Use SDK IPC to send action directly to page
+      termweb.sendToPage({ type: 'action', action });
+    });
+
     termweb.openAsync(url, {
       toolbar: false,
       allowedHotkeys: ['quit'],
+      singleTab: true,
       keyBindings: {
-        p: 'window.__termwebView && window.__termwebView("processes")',
-        n: 'window.__termwebView && window.__termwebView("network")',
-        d: 'window.__termwebView && window.__termwebView("disk")',
-        m: 'window.__termwebView && window.__termwebView("memory")',
-        c: 'window.__termwebView && window.__termwebView("cpu")',
-        f: 'window.__termwebFilter && window.__termwebFilter()'
+        p: 'view:processes',
+        c: 'view:cpu',
+        m: 'view:memory',
+        n: 'view:network',
+        d: 'view:disk',
+        f: 'filter'
       },
       verbose
     });
 
     if (verbose) console.log('[Dashboard] Started, press Ctrl+Q to quit...');
-
-    // Keep process alive
-    process.stdin.resume();
 
   } catch (err) {
     console.error('Error:', err.message);

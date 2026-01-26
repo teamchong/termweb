@@ -154,7 +154,8 @@ pub const Viewer = struct {
     toolbar_disabled: bool, // --no-toolbar flag
     hotkeys_disabled: bool, // --disable-hotkeys flag (legacy, use allowed_hotkeys)
     allowed_hotkeys: ?u32, // Bitmask of allowed actions when set (null = all allowed)
-    key_bindings: ?*const [26]?[]const u8, // Map a-z to JS code (null = no bindings)
+    key_bindings: ?*const [26]?[]const u8, // Map a-z to action strings (null = no bindings)
+    keybind_callback: ?*const fn (u8, []const u8) void, // Callback when key binding fires (key, action)
     hints_disabled: bool, // --disable-hints flag
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
     pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
@@ -331,6 +332,7 @@ pub const Viewer = struct {
             .hotkeys_disabled = false,
             .allowed_hotkeys = null,
             .key_bindings = null,
+            .keybind_callback = null,
             .hints_disabled = false,
             .single_tab_mode = false,
             .pending_tab_switch = null,
@@ -415,9 +417,14 @@ pub const Viewer = struct {
         self.allowed_hotkeys = mask;
     }
 
-    /// Set key bindings (map a-z to JS code to execute)
+    /// Set key bindings (map a-z to action strings)
     pub fn setKeyBindings(self: *Viewer, bindings: ?*const [26]?[]const u8) void {
         self.key_bindings = bindings;
+    }
+
+    /// Set keybind callback (called when a key binding fires)
+    pub fn setKeybindCallback(self: *Viewer, callback: ?*const fn (u8, []const u8) void) void {
+        self.keybind_callback = callback;
     }
 
     /// Disable hint mode (Ctrl+H)

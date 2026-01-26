@@ -62,9 +62,12 @@ pub fn handleInput(viewer: anytype, input: Input) !void {
                     if (event.base_key.getChar()) |c| {
                         if (c >= 'a' and c <= 'z') {
                             const idx = c - 'a';
-                            if (bindings[idx]) |js_code| {
-                                viewer.log("[KEYBIND] Executing JS for '{c}'\n", .{c});
-                                interact_mod.evalJS(viewer.cdp_client, viewer.allocator, js_code);
+                            if (bindings[idx]) |action| {
+                                viewer.log("[KEYBIND] Key '{c}' -> action: {s}\n", .{ c, action });
+                                // Call the keybind callback (notifies Node.js)
+                                if (viewer.keybind_callback) |callback| {
+                                    callback(c, action);
+                                }
                                 return;
                             }
                         }

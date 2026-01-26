@@ -2,52 +2,61 @@
  * System metrics collector using systeminformation
  */
 const si = require('systeminformation');
-const { execSync } = require('child_process');
+const { exec } = require('child_process');
+const { Worker, isMainThread, parentPort } = require('worker_threads');
+const path = require('path');
 
 // Cache for port info (expensive to fetch)
 let portCache = new Map();
 let portCacheTime = 0;
 const PORT_CACHE_TTL = 5000; // 5 seconds
 
+// Cache for heavy metrics (collected in background)
+let metricsCache = null;
+let metricsCacheTime = 0;
+let metricsRefreshing = false;
+const METRICS_CACHE_TTL = 500; // 500ms - return cached data quickly
+
 /**
- * Get port info for processes (cached)
+ * Get port info for processes (cached, async)
  */
-function getPortInfo() {
+async function getPortInfo() {
   const now = Date.now();
   if (now - portCacheTime < PORT_CACHE_TTL && portCache.size > 0) {
     return portCache;
   }
 
-  try {
-    // Use lsof to get listening ports (fast query)
-    const output = execSync('lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null || true', {
+  return new Promise((resolve) => {
+    exec('lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null || true', {
       encoding: 'utf-8',
       timeout: 2000
-    });
+    }, (err, output) => {
+      if (err) {
+        resolve(portCache); // Return old cache on error
+        return;
+      }
 
-    portCache = new Map();
-    const lines = output.split('\n').slice(1); // Skip header
-    for (const line of lines) {
-      const parts = line.split(/\s+/);
-      if (parts.length >= 9) {
-        const pid = parseInt(parts[1], 10);
-        const portMatch = parts[8]?.match(/:(\d+)$/);
-        if (pid && portMatch) {
-          const port = portMatch[1];
-          if (portCache.has(pid)) {
-            portCache.get(pid).push(port);
-          } else {
-            portCache.set(pid, [port]);
+      portCache = new Map();
+      const lines = output.split('\n').slice(1); // Skip header
+      for (const line of lines) {
+        const parts = line.split(/\s+/);
+        if (parts.length >= 9) {
+          const pid = parseInt(parts[1], 10);
+          const portMatch = parts[8]?.match(/:(\d+)$/);
+          if (pid && portMatch) {
+            const port = portMatch[1];
+            if (portCache.has(pid)) {
+              portCache.get(pid).push(port);
+            } else {
+              portCache.set(pid, [port]);
+            }
           }
         }
       }
-    }
-    portCacheTime = now;
-  } catch (e) {
-    // Ignore errors, return empty cache
-  }
-
-  return portCache;
+      portCacheTime = now;
+      resolve(portCache);
+    });
+  });
 }
 
 /**
@@ -126,14 +135,14 @@ async function collectMetrics() {
       rx_sec: n.rx_sec,
       tx_sec: n.tx_sec
     })),
-    processes: {
-      all: processes.all,
-      running: processes.running,
-      blocked: processes.blocked,
-      sleeping: processes.sleeping,
-      list: (() => {
-        const ports = getPortInfo();
-        return processes.list
+    processes: await (async () => {
+      const ports = await getPortInfo();
+      return {
+        all: processes.all,
+        running: processes.running,
+        blocked: processes.blocked,
+        sleeping: processes.sleeping,
+        list: processes.list
           .sort((a, b) => b.cpu - a.cpu)
           .slice(0, 50)
           .map(p => ({
@@ -144,9 +153,9 @@ async function collectMetrics() {
             state: p.state,
             user: p.user,
             ports: ports.get(p.pid) || []
-          }));
-      })()
-    },
+          }))
+      };
+    })(),
     temperature: {
       main: temp.main,
       cores: temp.cores
@@ -196,6 +205,71 @@ async function collectLightMetrics() {
 }
 
 /**
+ * Get metrics with caching - returns cached data immediately, refreshes in background
+ * This prevents UI lag by never blocking on slow si.processes() calls
+ * @returns {Promise<Object>} Cached or fresh metrics
+ */
+async function getMetricsCached() {
+  const now = Date.now();
+
+  // If we have recent cache, return it immediately
+  if (metricsCache && (now - metricsCacheTime) < METRICS_CACHE_TTL) {
+    return metricsCache;
+  }
+
+  // If cache is stale but we're already refreshing, return stale cache
+  if (metricsCache && metricsRefreshing) {
+    return metricsCache;
+  }
+
+  // If no cache at all, we must wait for first fetch
+  if (!metricsCache) {
+    metricsCache = await collectMetrics();
+    metricsCacheTime = Date.now();
+    return metricsCache;
+  }
+
+  // Cache is stale - trigger background refresh and return stale data
+  metricsRefreshing = true;
+  collectMetrics().then(data => {
+    metricsCache = data;
+    metricsCacheTime = Date.now();
+    metricsRefreshing = false;
+  }).catch(() => {
+    metricsRefreshing = false;
+  });
+
+  return metricsCache;
+}
+
+/**
+ * Start background metrics polling
+ * Pre-fetches metrics so they're always cached and ready
+ * @param {number} interval - Polling interval in ms (default 2000)
+ */
+function startBackgroundPolling(interval = 2000) {
+  // Initial fetch
+  collectMetrics().then(data => {
+    metricsCache = data;
+    metricsCacheTime = Date.now();
+  }).catch(() => {});
+
+  // Poll in background
+  setInterval(async () => {
+    if (!metricsRefreshing) {
+      metricsRefreshing = true;
+      try {
+        metricsCache = await collectMetrics();
+        metricsCacheTime = Date.now();
+      } catch (e) {
+        // Ignore errors, keep old cache
+      }
+      metricsRefreshing = false;
+    }
+  }, interval);
+}
+
+/**
  * Kill a process by PID
  * @param {number} pid - Process ID to kill
  * @returns {boolean} - true if successful
@@ -212,5 +286,7 @@ function killProcess(pid) {
 module.exports = {
   collectMetrics,
   collectLightMetrics,
+  getMetricsCached,
+  startBackgroundPolling,
   killProcess
 };

@@ -5,7 +5,7 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const WebSocket = require('ws');
-const { collectMetrics, collectLightMetrics } = require('./metrics');
+const { collectMetrics, collectLightMetrics, getMetricsCached, startBackgroundPolling, killProcess } = require('./metrics');
 
 /**
  * Start the metrics server
@@ -49,10 +49,14 @@ function startServer(port = 0) {
     // Create WebSocket server
     const wss = new WebSocket.Server({ server });
 
+    // Start background polling for metrics (every 2 seconds)
+    // This ensures metrics are always cached and ready
+    startBackgroundPolling(2000);
+
     wss.on('connection', async (ws) => {
-      // Send initial full metrics
+      // Send initial full metrics (from cache, instant)
       try {
-        const metrics = await collectMetrics();
+        const metrics = await getMetricsCached();
         ws.send(JSON.stringify({ type: 'full', data: metrics }));
       } catch (err) {
         console.error('Error collecting initial metrics:', err);
@@ -73,7 +77,7 @@ function startServer(port = 0) {
         }
       }, 1000);
 
-      // Send full metrics every 30 seconds
+      // Send full metrics every 5 seconds (from cache, instant)
       const fullInterval = setInterval(async () => {
         if (ws.readyState !== WebSocket.OPEN) {
           clearInterval(fullInterval);
@@ -81,12 +85,12 @@ function startServer(port = 0) {
         }
 
         try {
-          const metrics = await collectMetrics();
+          const metrics = await getMetricsCached();
           ws.send(JSON.stringify({ type: 'full', data: metrics }));
         } catch (err) {
           console.error('Error collecting full metrics:', err);
         }
-      }, 30000);
+      }, 5000);
 
       ws.on('close', () => {
         clearInterval(interval);
@@ -97,8 +101,11 @@ function startServer(port = 0) {
         try {
           const cmd = JSON.parse(message.toString());
           if (cmd.type === 'refresh') {
-            const metrics = await collectMetrics();
+            const metrics = await getMetricsCached();
             ws.send(JSON.stringify({ type: 'full', data: metrics }));
+          } else if (cmd.type === 'kill' && cmd.pid) {
+            const success = killProcess(cmd.pid);
+            ws.send(JSON.stringify({ type: 'kill', success, pid: cmd.pid }));
           }
         } catch (err) {
           // Ignore invalid messages

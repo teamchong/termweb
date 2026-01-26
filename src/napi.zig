@@ -105,10 +105,18 @@ var viewer_mutex = std.Thread.Mutex{};
 var console_callback: ?napi_threadsafe_function = null;
 var close_callback: ?napi_threadsafe_function = null;
 var message_callback: ?napi_threadsafe_function = null;
+var keybind_callback: ?napi_threadsafe_function = null;
 
 // Message callback data for IPC
 const MessageCallbackData = struct {
     message: []u8,
+    allocator: std.mem.Allocator,
+};
+
+// Keybind callback data
+const KeybindCallbackData = struct {
+    key: u8,
+    action: []u8,
     allocator: std.mem.Allocator,
 };
 
@@ -119,6 +127,23 @@ fn ipcMessageHandler(message: []const u8) void {
         const data = allocator.create(MessageCallbackData) catch return;
         data.* = .{
             .message = allocator.dupe(u8, message) catch {
+                allocator.destroy(data);
+                return;
+            },
+            .allocator = allocator,
+        };
+        _ = napi_call_threadsafe_function(cb, data, .nonblocking);
+    }
+}
+
+// Internal keybind handler called by input_handler
+pub fn keybindHandler(key: u8, action: []const u8) void {
+    if (keybind_callback) |cb| {
+        const allocator = gpa.allocator();
+        const data = allocator.create(KeybindCallbackData) catch return;
+        data.* = .{
+            .key = key,
+            .action = allocator.dupe(u8, action) catch {
                 allocator.destroy(data);
                 return;
             },
@@ -163,7 +188,36 @@ fn messageJsCallback(env: napi_env, js_callback: napi_value, _: ?*anyopaque, dat
 // External N-API function declaration
 extern fn napi_call_function(env: napi_env, recv: napi_value, func: napi_value, argc: usize, argv: [*]const napi_value, result: ?*napi_value) napi_status;
 
-/// Key bindings storage - maps a-z to JS code (static to persist across calls)
+// JS callback for keybind - calls Node.js with (key, action)
+fn keybindJsCallback(env: napi_env, js_callback: napi_value, _: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const kb_data: *KeybindCallbackData = @ptrCast(@alignCast(data orelse return));
+    defer {
+        kb_data.allocator.free(kb_data.action);
+        kb_data.allocator.destroy(kb_data);
+    }
+
+    // Create key string (single char)
+    var key_str: napi_value = undefined;
+    const key_char = [_]u8{kb_data.key};
+    if (napi_create_string_utf8(env, &key_char, 1, &key_str) != .ok) {
+        return;
+    }
+
+    // Create action string
+    var action_str: napi_value = undefined;
+    if (napi_create_string_utf8(env, kb_data.action.ptr, kb_data.action.len, &action_str) != .ok) {
+        return;
+    }
+
+    // Call the JS callback with (key, action)
+    var global: napi_value = undefined;
+    _ = napi_get_undefined(env, &global);
+
+    var args = [_]napi_value{ key_str, action_str };
+    _ = napi_call_function(env, global, js_callback, 2, &args, null);
+}
+
+/// Key bindings storage - maps a-z to action strings (static to persist across calls)
 var key_bindings_storage: [26]?[]const u8 = [_]?[]const u8{null} ** 26;
 var key_bindings_buffers: [26][256]u8 = undefined;
 
@@ -414,6 +468,7 @@ fn runBrowserAsync(async_data: *AsyncOpenData) !void {
     }
     if (async_data.has_key_bindings) {
         viewer.setKeyBindings(&key_bindings_storage);
+        viewer.setKeybindCallback(&keybindHandler);
     }
     if (async_data.disable_hints) {
         viewer.disableHints();
@@ -713,6 +768,7 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     }
     if (has_key_bindings) {
         viewer.setKeyBindings(&key_bindings_storage);
+        viewer.setKeybindCallback(&keybindHandler);
     }
     if (disable_hints) {
         viewer.disableHints();
@@ -1073,6 +1129,51 @@ fn napi_onClose(env: napi_env, info: napi_callback_info) callconv(.c) napi_value
     return undef;
 }
 
+/// napi_onKeyBinding(callback: function) -> void
+/// Register a callback to receive key binding events.
+/// Callback receives (key: string, action: string) when a bound key is pressed.
+fn napi_onKeyBinding(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    var argc: usize = 1;
+    var argv: [1]napi_value = undefined;
+    _ = napi_get_cb_info(env, info, &argc, &argv, null, null);
+
+    if (argc < 1) {
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    // Check if it's a function
+    var val_type: c_uint = 0;
+    _ = napi_typeof(env, argv[0], &val_type);
+    if (val_type != @intFromEnum(napi_valuetype.function)) {
+        _ = napi_throw_error(env, null, "Callback must be a function");
+        var undef: napi_value = undefined;
+        _ = napi_get_undefined(env, &undef);
+        return undef;
+    }
+
+    // Release old callback if exists
+    if (keybind_callback) |cb| {
+        _ = napi_release_threadsafe_function(cb, 0);
+        keybind_callback = null;
+    }
+
+    // Create async resource name
+    var resource_name: napi_value = undefined;
+    _ = napi_create_string_utf8(env, "termweb:onKeyBinding", 20, &resource_name);
+
+    // Create threadsafe function for callback with custom JS callback handler
+    var tsfn: napi_threadsafe_function = undefined;
+    if (napi_create_threadsafe_function(env, argv[0], null, resource_name, 0, 1, null, null, null, &keybindJsCallback, &tsfn) == .ok) {
+        keybind_callback = tsfn;
+    }
+
+    var undef: napi_value = undefined;
+    _ = napi_get_undefined(env, &undef);
+    return undef;
+}
+
 /// napi_onMessage(callback: function) -> void
 /// Register a callback to receive IPC messages from the browser.
 /// Messages with __TERMWEB_IPC__: prefix will trigger this callback.
@@ -1154,6 +1255,11 @@ export fn napi_register_module_v1(env: napi_env, exports: napi_value) napi_value
     var on_message_fn: napi_value = undefined;
     _ = napi_create_function(env, "onMessage", 9, &napi_onMessage, null, &on_message_fn);
     _ = napi_set_named_property(env, exports, "onMessage", on_message_fn);
+
+    // onKeyBinding function
+    var on_keybind_fn: napi_value = undefined;
+    _ = napi_create_function(env, "onKeyBinding", 12, &napi_onKeyBinding, null, &on_keybind_fn);
+    _ = napi_set_named_property(env, exports, "onKeyBinding", on_keybind_fn);
 
     // version function
     var version_fn: napi_value = undefined;

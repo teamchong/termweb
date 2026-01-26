@@ -2,6 +2,22 @@ import { Chart, registerables } from 'chart.js';
 
 Chart.register(...registerables);
 
+// SDK IPC receiver - termweb.sendToPage() calls this
+window.__termweb = {
+  _callbacks: [],
+  _receive: function(msgJson) {
+    try {
+      const msg = typeof msgJson === 'string' ? JSON.parse(msgJson) : msgJson;
+      this._callbacks.forEach(cb => cb(msg));
+    } catch (e) {
+      // Invalid message
+    }
+  },
+  onMessage: function(cb) {
+    this._callbacks.push(cb);
+  }
+};
+
 // State
 let cpuChart, memChart, netChart;
 let detailChart = null; // Chart for detail views
@@ -15,7 +31,43 @@ let isFiltering = false;
 let detailLoading = false; // Loading state for detail views
 let lastDetailData = null; // Cache last data for detail views
 
+// Smoothed values for stable sorting (prevents jumping)
+const smoothedValues = new Map(); // pid -> { cpu, mem }
+const SMOOTH_FACTOR = 0.3; // Lower = more stable, higher = more responsive
+
 const SORT_COLUMNS = ['pid', 'name', 'cpu', 'mem', 'port'];
+
+// Update smoothed values for a process
+function updateSmoothedValues(process) {
+  const pid = process.pid;
+  const prev = smoothedValues.get(pid) || { cpu: process.cpu, mem: process.mem };
+
+  // Exponential moving average
+  const smoothed = {
+    cpu: prev.cpu * (1 - SMOOTH_FACTOR) + process.cpu * SMOOTH_FACTOR,
+    mem: prev.mem * (1 - SMOOTH_FACTOR) + process.mem * SMOOTH_FACTOR,
+  };
+
+  smoothedValues.set(pid, smoothed);
+  return smoothed;
+}
+
+// Get smoothed value for sorting
+function getSmoothedValue(process, field) {
+  const smoothed = smoothedValues.get(process.pid);
+  if (!smoothed) return process[field];
+  return smoothed[field] || process[field];
+}
+
+// Clean up smoothed values for dead processes
+function cleanupSmoothedValues(activePids) {
+  const activeSet = new Set(activePids);
+  for (const pid of smoothedValues.keys()) {
+    if (!activeSet.has(pid)) {
+      smoothedValues.delete(pid);
+    }
+  }
+}
 
 // Global key binding handlers called by termweb
 window.__termwebView = function(view) {
@@ -194,14 +246,20 @@ function getFilteredProcesses() {
     );
   }
 
-  // Sort
+  // Sort using smoothed values for cpu/mem to prevent jumping
   list.sort((a, b) => {
     let cmp = 0;
     switch (sortColumn) {
       case 'pid': cmp = a.pid - b.pid; break;
       case 'name': cmp = a.name.localeCompare(b.name); break;
-      case 'cpu': cmp = a.cpu - b.cpu; break;
-      case 'mem': cmp = a.mem - b.mem; break;
+      case 'cpu':
+        // Use smoothed CPU for stable sorting
+        cmp = getSmoothedValue(a, 'cpu') - getSmoothedValue(b, 'cpu');
+        break;
+      case 'mem':
+        // Use smoothed memory for stable sorting
+        cmp = getSmoothedValue(a, 'mem') - getSmoothedValue(b, 'mem');
+        break;
       case 'port':
         const aPort = a.ports?.[0] || '';
         const bPort = b.ports?.[0] || '';
@@ -214,37 +272,73 @@ function getFilteredProcesses() {
   return list;
 }
 
-// Render full screen process view
-function renderProcessView() {
-  const filtered = getFilteredProcesses();
-  const container = document.getElementById('process-fullscreen');
+// Fast selection update - just moves the selected class without re-rendering
+function updateSelectionFast(oldIndex, newIndex) {
+  const tbody = document.querySelector('.process-table tbody');
+  if (!tbody) return false;
 
-  // Ensure selection is valid
+  const rows = tbody.querySelectorAll('tr');
+  if (oldIndex >= 0 && oldIndex < rows.length) {
+    rows[oldIndex].classList.remove('selected');
+  }
+  if (newIndex >= 0 && newIndex < rows.length) {
+    rows[newIndex].classList.add('selected');
+    // Scroll into view if needed
+    rows[newIndex].scrollIntoView({ block: 'nearest' });
+    return true;
+  }
+  return false;
+}
+
+// Build table rows HTML from filtered process list
+function buildTableRows(filtered) {
+  return filtered.map((p, i) => {
+    const selected = i === selectedProcessIndex;
+    const ports = p.ports?.join(', ') || '-';
+    return `<tr class="${selected ? 'selected' : ''}">
+      <td>${p.pid}</td>
+      <td>${p.name}</td>
+      <td class="${getLoadClass(p.cpu)}">${p.cpu.toFixed(1)}%</td>
+      <td>${p.mem.toFixed(1)}%</td>
+      <td>${ports}</td>
+      <td>${p.state}</td>
+      <td>${p.user}</td>
+    </tr>`;
+  }).join('');
+}
+
+// Build table header HTML
+function buildTableHeader() {
+  return SORT_COLUMNS.map(col => {
+    const arrow = sortColumn === col ? (sortAsc ? '▲' : '▼') : '';
+    return `<th class="${sortColumn === col ? 'sorted' : ''}">${col.toUpperCase()} ${arrow}</th>`;
+  }).join('') + '<th>STATE</th><th>USER</th>';
+}
+
+// Update table in place (fast path - no container rebuild)
+function updateTable() {
+  const thead = document.querySelector('.process-table thead tr');
+  const tbody = document.querySelector('.process-table tbody');
+  if (!thead || !tbody) return false;
+
+  const filtered = getFilteredProcesses();
   if (selectedProcessIndex >= filtered.length) {
     selectedProcessIndex = Math.max(0, filtered.length - 1);
   }
 
-  const headerRow = SORT_COLUMNS.map(col => {
-    const arrow = sortColumn === col ? (sortAsc ? '▲' : '▼') : '';
-    const label = col.toUpperCase();
-    return `<th class="${sortColumn === col ? 'sorted' : ''}">${label} ${arrow}</th>`;
-  }).join('') + '<th>STATE</th><th>USER</th>';
+  thead.innerHTML = buildTableHeader();
+  tbody.innerHTML = buildTableRows(filtered);
+  return true;
+}
 
-  const rows = filtered.map((p, i) => {
-    const selected = i === selectedProcessIndex;
-    const ports = p.ports?.join(', ') || '-';
-    return `
-      <tr class="${selected ? 'selected' : ''}">
-        <td>${p.pid}</td>
-        <td>${p.name}</td>
-        <td class="${getLoadClass(p.cpu)}">${p.cpu.toFixed(1)}%</td>
-        <td>${p.mem.toFixed(1)}%</td>
-        <td>${ports}</td>
-        <td>${p.state}</td>
-        <td>${p.user}</td>
-      </tr>
-    `;
-  }).join('');
+// Render full screen process view (full rebuild)
+function renderProcessView() {
+  const filtered = getFilteredProcesses();
+  const container = document.getElementById('process-fullscreen');
+
+  if (selectedProcessIndex >= filtered.length) {
+    selectedProcessIndex = Math.max(0, filtered.length - 1);
+  }
 
   container.innerHTML = `
     <div class="process-header">
@@ -253,8 +347,8 @@ function renderProcessView() {
     </div>
     <div class="process-table-wrap">
       <table class="process-table">
-        <thead><tr>${headerRow}</tr></thead>
-        <tbody>${rows}</tbody>
+        <thead><tr>${buildTableHeader()}</tr></thead>
+        <tbody>${buildTableRows(filtered)}</tbody>
       </table>
     </div>
   `;
@@ -556,65 +650,65 @@ function updateUI(data, isFull) {
   // Always update process list for full screen view
   if (isFull && data.processes) {
     processList = data.processes.list;
+
+    // Update smoothed values for stable sorting
+    const activePids = [];
+    for (const process of processList) {
+      updateSmoothedValues(process);
+      activePids.push(process.pid);
+    }
+    cleanupSmoothedValues(activePids);
+
     if (currentView === 'processes') {
       renderProcessView();
     }
   }
 }
 
-// IPC for metrics
-const pendingMetrics = new Map();
-const pendingKills = new Map();
-let ipcId = 0;
+// WebSocket connection for metrics
+let ws = null;
+let wsConnected = false;
 
-window.__termwebMetricsResponse = (id, data) => {
-  const resolve = pendingMetrics.get(id);
-  if (resolve) {
-    pendingMetrics.delete(id);
-    resolve(data);
-  }
-};
+function connectWebSocket() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${location.host}`);
 
-window.__termwebKillResponse = (id, success) => {
-  const resolve = pendingKills.get(id);
-  if (resolve) {
-    pendingKills.delete(id);
-    resolve(success);
-  }
-};
+  ws.onopen = () => {
+    wsConnected = true;
+  };
 
-function requestMetrics(type) {
-  return new Promise(resolve => {
-    const id = ++ipcId;
-    pendingMetrics.set(id, resolve);
-    console.log(`__TERMWEB_IPC__:${id}:${type}`);
-    setTimeout(() => {
-      if (pendingMetrics.has(id)) {
-        pendingMetrics.delete(id);
-        resolve(null);
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'full') {
+        updateUI(msg.data, true);
+      } else if (msg.type === 'update') {
+        updateUI(msg.data, false);
+      } else if (msg.type === 'kill') {
+        ws.send(JSON.stringify({ type: 'refresh' }));
       }
-    }, 5000);
-  });
+      // Note: 'action' type now handled by SDK IPC via window.__termweb
+    } catch (e) {
+      // Ignore parse errors
+    }
+  };
+
+  ws.onclose = () => {
+    wsConnected = false;
+    // Reconnect after 1 second
+    setTimeout(connectWebSocket, 1000);
+  };
 }
 
 function killProcess(pid) {
-  return new Promise(resolve => {
-    const id = ++ipcId;
-    pendingKills.set(id, resolve);
-    console.log(`__TERMWEB_IPC__:${id}:kill:${pid}`);
-    setTimeout(() => {
-      if (pendingKills.has(id)) {
-        pendingKills.delete(id);
-        resolve(false);
-      }
-    }, 5000);
-  });
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'kill', pid }));
+  }
 }
 
-// Keyboard handling - use window with capture to ensure we get all keys
+// Keyboard handling - only for process view navigation (arrow keys, etc.)
+// Main view keys (p, c, m, n, d, f) are handled by SDK via WebSocket
 window.addEventListener('keydown', async (e) => {
-  // Log via IPC so it shows in terminal with --verbose
-  console.log(`__TERMWEB_IPC__:0:keypress:${e.key}:${currentView}`);
   if (currentView === 'processes') {
     if (isFiltering) {
       if (e.key === 'Escape') {
@@ -627,28 +721,37 @@ window.addEventListener('keydown', async (e) => {
       return;
     }
 
-    const filtered = getFilteredProcesses();
-
     if (e.key === 'Escape') {
       hideDetailView();
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
+      const oldIndex = selectedProcessIndex;
       selectedProcessIndex = Math.max(0, selectedProcessIndex - 1);
-      renderProcessView();
+      if (!updateSelectionFast(oldIndex, selectedProcessIndex)) {
+        renderProcessView();
+      }
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
-      selectedProcessIndex = Math.min(filtered.length - 1, selectedProcessIndex + 1);
-      renderProcessView();
+      const oldIndex = selectedProcessIndex;
+      const maxIndex = processList.length - 1; // Use cached list length
+      selectedProcessIndex = Math.min(maxIndex, selectedProcessIndex + 1);
+      if (!updateSelectionFast(oldIndex, selectedProcessIndex)) {
+        renderProcessView();
+      }
     } else if (e.key === 'ArrowLeft') {
       e.preventDefault();
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length];
-      renderProcessView();
+      selectedProcessIndex = 0;
+      if (!updateTable()) renderProcessView();
+      updateHints();
     } else if (e.key === 'ArrowRight') {
       e.preventDefault();
       const idx = SORT_COLUMNS.indexOf(sortColumn);
       sortColumn = SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
-      renderProcessView();
+      selectedProcessIndex = 0;
+      if (!updateTable()) renderProcessView();
+      updateHints();
     } else if (e.key === '/' || e.key === 'f') {
       e.preventDefault();
       isFiltering = true;
@@ -680,9 +783,11 @@ document.addEventListener('input', (e) => {
 });
 
 // Initialize on load
-document.addEventListener('DOMContentLoaded', async () => {
-  // Focus body to receive keyboard events
+document.addEventListener('DOMContentLoaded', () => {
+  // Focus page to receive keyboard events
+  document.body.tabIndex = -1;
   document.body.focus();
+  window.focus();
 
   initCharts();
 
@@ -703,27 +808,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.__termwebView('processes');
   });
 
-  // Initial full metrics
-  const initial = await requestMetrics('full');
-  if (initial) {
-    updateUI(initial, true);
-  }
-
   updateHints();
 
-  // Poll for updates every second
-  setInterval(async () => {
-    const data = await requestMetrics('light');
-    if (data) {
-      updateUI(data, false);
+  // Register SDK IPC handler for key binding actions
+  window.__termweb.onMessage((msg) => {
+    if (msg.type === 'action') {
+      if (msg.action === 'view:processes') {
+        window.__termwebView('processes');
+      } else if (msg.action === 'view:cpu') {
+        window.__termwebView('cpu');
+      } else if (msg.action === 'view:memory') {
+        window.__termwebView('memory');
+      } else if (msg.action === 'view:network') {
+        window.__termwebView('network');
+      } else if (msg.action === 'view:disk') {
+        window.__termwebView('disk');
+      } else if (msg.action === 'filter') {
+        window.__termwebFilter();
+      }
     }
-  }, 1000);
+  });
 
-  // Full update every 30 seconds
-  setInterval(async () => {
-    const data = await requestMetrics('full');
-    if (data) {
-      updateUI(data, true);
-    }
-  }, 30000);
+  // Connect to WebSocket - server pushes metrics
+  connectWebSocket();
 });
