@@ -1,6 +1,6 @@
 {
   "name": "termweb",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "description": "Web browser in your terminal using Kitty graphics protocol. SDK for building terminal apps with web technologies.",
   "main": "./lib/index.js",
   "bin": {
@@ -24,7 +24,7 @@
     "cli",
     "web"
   ],
-  "author": "teamchong",
+  "author": "teamch",
   "license": "MIT",
   "repository": {
     "type": "git",

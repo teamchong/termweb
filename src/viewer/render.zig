@@ -254,6 +254,14 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
         } else |_| {}
     }
 
+    // If we have chrome inner dims (from extension resize) but no frame dims yet, capture them now
+    if (viewer.chrome_inner_width > 0 and viewer.chrome_inner_height > 0 and
+        (viewer.chrome_inner_frame_width == 0 or viewer.chrome_inner_frame_height == 0))
+    {
+        viewer.chrome_inner_frame_width = frame_width;
+        viewer.chrome_inner_frame_height = frame_height;
+    }
+
     // Adjust chrome dimensions if frame changed (e.g., download bar appeared)
     // Apply ratio: new_chrome = old_chrome * new_frame / old_frame
     var chrome_width: u32 = if (viewer.chrome_inner_width > 0) viewer.chrome_inner_width else frame_width;
