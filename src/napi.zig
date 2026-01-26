@@ -1174,6 +1174,86 @@ fn napi_onKeyBinding(env: napi_env, info: napi_callback_info) callconv(.c) napi_
     return undef;
 }
 
+/// napi_addKeyBinding(key: string, action: string) -> boolean
+/// Add a key binding dynamically
+fn napi_addKeyBinding(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    var argc: usize = 2;
+    var argv: [2]napi_value = undefined;
+    _ = napi_get_cb_info(env, info, &argc, &argv, null, null);
+
+    if (argc < 2) {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    // Get key (single char)
+    var key_buf: [2]u8 = undefined;
+    var key_len: usize = 0;
+    if (napi_get_value_string_utf8(env, argv[0], &key_buf, 2, &key_len) != .ok or key_len != 1) {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+    const key = key_buf[0];
+    if (key < 'a' or key > 'z') {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    // Get action string
+    const idx = key - 'a';
+    var action_len: usize = 0;
+    if (napi_get_value_string_utf8(env, argv[1], &key_bindings_buffers[idx], key_bindings_buffers[idx].len, &action_len) != .ok) {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    key_bindings_storage[idx] = key_bindings_buffers[idx][0..action_len];
+
+    var result: napi_value = undefined;
+    _ = napi_get_boolean(env, true, &result);
+    return result;
+}
+
+/// napi_removeKeyBinding(key: string) -> boolean
+/// Remove a key binding dynamically
+fn napi_removeKeyBinding(env: napi_env, info: napi_callback_info) callconv(.c) napi_value {
+    var argc: usize = 1;
+    var argv: [1]napi_value = undefined;
+    _ = napi_get_cb_info(env, info, &argc, &argv, null, null);
+
+    if (argc < 1) {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    // Get key (single char)
+    var key_buf: [2]u8 = undefined;
+    var key_len: usize = 0;
+    if (napi_get_value_string_utf8(env, argv[0], &key_buf, 2, &key_len) != .ok or key_len != 1) {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+    const key = key_buf[0];
+    if (key < 'a' or key > 'z') {
+        var result: napi_value = undefined;
+        _ = napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    const idx = key - 'a';
+    key_bindings_storage[idx] = null;
+
+    var result: napi_value = undefined;
+    _ = napi_get_boolean(env, true, &result);
+    return result;
+}
+
 /// napi_onMessage(callback: function) -> void
 /// Register a callback to receive IPC messages from the browser.
 /// Messages with __TERMWEB_IPC__: prefix will trigger this callback.
@@ -1260,6 +1340,16 @@ export fn napi_register_module_v1(env: napi_env, exports: napi_value) napi_value
     var on_keybind_fn: napi_value = undefined;
     _ = napi_create_function(env, "onKeyBinding", 12, &napi_onKeyBinding, null, &on_keybind_fn);
     _ = napi_set_named_property(env, exports, "onKeyBinding", on_keybind_fn);
+
+    // addKeyBinding function
+    var add_keybind_fn: napi_value = undefined;
+    _ = napi_create_function(env, "addKeyBinding", 13, &napi_addKeyBinding, null, &add_keybind_fn);
+    _ = napi_set_named_property(env, exports, "addKeyBinding", add_keybind_fn);
+
+    // removeKeyBinding function
+    var remove_keybind_fn: napi_value = undefined;
+    _ = napi_create_function(env, "removeKeyBinding", 16, &napi_removeKeyBinding, null, &remove_keybind_fn);
+    _ = napi_set_named_property(env, exports, "removeKeyBinding", remove_keybind_fn);
 
     // version function
     var version_fn: napi_value = undefined;
