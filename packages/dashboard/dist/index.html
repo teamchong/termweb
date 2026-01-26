@@ -208,6 +208,29 @@
       align-items: center;
       gap: 4px;
     }
+
+    /* Loading spinner */
+    .spinner {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      color: #888;
+      font-size: 13px;
+    }
+    .spinner::before {
+      content: '';
+      width: 16px;
+      height: 16px;
+      border: 2px solid #3c3c3c;
+      border-top-color: #569cd6;
+      border-radius: 50%;
+      margin-right: 8px;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
   </style>
 </head>
 <body tabindex="0" autofocus>

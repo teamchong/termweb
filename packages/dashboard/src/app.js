@@ -4,13 +4,16 @@ Chart.register(...registerables);
 
 // State
 let cpuChart, memChart, netChart;
-let currentView = 'main'; // 'main' or 'processes'
+let detailChart = null; // Chart for detail views
+let currentView = 'main'; // 'main', 'processes', 'cpu', 'memory', 'network', 'disk'
 let processList = [];
 let selectedProcessIndex = 0;
 let sortColumn = 'cpu'; // 'pid', 'name', 'cpu', 'mem', 'port'
 let sortAsc = false;
 let filterText = '';
 let isFiltering = false;
+let detailLoading = false; // Loading state for detail views
+let lastDetailData = null; // Cache last data for detail views
 
 const SORT_COLUMNS = ['pid', 'name', 'cpu', 'mem', 'port'];
 
@@ -46,7 +49,7 @@ window.__termwebEsc = function() {
   }
 };
 
-function renderCurrentView() {
+async function renderCurrentView() {
   document.getElementById('main-dashboard').style.display = currentView === 'main' ? 'block' : 'none';
   document.getElementById('process-fullscreen').style.display = currentView === 'processes' ? 'flex' : 'none';
   document.getElementById('detail-fullscreen').style.display = ['cpu', 'memory', 'network', 'disk'].includes(currentView) ? 'flex' : 'none';
@@ -54,7 +57,15 @@ function renderCurrentView() {
   if (currentView === 'processes') {
     renderProcessView();
   } else if (['cpu', 'memory', 'network', 'disk'].includes(currentView)) {
+    // Show spinner and fetch data async
+    detailLoading = true;
     renderDetailView(currentView);
+    const data = await requestMetrics('full');
+    detailLoading = false;
+    if (data && ['cpu', 'memory', 'network', 'disk'].includes(currentView)) {
+      lastDetailData = data;
+      updateDetailView(currentView, data);
+    }
   }
   updateHints();
 }
@@ -264,25 +275,28 @@ function renderDetailView(type) {
   const container = document.getElementById('detail-fullscreen');
   const titles = { cpu: 'CPU Details', memory: 'Memory Details', network: 'Network Details', disk: 'Disk Details' };
 
+  // Show spinner while loading
+  const spinner = detailLoading ? '<div class="spinner">Loading...</div>' : '';
+
   let content = '';
   if (type === 'cpu') {
     content = `
       <div class="detail-chart"><canvas id="detail-cpu-chart"></canvas></div>
-      <div id="detail-cpu-info"></div>
+      <div id="detail-cpu-info">${spinner}</div>
       <div id="detail-cpu-cores" class="core-grid"></div>
     `;
   } else if (type === 'memory') {
     content = `
       <div class="detail-chart"><canvas id="detail-mem-chart"></canvas></div>
-      <div id="detail-mem-info"></div>
+      <div id="detail-mem-info">${spinner}</div>
     `;
   } else if (type === 'network') {
     content = `
       <div class="detail-chart"><canvas id="detail-net-chart"></canvas></div>
-      <div id="detail-net-info"></div>
+      <div id="detail-net-info">${spinner}</div>
     `;
   } else if (type === 'disk') {
-    content = '<div id="detail-disk-info"></div>';
+    content = `<div id="detail-disk-info">${spinner}</div>`;
   }
 
   container.innerHTML = `
@@ -291,6 +305,111 @@ function renderDetailView(type) {
     </div>
     <div class="detail-content">${content}</div>
   `;
+}
+
+// Update detail view with data
+function updateDetailView(type, data) {
+  if (type === 'cpu' && data.cpu) {
+    const info = document.getElementById('detail-cpu-info');
+    const cores = document.getElementById('detail-cpu-cores');
+    if (info) {
+      info.innerHTML = `
+        <div class="stat-row">
+          <span class="stat-label">Model</span>
+          <span class="stat-value">${data.cpu.brand || 'Unknown'}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Cores</span>
+          <span class="stat-value">${data.cpu.cores} (${data.cpu.physicalCores} physical)</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Speed</span>
+          <span class="stat-value">${data.cpu.speed ? data.cpu.speed.toFixed(2) + ' GHz' : 'N/A'}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Load</span>
+          <span class="stat-value ${getLoadClass(data.cpu.load)}">${data.cpu.load.toFixed(1)}%</span>
+        </div>
+      `;
+    }
+    if (cores && data.cpu.loadPerCore) {
+      cores.innerHTML = data.cpu.loadPerCore.map((load, i) => `
+        <div class="core-item">
+          <div class="label">Core ${i}</div>
+          <div class="value ${getLoadClass(load)}">${load.toFixed(0)}%</div>
+        </div>
+      `).join('');
+    }
+  } else if (type === 'memory' && data.memory) {
+    const info = document.getElementById('detail-mem-info');
+    if (info) {
+      const mem = data.memory;
+      info.innerHTML = `
+        <div class="stat-row">
+          <span class="stat-label">Total</span>
+          <span class="stat-value">${formatBytes(mem.total)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Used</span>
+          <span class="stat-value">${formatBytes(mem.used)} (${((mem.used / mem.total) * 100).toFixed(1)}%)</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Free</span>
+          <span class="stat-value">${formatBytes(mem.free)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Available</span>
+          <span class="stat-value">${formatBytes(mem.available)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Active</span>
+          <span class="stat-value">${formatBytes(mem.active || 0)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Buffers/Cached</span>
+          <span class="stat-value">${formatBytes(mem.buffcache || 0)}</span>
+        </div>
+        <div class="stat-row" style="margin-top: 12px; border-top: 1px solid #3c3c3c; padding-top: 12px;">
+          <span class="stat-label">Swap Total</span>
+          <span class="stat-value">${formatBytes(mem.swapTotal)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Swap Used</span>
+          <span class="stat-value">${formatBytes(mem.swapUsed)} (${mem.swapTotal > 0 ? ((mem.swapUsed / mem.swapTotal) * 100).toFixed(1) : 0}%)</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Swap Free</span>
+          <span class="stat-value">${formatBytes(mem.swapFree || (mem.swapTotal - mem.swapUsed))}</span>
+        </div>
+      `;
+    }
+  } else if (type === 'network' && data.network) {
+    const info = document.getElementById('detail-net-info');
+    if (info) {
+      info.innerHTML = data.network.map(n => `
+        <div class="stat-row">
+          <span class="stat-label">${n.iface}</span>
+          <span class="stat-value">↓ ${formatBps(n.rx_sec || 0)} / ↑ ${formatBps(n.tx_sec || 0)}</span>
+        </div>
+      `).join('') || '<div class="stat-row"><span class="stat-label">No active interfaces</span></div>';
+    }
+  } else if (type === 'disk' && data.disk) {
+    const info = document.getElementById('detail-disk-info');
+    if (info) {
+      info.innerHTML = data.disk.map(d => `
+        <div class="stat-row">
+          <span class="stat-label">${d.mount} (${d.fs})</span>
+          <span class="stat-value ${getLoadClass(d.usePercent)}">${d.usePercent.toFixed(0)}% used</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill disk" style="width: ${d.usePercent}%"></div>
+        </div>
+        <div style="font-size: 11px; color: #888; margin-top: 4px; margin-bottom: 12px;">
+          ${formatBytes(d.used)} used of ${formatBytes(d.size)} (${formatBytes(d.available)} free)
+        </div>
+      `).join('');
+    }
+  }
 }
 
 // Hide any detail view and go back to main
