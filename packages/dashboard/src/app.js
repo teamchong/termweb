@@ -458,8 +458,8 @@ function renderProcessView() {
     }
   });
 
-  // Always focus search box
-  input.focus();
+  // Always focus search box (use setTimeout to ensure DOM is ready)
+  setTimeout(() => input.focus(), 0);
 
   container.style.display = 'flex';
   document.getElementById('main-dashboard').style.display = 'none';
