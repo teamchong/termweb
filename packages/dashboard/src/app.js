@@ -69,11 +69,19 @@ function cleanupSmoothedValues(activePids) {
   }
 }
 
+// Notify Node.js of view change (so it knows whether to forward key bindings)
+function notifyViewChange(view) {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'viewChange', view }));
+  }
+}
+
 // Global key binding handlers called by termweb
 window.__termwebView = function(view) {
   // c,m,n,d,p only work on main view
   if (currentView !== 'main') return;
   currentView = view;
+  notifyViewChange(view);
   selectedProcessIndex = 0;
   isFiltering = false;
   renderCurrentView();
@@ -606,6 +614,7 @@ function hideDetailView() {
   document.getElementById('detail-fullscreen').style.display = 'none';
   document.getElementById('main-dashboard').style.display = 'block';
   currentView = 'main';
+  notifyViewChange('main');
   isFiltering = false;
   updateHints();
 }
@@ -836,8 +845,7 @@ function requestMetrics(type = 'full') {
   });
 }
 
-// Keyboard handling - only for process view navigation (arrow keys, etc.)
-// Main view keys (p, c, m, n, d, f) are handled by SDK via WebSocket
+// Keyboard handling (SDK handles c/m/n/d/p on main view)
 window.addEventListener('keydown', async (e) => {
   if (currentView === 'processes') {
     const searchInput = document.getElementById('filter-input');

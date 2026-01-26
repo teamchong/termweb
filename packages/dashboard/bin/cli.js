@@ -41,11 +41,28 @@ async function main() {
       process.exit(0);
     });
 
-    // SDK handles keys, sends action to page via SDK IPC
+    // Track current view - only forward key bindings on main view
+    let currentView = 'main';
+
+    // Listen for view changes from page via WebSocket
+    wss.on('connection', (ws) => {
+      ws.on('message', (message) => {
+        try {
+          const msg = JSON.parse(message.toString());
+          if (msg.type === 'viewChange') {
+            currentView = msg.view;
+            if (verbose) console.log(`[View] Changed to: ${currentView}`);
+          }
+        } catch (e) {}
+      });
+    });
+
+    // SDK handles keys, but only forward to page when on main view
     termweb.onKeyBinding((key, action) => {
-      if (verbose) console.log(`[KeyBinding] ${key} -> ${action}`);
-      // Use SDK IPC to send action directly to page
-      termweb.sendToPage({ type: 'action', action });
+      if (verbose) console.log(`[KeyBinding] ${key} -> ${action} (view: ${currentView})`);
+      if (currentView === 'main') {
+        termweb.sendToPage({ type: 'action', action });
+      }
     });
 
     termweb.openAsync(url, {
@@ -57,8 +74,7 @@ async function main() {
         c: 'view:cpu',
         m: 'view:memory',
         n: 'view:network',
-        d: 'view:disk',
-        f: 'filter'
+        d: 'view:disk'
       },
       verbose
     });
