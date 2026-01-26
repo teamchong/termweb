@@ -261,9 +261,10 @@ function getFilteredProcesses() {
         cmp = getSmoothedValue(a, 'mem') - getSmoothedValue(b, 'mem');
         break;
       case 'port':
-        const aPort = a.ports?.[0] || '';
-        const bPort = b.ports?.[0] || '';
-        cmp = aPort.localeCompare(bPort);
+        // Parse first port as number for numeric sort
+        const aPort = parseInt(a.ports?.[0], 10) || 0;
+        const bPort = parseInt(b.ports?.[0], 10) || 0;
+        cmp = aPort - bPort;
         break;
     }
     return sortAsc ? cmp : -cmp;
@@ -675,17 +676,29 @@ function updateUI(data, isFull) {
       `).join('');
     }
 
-    // Processes (mini view)
+    // Processes (mini view) - update in place
     if (isFull && data.processes) {
-      document.getElementById('process-tbody').innerHTML = data.processes.list.slice(0, 10).map(p => `
-        <tr>
-          <td>${p.pid}</td>
-          <td>${p.name}</td>
-          <td class="${getLoadClass(p.cpu)}">${p.cpu.toFixed(1)}%</td>
-          <td>${p.mem.toFixed(1)}%</td>
-          <td>${p.ports?.join(', ') || '-'}</td>
-        </tr>
-      `).join('');
+      const tbody = document.getElementById('process-tbody');
+      const procs = data.processes.list.slice(0, 10);
+      const rows = tbody.querySelectorAll('tr');
+
+      // Create rows if needed (first load or count changed)
+      if (rows.length !== procs.length) {
+        tbody.innerHTML = procs.map(() => `<tr><td></td><td></td><td></td><td></td><td></td></tr>`).join('');
+      }
+
+      // Update cell text in place
+      tbody.querySelectorAll('tr').forEach((row, i) => {
+        const p = procs[i];
+        if (!p) return;
+        const cells = row.querySelectorAll('td');
+        cells[0].textContent = p.pid;
+        cells[1].textContent = p.name;
+        cells[2].textContent = p.cpu.toFixed(1) + '%';
+        cells[2].className = getLoadClass(p.cpu);
+        cells[3].textContent = p.mem.toFixed(1) + '%';
+        cells[4].textContent = p.ports?.join(', ') || '-';
+      });
     }
 
     // System info
