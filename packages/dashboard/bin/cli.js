@@ -56,7 +56,7 @@ async function main() {
       }
     }
 
-    // Listen for view changes from page via WebSocket
+    // Listen for view/state changes from page via WebSocket
     wss.on('connection', (ws) => {
       ws.on('message', (message) => {
         try {
@@ -68,6 +68,16 @@ async function main() {
             } else {
               removeMainBindings();
             }
+          } else if (msg.type === 'killConfirm') {
+            // Add y/n bindings for kill confirmation
+            if (verbose) console.log('[Kill] Confirm mode');
+            termweb.addKeyBinding('y', 'kill:confirm');
+            termweb.addKeyBinding('n', 'kill:cancel');
+          } else if (msg.type === 'killCancel') {
+            // Remove y/n bindings
+            if (verbose) console.log('[Kill] Cancel mode');
+            termweb.removeKeyBinding('y');
+            termweb.removeKeyBinding('n');
           }
         } catch (e) {}
       });
@@ -81,7 +91,7 @@ async function main() {
 
     termweb.openAsync(url, {
       toolbar: false,
-      allowedHotkeys: ['quit'],
+      allowedHotkeys: ['quit', 'select_all', 'copy', 'cut', 'paste'],
       singleTab: true,
       keyBindings: mainBindings,
       verbose

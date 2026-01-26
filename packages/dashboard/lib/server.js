@@ -5,7 +5,7 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const WebSocket = require('ws');
-const { collectMetrics, collectLightMetrics, getMetricsCached, startBackgroundPolling, killProcess } = require('./metrics');
+const { collectMetrics, collectLightMetrics, getMetricsCached, startBackgroundPolling, killProcess, getConnections, getFolderSizes } = require('./metrics');
 
 /**
  * Start the metrics server
@@ -106,6 +106,18 @@ function startServer(port = 0) {
           } else if (cmd.type === 'kill' && cmd.pid) {
             const success = killProcess(cmd.pid);
             ws.send(JSON.stringify({ type: 'kill', success, pid: cmd.pid }));
+          } else if (cmd.type === 'connections') {
+            const connections = await getConnections();
+            ws.send(JSON.stringify({ type: 'connections', data: connections }));
+          } else if (cmd.type === 'folderSizes' && cmd.path) {
+            // Progressive scanning - returns estimates immediately, pushes updates
+            const onUpdate = (path, data) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'folderSizes', path, data }));
+              }
+            };
+            const sizes = await getFolderSizes(cmd.path, onUpdate);
+            ws.send(JSON.stringify({ type: 'folderSizes', path: cmd.path, data: sizes }));
           }
         } catch (err) {
           // Ignore invalid messages

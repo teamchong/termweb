@@ -80,12 +80,27 @@
 
     #process-table {
       width: 100%;
-      border-collapse: collapse;
       font-size: 11px;
     }
-    #process-table th {
+    #process-table tbody {
+      display: block;
+      position: relative;
+    }
+    #process-table tbody tr {
+      display: flex;
+      position: absolute;
+      width: 100%;
+      left: 0;
+      transition: transform 0.4s ease-out;
+    }
+    #process-table th, #process-table td {
       text-align: left;
-      padding: 6px 8px;
+      padding: 4px 8px;
+    }
+    #process-table thead tr {
+      display: flex;
+    }
+    #process-table th {
       background: #1e1e1e;
       color: #888;
       font-weight: 600;
@@ -94,24 +109,30 @@
       color: #569cd6;
     }
     #process-table td {
-      padding: 4px 8px;
       border-bottom: 1px solid #2d2d2d;
     }
-    #process-table tr:hover { background: #2a2d2e; }
+    /* Column widths for mini table */
+    #process-table th:nth-child(1), #process-table td:nth-child(1) { width: 60px; }
+    #process-table th:nth-child(2), #process-table td:nth-child(2) { flex: 1; }
+    #process-table th:nth-child(3), #process-table td:nth-child(3) { width: 60px; }
+    #process-table th:nth-child(4), #process-table td:nth-child(4) { width: 60px; }
+    #process-table th:nth-child(5), #process-table td:nth-child(5) { width: 80px; }
+    #process-table tbody tr:hover { background: #2a2d2e; }
 
     .core-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
     }
     .core-item {
       text-align: center;
-      padding: 8px;
+      padding: 2px 6px;
       background: #1e1e1e;
-      border-radius: 4px;
+      border-radius: 3px;
+      min-width: 32px;
     }
-    .core-item .label { font-size: 10px; color: #888; }
-    .core-item .value { font-size: 16px; font-weight: 600; }
+    .core-item .label { font-size: 8px; color: #666; }
+    .core-item .value { font-size: 9px; font-weight: 500; }
 
     /* Fullscreen views */
     #process-fullscreen, #detail-fullscreen {
@@ -131,6 +152,8 @@
     .detail-content {
       flex: 1;
       overflow: auto;
+      display: flex;
+      flex-direction: column;
     }
     .detail-chart {
       height: 200px;
@@ -168,21 +191,31 @@
     .process-table {
       width: 100%;
       font-size: 12px;
-      display: flex;
-      flex-direction: column;
     }
     .process-table thead {
       position: sticky;
       top: 0;
       z-index: 1;
     }
-    .process-table thead tr, .process-table tbody tr {
+    .process-table thead tr {
       display: flex;
       width: 100%;
     }
+    .process-table tbody {
+      display: block;
+      position: relative;
+    }
+    .process-table tbody tr {
+      display: flex;
+      position: absolute;
+      width: 100%;
+      left: 0;
+      transition: transform 0.4s ease-out;
+    }
     .process-table th, .process-table td {
-      padding: 6px 12px;
+      padding: 3px 8px;
       text-align: left;
+      font-size: 11px;
     }
     .process-table th {
       background: #1e1e1e;
@@ -206,10 +239,102 @@
       flex-direction: column;
     }
     .process-table tr.selected {
-      background: #2a2d2e;
+      background: linear-gradient(90deg, rgba(86, 156, 214, 0.25) 0%, rgba(86, 156, 214, 0.1) 100%);
+      border-left: 2px solid #569cd6;
+    }
+    .process-table tr.selected td:first-child {
+      padding-left: 6px;
     }
     .process-table tr:hover {
       background: #333;
+    }
+    .process-table:focus, .process-table *:focus,
+    #process-fullscreen:focus, #detail-fullscreen:focus,
+    body:focus, [tabindex]:focus {
+      outline: none;
+    }
+
+    /* Treemap styles */
+    .distribution-chart {
+      flex: 1;
+      min-height: 150px;
+      margin-top: 16px;
+    }
+    .treemap-label {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .treemap-2d {
+      position: relative;
+      width: 100%;
+      height: calc(100% - 24px);
+      min-height: 120px;
+      border-radius: 4px;
+    }
+    .treemap-cell {
+      position: absolute;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 4px;
+      box-sizing: border-box;
+      border: 1px solid rgba(30, 30, 30, 0.3);
+      overflow: hidden;
+      transition: all 0.3s ease;
+      cursor: pointer;
+    }
+    .treemap-cell:hover {
+      filter: brightness(1.1);
+      z-index: 10;
+    }
+    #tooltip {
+      position: fixed;
+      background: #1e1e1e;
+      color: #ccc;
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      white-space: nowrap;
+      z-index: 9999;
+      border: 1px solid #569cd6;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+      pointer-events: none;
+      display: none;
+    }
+    .treemap-name, .treemap-value {
+      pointer-events: none;
+      text-shadow: 0 0 2px rgba(255,255,255,0.5);
+    }
+    .treemap-name {
+      font-size: 11px;
+      font-weight: 500;
+      color: #1e1e1e;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+    .treemap-value {
+      font-size: 12px;
+      font-weight: 600;
+      color: #1e1e1e;
+    }
+
+    /* Larger core items for detail view */
+    #detail-cpu-cores .core-item {
+      padding: 6px 12px;
+      min-width: 48px;
+    }
+    #detail-cpu-cores .core-item .label {
+      font-size: 10px;
+    }
+    #detail-cpu-cores .core-item .value {
+      font-size: 14px;
+      font-weight: 600;
     }
 
     /* Bottom hints bar */
@@ -251,6 +376,35 @@
     }
     @keyframes spin {
       to { transform: rotate(360deg); }
+    }
+    @keyframes row-flash {
+      0% { background: rgba(60, 60, 60, 0.6); }
+      100% { background: transparent; }
+    }
+    .row-new {
+      animation: row-flash 0.6s ease-out;
+    }
+    /* Disk path breadcrumb */
+    .disk-path {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 4px;
+      font-size: 13px;
+      margin-bottom: 12px;
+      padding: 8px 12px;
+      background: #1e1e1e;
+      border-radius: 4px;
+      overflow-x: auto;
+    }
+    .path-item {
+      color: #569cd6;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .path-item:hover {
+      background: #333;
     }
   </style>
 </head>
@@ -321,10 +475,11 @@
     </div>
   </div>
 
-  <div id="process-fullscreen"></div>
-  <div id="detail-fullscreen"></div>
+  <div id="process-fullscreen" tabindex="-1"></div>
+  <div id="detail-fullscreen" tabindex="-1"></div>
 
   <div id="hints"></div>
+  <div id="tooltip"></div>
 
   <script src="app.bundle.js"></script>
 </body>

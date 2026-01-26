@@ -30,44 +30,14 @@ let filterText = '';
 let isFiltering = false;
 let detailLoading = false; // Loading state for detail views
 let lastDetailData = null; // Cache last data for detail views
-
-// Smoothed values for stable sorting (prevents jumping)
-const smoothedValues = new Map(); // pid -> { cpu, mem }
-const SMOOTH_FACTOR = 0.3; // Lower = more stable, higher = more responsive
+let pendingKill = null; // { pid, name } when waiting for kill confirmation
+let connectionsData = []; // Network connections by host
+let currentDiskPath = '/'; // Current folder path for disk drill-down
+let folderData = []; // Folder sizes for current path
+let selectedFolderIndex = 0; // Selected folder in disk treemap
 
 const SORT_COLUMNS = ['pid', 'name', 'cpu', 'mem', 'port'];
-
-// Update smoothed values for a process
-function updateSmoothedValues(process) {
-  const pid = process.pid;
-  const prev = smoothedValues.get(pid) || { cpu: process.cpu, mem: process.mem };
-
-  // Exponential moving average
-  const smoothed = {
-    cpu: prev.cpu * (1 - SMOOTH_FACTOR) + process.cpu * SMOOTH_FACTOR,
-    mem: prev.mem * (1 - SMOOTH_FACTOR) + process.mem * SMOOTH_FACTOR,
-  };
-
-  smoothedValues.set(pid, smoothed);
-  return smoothed;
-}
-
-// Get smoothed value for sorting
-function getSmoothedValue(process, field) {
-  const smoothed = smoothedValues.get(process.pid);
-  if (!smoothed) return process[field];
-  return smoothed[field] || process[field];
-}
-
-// Clean up smoothed values for dead processes
-function cleanupSmoothedValues(activePids) {
-  const activeSet = new Set(activePids);
-  for (const pid of smoothedValues.keys()) {
-    if (!activeSet.has(pid)) {
-      smoothedValues.delete(pid);
-    }
-  }
-}
+const FULLSCREEN_ROW_HEIGHT = 20;
 
 // Notify Node.js of view change (so it knows whether to forward key bindings)
 function notifyViewChange(view) {
@@ -76,39 +46,28 @@ function notifyViewChange(view) {
   }
 }
 
-// Global key binding handlers called by termweb
-window.__termwebView = function(view) {
-  // c,m,n,d,p only work on main view
+// Notify Node.js of kill confirmation state
+function notifyKillConfirm() {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'killConfirm' }));
+  }
+}
+
+function notifyKillCancel() {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'killCancel' }));
+  }
+}
+
+// View change handler (called from SDK IPC and click handlers)
+function switchView(view) {
   if (currentView !== 'main') return;
   currentView = view;
   notifyViewChange(view);
   selectedProcessIndex = 0;
   isFiltering = false;
   renderCurrentView();
-};
-
-window.__termwebFilter = function() {
-  // Open processes view and focus search
-  if (currentView === 'main') {
-    currentView = 'processes';
-    renderCurrentView();
-  }
-  setTimeout(() => {
-    const input = document.getElementById('filter-input');
-    if (input) input.focus();
-  }, 0);
-};
-
-window.__termwebEsc = function() {
-  // Esc only works on detail pages (not main)
-  if (currentView === 'main') return;
-  if (isFiltering) {
-    isFiltering = false;
-    renderCurrentView();
-  } else {
-    hideDetailView();
-  }
-};
+}
 
 async function renderCurrentView() {
   document.getElementById('main-dashboard').style.display = currentView === 'main' ? 'block' : 'none';
@@ -118,14 +77,18 @@ async function renderCurrentView() {
   if (currentView === 'processes') {
     renderProcessView();
   } else if (['cpu', 'memory', 'network', 'disk'].includes(currentView)) {
-    // Show spinner and fetch data async
-    detailLoading = true;
+    // Use cached data from main dashboard (already updated every 5s)
+    detailLoading = !lastDetailData;
     renderDetailView(currentView);
-    const data = await requestMetrics('full');
-    detailLoading = false;
-    if (data && ['cpu', 'memory', 'network', 'disk'].includes(currentView)) {
-      lastDetailData = data;
-      updateDetailView(currentView, data);
+    if (lastDetailData) {
+      updateDetailView(currentView, lastDetailData);
+    }
+    // Request additional data for network and disk views
+    if (currentView === 'network') {
+      requestConnections();
+    } else if (currentView === 'disk') {
+      folderData = [];
+      requestFolderSizes(currentDiskPath);
     }
   }
   updateHints();
@@ -262,12 +225,10 @@ function getFilteredProcesses() {
       case 'pid': cmp = a.pid - b.pid; break;
       case 'name': cmp = a.name.localeCompare(b.name); break;
       case 'cpu':
-        // Use smoothed CPU for stable sorting
-        cmp = getSmoothedValue(a, 'cpu') - getSmoothedValue(b, 'cpu');
+        cmp = a.cpu - b.cpu;
         break;
       case 'mem':
-        // Use smoothed memory for stable sorting
-        cmp = getSmoothedValue(a, 'mem') - getSmoothedValue(b, 'mem');
+        cmp = a.mem - b.mem;
         break;
       case 'port':
         // Parse first port as number for numeric sort
@@ -309,12 +270,13 @@ function updateSelectionFast(oldIndex, newIndex) {
   return false;
 }
 
-// Build table rows HTML from filtered process list (with data-pid for CSS order)
+// Build table rows HTML with transform positioning
 function buildTableRows(filtered) {
   return filtered.map((p, i) => {
     const selected = i === selectedProcessIndex;
     const ports = p.ports?.join(', ') || '-';
-    return `<tr data-pid="${p.pid}" style="order: ${i}" class="${selected ? 'selected' : ''}">
+    const y = i * FULLSCREEN_ROW_HEIGHT;
+    return `<tr data-pid="${p.pid}" style="transform: translateY(${y}px)" class="${selected ? 'selected' : ''}">
       <td>${p.pid}</td>
       <td>${p.name}</td>
       <td class="${getLoadClass(p.cpu)}">${p.cpu.toFixed(1)}%</td>
@@ -326,7 +288,7 @@ function buildTableRows(filtered) {
   }).join('');
 }
 
-// Apply sort order via CSS (no DOM rebuild)
+// Apply sort order with transform animation
 function applySortOrder() {
   const tbody = document.querySelector('.process-table tbody');
   if (!tbody) return false;
@@ -334,16 +296,16 @@ function applySortOrder() {
   const filtered = getFilteredProcesses();
   const rows = tbody.querySelectorAll('tr');
 
-  // Build pid -> new order map
-  const orderMap = new Map();
-  filtered.forEach((p, i) => orderMap.set(p.pid, i));
+  // Build pid -> new index map
+  const indexMap = new Map();
+  filtered.forEach((p, i) => indexMap.set(p.pid, i));
 
-  // Apply CSS order to each row
+  // Apply transform position to each row
   rows.forEach(row => {
     const pid = parseInt(row.dataset.pid, 10);
-    const order = orderMap.get(pid);
-    if (order !== undefined) {
-      row.style.order = order;
+    const idx = indexMap.get(pid);
+    if (idx !== undefined) {
+      row.style.transform = `translateY(${idx * FULLSCREEN_ROW_HEIGHT}px)`;
       row.style.display = '';
     } else {
       // Hide rows not in filtered list
@@ -362,6 +324,9 @@ function applySortOrder() {
     }
   }
 
+  // Update tbody height
+  tbody.style.height = `${filtered.length * FULLSCREEN_ROW_HEIGHT}px`;
+
   return true;
 }
 
@@ -373,7 +338,7 @@ function buildTableHeader() {
   }).join('') + '<th>STATE</th><th>USER</th>';
 }
 
-// Update table in place (fast path - no container rebuild)
+// Update table in place with transform animation
 function updateTable() {
   const thead = document.querySelector('.process-table thead tr');
   const tbody = document.querySelector('.process-table tbody');
@@ -384,8 +349,79 @@ function updateTable() {
     selectedProcessIndex = Math.max(0, filtered.length - 1);
   }
 
+  // Update header
   thead.innerHTML = buildTableHeader();
-  tbody.innerHTML = buildTableRows(filtered);
+
+  // Get existing rows by PID
+  const existingRows = new Map();
+  tbody.querySelectorAll('tr').forEach(row => {
+    existingRows.set(parseInt(row.dataset.pid, 10), row);
+  });
+
+  // Track which PIDs are in filtered list
+  const filteredPids = new Set(filtered.map(p => p.pid));
+  const allPids = new Set(processList.map(p => p.pid));
+
+  // Update or create rows
+  filtered.forEach((p, i) => {
+    let row = existingRows.get(p.pid);
+    const isNew = !row;
+
+    if (isNew) {
+      // Create new row with flash effect
+      row = document.createElement('tr');
+      row.dataset.pid = p.pid;
+      row.style.transition = 'none';
+      row.classList.add('row-new');
+      for (let j = 0; j < 7; j++) {
+        row.appendChild(document.createElement('td'));
+      }
+      tbody.appendChild(row);
+      // Remove flash class after animation
+      setTimeout(() => row.classList.remove('row-new'), 600);
+    }
+
+    // Update cell innerText
+    const cells = row.querySelectorAll('td');
+    cells[0].textContent = p.pid;
+    cells[1].textContent = p.name;
+    cells[2].textContent = p.cpu.toFixed(1) + '%';
+    cells[2].className = getLoadClass(p.cpu);
+    cells[3].textContent = p.mem.toFixed(1) + '%';
+    cells[4].textContent = p.ports?.join(', ') || '-';
+    cells[5].textContent = p.state || '';
+    cells[6].textContent = p.user || '';
+
+    // Position with transform
+    const newY = i * FULLSCREEN_ROW_HEIGHT;
+    if (isNew) {
+      // New row: set position directly without animation
+      row.style.transform = `translateY(${newY}px)`;
+      // Enable transition after initial position set
+      requestAnimationFrame(() => {
+        row.style.transition = 'transform 0.4s ease-out';
+      });
+    } else {
+      // Existing row: animate to new position
+      row.style.transform = `translateY(${newY}px)`;
+    }
+
+    row.style.display = '';
+    row.classList.toggle('selected', i === selectedProcessIndex);
+  });
+
+  // Remove or hide rows
+  existingRows.forEach((row, pid) => {
+    if (!allPids.has(pid)) {
+      row.remove();
+    } else if (!filteredPids.has(pid)) {
+      row.style.display = 'none';
+    }
+  });
+
+  // Set tbody height
+  tbody.style.height = `${filtered.length * FULLSCREEN_ROW_HEIGHT}px`;
+
   return true;
 }
 
@@ -399,70 +435,31 @@ function renderProcessView() {
   }
 
   container.innerHTML = `
-    <div class="process-header">
+    <div class="process-header" tabindex="-1">
       <h2>Processes</h2>
-      <input type="text" id="filter-input" value="${filterText}" placeholder="Search by name, pid, or port...">
+      <input type="text" id="filter-input" value="${filterText}" placeholder="Search by name, pid, or port..." tabindex="0" autofocus>
     </div>
-    <div class="process-table-wrap">
-      <table class="process-table">
+    <div class="process-table-wrap" tabindex="-1">
+      <table class="process-table" tabindex="-1">
         <thead><tr>${buildTableHeader()}</tr></thead>
-        <tbody>${buildTableRows(filtered)}</tbody>
+        <tbody style="height: ${filtered.length * FULLSCREEN_ROW_HEIGHT}px">${buildTableRows(filtered)}</tbody>
       </table>
     </div>
   `;
 
-  // Setup search input handler
+  container.style.display = 'flex';
+  document.getElementById('main-dashboard').style.display = 'none';
+
+  // Focus input immediately after render
   const input = document.getElementById('filter-input');
+  input.focus();
+
   input.addEventListener('input', (e) => {
     filterText = e.target.value;
     selectedProcessIndex = 0;
     applySortOrder();
   });
 
-  // Navigation keys work even when search focused
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      const oldIndex = selectedProcessIndex;
-      selectedProcessIndex = Math.max(0, selectedProcessIndex - 1);
-      updateSelectionFast(oldIndex, selectedProcessIndex);
-    } else if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      const filtered = getFilteredProcesses();
-      const oldIndex = selectedProcessIndex;
-      selectedProcessIndex = Math.min(filtered.length - 1, selectedProcessIndex + 1);
-      updateSelectionFast(oldIndex, selectedProcessIndex);
-    } else if (e.key === 'Tab' && e.shiftKey) {
-      e.preventDefault();
-      const idx = SORT_COLUMNS.indexOf(sortColumn);
-      sortColumn = SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length];
-      selectedProcessIndex = 0;
-      const thead = document.querySelector('.process-table thead tr');
-      if (thead) thead.innerHTML = buildTableHeader();
-      applySortOrder();
-      updateHints();
-      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
-    } else if (e.key === 'Tab' && !e.shiftKey) {
-      e.preventDefault();
-      const idx = SORT_COLUMNS.indexOf(sortColumn);
-      sortColumn = SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
-      selectedProcessIndex = 0;
-      const thead = document.querySelector('.process-table thead tr');
-      if (thead) thead.innerHTML = buildTableHeader();
-      applySortOrder();
-      updateHints();
-      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      hideDetailView();
-    }
-  });
-
-  // Always focus search box (use setTimeout to ensure DOM is ready)
-  setTimeout(() => input.focus(), 0);
-
-  container.style.display = 'flex';
-  document.getElementById('main-dashboard').style.display = 'none';
   updateHints();
 }
 
@@ -471,28 +468,38 @@ function renderDetailView(type) {
   const container = document.getElementById('detail-fullscreen');
   const titles = { cpu: 'CPU Details', memory: 'Memory Details', network: 'Network Details', disk: 'Disk Details' };
 
-  // Show spinner while loading
-  const spinner = detailLoading ? '<div class="spinner">Loading...</div>' : '';
+  // Destroy previous detail chart
+  if (detailChart) {
+    detailChart.destroy();
+    detailChart = null;
+  }
 
   let content = '';
-  if (type === 'cpu') {
+  if (detailLoading) {
+    // Show spinner when no data yet
+    content = '<div class="spinner">Loading...</div>';
+  } else if (type === 'cpu') {
     content = `
-      <div class="detail-chart"><canvas id="detail-cpu-chart"></canvas></div>
-      <div id="detail-cpu-info">${spinner}</div>
+      <div id="detail-cpu-info"></div>
       <div id="detail-cpu-cores" class="core-grid"></div>
+      <div id="detail-cpu-dist" class="distribution-chart"></div>
     `;
   } else if (type === 'memory') {
     content = `
-      <div class="detail-chart"><canvas id="detail-mem-chart"></canvas></div>
-      <div id="detail-mem-info">${spinner}</div>
+      <div id="detail-mem-info"></div>
+      <div id="detail-mem-dist" class="distribution-chart"></div>
     `;
   } else if (type === 'network') {
     content = `
-      <div class="detail-chart"><canvas id="detail-net-chart"></canvas></div>
-      <div id="detail-net-info">${spinner}</div>
+      <div class="detail-chart"><canvas id="detail-chart-canvas"></canvas></div>
+      <div id="detail-net-info"></div>
+      <div id="detail-net-connections" class="distribution-chart"></div>
     `;
   } else if (type === 'disk') {
-    content = `<div id="detail-disk-info">${spinner}</div>`;
+    content = `
+      <div id="detail-disk-path" class="disk-path"></div>
+      <div id="detail-disk-treemap" class="distribution-chart" style="flex:1;"></div>
+    `;
   }
 
   container.innerHTML = `
@@ -501,6 +508,383 @@ function renderDetailView(type) {
     </div>
     <div class="detail-content">${content}</div>
   `;
+
+  // Create chart only for network (line chart)
+  const canvas = document.getElementById('detail-chart-canvas');
+  if (canvas && type === 'network') {
+    detailChart = new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: Array(60).fill(''),
+        datasets: [
+          {
+            label: 'Download',
+            data: Array(60).fill(0),
+            borderColor: 'rgb(106, 153, 85)',
+            backgroundColor: 'rgba(106, 153, 85, 0.1)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 0,
+            borderWidth: 2
+          },
+          {
+            label: 'Upload',
+            data: Array(60).fill(0),
+            borderColor: 'rgb(206, 145, 120)',
+            backgroundColor: 'rgba(206, 145, 120, 0.1)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 0,
+            borderWidth: 2
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        plugins: { legend: { display: true } },
+        scales: {
+          x: { display: false },
+          y: {
+            display: true,
+            min: 0,
+            grid: { color: 'rgba(60, 60, 60, 0.5)' },
+            ticks: { color: '#888', font: { size: 10 } }
+          }
+        }
+      }
+    });
+  }
+}
+
+// Color palette for treemap
+const TREEMAP_COLORS = [
+  '#569cd6', '#4ec9b0', '#dcdcaa', '#ce9178', '#c586c0',
+  '#6a9955', '#d7ba7d', '#9cdcfe', '#f14c4c', '#b5cea8'
+];
+
+// Squarified treemap layout algorithm
+function squarify(items, x, y, w, h, result = []) {
+  if (items.length === 0) return result;
+  if (items.length === 1) {
+    result.push({ ...items[0], x, y, w, h });
+    return result;
+  }
+
+  const total = items.reduce((sum, it) => sum + it.value, 0);
+  if (total === 0) return result;
+
+  // Determine layout direction (horizontal or vertical split)
+  const vertical = h > w;
+  const side = vertical ? h : w;
+
+  // Find best split using squarify algorithm
+  let row = [];
+  let rowSum = 0;
+  let remaining = [...items];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const testRow = [...row, item];
+    const testSum = rowSum + item.value;
+
+    // Calculate aspect ratios
+    const rowArea = (testSum / total) * w * h;
+    const rowSide = vertical ? (rowArea / w) : (rowArea / h);
+    const worstRatio = Math.max(...testRow.map(it => {
+      const itemArea = (it.value / testSum) * rowArea;
+      const itemSide = vertical ? (itemArea / rowSide) : (itemArea / rowSide);
+      const otherSide = rowSide;
+      return Math.max(itemSide / otherSide, otherSide / itemSide);
+    }));
+
+    // Check if adding this item improves or worsens the layout
+    if (row.length > 0) {
+      const prevRowArea = (rowSum / total) * w * h;
+      const prevRowSide = vertical ? (prevRowArea / w) : (prevRowArea / h);
+      const prevWorstRatio = Math.max(...row.map(it => {
+        const itemArea = (it.value / rowSum) * prevRowArea;
+        const itemSide = vertical ? (itemArea / prevRowSide) : (itemArea / prevRowSide);
+        const otherSide = prevRowSide;
+        return Math.max(itemSide / otherSide, otherSide / itemSide);
+      }));
+
+      if (worstRatio > prevWorstRatio && row.length > 0) {
+        // Layout current row and recurse with remaining
+        const rowArea = (rowSum / total) * w * h;
+        const rowSize = vertical ? (rowArea / w) : (rowArea / h);
+
+        let offset = 0;
+        for (const rowItem of row) {
+          const itemSize = (rowItem.value / rowSum) * (vertical ? w : h);
+          if (vertical) {
+            result.push({ ...rowItem, x: x + offset, y, w: itemSize, h: rowSize });
+          } else {
+            result.push({ ...rowItem, x, y: y + offset, w: rowSize, h: itemSize });
+          }
+          offset += itemSize;
+        }
+
+        // Recurse with remaining items
+        if (vertical) {
+          return squarify(remaining.slice(row.length), x, y + rowSize, w, h - rowSize, result);
+        } else {
+          return squarify(remaining.slice(row.length), x + rowSize, y, w - rowSize, h, result);
+        }
+      }
+    }
+
+    row.push(item);
+    rowSum += item.value;
+  }
+
+  // Layout final row
+  const rowArea = (rowSum / total) * w * h;
+  const rowSize = vertical ? (rowArea / w) : (rowArea / h);
+  let offset = 0;
+  for (const rowItem of row) {
+    const itemSize = (rowItem.value / rowSum) * (vertical ? w : h);
+    if (vertical) {
+      result.push({ ...rowItem, x: x + offset, y, w: itemSize, h: rowSize });
+    } else {
+      result.push({ ...rowItem, x, y: y + offset, w: rowSize, h: itemSize });
+    }
+    offset += itemSize;
+  }
+
+  return result;
+}
+
+// Render treemap for top consumers
+function renderTreemap(containerId, processes, valueKey, label) {
+  const container = document.getElementById(containerId);
+  if (!container || !processes || processes.length === 0) return;
+
+  // Get top 15 by value
+  const sorted = [...processes]
+    .filter(p => p[valueKey] > 0.1)
+    .sort((a, b) => b[valueKey] - a[valueKey])
+    .slice(0, 15);
+
+  const total = sorted.reduce((sum, p) => sum + p[valueKey], 0);
+  if (total === 0) {
+    container.innerHTML = '<div style="color: #888; padding: 16px;">No significant usage</div>';
+    return;
+  }
+
+  // Prepare items with normalized values
+  const items = sorted.map((p, i) => ({
+    name: p.name,
+    pid: p.pid,
+    value: p[valueKey],
+    pct: p[valueKey],
+    mem: p.mem,
+    cpu: p.cpu,
+    color: TREEMAP_COLORS[i % TREEMAP_COLORS.length]
+  }));
+
+  // Calculate layout (use percentage-based coordinates)
+  const layout = squarify(items, 0, 0, 100, 100);
+
+  // Build treemap HTML
+  let html = `<div class="treemap-label">${label} - Top Consumers</div><div class="treemap-2d">`;
+  for (const item of layout) {
+    const showLabel = item.w > 8 && item.h > 12;
+    const showValue = item.w > 5 && item.h > 8;
+    const tip = `${item.name} (PID: ${item.pid}) | CPU: ${item.cpu.toFixed(1)}% | MEM: ${item.mem.toFixed(1)}%`;
+    html += `
+      <div class="treemap-cell" style="left:${item.x}%;top:${item.y}%;width:${item.w}%;height:${item.h}%;background:${item.color};" data-tip="${tip}">
+        ${showLabel ? `<span class="treemap-name">${item.name}</span>` : ''}
+        ${showValue ? `<span class="treemap-value">${item.pct.toFixed(1)}%</span>` : ''}
+      </div>
+    `;
+  }
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+
+// Request connections from server
+function requestConnections() {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'connections' }));
+  }
+}
+
+// Request folder sizes from server
+function requestFolderSizes(path) {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ type: 'folderSizes', path }));
+  }
+}
+
+// Render connections treemap
+function renderConnectionsTreemap(containerId) {
+  const container = document.getElementById(containerId);
+  if (!container || connectionsData.length === 0) {
+    if (container) container.innerHTML = '<div style="color:#888;padding:16px;">No active connections</div>';
+    return;
+  }
+
+  const totalBytes = connectionsData.reduce((sum, c) => sum + (c.bytes || 0), 0);
+  const items = connectionsData.map((c, i) => ({
+    ip: c.host,
+    hostname: c.hostname || c.host,
+    name: (c.hostname && c.hostname !== c.host) ? c.hostname : c.host,
+    value: c.bytes || 1, // Use bytes for sizing
+    bytes: c.bytes || 0,
+    count: c.count,
+    ports: c.ports,
+    processes: c.processes,
+    color: TREEMAP_COLORS[i % TREEMAP_COLORS.length]
+  }));
+
+  const layout = squarify(items, 0, 0, 100, 100);
+
+  let html = `<div class="treemap-label">Network Traffic (${formatBytes(totalBytes)} total)</div><div class="treemap-2d">`;
+  for (const item of layout) {
+    const showLabel = item.w > 10 && item.h > 15;
+    const showValue = item.w > 6 && item.h > 10;
+    const hostInfo = item.hostname !== item.ip ? `${item.hostname} (${item.ip})` : item.ip;
+    const tip = `${hostInfo} | ${formatBytes(item.bytes)} | ${item.count} conn | Ports: ${item.ports.join(',')} | ${item.processes.join(',')}`;
+    html += `
+      <div class="treemap-cell" style="left:${item.x}%;top:${item.y}%;width:${item.w}%;height:${item.h}%;background:${item.color};" data-tip="${tip}">
+        ${showLabel ? `<span class="treemap-name">${item.name}</span>` : ''}
+        ${showValue ? `<span class="treemap-value">${formatBytes(item.bytes)}</span>` : ''}
+      </div>
+    `;
+  }
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+// Render folder treemap with drill-down
+function renderFolderTreemap(containerId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  if (folderData.length === 0) {
+    container.innerHTML = '<div class="spinner">Scanning...</div>';
+    return;
+  }
+
+  // Clamp selection
+  if (selectedFolderIndex >= folderData.length) {
+    selectedFolderIndex = Math.max(0, folderData.length - 1);
+  }
+
+  const confirmedCount = folderData.filter(f => f.confirmed).length;
+  const total = folderData.reduce((sum, f) => sum + f.size, 0);
+  const items = folderData.map((f, i) => ({
+    name: f.name,
+    path: f.path,
+    value: f.size,
+    size: f.size,
+    confirmed: f.confirmed,
+    index: i,
+    color: TREEMAP_COLORS[i % TREEMAP_COLORS.length]
+  }));
+
+  const layout = squarify(items, 0, 0, 100, 100);
+
+  const scanningText = confirmedCount < folderData.length ? ` (scanning ${confirmedCount}/${folderData.length})` : '';
+  let html = `<div class="treemap-label">Folder Sizes (${formatBytes(total)} total)${scanningText}</div><div class="treemap-2d">`;
+  for (const item of layout) {
+    const showLabel = item.w > 8 && item.h > 12;
+    const showValue = item.w > 5 && item.h > 8;
+    const pct = total > 0 ? (item.size / total * 100).toFixed(1) : 0;
+    const status = item.confirmed ? '' : ' (estimated)';
+    const tip = `${item.path} | ${formatBytes(item.size)}${status} (${pct}%)`;
+    const isSelected = item.index === selectedFolderIndex;
+    // Unconfirmed items have striped pattern overlay
+    const opacity = item.confirmed ? 1 : 0.6;
+    const pattern = item.confirmed ? '' : 'background-image: repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.1) 5px, rgba(0,0,0,0.1) 10px);';
+    const selectedStyle = isSelected ? 'outline: 3px solid #fff; outline-offset: -3px; z-index: 10;' : '';
+    html += `
+      <div class="treemap-cell folder-cell${isSelected ? ' selected' : ''}" style="left:${item.x}%;top:${item.y}%;width:${item.w}%;height:${item.h}%;background-color:${item.color};opacity:${opacity};${pattern}${selectedStyle}" data-tip="${tip}" data-path="${item.path}" data-index="${item.index}">
+        ${showLabel ? `<span class="treemap-name">${item.name}</span>` : ''}
+        ${showValue ? `<span class="treemap-value">${item.confirmed ? formatBytes(item.size) : '~' + formatBytes(item.size)}</span>` : ''}
+      </div>
+    `;
+  }
+  html += '</div>';
+  container.innerHTML = html;
+
+  // Add click handlers for drill-down
+  container.querySelectorAll('.folder-cell').forEach(cell => {
+    cell.addEventListener('click', () => {
+      const path = cell.dataset.path;
+      if (path) {
+        drillIntoFolder(path);
+      }
+    });
+  });
+}
+
+// Drill into a folder
+function drillIntoFolder(path) {
+  currentDiskPath = path;
+  folderData = [];
+  selectedFolderIndex = 0;
+  updateDiskPath();
+  renderFolderTreemap('detail-disk-treemap');
+  requestFolderSizes(path);
+}
+
+// Update folder selection visually
+function updateFolderSelection() {
+  const cells = document.querySelectorAll('.folder-cell');
+  cells.forEach(cell => {
+    const idx = parseInt(cell.dataset.index, 10);
+    const isSelected = idx === selectedFolderIndex;
+    cell.classList.toggle('selected', isSelected);
+    cell.style.outline = isSelected ? '3px solid #fff' : '';
+    cell.style.outlineOffset = isSelected ? '-3px' : '';
+    cell.style.zIndex = isSelected ? '10' : '';
+  });
+}
+
+// Update disk path breadcrumb
+function updateDiskPath() {
+  const pathEl = document.getElementById('detail-disk-path');
+  if (!pathEl) return;
+
+  const parts = currentDiskPath.split('/').filter(p => p);
+  // Format: / opt/ homebrew/ proto/
+  let html = '<span class="path-item" data-path="/">/</span> ';
+  let accumulated = '';
+  for (const part of parts) {
+    accumulated += '/' + part;
+    html += `<span class="path-item" data-path="${accumulated}">${part}/</span> `;
+  }
+  pathEl.innerHTML = html.trim();
+
+  // Add click handlers for breadcrumb navigation
+  pathEl.querySelectorAll('.path-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const path = item.dataset.path;
+      if (path && path !== currentDiskPath) {
+        currentDiskPath = path;
+        folderData = [];
+        updateDiskPath();
+        renderFolderTreemap('detail-disk-treemap');
+        requestFolderSizes(path);
+      }
+    });
+  });
+}
+
+// Navigate up one directory level
+function navigateUp() {
+  if (currentDiskPath === '/') return;
+  const parts = currentDiskPath.split('/').filter(p => p);
+  parts.pop();
+  currentDiskPath = parts.length === 0 ? '/' : '/' + parts.join('/');
+  folderData = [];
+  updateDiskPath();
+  renderFolderTreemap('detail-disk-treemap');
+  requestFolderSizes(currentDiskPath);
 }
 
 // Update detail view with data
@@ -526,20 +910,28 @@ function updateDetailView(type, data) {
           <span class="stat-label">Load</span>
           <span class="stat-value ${getLoadClass(data.cpu.load)}">${data.cpu.load.toFixed(1)}%</span>
         </div>
+        <div class="progress-bar" style="margin-top: 8px;">
+          <div class="progress-fill cpu" style="width: ${data.cpu.load.toFixed(1)}%"></div>
+        </div>
       `;
     }
     if (cores && data.cpu.loadPerCore) {
       cores.innerHTML = data.cpu.loadPerCore.map((load, i) => `
         <div class="core-item">
-          <div class="label">Core ${i}</div>
+          <div class="label">${i + 1}</div>
           <div class="value ${getLoadClass(load)}">${load.toFixed(0)}%</div>
         </div>
       `).join('');
     }
+    // Treemap of top CPU consumers
+    if (data.processes?.list) {
+      renderTreemap('detail-cpu-dist', data.processes.list, 'cpu', 'CPU');
+    }
   } else if (type === 'memory' && data.memory) {
+    const mem = data.memory;
+    const memPercent = (mem.used / mem.total) * 100;
     const info = document.getElementById('detail-mem-info');
     if (info) {
-      const mem = data.memory;
       info.innerHTML = `
         <div class="stat-row">
           <span class="stat-label">Total</span>
@@ -547,7 +939,10 @@ function updateDetailView(type, data) {
         </div>
         <div class="stat-row">
           <span class="stat-label">Used</span>
-          <span class="stat-value">${formatBytes(mem.used)} (${((mem.used / mem.total) * 100).toFixed(1)}%)</span>
+          <span class="stat-value">${formatBytes(mem.used)} (${memPercent.toFixed(1)}%)</span>
+        </div>
+        <div class="progress-bar" style="margin-top: 4px; margin-bottom: 8px;">
+          <div class="progress-fill mem" style="width: ${memPercent.toFixed(1)}%"></div>
         </div>
         <div class="stat-row">
           <span class="stat-label">Free</span>
@@ -579,43 +974,58 @@ function updateDetailView(type, data) {
         </div>
       `;
     }
+    // Treemap of top memory consumers
+    if (data.processes?.list) {
+      renderTreemap('detail-mem-dist', data.processes.list, 'mem', 'Memory');
+    }
   } else if (type === 'network' && data.network) {
+    const netRx = data.network.reduce((sum, n) => sum + (n.rx_sec || 0), 0);
+    const netTx = data.network.reduce((sum, n) => sum + (n.tx_sec || 0), 0);
+    // Update chart
+    if (detailChart) {
+      detailChart.data.datasets[0].data.push(netRx);
+      detailChart.data.datasets[0].data.shift();
+      detailChart.data.datasets[1].data.push(netTx);
+      detailChart.data.datasets[1].data.shift();
+      detailChart.update('none');
+    }
     const info = document.getElementById('detail-net-info');
     if (info) {
-      info.innerHTML = data.network.map(n => `
+      info.innerHTML = `
+        <div class="stat-row" style="margin-bottom: 8px;">
+          <span class="stat-label">Total</span>
+          <span class="stat-value">↓ ${formatBps(netRx)} / ↑ ${formatBps(netTx)}</span>
+        </div>
+      ` + data.network.map(n => `
         <div class="stat-row">
           <span class="stat-label">${n.iface}</span>
           <span class="stat-value">↓ ${formatBps(n.rx_sec || 0)} / ↑ ${formatBps(n.tx_sec || 0)}</span>
         </div>
       `).join('') || '<div class="stat-row"><span class="stat-label">No active interfaces</span></div>';
     }
-  } else if (type === 'disk' && data.disk) {
-    const info = document.getElementById('detail-disk-info');
-    if (info) {
-      info.innerHTML = data.disk.map(d => `
-        <div class="stat-row">
-          <span class="stat-label">${d.mount} (${d.fs})</span>
-          <span class="stat-value ${getLoadClass(d.usePercent)}">${d.usePercent.toFixed(0)}% used</span>
-        </div>
-        <div class="progress-bar">
-          <div class="progress-fill disk" style="width: ${d.usePercent}%"></div>
-        </div>
-        <div style="font-size: 11px; color: #888; margin-top: 4px; margin-bottom: 12px;">
-          ${formatBytes(d.used)} used of ${formatBytes(d.size)} (${formatBytes(d.available)} free)
-        </div>
-      `).join('');
-    }
+    // Render connections treemap
+    renderConnectionsTreemap('detail-net-connections');
+  } else if (type === 'disk') {
+    // Disk view uses folder treemap, not stats
+    updateDiskPath();
+    renderFolderTreemap('detail-disk-treemap');
   }
 }
 
 // Hide any detail view and go back to main
 function hideDetailView() {
+  // Destroy detail chart
+  if (detailChart) {
+    detailChart.destroy();
+    detailChart = null;
+  }
   document.getElementById('process-fullscreen').style.display = 'none';
   document.getElementById('detail-fullscreen').style.display = 'none';
   document.getElementById('main-dashboard').style.display = 'block';
   currentView = 'main';
   notifyViewChange('main');
   isFiltering = false;
+  pendingKill = null;
   updateHints();
 }
 
@@ -625,12 +1035,19 @@ function updateHints() {
   if (currentView === 'main') {
     hints.innerHTML = '<span>c: CPU</span><span>m: Memory</span><span>n: Network</span><span>d: Disk</span><span>p: Processes</span><span>Ctrl+Q: Quit</span>';
   } else if (currentView === 'processes') {
-    hints.innerHTML = `
-      <span>Tab: Sort (${sortColumn})</span>
-      <span>↑↓: Select</span>
-      <span>Ctrl+K: Kill</span>
-      <span>Esc: Back</span>
-    `;
+    if (pendingKill) {
+      const ports = pendingKill.ports?.join(',') || '-';
+      hints.innerHTML = `<span style="color: #f14c4c;">Kill "${pendingKill.name}" PID:${pendingKill.pid} CPU:${pendingKill.cpu.toFixed(1)}% MEM:${pendingKill.mem.toFixed(1)}% PORT:${ports} ? Y: Confirm, N: Cancel</span>`;
+    } else {
+      hints.innerHTML = `
+        <span>Tab/Shift+Tab: Sort (${sortColumn})</span>
+        <span>↑↓: Select</span>
+        <span>Ctrl+K: Kill</span>
+        <span>Esc: Back</span>
+      `;
+    }
+  } else if (currentView === 'disk') {
+    hints.innerHTML = '<span>←→↑↓: Select</span><span>Enter: Drill in</span><span>Backspace: Up</span><span>Esc: Back</span>';
   } else {
     hints.innerHTML = '<span>Esc: Back</span>';
   }
@@ -662,7 +1079,7 @@ function updateUI(data, isFull) {
     if (data.cpu.loadPerCore) {
       document.getElementById('cpu-cores').innerHTML = data.cpu.loadPerCore.map((load, i) => `
         <div class="core-item">
-          <div class="label">Core ${i}</div>
+          <div class="label">${i + 1}</div>
           <div class="value ${getLoadClass(load)}">${load.toFixed(0)}%</div>
         </div>
       `).join('');
@@ -727,21 +1144,63 @@ function updateUI(data, isFull) {
       `).join('');
     }
 
-    // Processes (mini view) - update in place
+    // Processes (mini view) - use same sort as fullscreen
     if (isFull && data.processes) {
       const tbody = document.getElementById('process-tbody');
-      const procs = data.processes.list.slice(0, 10);
-      const rows = tbody.querySelectorAll('tr');
-
-      // Create rows if needed (first load or count changed)
-      if (rows.length !== procs.length) {
-        tbody.innerHTML = procs.map(() => `<tr><td></td><td></td><td></td><td></td><td></td></tr>`).join('');
+      // Update mini table header to show current sort
+      const miniThead = document.querySelector('#process-table thead tr');
+      if (miniThead) {
+        const cols = ['pid', 'name', 'cpu', 'mem', 'port'];
+        const labels = ['PID', 'Name', 'CPU %', 'MEM %', 'PORT'];
+        miniThead.innerHTML = cols.map((col, i) => {
+          const arrow = sortColumn === col ? (sortAsc ? '▲' : '▼') : '';
+          return `<th class="${sortColumn === col ? 'sorted' : ''}">${labels[i]} ${arrow}</th>`;
+        }).join('');
       }
+      // Sort using same column/order as fullscreen view
+      const sorted = [...data.processes.list].sort((a, b) => {
+        let cmp = 0;
+        switch (sortColumn) {
+          case 'pid': cmp = a.pid - b.pid; break;
+          case 'name': cmp = a.name.localeCompare(b.name); break;
+          case 'cpu': cmp = a.cpu - b.cpu; break;
+          case 'mem': cmp = a.mem - b.mem; break;
+          case 'port':
+            const aPort = parseInt(a.ports?.[0], 10) || 0;
+            const bPort = parseInt(b.ports?.[0], 10) || 0;
+            cmp = aPort - bPort;
+            break;
+        }
+        return sortAsc ? cmp : -cmp;
+      });
+      const procs = sorted.slice(0, 10);
+      const rowHeight = 24;
 
-      // Update cell text in place
-      tbody.querySelectorAll('tr').forEach((row, i) => {
-        const p = procs[i];
-        if (!p) return;
+      // Get existing rows by PID
+      const existingRows = new Map();
+      tbody.querySelectorAll('tr').forEach(row => {
+        if (row.dataset.pid) {
+          existingRows.set(parseInt(row.dataset.pid, 10), row);
+        }
+      });
+
+      const procsSet = new Set(procs.map(p => p.pid));
+
+      // Update or create rows, position with transform
+      procs.forEach((p, i) => {
+        let row = existingRows.get(p.pid);
+        if (!row) {
+          row = document.createElement('tr');
+          row.dataset.pid = p.pid;
+          row.classList.add('row-new');
+          for (let j = 0; j < 5; j++) {
+            row.appendChild(document.createElement('td'));
+          }
+          tbody.appendChild(row);
+          setTimeout(() => row.classList.remove('row-new'), 600);
+        }
+
+        // Update cells
         const cells = row.querySelectorAll('td');
         cells[0].textContent = p.pid;
         cells[1].textContent = p.name;
@@ -749,7 +1208,20 @@ function updateUI(data, isFull) {
         cells[2].className = getLoadClass(p.cpu);
         cells[3].textContent = p.mem.toFixed(1) + '%';
         cells[4].textContent = p.ports?.join(', ') || '-';
+
+        // Position with transform (animates via CSS transition)
+        row.style.transform = `translateY(${i * rowHeight}px)`;
       });
+
+      // Remove old rows not in top 10
+      existingRows.forEach((row, pid) => {
+        if (!procsSet.has(pid)) {
+          row.remove();
+        }
+      });
+
+      // Set tbody height for proper spacing
+      tbody.style.height = `${procs.length * rowHeight}px`;
     }
 
     // System info
@@ -763,16 +1235,11 @@ function updateUI(data, isFull) {
   if (isFull && data.processes) {
     processList = data.processes.list;
 
-    // Update smoothed values for stable sorting
-    const activePids = [];
-    for (const process of processList) {
-      updateSmoothedValues(process);
-      activePids.push(process.pid);
-    }
-    cleanupSmoothedValues(activePids);
-
     if (currentView === 'processes') {
-      renderProcessView();
+      // Update table in place without re-rendering container (preserves search input)
+      if (!updateTable()) {
+        renderProcessView();
+      }
     }
   }
 }
@@ -793,11 +1260,30 @@ function connectWebSocket() {
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'full') {
+        lastDetailData = msg.data; // Cache for detail views
         updateUI(msg.data, true);
+        // Update detail view if active
+        if (['cpu', 'memory', 'network'].includes(currentView)) {
+          updateDetailView(currentView, msg.data);
+        }
+        // Periodically refresh connections when on network view
+        if (currentView === 'network') {
+          requestConnections();
+        }
       } else if (msg.type === 'update') {
         updateUI(msg.data, false);
       } else if (msg.type === 'kill') {
         ws.send(JSON.stringify({ type: 'refresh' }));
+      } else if (msg.type === 'connections') {
+        connectionsData = msg.data || [];
+        if (currentView === 'network') {
+          renderConnectionsTreemap('detail-net-connections');
+        }
+      } else if (msg.type === 'folderSizes') {
+        folderData = msg.data || [];
+        if (currentView === 'disk') {
+          renderFolderTreemap('detail-disk-treemap');
+        }
       }
       // Note: 'action' type now handled by SDK IPC via window.__termweb
     } catch (e) {
@@ -845,80 +1331,163 @@ function requestMetrics(type = 'full') {
   });
 }
 
-// Keyboard handling (SDK handles c/m/n/d/p on main view)
-window.addEventListener('keydown', async (e) => {
-  if (currentView === 'processes') {
-    const searchInput = document.getElementById('filter-input');
-    const isSearchFocused = document.activeElement === searchInput;
+// Single keyboard handler with state-based logic (capture phase to intercept before input)
+// NOTE: y/n for kill confirmation are handled via SDK key bindings, not here
+window.addEventListener('keydown', (e) => {
+  const key = e.key;
 
-    // When search is focused, Escape/Enter blur it
-    if (isSearchFocused) {
-      if (e.key === 'Escape' || e.key === 'Enter') {
-        searchInput.blur();
-        e.preventDefault();
-      }
-      return; // Let other keys go to input
-    }
-
-    if (e.key === 'Escape') {
-      hideDetailView();
-    } else if (e.key === 'ArrowUp') {
+  // State 1: Kill confirmation mode - block browser keys except y/n (handled by SDK)
+  if (pendingKill) {
+    // Only allow Escape to cancel (as fallback)
+    if (key === 'Escape') {
       e.preventDefault();
+      e.stopPropagation();
+      pendingKill = null;
+      notifyKillCancel();
+      updateHints();
+    } else {
+      // Block all other keys during kill confirm
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
+
+  // State 2: Process view
+  if (currentView === 'processes') {
+    // Tab: change sort
+    if (key === 'Tab') {
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = SORT_COLUMNS.indexOf(sortColumn);
+      sortColumn = e.shiftKey
+        ? SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length]
+        : SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
+      selectedProcessIndex = 0;
+      const thead = document.querySelector('.process-table thead tr');
+      if (thead) thead.innerHTML = buildTableHeader();
+      applySortOrder();
+      updateHints();
+      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
+      return;
+    }
+    // Ctrl+K: start kill (only if process selected)
+    if (key === 'k' && e.ctrlKey) {
+      const proc = getFilteredProcesses()[selectedProcessIndex];
+      if (!proc) return; // Ignore if no process
+      e.preventDefault();
+      e.stopPropagation();
+      pendingKill = {
+        pid: proc.pid,
+        name: proc.name,
+        cpu: proc.cpu,
+        mem: proc.mem,
+        ports: proc.ports
+      };
+      notifyKillConfirm(); // Tell SDK to bind y/n keys
+      updateHints();
+      return;
+    }
+    // Arrow keys: select
+    if (key === 'ArrowUp') {
+      e.preventDefault();
+      e.stopPropagation();
       const oldIndex = selectedProcessIndex;
       selectedProcessIndex = Math.max(0, selectedProcessIndex - 1);
-      if (!updateSelectionFast(oldIndex, selectedProcessIndex)) {
-        renderProcessView();
-      }
-    } else if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      const oldIndex = selectedProcessIndex;
-      const maxIndex = processList.length - 1; // Use cached list length
-      selectedProcessIndex = Math.min(maxIndex, selectedProcessIndex + 1);
-      if (!updateSelectionFast(oldIndex, selectedProcessIndex)) {
-        renderProcessView();
-      }
-    } else if (e.key === 'Tab' && e.shiftKey) {
-      e.preventDefault();
-      const idx = SORT_COLUMNS.indexOf(sortColumn);
-      sortColumn = SORT_COLUMNS[(idx - 1 + SORT_COLUMNS.length) % SORT_COLUMNS.length];
-      selectedProcessIndex = 0;
-      const thead = document.querySelector('.process-table thead tr');
-      if (thead) thead.innerHTML = buildTableHeader();
-      if (!applySortOrder()) renderProcessView();
-      updateHints();
-      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
-    } else if (e.key === 'Tab' && !e.shiftKey) {
-      e.preventDefault();
-      const idx = SORT_COLUMNS.indexOf(sortColumn);
-      sortColumn = SORT_COLUMNS[(idx + 1) % SORT_COLUMNS.length];
-      selectedProcessIndex = 0;
-      const thead = document.querySelector('.process-table thead tr');
-      if (thead) thead.innerHTML = buildTableHeader();
-      if (!applySortOrder()) renderProcessView();
-      updateHints();
-      requestMetrics('full').then(data => { if (data) updateUI(data, true); });
-    } else if (e.key === '/' || e.key === 'f') {
-      // Focus search box
-      e.preventDefault();
-      const input = document.getElementById('filter-input');
-      if (input) input.focus();
-    } else if (e.key === 'k' && e.ctrlKey) {
-      e.preventDefault();
-      if (filtered[selectedProcessIndex]) {
-        const pid = filtered[selectedProcessIndex].pid;
-        await killProcess(pid);
-        // Refresh immediately
-        const data = await requestMetrics('full');
-        if (data) updateUI(data, true);
-      }
+      updateSelectionFast(oldIndex, selectedProcessIndex);
+      return;
     }
-  } else if (['cpu', 'memory', 'network', 'disk'].includes(currentView)) {
-    // Detail view - Escape goes back
-    if (e.key === 'Escape') {
+    if (key === 'ArrowDown') {
+      e.preventDefault();
+      e.stopPropagation();
+      const oldIndex = selectedProcessIndex;
+      selectedProcessIndex = Math.min(processList.length - 1, selectedProcessIndex + 1);
+      updateSelectionFast(oldIndex, selectedProcessIndex);
+      return;
+    }
+    // Escape: back to main
+    if (key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
       hideDetailView();
+      return;
+    }
+    return;
+  }
+
+  // State 3: Detail views (cpu, memory, network, disk)
+  if (['cpu', 'memory', 'network', 'disk'].includes(currentView)) {
+    if (key === 'Escape') {
+      hideDetailView();
+      return;
+    }
+
+    // Disk view keyboard navigation
+    if (currentView === 'disk' && folderData.length > 0) {
+      if (key === 'Backspace') {
+        e.preventDefault();
+        navigateUp();
+        return;
+      }
+      if (key === 'ArrowUp' || key === 'ArrowLeft') {
+        e.preventDefault();
+        selectedFolderIndex = Math.max(0, selectedFolderIndex - 1);
+        updateFolderSelection();
+        return;
+      }
+      if (key === 'ArrowDown' || key === 'ArrowRight') {
+        e.preventDefault();
+        selectedFolderIndex = Math.min(folderData.length - 1, selectedFolderIndex + 1);
+        updateFolderSelection();
+        return;
+      }
+      if (key === 'Enter') {
+        e.preventDefault();
+        const folder = folderData[selectedFolderIndex];
+        if (folder) {
+          drillIntoFolder(folder.path);
+        }
+        return;
+      }
     }
   }
-});
+}, true); // Capture phase - runs before input element receives event
+
+// Tooltip for treemap cells
+function initTooltip() {
+  const tooltip = document.getElementById('tooltip');
+  document.addEventListener('mouseover', (e) => {
+    const cell = e.target.closest('[data-tip]');
+    if (cell) {
+      tooltip.textContent = cell.dataset.tip;
+      tooltip.style.display = 'block';
+    }
+  });
+  document.addEventListener('mouseout', (e) => {
+    const cell = e.target.closest('[data-tip]');
+    if (cell) {
+      tooltip.style.display = 'none';
+    }
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (tooltip.style.display === 'block') {
+      const rect = tooltip.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      // Position tooltip, flip if needed
+      let x = e.clientX + 10;
+      let y = e.clientY + 10;
+      if (x + rect.width > vw) {
+        x = e.clientX - rect.width - 10;
+      }
+      if (y + rect.height > vh) {
+        y = e.clientY - rect.height - 10;
+      }
+      tooltip.style.left = x + 'px';
+      tooltip.style.top = y + 'px';
+    }
+  });
+}
 
 // Initialize on load
 document.addEventListener('DOMContentLoaded', () => {
@@ -927,42 +1496,46 @@ document.addEventListener('DOMContentLoaded', () => {
   document.body.focus();
   window.focus();
 
+  initTooltip();
   initCharts();
 
   // Make cards clickable
-  document.getElementById('cpu-card').addEventListener('click', () => {
-    window.__termwebView('cpu');
-  });
-  document.getElementById('memory-card').addEventListener('click', () => {
-    window.__termwebView('memory');
-  });
-  document.getElementById('network-card').addEventListener('click', () => {
-    window.__termwebView('network');
-  });
-  document.getElementById('disk-card').addEventListener('click', () => {
-    window.__termwebView('disk');
-  });
-  document.getElementById('processes').addEventListener('click', () => {
-    window.__termwebView('processes');
-  });
+  document.getElementById('cpu-card').addEventListener('click', () => switchView('cpu'));
+  document.getElementById('memory-card').addEventListener('click', () => switchView('memory'));
+  document.getElementById('network-card').addEventListener('click', () => switchView('network'));
+  document.getElementById('disk-card').addEventListener('click', () => switchView('disk'));
+  document.getElementById('processes').addEventListener('click', () => switchView('processes'));
 
   updateHints();
 
-  // Register SDK IPC handler for key binding actions
+  // Register SDK IPC handler for key binding actions (c,m,n,d,p,y,n handled via SDK)
   window.__termweb.onMessage((msg) => {
     if (msg.type === 'action') {
-      if (msg.action === 'view:processes') {
-        window.__termwebView('processes');
-      } else if (msg.action === 'view:cpu') {
-        window.__termwebView('cpu');
-      } else if (msg.action === 'view:memory') {
-        window.__termwebView('memory');
-      } else if (msg.action === 'view:network') {
-        window.__termwebView('network');
-      } else if (msg.action === 'view:disk') {
-        window.__termwebView('disk');
-      } else if (msg.action === 'filter') {
-        window.__termwebFilter();
+      const action = msg.action;
+      // View switching (only works on main view)
+      if (action === 'view:processes') {
+        switchView('processes');
+      } else if (action === 'view:cpu') {
+        switchView('cpu');
+      } else if (action === 'view:memory') {
+        switchView('memory');
+      } else if (action === 'view:network') {
+        switchView('network');
+      } else if (action === 'view:disk') {
+        switchView('disk');
+      }
+      // Kill confirmation via SDK (y/n keys)
+      else if (action === 'kill:confirm' && pendingKill) {
+        const pid = pendingKill.pid;
+        pendingKill = null;
+        notifyKillCancel();
+        updateHints();
+        killProcess(pid);
+        requestMetrics('full').then(data => { if (data) updateUI(data, true); });
+      } else if (action === 'kill:cancel' && pendingKill) {
+        pendingKill = null;
+        notifyKillCancel();
+        updateHints();
       }
     }
   });
