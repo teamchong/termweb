@@ -8,13 +8,12 @@ Web browser in your terminal using Kitty graphics protocol.
 
 ## Demo: CLI - browsing the web in terminal
 
-https://github.com/user-attachments/assets/4019aaa6-754a-4793-9ce7-08da66f20790
+https://github.com/user-attachments/assets/70b86b29-19b4-458b-8d5d-683f5e139908
 
 
 ## Demo: SDK: building apps with termweb as render engine
 
-https://github.com/user-attachments/assets/806cac11-3348-48b7-95a0-0c98fd61c873
-
+https://github.com/user-attachments/assets/12183bb7-de8b-4e44-b884-216e304ab8ce
 
 ## Features
 
