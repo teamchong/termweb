@@ -15,6 +15,8 @@ const prompt_mod = @import("terminal/prompt.zig");
 const coordinates_mod = @import("terminal/coordinates.zig");
 const cdp = @import("chrome/cdp_client.zig");
 const screenshot_api = @import("chrome/screenshot.zig");
+const rtc_frame_server_mod = @import("capture/rtc_frame_server.zig");
+const RtcFrameServer = rtc_frame_server_mod.RtcFrameServer;
 const mouse_event_bus = @import("mouse_event_bus.zig");
 const dom_mod = @import("chrome/dom.zig");
 const interact_mod = @import("chrome/interact.zig");
@@ -108,6 +110,7 @@ pub const Viewer = struct {
     terminal: Terminal,
     kitty: KittyGraphics,
     cdp_client: *cdp.CdpClient,
+    rtc_frame_server: *RtcFrameServer, // WebRTC-based frame server for frame transport
     input: InputReader,
     current_url: []const u8,
     running: bool,
@@ -136,8 +139,12 @@ pub const Viewer = struct {
     // Screencast streaming
     screencast_mode: bool,
     screenshot_polling_mode: bool, // Fallback when screencast doesn't work (Linux headless)
+    extension_connected: bool, // True when browser extension WebSocket is connected to frame server
     screencast_format: screenshot_api.ScreenshotFormat,
     last_frame_time: i128,
+    last_frame_generation: u64, // Track frame generation for stall detection (only update time on NEW frames)
+    screencast_started_at: i128, // When screencast was started (for stall detection)
+    rtc_session_id: u32, // Unique session ID for WebRTC - ignore frames with old IDs
     last_frame_width: u32,  // Current frame width from screencast
     last_frame_height: u32, // Current frame height from screencast
     baseline_frame_width: u32,  // Frame size after navigate/resize (for coord scaling)
@@ -161,6 +168,13 @@ pub const Viewer = struct {
     pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
     pending_tab_add: PendingTabAdd, // Deferred tab add (uses atomic ready flag)
 
+    // RTC signaling queue (thread-safe: callback writes, background thread reads)
+    rtc_signal_queue: [4][32768]u8, // 4 message slots
+    rtc_signal_lens: [4]std.atomic.Value(usize), // Length of each message (0 = empty)
+    rtc_signal_write_idx: std.atomic.Value(usize), // Next slot to write
+    rtc_signal_thread: ?std.Thread, // Background thread for RTC signaling
+    rtc_signal_running: std.atomic.Value(bool), // Flag to stop signaling thread
+
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
     mouse_y: u16,
@@ -175,14 +189,11 @@ pub const Viewer = struct {
     last_input_time: i128,
     last_mouse_move_time: i128,  // Separate throttle for mouse move events
 
-    // Frame tracking for skip detection
-    last_rendered_generation: u64,
     last_content_image_id: ?u32, // Track content image ID for reuse
 
     // Navigation state debounce (avoid repeated CDP calls on rapid events)
     last_nav_state_update: i128,
     loading_started_at: i128, // When loading started (for minimum display time)
-    frames_skipped: u32,  // Counter for monitoring
     showing_blank_placeholder: bool, // True when showing "New Tab" placeholder (skip screencast)
 
     // Debug flags
@@ -230,6 +241,9 @@ pub const Viewer = struct {
     // Terminal type detection (Ghostty uses cell-based mouse coords, not pixel)
     is_ghostty: bool,
 
+    // Reload state - prevents CDP pipe buffer overflow during page reload
+    reload_in_progress: bool,
+
     // Device pixel ratio (1 for standard displays, 2 for HiDPI/Retina)
     dpr: u32,
 
@@ -252,6 +266,7 @@ pub const Viewer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         cdp_client: *cdp.CdpClient,
+        rtc_frame_server: *RtcFrameServer,
         url: []const u8,
         viewport_width: u32,
         viewport_height: u32,
@@ -297,6 +312,7 @@ pub const Viewer = struct {
             .terminal = Terminal.init(),
             .kitty = KittyGraphics.init(allocator),
             .cdp_client = cdp_client,
+            .rtc_frame_server = rtc_frame_server,
             .input = InputReader.init(std.posix.STDIN_FILENO, enable_input_debug, allocator),
             .current_url = try allocator.dupe(u8, url),
             .running = true,
@@ -319,8 +335,12 @@ pub const Viewer = struct {
             .last_click = null,
             .screencast_mode = false,
             .screenshot_polling_mode = false,
+            .extension_connected = false,
             .screencast_format = screencast_format,
             .last_frame_time = 0,
+            .last_frame_generation = 0,
+            .screencast_started_at = 0,
+            .rtc_session_id = 1,
             .last_frame_width = viewport_width,
             .last_frame_height = viewport_height,
             .baseline_frame_width = 0,  // Will be set from first screencast frame
@@ -346,6 +366,16 @@ pub const Viewer = struct {
                 .auto_switch = false,
                 .ready = std.atomic.Value(bool).init(false),
             },
+            .rtc_signal_queue = undefined,
+            .rtc_signal_lens = .{
+                std.atomic.Value(usize).init(0),
+                std.atomic.Value(usize).init(0),
+                std.atomic.Value(usize).init(0),
+                std.atomic.Value(usize).init(0),
+            },
+            .rtc_signal_write_idx = std.atomic.Value(usize).init(0),
+            .rtc_signal_thread = null,
+            .rtc_signal_running = std.atomic.Value(bool).init(false),
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -354,11 +384,9 @@ pub const Viewer = struct {
             .event_bus = mouse_event_bus.MouseEventBus.initWithFps(cdp_client, allocator, isNaturalScrollEnabled(), target_fps),
             .last_input_time = 0,
             .last_mouse_move_time = 0,
-            .last_rendered_generation = 0,
             .last_content_image_id = null,
             .last_nav_state_update = 0,
             .loading_started_at = 0,
-            .frames_skipped = 0,
             .showing_blank_placeholder = false,
             .debug_input = enable_input_debug,
             .ui_dirty = true,
@@ -389,6 +417,7 @@ pub const Viewer = struct {
             .shm_buffer = shm_buffer,
             .natural_scroll = isNaturalScrollEnabled(),
             .is_ghostty = true, // Kitty-compatible terminal required
+            .reload_in_progress = false,
             .dpr = 2, // Default to HiDPI, will be updated on first resize
             .perf_frame_count = 0,
             .perf_total_render_ns = 0,
@@ -490,7 +519,7 @@ pub const Viewer = struct {
             var buf: [1024]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
             file.writeAll(msg) catch {};
-            // Note: removed file.sync() - was causing major performance issues
+            file.sync() catch {}; // Sync for debugging freeze
         }
     }
 
@@ -599,35 +628,85 @@ pub const Viewer = struct {
         }
         try writer.flush();
 
-        // Start screencast streaming with viewport dimensions
-        // Note: cli.zig already scales viewport for High-DPI displays
-        const total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
-        const adaptive_quality = config.getAdaptiveQuality(total_pixels);
-        const every_nth = config.getEveryNthFrame(self.target_fps);
-        self.log("[DEBUG] Starting screencast {}x{} ({}px, quality={}, fps={}, everyNth={})...\n", .{ self.viewport_width, self.viewport_height, total_pixels, adaptive_quality, self.target_fps, every_nth });
+        // Start CDP thread early so we can receive console events during initialization
+        self.startCdpThread();
+        self.log("[DEBUG] CDP thread started early for console event processing\n", .{});
 
-        try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-            .format = self.screencast_format,
-            .quality = adaptive_quality,
-            .width = self.viewport_width,
-            .height = self.viewport_height,
-            .every_nth_frame = every_nth,
-        });
+        // Set up WebRTC signaling callback to send answers/candidates via CDP
+        self.rtc_frame_server.setSendCallback(rtcSignalingCallback, self);
+
+        // Frame capture via CDP-injected getDisplayMedia + WebRTC (no extension)
+        self.log("[DEBUG] Starting WebRTC connection via CDP-injected getDisplayMedia...\n", .{});
         self.screencast_mode = true;
-        self.log("[DEBUG] Screencast started\n", .{});
+        const start_time = std.time.nanoTimestamp();
+        self.screencast_started_at = start_time;
+        self.last_frame_time = start_time; // Initialize to prevent immediate stall detection
 
-        // Wait for first frame (3 second timeout)
-        self.log("[DEBUG] Waiting for first screencast frame...\n", .{});
+        // Inject getDisplayMedia capture script
+        self.sendRtcStartMessage();
+
+        // Also start CDP screencast as fallback (works even without extension)
+        self.log("[DEBUG] Starting CDP screencast as fallback...\n", .{});
+        self.cdp_client.startScreencast(
+            "jpeg",
+            80, // quality
+            self.viewport_width,
+            self.viewport_height,
+            1, // every frame
+        ) catch |err| {
+            self.log("[DEBUG] CDP screencast start failed: {}, continuing with WebRTC only\n", .{err});
+        };
+
+        // Start RTC signaling background thread BEFORE wait loops
+        // This thread processes answers/candidates/FPS changes independently
+        startRtcSignalThread(self);
+
+        // Wait for WebRTC DataChannel to connect (max 5 seconds)
+        var rtc_wait: u32 = 0;
+        while (rtc_wait < 100 and !self.rtc_frame_server.isConnected() and !self.extension_connected) : (rtc_wait += 1) {
+            // Background thread handles signaling
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        if (self.rtc_frame_server.isConnected() or self.extension_connected) {
+            self.log("[DEBUG] WebRTC connected after {} waits (rtc={}, flag={})\n", .{ rtc_wait, self.rtc_frame_server.isConnected(), self.extension_connected });
+        } else {
+            self.log("[DEBUG] WebRTC not connected after 5s, continuing anyway\n", .{});
+        }
+
+        // Frames come from CDP-injected script via WebRTC DataChannel
+        self.log("[DEBUG] Waiting for frames from getDisplayMedia via WebRTC...\n", .{});
+
+        // Wait for first frame (10 second timeout for WebRTC capture)
+        // SSH connections need longer timeout due to:
+        // - WebRTC handshake latency (500ms-1s)
+        // - ICE candidate gathering (1-2s)
+        // - First frame delay after getDisplayMedia resolves
+        self.log("[DEBUG] Waiting for first frame from WebRTC (10s timeout)...\n", .{});
         var retries: u32 = 0;
-        while (retries < 300) : (retries += 1) {
+        while (retries < 1000) : (retries += 1) {
+            // Log progress every second
+            if (retries > 0 and retries % 100 == 0) {
+                self.log("[DEBUG] Still waiting... retries={}, rtc_connected={}, frame_count={}\n", .{
+                    retries,
+                    self.rtc_frame_server.isConnected(),
+                    self.rtc_frame_server.getFrameCount(),
+                });
+            }
+            // Background thread handles signaling
             if (try self.tryRenderScreencast()) {
-                self.log("[DEBUG] First frame received after {} retries\n", .{retries});
+                self.log("[DEBUG] First frame received after {} retries ({}ms)\n", .{ retries, retries * 10 });
                 break;
             }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
-        if (retries >= 300) {
-            return error.ScreencastTimeout;
+        if (retries >= 1000) {
+            self.log("[ERROR] WebRTC capture timeout - no frames received in 10 seconds\n", .{});
+            self.log("[ERROR] rtc_connected={}, extension_connected={}, frame_count={}\n", .{
+                self.rtc_frame_server.isConnected(),
+                self.extension_connected,
+                self.rtc_frame_server.getFrameCount(),
+            });
+            return error.WebRtcCaptureTimeout;
         }
 
         // Get initial navigation state (after page has loaded)
@@ -639,12 +718,11 @@ pub const Viewer = struct {
         self.log("[DEBUG] About to enter event loop\n", .{});
         self.log("[DEBUG] self.running = {}\n", .{self.running});
 
-        // Start worker threads
+        // Start input thread (CDP thread already started earlier)
         if (!self.terminal.isNoInputMode()) {
             self.startInputThread();
         }
-        self.startCdpThread();
-        self.log("[DEBUG] Worker threads started\n", .{});
+        self.log("[DEBUG] Input thread started\n", .{});
 
         // Main loop
         var loop_count: u32 = 0;
@@ -658,7 +736,7 @@ pub const Viewer = struct {
                 self.log("[DEBUG] Loop iteration {d}, mode={s}, frames_received={d}\n", .{
                     loop_count,
                     @tagName(self.mode),
-                    self.cdp_client.getFrameCount(),
+                    self.rtc_frame_server.getFrameCount(),
                 });
             }
 
@@ -667,10 +745,10 @@ pub const Viewer = struct {
                 self.log("[RESIZE] Terminal resized, updating viewport...\n", .{});
                 self.handleResize() catch |err| {
                     // Browser may have closed during resize - exit gracefully
-                    if (err == error.NotOpenForReading or err == error.BrokenPipe) {
+                    if (err == error.NotOpenForReading or err == error.BrokenPipe or err == error.PipeBroken) {
                         self.log("[RESIZE] Browser disconnected, exiting...\n", .{});
                         self.running = false;
-                        return;
+                        break; // Exit loop, don't return (need cleanup)
                     }
                     return err;
                 };
@@ -682,6 +760,8 @@ pub const Viewer = struct {
             var time_after_bus: i128 = 0;
             var time_after_render: i128 = 0;
             var time_after_events: i128 = 0;
+
+            // RTC signaling handled by background thread
 
             // Process input from ring buffer (filled by input thread)
             var events_processed: u32 = 0;
@@ -703,7 +783,9 @@ pub const Viewer = struct {
                     .paste => |text| self.log("[INPUT] Paste: {d} bytes\n", .{text.len}),
                     .none => {},
                 }
-                self.handleInput(input) catch {};
+                self.handleInput(input) catch |err| {
+                    self.log("[INPUT] handleInput error: {}\n", .{err});
+                };
             }
             time_after_input = std.time.nanoTimestamp();
 
@@ -721,16 +803,24 @@ pub const Viewer = struct {
                 };
                 const t1 = std.time.nanoTimestamp();
 
-                // Auto-recovery: if no frame rendered for 3+ seconds AND there was recent input
-                // Don't reset for static pages with no user activity
+                // Check if Chrome closed the pipe - exit loop (don't return, need cleanup)
+                if (self.cdp_client.isPipeBroken()) {
+                    self.log("[PIPE] Chrome disconnected, exiting\n", .{});
+                    self.running = false;
+                    break;
+                }
+
+                // Simple auto-recovery: no frames for 2 seconds = restart capture with new session ID
                 const now_ns = std.time.nanoTimestamp();
-                const no_frame_for_3s = self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 3 * std.time.ns_per_s;
-                const had_recent_input = self.last_input_time > 0 and (now_ns - self.last_input_time) < 5 * std.time.ns_per_s;
-                if (no_frame_for_3s and had_recent_input) {
-                    self.log("[STALL] No frame for >3s after input, restarting screencast (frames={}, gen={})\n", .{
-                        self.cdp_client.getFrameCount(), self.last_rendered_generation,
-                    });
-                    self.resetScreencast();
+                const stall_timeout: i128 = 2 * std.time.ns_per_s;
+                const no_frames = (now_ns - self.last_frame_time) > stall_timeout;
+
+                if (no_frames) {
+                    self.rtc_session_id +%= 1; // Increment session ID (wrapping)
+                    self.log("[STALL] No frame for 2s, restarting capture with session_id={}\n", .{self.rtc_session_id});
+                    self.last_frame_time = now_ns; // Reset to avoid rapid restarts
+                    self.last_frame_generation = 0; // Reset so new frames are detected
+                    self.sendRtcStartMessage();
                 }
                 const t2 = std.time.nanoTimestamp();
 
@@ -812,8 +902,7 @@ pub const Viewer = struct {
             // CDP events handled by CDP thread
             time_after_events = std.time.nanoTimestamp();
 
-            // Process pending tab add (deferred from CDP thread to avoid data races)
-            // Acquire fence ensures we see all writes made before the ready flag was set
+            // Process pending tab add (deferred from event handlers)
             if (self.pending_tab_add.ready.load(.acquire)) {
                 // Clear ready flag first to allow new requests
                 self.pending_tab_add.ready.store(false, .release);
@@ -845,18 +934,8 @@ pub const Viewer = struct {
             if (self.needs_nav_state_update) {
                 self.needs_nav_state_update = false;
                 self.forceUpdateNavigationState();
-                // Also update viewport
-                if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |vp| {
-                    if (vp.width > 0 and vp.height > 0) {
-                        self.chrome_inner_width = vp.width;
-                        self.chrome_inner_height = vp.height;
-                        self.log("[NAV] Chrome viewport after load: {}x{}\n", .{ vp.width, vp.height });
-                    }
-                } else |_| {}
+                // Viewport is updated via extension resize message - no blocking call needed
             }
-
-            // Flush pending ACK (no-op, kept for API compatibility)
-            self.cdp_client.flushPendingAck();
 
             // Yield CPU (1ms = 1000Hz max loop rate)
             std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -881,13 +960,15 @@ pub const Viewer = struct {
 
         self.log("[DEBUG] Exited main loop (running={}), loop_count={}\n", .{self.running, loop_count});
 
-        // Stop screencast completely (including reader thread) for shutdown
-        self.log("[DEBUG] Stopping screencast...\n", .{});
-        if (self.screencast_mode) {
-            self.cdp_client.stopScreencastFull() catch {};
-            self.screencast_mode = false;
-        }
-        self.log("[DEBUG] Screencast stopped\n", .{});
+        // Stop RTC signaling background thread
+        self.log("[DEBUG] Stopping RTC signal thread...\n", .{});
+        stopRtcSignalThread(self);
+        self.log("[DEBUG] RTC signal thread stopped\n", .{});
+
+        // Stop frame capture (frame server handles cleanup)
+        self.log("[DEBUG] Stopping frame capture...\n", .{});
+        self.screencast_mode = false;
+        self.log("[DEBUG] Frame capture stopped\n", .{});
 
         // Cleanup - clear images, reset screen, show cursor
         self.log("[DEBUG] Clearing screen...\n", .{});
@@ -977,12 +1058,7 @@ pub const Viewer = struct {
         self.viewport_width = new_width;
         self.viewport_height = new_height;
 
-        // Stop current screencast
-        if (self.screencast_mode) {
-            screenshot_api.stopScreencast(self.cdp_client, self.allocator) catch {};
-            self.screencast_mode = false;
-        }
-
+        // Frame capture continues via tabCapture extension (auto-adapts to viewport)
         self.ui_dirty = true;
 
         // Reallocate SHM buffer if new size is larger
@@ -1022,24 +1098,10 @@ pub const Viewer = struct {
         self.chrome_inner_frame_width = 0;
         self.chrome_inner_frame_height = 0;
 
-        // Restart screencast with new dimensions and adaptive quality
-        const resize_total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);
-        const resize_quality = config.getAdaptiveQuality(resize_total_pixels);
-        const resize_every_nth = config.getEveryNthFrame(self.target_fps);
-        screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-            .format = self.screencast_format,
-            .quality = resize_quality,
-            .width = new_width,
-            .height = new_height,
-            .every_nth_frame = resize_every_nth,
-        }) catch |err| {
-            self.log("[RESIZE] startScreencast failed: {}\n", .{err});
-            return;
-        };
-        self.screencast_mode = true;
+        // Frame capture continues via tabCapture extension (auto-adapts to viewport changes)
 
-        // Reset frame tracking - next frame will render immediately
-        self.last_frame_time = 0;
+        // Reset frame tracking - use current time to prevent immediate stall detection
+        self.last_frame_time = std.time.nanoTimestamp();
         self.last_content_image_id = null; // Force new image ID after resize
         self.cursor_image_id = null; // Reset cursor image ID as well
 
@@ -1047,13 +1109,23 @@ pub const Viewer = struct {
         self.baseline_frame_width = 0;
         self.baseline_frame_height = 0;
 
-        self.log("[RESIZE] Viewport updated to {}x{} (quality={})\n", .{ new_width, new_height, resize_quality });
+        self.log("[RESIZE] Viewport updated to {}x{}\n", .{ new_width, new_height });
     }
 
     /// Try to render latest screencast frame (non-blocking)
     /// Returns true if frame was rendered, false if no new frame
     fn tryRenderScreencast(self: *Viewer) !bool {
         return render_mod.tryRenderScreencast(self);
+    }
+
+    /// Trigger tab capture via extension's tabCapture API
+    /// Uses CDP Runtime.evaluate to dispatch event that content script listens for
+    fn triggerCaptureViaClick(self: *Viewer) void {
+        // Dispatch custom event that content script listens for
+        // Content script then sends message to background.js to start capture
+        const js_code = "window.dispatchEvent(new Event('__termweb_start_capture__'))";
+        // Use async to avoid blocking main loop
+        self.evalJavaScriptAsync(js_code);
     }
 
     /// Update navigation button states from Chrome history (call after navigation events)
@@ -1087,43 +1159,12 @@ pub const Viewer = struct {
         self.requestToolbarRender();
     }
 
-    /// Reset screencast - stops and restarts to recover from broken state
-    /// Call this on reload to ensure clean frame state
-    pub fn resetScreencast(self: *Viewer) void {
-        self.log("[RESET] Resetting screencast...\n", .{});
-
-        // Stop current screencast
-        if (self.screencast_mode) {
-            screenshot_api.stopScreencast(self.cdp_client, self.allocator) catch {};
-            self.screencast_mode = false;
+    /// Clear RTC signaling queue - call on reload to prevent CDP pipe buffer overflow
+    pub fn clearRtcSignalQueue(self: *Viewer) void {
+        self.log("[RTC] Clearing signal queue (reload)\n", .{});
+        for (0..4) |i| {
+            _ = self.rtc_signal_lens[i].swap(0, .release);
         }
-
-        // Small yield to let Chrome process stop
-        std.Thread.sleep(20 * std.time.ns_per_ms);
-
-        // Restart screencast with adaptive quality
-        const reset_total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
-        const reset_quality = config.getAdaptiveQuality(reset_total_pixels);
-        const reset_every_nth = config.getEveryNthFrame(self.target_fps);
-        screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
-            .format = self.screencast_format,
-            .quality = reset_quality,
-            .width = self.viewport_width,
-            .height = self.viewport_height,
-            .every_nth_frame = reset_every_nth,
-        }) catch |err| {
-            self.log("[RESET] startScreencast failed: {}\n", .{err});
-            return;
-        };
-        self.screencast_mode = true;
-
-        // Reset frame tracking - next frame will render immediately
-        self.last_frame_time = 0;
-        self.last_rendered_generation = 0;
-        self.frames_skipped = 0;
-        // Keep image IDs - new frames overwrite using same ID (no memory leak)
-
-        self.log("[RESET] Screencast reset complete (quality={})\n", .{reset_quality});
     }
 
     /// Display a base64 PNG frame using stored dimensions (single source of truth)
@@ -1223,6 +1264,18 @@ pub const Viewer = struct {
                     const filter = grid.getInput();
                     var badge_idx: u32 = 0;
 
+                    // Calculate scale factor based on frame vs Chrome viewport
+                    // Frame is smaller than Chrome viewport, so badges appear larger
+                    // Scale down to match the content
+                    const scale: f32 = blk: {
+                        const frame_w = self.last_frame_width;
+                        const chrome_w = self.chrome_inner_width;
+                        if (frame_w > 0 and chrome_w > 0 and chrome_w > frame_w) {
+                            break :blk @as(f32, @floatFromInt(frame_w)) / @as(f32, @floatFromInt(chrome_w));
+                        }
+                        break :blk 1.0;
+                    };
+
                     for (grid.hints) |hint| {
                         if (badge_idx >= MAX_HINT_BADGES) break;
 
@@ -1238,15 +1291,19 @@ pub const Viewer = struct {
                             if (!matches) continue;
                         }
 
-                        // Calculate badge dimensions
-                        const badge_w: u32 = @as(u32, hint.label_len) * 16 + 6;
-                        const badge_h: u32 = 24;
+                        // Calculate badge dimensions with scaling
+                        // scale < 0.7 means frame is less than 70% of Chrome viewport → use 1x
+                        const use_1x = scale < 0.7;
+                        const char_w: u32 = if (use_1x) 8 else 16;
+                        const badge_h: u32 = if (use_1x) 12 else 24;
+                        const badge_w: u32 = @as(u32, hint.label_len) * char_w + (if (use_1x) @as(u32, 4) else @as(u32, 6));
                         const badge_size = badge_w * badge_h * 4;
+                        const render_scale: u8 = if (use_1x) 1 else 2;
 
                         // Render badge to pre-allocated buffer
                         var badge = &self.hint_badges[badge_idx];
                         @memset(&badge.rgba, 0);
-                        ui_mod.hints.drawBadgePublic(&badge.rgba, badge_w, badge_h, &hint.label, hint.label_len);
+                        ui_mod.hints.drawBadgeScaled(&badge.rgba, badge_w, badge_h, &hint.label, hint.label_len, render_scale);
 
                         badge.width = badge_w;
                         badge.height = badge_h;
@@ -1481,9 +1538,13 @@ pub const Viewer = struct {
                 if (maybe_event) |*event| {
                     var evt = event.*;
                     defer evt.deinit();
-                    cdp_events_mod.handleCdpEvent(self, &evt) catch {};
+                    cdp_events_mod.handleCdpEvent(self, &evt) catch |err| {
+                        self.log("[CDP LOOP] handleCdpEvent error: {}\n", .{err});
+                    };
                 }
-            } else |_| {}
+            } else |err| {
+                self.log("[CDP LOOP] nextEvent error: {}\n", .{err});
+            }
             std.Thread.sleep(2 * std.time.ns_per_ms);
         }
     }
@@ -1654,8 +1715,10 @@ pub const Viewer = struct {
         const content_rows = size.rows - toolbar_rows - 1;
 
         const grid = try self.allocator.create(ui_mod.HintGrid);
-        // Use stored frame dimensions (single source of truth) for hint positioning
-        // Element coords from DOM are in frame space (what Chrome is actually rendering)
+        // Use Chrome viewport dimensions for hint positioning
+        // Element coords from DOM are in Chrome's viewport space
+        const hint_vp_w = if (self.chrome_inner_width > 0) self.chrome_inner_width else self.last_frame_width;
+        const hint_vp_h = if (self.chrome_inner_height > 0) self.chrome_inner_height else self.last_frame_height;
         grid.* = try ui_mod.HintGrid.generateFromElements(
             self.allocator,
             elements,
@@ -1664,8 +1727,8 @@ pub const Viewer = struct {
             content_rows,
             cell_width,
             cell_height,
-            self.last_frame_width,
-            self.last_frame_height,
+            hint_vp_w,
+            hint_vp_h,
         );
 
         self.hint_grid = grid;
@@ -1835,10 +1898,10 @@ pub const Viewer = struct {
                 .{ trimmed_path, name, if (is_dir) "true" else "false" },
             ) catch return;
 
-            try self.evalJavaScript(script);
+            self.evalJavaScriptAsync(script);
         } else {
             // User cancelled
-            try self.evalJavaScript("window.__termwebPickerResult(false)");
+            self.evalJavaScriptAsync("window.__termwebPickerResult(false)");
         }
     }
 
@@ -1893,10 +1956,10 @@ pub const Viewer = struct {
                 .{ trimmed_path, name, if (is_dir) "true" else "false" },
             ) catch return;
 
-            try self.evalJavaScript(script);
+            self.evalJavaScriptAsync(script);
         } else {
             // User cancelled
-            try self.evalJavaScript("window.__termwebPickerResult(false)");
+            self.evalJavaScriptAsync("window.__termwebPickerResult(false)");
         }
     }
 
@@ -2078,7 +2141,7 @@ pub const Viewer = struct {
         // Security check: path must be within allowed roots
         if (!self.isPathAllowed(path)) {
             self.log("[FS] Path not allowed: {s}\n", .{path});
-            try self.sendFsResponse(id, false, "Path not allowed");
+            self.sendFsResponse(id, false, "Path not allowed");
             return;
         }
 
@@ -2098,7 +2161,7 @@ pub const Viewer = struct {
         } else if (std.mem.eql(u8, op_type, "createfile")) {
             try self.handleFsCreateFile(id, path);
         } else {
-            try self.sendFsResponse(id, false, "Unknown operation");
+            self.sendFsResponse(id, false, "Unknown operation");
         }
     }
 
@@ -2108,14 +2171,14 @@ pub const Viewer = struct {
     }
 
     /// Send file system response back to JavaScript
-    fn sendFsResponse(self: *Viewer, id: u32, success: bool, data: []const u8) !void {
+    fn sendFsResponse(self: *Viewer, id: u32, success: bool, data: []const u8) void {
         var script_buf: [65536]u8 = undefined;
         const script = std.fmt.bufPrint(&script_buf,
             "window.__termwebFSResponse({d}, {s}, {s})",
             .{ id, if (success) "true" else "false", data },
         ) catch return;
 
-        try self.evalJavaScript(script);
+        self.evalJavaScriptAsync(script);
     }
 
     /// Execute JavaScript in the browser
@@ -2127,16 +2190,214 @@ pub const Viewer = struct {
         var params_buf: [131072]u8 = undefined;
         const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{escaped}) catch return;
         const result = self.cdp_client.sendNavCommand("Runtime.evaluate", params) catch |err| {
-            self.log("[FS] evalJavaScript error: {}\n", .{err});
-            return;
+            self.log("[CDP] evalJavaScript error: {} - script_len={}\n", .{ err, script.len });
+            return err;
         };
         self.allocator.free(result);
+    }
+
+    /// Execute JavaScript async (fire-and-forget, for use from callbacks)
+    pub fn evalJavaScriptAsync(self: *Viewer, script: []const u8) void {
+        // Escape the script for JSON (escapeString includes quotes)
+        var escaped_buf: [131072]u8 = undefined;
+        const escaped = json.escapeString(script, &escaped_buf) catch {
+            self.log("[ASYNC EVAL] escapeString failed\n", .{});
+            return;
+        };
+
+        var params_buf: [131072]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"expression\":{s}}}", .{escaped}) catch {
+            self.log("[ASYNC EVAL] bufPrint failed\n", .{});
+            return;
+        };
+
+        self.log("[ASYNC EVAL] Sending, script_len={}, params_len={}\n", .{ script.len, params.len });
+        self.cdp_client.sendCommandAsync("Runtime.evaluate", params) catch |err| {
+            self.log("[ASYNC EVAL] sendCommandAsync failed: {}\n", .{err});
+            // BrokenPipe/PipeBroken means Chrome/CDP connection is dead - exit cleanly
+            if (err == error.BrokenPipe or err == error.PipeBroken) {
+                self.log("[FATAL] CDP pipe broken, exiting\n", .{});
+                self.running = false;
+            }
+        };
+    }
+
+    /// Inject getDisplayMedia capture script via CDP
+    pub fn sendRtcStartMessage(self: *Viewer) void {
+        self.log("[RTC] Injecting getDisplayMedia capture script with session_id={}\n", .{self.rtc_session_id});
+
+        // First set the session ID global variable
+        var session_buf: [128]u8 = undefined;
+        const session_script = std.fmt.bufPrint(&session_buf, "window.__termwebSessionId = {};", .{self.rtc_session_id}) catch return;
+        self.evalJavaScriptAsync(session_script);
+
+        // Complete capture script that:
+        // 1. Creates WebRTC PeerConnection and DataChannel
+        // 2. Calls getDisplayMedia() to capture current tab (auto-accepted via Chrome flag)
+        // 3. Captures frames and sends over DataChannel (with session_id in header)
+        // 4. Uses console.log for signaling (intercepted by CDP)
+        const script =
+            \\(async function() {
+            \\  const sessionId = window.__termwebSessionId || 0;
+            \\  console.log('__TERMWEB_CAPTURE__:script_injected:sid=' + sessionId);
+            \\
+            \\  // Clean up any existing capture before starting new one
+            \\  if (window.__termwebCleanup) {
+            \\    window.__termwebCleanup();
+            \\  }
+            \\
+            \\  const DEFAULT_FPS = 30;
+            \\  const MAX_FPS = 60;
+            \\  const MIN_FPS = 15;
+            \\  let currentFps = DEFAULT_FPS;
+            \\  let captureStream = null;
+            \\  let captureVideo = null;
+            \\  let captureCanvas = null;
+            \\  let captureCtx = null;
+            \\  let captureInterval = null;
+            \\  let isCapturing = false;
+            \\  let peerConnection = null;
+            \\  let dataChannel = null;
+            \\  let dataChannelOpen = false;
+            \\
+            \\  function sendSignaling(msg) {
+            \\    console.log('__TERMWEB_RTC__:' + JSON.stringify(msg));
+            \\  }
+            \\
+            \\  // Register cleanup function for re-injection
+            \\  window.__termwebCleanup = function() {
+            \\    console.log('__TERMWEB_CAPTURE__:cleanup');
+            \\    if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+            \\    if (dataChannel) { try { dataChannel.close(); } catch(e) {} dataChannel = null; }
+            \\    if (peerConnection) { try { peerConnection.close(); } catch(e) {} peerConnection = null; }
+            \\    if (captureStream) { captureStream.getTracks().forEach(t => t.stop()); captureStream = null; }
+            \\    isCapturing = false;
+            \\    dataChannelOpen = false;
+            \\  };
+            \\
+            \\  let loopCount = 0;
+            \\  function startCaptureLoop() {
+            \\    if (captureInterval) clearInterval(captureInterval);
+            \\    const intervalMs = Math.floor(1000 / currentFps);
+            \\    captureInterval = setInterval(() => {
+            \\      loopCount++;
+            \\      if (loopCount % 30 === 0) console.log('__TERMWEB_CAPTURE__:loop:' + loopCount + ':dc=' + (dataChannel?.readyState || 'null'));
+            \\      if (!isCapturing || !captureVideo || !captureCtx || !dataChannelOpen || !dataChannel) return;
+            \\      const width = captureVideo.videoWidth;
+            \\      const height = captureVideo.videoHeight;
+            \\      if (width === 0 || height === 0) return;
+            \\      if (captureCanvas.width !== width || captureCanvas.height !== height) {
+            \\        captureCanvas.width = width;
+            \\        captureCanvas.height = height;
+            \\      }
+            \\      captureCtx.drawImage(captureVideo, 0, 0);
+            \\      captureCanvas.toBlob((blob) => {
+            \\        if (blob && dataChannelOpen && dataChannel && dataChannel.readyState === 'open') {
+            \\          blob.arrayBuffer().then(buffer => {
+            \\            const header = new ArrayBuffer(12);
+            \\            const headerView = new DataView(header);
+            \\            headerView.setUint32(0, width, true);
+            \\            headerView.setUint32(4, height, true);
+            \\            headerView.setUint32(8, sessionId, true);
+            \\            const frame = new Uint8Array(12 + buffer.byteLength);
+            \\            frame.set(new Uint8Array(header), 0);
+            \\            frame.set(new Uint8Array(buffer), 12);
+            \\            try { dataChannel.send(frame.buffer); } catch(e) { console.log('__TERMWEB_CAPTURE__:send_error:' + e.message); }
+            \\          });
+            \\        }
+            \\      }, 'image/jpeg', 0.92);
+            \\    }, intervalMs);
+            \\  }
+            \\
+            \\  async function startCapture() {
+            \\    try {
+            \\      console.log('__TERMWEB_CAPTURE__:requesting_getdisplaymedia');
+            \\      captureStream = await navigator.mediaDevices.getDisplayMedia({
+            \\        video: {
+            \\          width: { ideal: 2560 },
+            \\          height: { ideal: 1440 },
+            \\          frameRate: { ideal: MAX_FPS, max: MAX_FPS }
+            \\        },
+            \\        audio: false,
+            \\        preferCurrentTab: true,
+            \\        selfBrowserSurface: 'include'
+            \\      });
+            \\      console.log('__TERMWEB_CAPTURE__:got_stream');
+            \\      const videoTrack = captureStream.getVideoTracks()[0];
+            \\      const settings = videoTrack.getSettings();
+            \\      console.log('__TERMWEB_CAPTURE__:resolution:' + settings.width + 'x' + settings.height);
+            \\      captureVideo = document.createElement('video');
+            \\      captureVideo.srcObject = captureStream;
+            \\      captureVideo.muted = true;
+            \\      captureVideo.play();
+            \\      await new Promise(r => captureVideo.onloadedmetadata = r);
+            \\      console.log('__TERMWEB_CAPTURE__:video_size:' + captureVideo.videoWidth + 'x' + captureVideo.videoHeight);
+            \\      captureCanvas = document.createElement('canvas');
+            \\      captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
+            \\      isCapturing = true;
+            \\      startCaptureLoop();
+            \\      console.log('__TERMWEB_CAPTURE__:started');
+            \\    } catch (e) {
+            \\      console.log('__TERMWEB_CAPTURE__:error:' + e.message);
+            \\    }
+            \\  }
+            \\
+            \\  // Create peer connection
+            \\  peerConnection = new RTCPeerConnection({ iceServers: [] });
+            \\  dataChannel = peerConnection.createDataChannel('frames', { ordered: false, maxRetransmits: 0 });
+            \\  dataChannel.binaryType = 'arraybuffer';
+            \\  dataChannel.onopen = () => {
+            \\    console.log('__TERMWEB_CAPTURE__:datachannel_open');
+            \\    dataChannelOpen = true;
+            \\    startCapture();
+            \\  };
+            \\  dataChannel.onclose = () => { console.log('__TERMWEB_CAPTURE__:datachannel_closed'); dataChannelOpen = false; };
+            \\  peerConnection.onicecandidate = (e) => {
+            \\    if (e.candidate) sendSignaling({ type: 'candidate', candidate: e.candidate.candidate, mid: e.candidate.sdpMid || '0' });
+            \\  };
+            \\  peerConnection.onconnectionstatechange = () => {
+            \\    console.log('__TERMWEB_CAPTURE__:connection_state:' + peerConnection.connectionState);
+            \\  };
+            \\
+            \\  // Handle signaling from Zig (polled via window.__termwebRtcSignal)
+            \\  window.__termwebHandleSignal = async (msg) => {
+            \\    if (msg.type === 'answer' && peerConnection) {
+            \\      try {
+            \\        await peerConnection.setRemoteDescription({ type: msg.sdpType || 'answer', sdp: msg.sdp });
+            \\        console.log('__TERMWEB_CAPTURE__:answer_set');
+            \\      } catch (e) { console.log('__TERMWEB_CAPTURE__:answer_error:' + e.message); }
+            \\    } else if (msg.type === 'candidate' && peerConnection) {
+            \\      try { await peerConnection.addIceCandidate({ candidate: msg.candidate, sdpMid: msg.mid }); } catch(e) {}
+            \\    } else if (msg.type === 'set_fps' && typeof msg.fps === 'number') {
+            \\      currentFps = Math.max(MIN_FPS, Math.min(MAX_FPS, msg.fps));
+            \\      if (isCapturing) startCaptureLoop();
+            \\    }
+            \\  };
+            \\
+            \\  // Signal queue from Zig (array to avoid overwrites)
+            \\  window.__termwebRtcSignalQueue = window.__termwebRtcSignalQueue || [];
+            \\  setInterval(() => {
+            \\    while (window.__termwebRtcSignalQueue.length > 0) {
+            \\      const msg = window.__termwebRtcSignalQueue.shift();
+            \\      console.log('__TERMWEB_CAPTURE__:processing_signal:' + msg.type);
+            \\      window.__termwebHandleSignal(msg);
+            \\    }
+            \\  }, 10);
+            \\
+            \\  // Create and send offer
+            \\  const offer = await peerConnection.createOffer();
+            \\  await peerConnection.setLocalDescription(offer);
+            \\  console.log('__TERMWEB_CAPTURE__:sending_offer');
+            \\  sendSignaling({ type: 'offer', sdp: offer.sdp, sdpType: offer.type });
+            \\})();
+        ;
+        self.evalJavaScriptAsync(script);
     }
 
     /// Handle readdir operation
     fn handleFsReadDir(self: *Viewer, id: u32, path: []const u8) !void {
         var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch {
-            try self.sendFsResponse(id, false, "\"Cannot open directory\"");
+            self.sendFsResponse(id, false, "\"Cannot open directory\"");
             return;
         };
         defer dir.close();
@@ -2164,25 +2425,25 @@ pub const Viewer = struct {
         }
         try writer.writeAll("]");
 
-        try self.sendFsResponse(id, true, stream.getWritten());
+        self.sendFsResponse(id, true, stream.getWritten());
     }
 
     /// Handle readfile operation
     fn handleFsReadFile(self: *Viewer, id: u32, path: []const u8) !void {
         const file = std.fs.openFileAbsolute(path, .{}) catch {
-            try self.sendFsResponse(id, false, "\"Cannot open file\"");
+            self.sendFsResponse(id, false, "\"Cannot open file\"");
             return;
         };
         defer file.close();
 
         const stat = file.stat() catch {
-            try self.sendFsResponse(id, false, "\"Cannot stat file\"");
+            self.sendFsResponse(id, false, "\"Cannot stat file\"");
             return;
         };
 
         // Read file content
         const content = file.readToEndAlloc(self.allocator, 100 * 1024 * 1024) catch {
-            try self.sendFsResponse(id, false, "\"File too large or read error\"");
+            self.sendFsResponse(id, false, "\"File too large or read error\"");
             return;
         };
         defer self.allocator.free(content);
@@ -2191,7 +2452,7 @@ pub const Viewer = struct {
         const base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         const base64_len = ((content.len + 2) / 3) * 4;
         const base64 = self.allocator.alloc(u8, base64_len) catch {
-            try self.sendFsResponse(id, false, "\"Out of memory\"");
+            self.sendFsResponse(id, false, "\"Out of memory\"");
             return;
         };
         defer self.allocator.free(base64);
@@ -2226,11 +2487,11 @@ pub const Viewer = struct {
             "{{\"content\":\"{s}\",\"size\":{d},\"type\":\"{s}\",\"lastModified\":{d}}}",
             .{ base64, stat.size, mime_type, last_modified },
         ) catch {
-            try self.sendFsResponse(id, false, "\"Response too large\"");
+            self.sendFsResponse(id, false, "\"Response too large\"");
             return;
         };
 
-        try self.sendFsResponse(id, true, response);
+        self.sendFsResponse(id, true, response);
     }
 
     /// Handle writefile operation
@@ -2238,7 +2499,7 @@ pub const Viewer = struct {
         // Base64 decode
         const decoded_len = (base64_data.len / 4) * 3;
         const decoded = self.allocator.alloc(u8, decoded_len) catch {
-            try self.sendFsResponse(id, false, "\"Out of memory\"");
+            self.sendFsResponse(id, false, "\"Out of memory\"");
             return;
         };
         defer self.allocator.free(decoded);
@@ -2270,17 +2531,17 @@ pub const Viewer = struct {
 
         // Write to file
         const file = std.fs.createFileAbsolute(path, .{}) catch {
-            try self.sendFsResponse(id, false, "\"Cannot create file\"");
+            self.sendFsResponse(id, false, "\"Cannot create file\"");
             return;
         };
         defer file.close();
 
         file.writeAll(decoded[0..actual_len]) catch {
-            try self.sendFsResponse(id, false, "\"Write error\"");
+            self.sendFsResponse(id, false, "\"Write error\"");
             return;
         };
 
-        try self.sendFsResponse(id, true, "true");
+        self.sendFsResponse(id, true, "true");
     }
 
     /// Handle stat operation
@@ -2289,19 +2550,19 @@ pub const Viewer = struct {
         if (std.fs.openDirAbsolute(path, .{})) |dir| {
             var d = dir;
             d.close();
-            try self.sendFsResponse(id, true, "{\"isDirectory\":true}");
+            self.sendFsResponse(id, true, "{\"isDirectory\":true}");
             return;
         } else |_| {}
 
         // Try as file
         const file = std.fs.openFileAbsolute(path, .{}) catch {
-            try self.sendFsResponse(id, false, "\"Path not found\"");
+            self.sendFsResponse(id, false, "\"Path not found\"");
             return;
         };
         defer file.close();
 
         const stat = file.stat() catch {
-            try self.sendFsResponse(id, false, "\"Cannot stat\"");
+            self.sendFsResponse(id, false, "\"Cannot stat\"");
             return;
         };
 
@@ -2311,18 +2572,18 @@ pub const Viewer = struct {
             .{stat.size},
         ) catch return;
 
-        try self.sendFsResponse(id, true, response);
+        self.sendFsResponse(id, true, response);
     }
 
     /// Handle mkdir operation
     fn handleFsMkDir(self: *Viewer, id: u32, path: []const u8) !void {
         std.fs.makeDirAbsolute(path) catch |err| {
             if (err != error.PathAlreadyExists) {
-                try self.sendFsResponse(id, false, "\"Cannot create directory\"");
+                self.sendFsResponse(id, false, "\"Cannot create directory\"");
                 return;
             }
         };
-        try self.sendFsResponse(id, true, "true");
+        self.sendFsResponse(id, true, "true");
     }
 
     /// Handle remove operation
@@ -2332,29 +2593,29 @@ pub const Viewer = struct {
         // Try as directory first
         if (is_recursive) {
             std.fs.deleteTreeAbsolute(path) catch {
-                try self.sendFsResponse(id, false, "\"Cannot remove\"");
+                self.sendFsResponse(id, false, "\"Cannot remove\"");
                 return;
             };
         } else {
             std.fs.deleteDirAbsolute(path) catch {
                 // Try as file
                 std.fs.deleteFileAbsolute(path) catch {
-                    try self.sendFsResponse(id, false, "\"Cannot remove\"");
+                    self.sendFsResponse(id, false, "\"Cannot remove\"");
                     return;
                 };
             };
         }
-        try self.sendFsResponse(id, true, "true");
+        self.sendFsResponse(id, true, "true");
     }
 
     /// Handle createfile operation
     fn handleFsCreateFile(self: *Viewer, id: u32, path: []const u8) !void {
         const file = std.fs.createFileAbsolute(path, .{ .exclusive = false }) catch {
-            try self.sendFsResponse(id, false, "\"Cannot create file\"");
+            self.sendFsResponse(id, false, "\"Cannot create file\"");
             return;
         };
         file.close();
-        try self.sendFsResponse(id, true, "true");
+        self.sendFsResponse(id, true, "true");
     }
 
     /// Show file chooser (native OS picker)
@@ -2369,18 +2630,16 @@ pub const Viewer = struct {
         const file_path = try dialog_mod.showNativeFilePicker(self.allocator, mode);
         defer if (file_path) |p| self.allocator.free(p);
 
-        // Send response to Chrome
+        // Send response to Chrome (async - fire and forget)
         if (file_path) |path| {
             // Escape file path for JSON (handles quotes, backslashes)
             var escape_buf: [4096]u8 = undefined;
             const escaped_path = json.escapeContents(path, &escape_buf) catch return;
             var params_buf: [8192]u8 = undefined;
             const params = std.fmt.bufPrint(&params_buf, "{{\"action\":\"accept\",\"files\":[\"{s}\"]}}", .{escaped_path}) catch return;
-            const result = self.cdp_client.sendNavCommand("Page.handleFileChooser", params) catch return;
-            self.allocator.free(result);
+            self.cdp_client.sendNavCommandAsync("Page.handleFileChooser", params);
         } else {
-            const result = self.cdp_client.sendNavCommand("Page.handleFileChooser", "{\"action\":\"cancel\"}") catch return;
-            self.allocator.free(result);
+            self.cdp_client.sendNavCommandAsync("Page.handleFileChooser", "{\"action\":\"cancel\"}");
         }
     }
 
@@ -2402,23 +2661,29 @@ pub const Viewer = struct {
         self.log("[DEBUG] deinit: stopping input...\n", .{});
         self.input.deinit();
         self.log("[DEBUG] deinit: input stopped\n", .{});
+        self.log("[DEBUG] deinit: prompt_buffer...\n", .{});
         if (self.prompt_buffer) |*p| p.deinit();
+        self.log("[DEBUG] deinit: fs_roots...\n", .{});
         // Free allowed file system roots
         for (self.allowed_fs_roots.items) |root| {
             self.allocator.free(root);
         }
         self.allowed_fs_roots.deinit(self.allocator);
+        self.log("[DEBUG] deinit: pending_targets...\n", .{});
         // Free pending new targets
         for (self.pending_new_targets.items) |target_id| {
             self.allocator.free(target_id);
         }
         self.pending_new_targets.deinit(self.allocator);
+        self.log("[DEBUG] deinit: tabs...\n", .{});
         // Free tabs
         for (self.tabs.items) |*tab| {
             tab.deinit();
         }
         self.tabs.deinit(self.allocator);
+        self.log("[DEBUG] deinit: download_manager...\n", .{});
         self.download_manager.deinit();
+        self.log("[DEBUG] deinit: closing debug_log...\n", .{});
         if (self.debug_log) |file| {
             file.close();
         }
@@ -2436,6 +2701,76 @@ pub const Viewer = struct {
         self.terminal.deinit();
     }
 };
+
+/// Static callback for WebRTC signaling - queues message for main loop processing
+/// Called from libdatachannel's thread, so must not block or call CDP directly
+fn rtcSignalingCallback(msg: []const u8, ctx: ?*anyopaque) void {
+    const self: *Viewer = @ptrCast(@alignCast(ctx orelse return));
+    self.log("[RTC] Queueing signaling: {s}\n", .{msg[0..@min(100, msg.len)]});
+
+    // Build the script - push to queue instead of overwriting single variable
+    var script_buf: [32768]u8 = undefined;
+    const script = std.fmt.bufPrint(&script_buf,
+        \\window.__termwebRtcSignalQueue = window.__termwebRtcSignalQueue || [];
+        \\window.__termwebRtcSignalQueue.push({s});
+        \\console.log('__TERMWEB_CAPTURE__:signal_queued:' + window.__termwebRtcSignalQueue.length);
+    , .{msg}) catch {
+        self.log("[RTC] bufPrint failed for signal, msg_len={}\n", .{msg.len});
+        return;
+    };
+
+    // Queue the message (lock-free ring buffer)
+    const idx = self.rtc_signal_write_idx.fetchAdd(1, .monotonic) % 4;
+    @memcpy(self.rtc_signal_queue[idx][0..script.len], script);
+    self.rtc_signal_lens[idx].store(script.len, .release);
+}
+
+/// Background thread for processing RTC signaling messages
+/// Runs independently of main loop, uses async CDP calls
+fn rtcSignalThreadFn(self: *Viewer) void {
+    self.log("[RTC THREAD] Started\n", .{});
+
+    while (self.rtc_signal_running.load(.acquire)) {
+        var processed_any = false;
+
+        for (0..4) |i| {
+            const len = self.rtc_signal_lens[i].swap(0, .acquire);
+            if (len > 0) {
+                const script = self.rtc_signal_queue[i][0..len];
+                self.log("[RTC THREAD] Processing signal, len={}\n", .{len});
+                self.evalJavaScriptAsync(script);
+                processed_any = true;
+            }
+        }
+
+        // Sleep if nothing to process (avoid busy-wait)
+        if (!processed_any) {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+
+    self.log("[RTC THREAD] Stopped\n", .{});
+}
+
+/// Start RTC signaling background thread
+fn startRtcSignalThread(self: *Viewer) void {
+    if (self.rtc_signal_thread != null) return; // Already running
+
+    self.rtc_signal_running.store(true, .release);
+    self.rtc_signal_thread = std.Thread.spawn(.{}, rtcSignalThreadFn, .{self}) catch |err| {
+        self.log("[RTC THREAD] Failed to spawn: {}\n", .{err});
+        return;
+    };
+}
+
+/// Stop RTC signaling background thread
+fn stopRtcSignalThread(self: *Viewer) void {
+    self.rtc_signal_running.store(false, .release);
+    if (self.rtc_signal_thread) |thread| {
+        thread.join();
+        self.rtc_signal_thread = null;
+    }
+}
 
 // Use helper functions from viewer module
 const extractUrlFromNavEvent = viewer_helpers.extractUrlFromNavEvent;

@@ -7,6 +7,7 @@ const download_mod = @import("../chrome/download.zig");
 const ui_mod = @import("../ui/mod.zig");
 const helpers = @import("helpers.zig");
 const tabs_mod = @import("tabs.zig");
+const rtc_frame_server_mod = @import("../capture/rtc_frame_server.zig");
 
 const extractUrlFromNavEvent = helpers.extractUrlFromNavEvent;
 
@@ -48,12 +49,15 @@ pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
         viewer.chrome_inner_height = 0;
         viewer.chrome_inner_frame_width = 0;
         viewer.chrome_inner_frame_height = 0;
+        viewer.log("[CDP EVENT] Page.loadEventFired\n", .{});
     } else if (std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
         handleNavigatedWithinDocument(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
         handleNewTarget(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Target.targetInfoChanged")) {
         handleTargetInfoChanged(viewer, event.payload);
+    } else if (std.mem.eql(u8, event.method, "Page.screencastFrame")) {
+        handleScreencastFrame(viewer, event.payload);
     }
     // NOTE: Frame changes (download bar, etc.) are detected by comparing current frame
     // dimensions to chrome_inner_frame_width/height and applying ratio adjustment
@@ -67,6 +71,9 @@ pub fn handleFrameNavigated(viewer: anytype, payload: []const u8) void {
     viewer.log("[FRAME NAV] URL: {s} (main_frame={})\n", .{ url, is_main_frame });
 
     if (!is_main_frame) return;
+
+    // Stall detection will auto-restart capture if no frames for 2s
+    // No need to explicitly trigger here
 
     // Reset viewport cache on main frame navigation - different pages may have different viewports
     viewer.chrome_inner_width = 0;
@@ -131,6 +138,18 @@ pub fn handleNewTarget(viewer: anytype, payload: []const u8) void {
     const t_start = type_start + type_marker.len;
     const t_end = std.mem.indexOfPos(u8, payload, t_start, "\"") orelse return;
     const target_type = payload[t_start..t_end];
+
+    // Check for extension-related targets (for debugging)
+    if (std.mem.indexOf(u8, payload, "chrome-extension://") != null) {
+        viewer.log("[EXTENSION TARGET] Found extension target type={s}\n", .{target_type});
+        // Check if it's our termweb extension (look for background.js or offscreen.js)
+        if (std.mem.indexOf(u8, payload, "background.js") != null or
+            std.mem.indexOf(u8, payload, "offscreen.js") != null or
+            std.mem.indexOf(u8, payload, "Termweb") != null)
+        {
+            viewer.log("[EXTENSION TARGET] *** TERMWEB extension detected! ***\n", .{});
+        }
+    }
 
     if (!std.mem.eql(u8, target_type, "page")) {
         viewer.log("[NEW TARGET] Ignoring non-page target type={s}\n", .{target_type});
@@ -268,6 +287,9 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
 
 /// Handle console messages - look for special markers
 pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
+    // Debug: log all console messages to verify CDP events are being received
+    viewer.log("[CONSOLE] Received: {s}\n", .{payload[0..@min(200, payload.len)]});
+
     // Check for resize marker (from extension's ResizeObserver)
     const resize_marker = "__TERMWEB_RESIZE__:";
     if (std.mem.indexOf(u8, payload, resize_marker)) |resize_pos| {
@@ -282,10 +304,18 @@ pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
         return;
     }
 
-    // Check for bridge ready marker
+    // Check for bridge marker
     const bridge_marker = "__TERMWEB_BRIDGE__:";
-    if (std.mem.indexOf(u8, payload, bridge_marker) != null) {
-        viewer.log("[EXTENSION] Bridge ready\n", .{});
+    if (std.mem.indexOf(u8, payload, bridge_marker)) |bridge_pos| {
+        // Extract the message type
+        const msg_start = bridge_pos + bridge_marker.len;
+        var msg_end = msg_start;
+        for (payload[msg_start..]) |c| {
+            if (c == '"' or c == '\n' or c == '\r') break;
+            msg_end += 1;
+        }
+        const msg_type = if (msg_end > msg_start) payload[msg_start..msg_end] else "unknown";
+        viewer.log("[EXTENSION] Bridge message: {s}\n", .{msg_type});
         return;
     }
 
@@ -340,6 +370,20 @@ pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
     if (std.mem.indexOf(u8, payload, picker_marker)) |picker_pos| {
         viewer.log("[CONSOLE MSG] Found picker marker\n", .{});
         try handlePickerRequest(viewer, payload, picker_pos + picker_marker.len);
+        return;
+    }
+
+    // Check for capture marker (WebSocket connection status from extension)
+    const capture_marker = "__TERMWEB_CAPTURE__:";
+    if (std.mem.indexOf(u8, payload, capture_marker)) |capture_pos| {
+        handleCaptureEvent(viewer, payload, capture_pos + capture_marker.len);
+        return;
+    }
+
+    // Check for WebRTC signaling marker
+    const rtc_marker = "__TERMWEB_RTC__:";
+    if (std.mem.indexOf(u8, payload, rtc_marker)) |rtc_pos| {
+        handleRtcSignaling(viewer, payload, rtc_pos + rtc_marker.len);
         return;
     }
 }
@@ -592,11 +636,120 @@ fn handleClipboardReadRequest(viewer: anytype) void {
         }
     }
 
-    // Inject into browser
+    // Inject into browser (use async to avoid blocking CDP thread)
     const script = std.fmt.allocPrint(viewer.allocator, "window._termwebClipboardData = \"{s}\";", .{escaped[0..out_idx]}) catch return;
     defer viewer.allocator.free(script);
 
-    viewer.evalJavaScript(script) catch {};
+    viewer.evalJavaScriptAsync(script);
+}
+
+/// Handle WebRTC signaling message from extension
+fn handleRtcSignaling(viewer: anytype, payload: []const u8, start: usize) void {
+    // Find end of JSON data (look for end of console string)
+    var data_end = start;
+    var brace_depth: i32 = 0;
+    var in_string = false;
+    var escape_next = false;
+
+    for (payload[start..]) |c| {
+        if (escape_next) {
+            escape_next = false;
+            data_end += 1;
+            continue;
+        }
+        if (c == '\\') {
+            escape_next = true;
+            data_end += 1;
+            continue;
+        }
+        if (c == '"' and !escape_next) {
+            if (!in_string) {
+                in_string = true;
+            } else {
+                in_string = false;
+            }
+        }
+        if (!in_string) {
+            if (c == '{') brace_depth += 1;
+            if (c == '}') {
+                brace_depth -= 1;
+                if (brace_depth == 0) {
+                    data_end += 1;
+                    break;
+                }
+            }
+        }
+        data_end += 1;
+    }
+
+    if (data_end <= start) return;
+    const json_data = payload[start..data_end];
+
+    viewer.log("[RTC] Signaling message (escaped): {s}\n", .{json_data[0..@min(200, json_data.len)]});
+
+    // Unescape JSON (CDP console messages have escaped quotes/backslashes)
+    var unescaped_buf: [32768]u8 = undefined;
+    var unescaped_len: usize = 0;
+    var i: usize = 0;
+    while (i < json_data.len and unescaped_len < unescaped_buf.len - 1) {
+        if (json_data[i] == '\\' and i + 1 < json_data.len) {
+            const next = json_data[i + 1];
+            if (next == '"' or next == '\\' or next == '/') {
+                unescaped_buf[unescaped_len] = next;
+                unescaped_len += 1;
+                i += 2;
+            } else if (next == 'n') {
+                unescaped_buf[unescaped_len] = '\n';
+                unescaped_len += 1;
+                i += 2;
+            } else if (next == 'r') {
+                unescaped_buf[unescaped_len] = '\r';
+                unescaped_len += 1;
+                i += 2;
+            } else if (next == 't') {
+                unescaped_buf[unescaped_len] = '\t';
+                unescaped_len += 1;
+                i += 2;
+            } else {
+                unescaped_buf[unescaped_len] = json_data[i];
+                unescaped_len += 1;
+                i += 1;
+            }
+        } else {
+            unescaped_buf[unescaped_len] = json_data[i];
+            unescaped_len += 1;
+            i += 1;
+        }
+    }
+
+    viewer.log("[RTC] Signaling message (unescaped): {s}\n", .{unescaped_buf[0..@min(200, unescaped_len)]});
+
+    // Forward to RtcFrameServer
+    viewer.rtc_frame_server.handleSignalingMessage(unescaped_buf[0..unescaped_len]);
+}
+
+/// Handle capture event from extension - WebSocket connection status
+fn handleCaptureEvent(viewer: anytype, payload: []const u8, start: usize) void {
+    // Find end of event data
+    var data_end = start;
+    for (payload[start..]) |c| {
+        if (c == '"' or c == '\n' or c == '\r') break;
+        data_end += 1;
+    }
+
+    if (data_end <= start) return;
+    const event = payload[start..data_end];
+
+    viewer.log("[CAPTURE] Extension event: {s}\n", .{event});
+
+    // Handle connection events
+    if (std.mem.startsWith(u8, event, "ws_connected")) {
+        viewer.log("[CAPTURE] Extension connected to frame server!\n", .{});
+        viewer.extension_connected = true;
+    } else if (std.mem.startsWith(u8, event, "ws_closed") or std.mem.startsWith(u8, event, "ws_error")) {
+        viewer.log("[CAPTURE] Extension disconnected from frame server\n", .{});
+        viewer.extension_connected = false;
+    }
 }
 
 /// Handle file system operation request - delegates to viewer
@@ -614,4 +767,61 @@ fn handlePickerRequest(viewer: anytype, payload: []const u8, start: usize) !void
 pub fn showFileChooser(viewer: anytype, payload: []const u8) !void {
     // Delegate to the viewer's showFileChooser which handles the OS-native picker
     return viewer.showFileChooser(payload);
+}
+
+/// Handle Page.screencastFrame event - store frame data and acknowledge
+fn handleScreencastFrame(viewer: anytype, payload: []const u8) void {
+    // Parse sessionId for acknowledgment
+    // Format: {"method":"Page.screencastFrame","params":{"data":"...","metadata":{"..."},"sessionId":N}}
+    const session_marker = "\"sessionId\":";
+    const session_start = std.mem.indexOf(u8, payload, session_marker) orelse return;
+    const session_val_start = session_start + session_marker.len;
+    var session_val_end = session_val_start;
+    while (session_val_end < payload.len and
+        (payload[session_val_end] >= '0' and payload[session_val_end] <= '9'))
+    {
+        session_val_end += 1;
+    }
+    const session_id = std.fmt.parseInt(u32, payload[session_val_start..session_val_end], 10) catch return;
+
+    // Parse base64 image data
+    const data_marker = "\"data\":\"";
+    const data_start = std.mem.indexOf(u8, payload, data_marker) orelse return;
+    const data_val_start = data_start + data_marker.len;
+    // Find end of base64 data (closing quote, handle that data may contain special chars but not unescaped quotes)
+    var data_val_end = data_val_start;
+    while (data_val_end < payload.len and payload[data_val_end] != '"') {
+        data_val_end += 1;
+    }
+    const data = payload[data_val_start..data_val_end];
+
+    // Parse dimensions from metadata if available
+    var width: u32 = 0;
+    var height: u32 = 0;
+
+    const width_marker = "\"deviceWidth\":";
+    if (std.mem.indexOf(u8, payload, width_marker)) |w_start| {
+        const w_val_start = w_start + width_marker.len;
+        var w_val_end = w_val_start;
+        while (w_val_end < payload.len and payload[w_val_end] >= '0' and payload[w_val_end] <= '9') {
+            w_val_end += 1;
+        }
+        width = std.fmt.parseInt(u32, payload[w_val_start..w_val_end], 10) catch 0;
+    }
+
+    const height_marker = "\"deviceHeight\":";
+    if (std.mem.indexOf(u8, payload, height_marker)) |h_start| {
+        const h_val_start = h_start + height_marker.len;
+        var h_val_end = h_val_start;
+        while (h_val_end < payload.len and payload[h_val_end] >= '0' and payload[h_val_end] <= '9') {
+            h_val_end += 1;
+        }
+        height = std.fmt.parseInt(u32, payload[h_val_start..h_val_end], 10) catch 0;
+    }
+
+    // Store the frame
+    viewer.cdp_client.storeScreencastFrame(data, session_id, width, height) catch return;
+
+    // Acknowledge the frame immediately to keep the stream flowing
+    viewer.cdp_client.ackScreencastFrame(session_id);
 }

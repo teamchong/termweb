@@ -95,7 +95,7 @@ pub fn navigateToUrlAsync(
 
     logNav("[NAV] sending Page.navigate with params: {s}\n", .{params});
 
-    // Use dedicated nav WebSocket for Page.navigate
+    // Use pipe for Page.navigate
     const result = try client.sendNavCommand("Page.navigate", params);
     defer allocator.free(result);
 
@@ -346,7 +346,7 @@ fn isEntryAboutBlank(history: []const u8, target_index: usize) bool {
     return false;
 }
 
-/// Reload current page - uses dedicated nav WebSocket
+/// Reload current page via pipe
 /// Note: Scroll reset is handled by viewer after navigation event
 pub fn reload(
     client: *cdp.CdpClient,
@@ -365,7 +365,7 @@ pub fn reload(
     // Non-blocking - CDP events handle load completion
 }
 
-/// Stop page loading - uses dedicated nav WebSocket
+/// Stop page loading via pipe
 pub fn stopLoading(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -381,7 +381,7 @@ pub const NavigationState = struct {
     can_go_forward: bool,
 };
 
-/// Get current navigation history state - uses dedicated nav WebSocket
+/// Get current navigation history state via pipe
 pub fn getNavigationState(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,

@@ -60,7 +60,7 @@ pub fn mouseMove(
     client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
 }
 
-/// Click at specific coordinates - uses dedicated mouse WebSocket
+/// Click at specific coordinates
 pub fn clickAt(
     client: *cdp.CdpClient,
     allocator: std.mem.Allocator,
@@ -417,7 +417,7 @@ pub fn readBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocator
     return final;
 }
 
-/// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket
+/// Send raw mouse event - fire-and-forget via pipe
 /// Click sequence (HIGH PRIORITY - never throttled):
 ///   1. mouseMoved (triggers CSS :hover, JS mouseenter)
 ///   2. mousePressed (sets active state)
@@ -464,7 +464,7 @@ pub fn sendMouseEvent(
 
     debugLog("[MOUSE] Sending: {s}\n", .{params});
 
-    // All mouse events go through dedicated mouse websocket (fire-and-forget for low latency)
+    // All mouse events go through pipe (fire-and-forget for low latency)
     client.sendMouseCommandAsync("Input.dispatchMouseEvent", params);
 }
 

@@ -99,6 +99,27 @@ pub const FramePool = struct {
         self.allocator.destroy(self);
     }
 
+    /// Reset the frame pool for a new session
+    /// Clears all slots and resets state - call when connection is re-established
+    pub fn reset(self: *FramePool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Reset all slots
+        for (self.slots) |*slot| {
+            slot.len = 0;
+            slot.session_id = 0;
+            slot.device_width = 0;
+            slot.device_height = 0;
+            slot.generation = 0;
+            slot.ref_count = std.atomic.Value(u32).init(0);
+        }
+
+        // Reset write index and generation
+        self.write_idx = 0;
+        self.generation.store(1, .release);
+    }
+
     /// Write a frame into the pool (zero-copy if possible)
     /// Returns the generation number for this write, or null if all slots are in use
     pub fn writeFrame(

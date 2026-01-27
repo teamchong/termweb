@@ -5,46 +5,22 @@
 /// - FD 4: Chrome writes responses/events to this pipe
 const std = @import("std");
 const simd = @import("../simd/dispatch.zig");
-const FramePool = @import("../simd/frame_pool.zig").FramePool;
-const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
-const json = @import("../utils/json.zig");
 
-/// Debug logging - disabled by default for performance
-/// Set TERMWEB_CDP_DEBUG=1 to enable (truncates log on startup)
-var cdp_debug_enabled: ?bool = null;
-var cdp_debug_file: ?std.fs.File = null;
-var cdp_debug_bytes: usize = 0;
-const CDP_DEBUG_MAX_SIZE: usize = 10 * 1024 * 1024; // 10MB max, then truncate
+/// Debug logging - write to pipe_debug.log
+var pipe_debug_file: ?std.fs.File = null;
 
 fn logToFile(comptime fmt: []const u8, args: anytype) void {
-    // Check if debug is enabled (cached after first check)
-    if (cdp_debug_enabled == null) {
-        cdp_debug_enabled = if (std.posix.getenv("TERMWEB_CDP_DEBUG")) |v|
-            std.mem.eql(u8, v, "1")
-        else
-            false;
-
-        // Truncate on startup for fresh log each run
-        if (cdp_debug_enabled.?) {
-            cdp_debug_file = std.fs.cwd().createFile("cdp_debug.log", .{ .truncate = true }) catch null;
+    if (pipe_debug_file == null) {
+        pipe_debug_file = std.fs.cwd().createFile("pipe_debug.log", .{ .truncate = false }) catch null;
+        if (pipe_debug_file) |f| {
+            f.seekFromEnd(0) catch {};
         }
     }
-
-    if (!cdp_debug_enabled.?) return;
-
-    const file = cdp_debug_file orelse return;
-
-    // Auto-truncate if log gets too large
-    if (cdp_debug_bytes > CDP_DEBUG_MAX_SIZE) {
-        file.seekTo(0) catch {};
-        file.setEndPos(0) catch {};
-        cdp_debug_bytes = 0;
-        _ = file.write("--- LOG TRUNCATED (exceeded 10MB) ---\n") catch {};
-    }
-
+    const file = pipe_debug_file orelse return;
     var buf: [8192]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    cdp_debug_bytes += file.write(slice) catch 0;
+    _ = file.write(slice) catch {};
+    file.sync() catch {}; // Flush to disk for debugging
 }
 
 pub const PipeError = error{
@@ -56,21 +32,7 @@ pub const PipeError = error{
     InvalidFormat,
     TimeoutWaitingForResponse,
     OutOfMemory,
-};
-
-/// Screencast frame structure with zero-copy reference to pool slot
-pub const ScreencastFrame = struct {
-    data: []const u8, 
-    slot: *FrameSlot, 
-    session_id: u32,
-    device_width: u32,
-    device_height: u32,
-    generation: u64,
-
-    /// Release the pool slot reference
-    pub fn deinit(self: *ScreencastFrame) void {
-        self.slot.release();
-    }
+    PipeBroken, // Chrome closed the connection
 };
 
 const ResponseQueueEntry = struct {
@@ -83,8 +45,17 @@ const ResponseQueueEntry = struct {
     }
 };
 
-// NOTE: Event queue removed - pipe is ONLY for screencast frames
-// All events (console, dialogs, file chooser) go through nav_ws
+/// Event queue entry for CDP events (console, dialogs, etc.)
+const EventQueueEntry = struct {
+    method: []u8,
+    payload: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *EventQueueEntry) void {
+        self.allocator.free(self.method);
+        self.allocator.free(self.payload);
+    }
+};
 
 /// Pipe-based CDP client
 pub const PipeCdpClient = struct {
@@ -99,11 +70,9 @@ pub const PipeCdpClient = struct {
     response_queue: std.ArrayList(ResponseQueueEntry),
     response_mutex: std.Thread.Mutex,
 
-    // NOTE: No event queue - pipe is ONLY for screencast frames
-    // Events go through nav_ws
-
-    frame_pool: *FramePool,
-    frame_count: std.atomic.Value(u32),
+    // Event queue for console messages, dialogs, etc.
+    event_queue: std.ArrayList(EventQueueEntry),
+    event_mutex: std.Thread.Mutex,
 
     write_mutex: std.Thread.Mutex,
 
@@ -114,9 +83,10 @@ pub const PipeCdpClient = struct {
     read_file_closed: bool,
     write_file_closed: bool,
 
-    pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
-        const frame_pool = try FramePool.init(allocator);
+    // Set by reader thread when Chrome closes the pipe
+    pipe_broken: std.atomic.Value(bool),
 
+    pub fn init(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t) !*PipeCdpClient {
         // Allocate large read buffer for bursts
         const read_buffer = try allocator.alloc(u8, 4 * 1024 * 1024);
 
@@ -130,13 +100,14 @@ pub const PipeCdpClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .response_queue = try std.ArrayList(ResponseQueueEntry).initCapacity(allocator, 0),
             .response_mutex = .{},
-            .frame_pool = frame_pool,
-            .frame_count = std.atomic.Value(u32).init(0),
+            .event_queue = try std.ArrayList(EventQueueEntry).initCapacity(allocator, 0),
+            .event_mutex = .{},
             .write_mutex = .{},
             .read_buffer = read_buffer,
             .read_pos = 0,
             .read_file_closed = false,
             .write_file_closed = false,
+            .pipe_broken = std.atomic.Value(bool).init(false),
         };
 
         return client;
@@ -156,20 +127,40 @@ pub const PipeCdpClient = struct {
             self.write_file_closed = true;
         }
 
-        self.frame_pool.deinit();
-
         // Free any remaining response queue entries (in case stopReaderThread wasn't called)
         for (self.response_queue.items) |*entry| {
             self.allocator.free(entry.payload);
         }
         self.response_queue.deinit(self.allocator);
-        logToFile("[PIPE deinit] Response queue deinit done\n", .{});
+
+        // Free any remaining event queue entries
+        for (self.event_queue.items) |*entry| {
+            entry.deinit();
+        }
+        self.event_queue.deinit(self.allocator);
+        logToFile("[PIPE deinit] Response and event queues deinit done\n", .{});
 
         self.allocator.free(self.read_buffer);
         self.allocator.destroy(self);
     }
 
+    /// Check if Chrome closed the pipe (detected by reader thread)
+    pub fn isPipeBroken(self: *PipeCdpClient) bool {
+        return self.pipe_broken.load(.acquire);
+    }
+
     pub fn sendCommandAsync(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) !void {
+        _ = try self.sendCommandAsyncWithId(method, params);
+    }
+
+    /// Send command async and return the command ID for polling
+    pub fn sendCommandAsyncWithId(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) !u32 {
+        // Fail fast if Chrome closed the pipe
+        if (self.pipe_broken.load(.acquire)) {
+            logToFile("[PIPE] sendCommandAsyncWithId FAILED (pipe already broken) method={s}\n", .{method});
+            return PipeError.PipeBroken;
+        }
+
         const id = self.next_id.fetchAdd(1, .monotonic);
 
         const command = if (params) |p|
@@ -186,12 +177,29 @@ pub const PipeCdpClient = struct {
             );
         defer self.allocator.free(command);
 
+        logToFile("[PIPE] sendCommandAsyncWithId id={} method={s}\n", .{ id, method });
+
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
-        _ = try self.write_file.writeAll(command);
+        self.write_file.writeAll(command) catch |err| {
+            logToFile("[PIPE] sendCommandAsyncWithId FAILED: {}\n", .{err});
+            return err;
+        };
+        return id;
     }
 
     pub fn sendSessionCommandAsync(self: *PipeCdpClient, session_id: []const u8, method: []const u8, params: ?[]const u8) !void {
+        _ = try self.sendSessionCommandAsyncWithId(session_id, method, params);
+    }
+
+    /// Send session command async and return the command ID for polling
+    pub fn sendSessionCommandAsyncWithId(self: *PipeCdpClient, session_id: []const u8, method: []const u8, params: ?[]const u8) !u32 {
+        // Fail fast if Chrome closed the pipe
+        if (self.pipe_broken.load(.acquire)) {
+            logToFile("[PIPE] sendSessionCommandAsyncWithId FAILED (pipe already broken) method={s}\n", .{method});
+            return PipeError.PipeBroken;
+        }
+
         const id = self.next_id.fetchAdd(1, .monotonic);
 
         const command = if (params) |p|
@@ -208,12 +216,44 @@ pub const PipeCdpClient = struct {
             );
         defer self.allocator.free(command);
 
+        logToFile("[PIPE] sendSessionCommandAsyncWithId id={} sid={s} method={s}\n", .{ id, session_id, method });
+
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
-        _ = try self.write_file.writeAll(command);
+        self.write_file.writeAll(command) catch |err| {
+            logToFile("[PIPE] sendSessionCommandAsyncWithId FAILED id={} method={s}: {}\n", .{ id, method, err });
+            return err;
+        };
+        return id;
+    }
+
+    /// Poll for a response by command ID (non-blocking)
+    /// Returns the response payload if found, null if not yet available
+    /// Caller owns the returned memory
+    pub fn pollResponse(self: *PipeCdpClient, id: u32) ?[]u8 {
+        self.response_mutex.lock();
+        defer self.response_mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.response_queue.items.len) : (i += 1) {
+            const entry = self.response_queue.items[i];
+            if (entry.id == id) {
+                const response = entry.payload;
+                _ = self.response_queue.swapRemove(i);
+                logToFile("[PIPE] pollResponse id={} found ({} bytes)\n", .{ id, response.len });
+                return response;
+            }
+        }
+        return null;
     }
 
     pub fn sendSessionCommand(self: *PipeCdpClient, session_id: []const u8, method: []const u8, params: ?[]const u8) ![]u8 {
+        // Fail fast if Chrome closed the pipe
+        if (self.pipe_broken.load(.acquire)) {
+            logToFile("[PIPE] sendSessionCommand FAILED (pipe already broken) method={s}\n", .{method});
+            return PipeError.PipeBroken;
+        }
+
         const id = self.next_id.fetchAdd(1, .monotonic);
 
         const command = if (params) |p|
@@ -251,6 +291,12 @@ pub const PipeCdpClient = struct {
     }
 
     pub fn sendCommand(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) ![]u8 {
+        // Fail fast if Chrome closed the pipe
+        if (self.pipe_broken.load(.acquire)) {
+            logToFile("[PIPE] sendCommand FAILED (pipe already broken) method={s}\n", .{method});
+            return PipeError.PipeBroken;
+        }
+
         const id = self.next_id.fetchAdd(1, .monotonic);
 
         const command = if (params) |p|
@@ -267,13 +313,21 @@ pub const PipeCdpClient = struct {
             );
         defer self.allocator.free(command);
 
+        logToFile("[PIPE] sendCommand id={} method={s}\n", .{ id, method });
+
         {
             self.write_mutex.lock();
             defer self.write_mutex.unlock();
-            _ = try self.write_file.writeAll(command);
+            self.write_file.writeAll(command) catch |err| {
+                logToFile("[PIPE] sendCommand WRITE FAILED: {}\n", .{err});
+                return err;
+            };
         }
 
-        return self.waitForResponse(id);
+        return self.waitForResponse(id) catch |err| {
+            logToFile("[PIPE] sendCommand WAIT FAILED id={} method={s}: {}\n", .{ id, method, err });
+            return err;
+        };
     }
 
     fn waitForResponse(self: *PipeCdpClient, id: u32) ![]u8 {
@@ -404,34 +458,24 @@ pub const PipeCdpClient = struct {
         }
     }
 
-    pub fn getLatestFrame(self: *PipeCdpClient) ?ScreencastFrame {
-        const slot = self.frame_pool.acquireLatestFrame() orelse return null;
-
-        // ACKs are sent immediately in handleScreencastFrame()
-
-        return ScreencastFrame{
-            .data = slot.data(),
-            .slot = slot,
-            .session_id = slot.session_id,
-            .device_width = slot.device_width,
-            .device_height = slot.device_height,
-            .generation = slot.generation,
-        };
-    }
-
-    pub fn getFrameCount(self: *PipeCdpClient) u32 {
-        return self.frame_count.load(.monotonic);
-    }
-
     // NOTE: nextEvent removed - events come from nav_ws, not pipe
 
     fn readerThreadMain(self: *PipeCdpClient) void {
+        logToFile("[PIPE READER] Thread started\n", .{});
         while (self.running.load(.acquire)) {
             const message = self.readMessage() catch |err| {
                 // Pipe closed (either ConnectionFailed or NotOpenForReading from stopReaderThread)
-                if (err == PipeError.ConnectionFailed) break;
-                if (err == error.NotOpenForReading) break;
+                if (err == PipeError.ConnectionFailed) {
+                    logToFile("[PIPE READER] Chrome closed pipe (ConnectionFailed)\n", .{});
+                    self.pipe_broken.store(true, .release);
+                    break;
+                }
+                if (err == error.NotOpenForReading) {
+                    logToFile("[PIPE READER] Pipe closed for reading (stopping)\n", .{});
+                    break;
+                }
                 if (!self.running.load(.acquire)) break;
+                logToFile("[PIPE READER] readMessage error: {}, continuing\n", .{err});
                 continue;
             };
             defer self.allocator.free(message);
@@ -442,59 +486,78 @@ pub const PipeCdpClient = struct {
                 self.handleResponse(message) catch {};
             }
         }
+        logToFile("[PIPE READER] Thread exiting\n", .{});
     }
 
     /// Handle CDP events from pipe
-    /// PIPE IS ONLY FOR SCREENCAST FRAMES - events go through nav_ws
     fn handleEvent(self: *PipeCdpClient, payload: []const u8) !void {
         const method_start = std.mem.indexOf(u8, payload, "\"method\":\"") orelse return;
         const method_v_start = method_start + "\"method\":\"".len;
         const method_end = std.mem.indexOfPos(u8, payload, method_v_start, "\"") orelse return;
         const method = payload[method_v_start..method_end];
 
-        // PIPE ONLY HANDLES SCREENCAST FRAMES
-        // All other events (navigation, console, dialogs, etc.) go through nav_ws
-        if (std.mem.eql(u8, method, "Page.screencastFrame")) {
-            self.handleScreencastFrame(payload) catch return;
+        // Queue events for processing (console messages, dialogs, etc.)
+        self.event_mutex.lock();
+        defer self.event_mutex.unlock();
+
+        if (!self.running.load(.acquire)) return;
+
+        const MAX_EVENT_QUEUE_SIZE = 100;
+        while (self.event_queue.items.len >= MAX_EVENT_QUEUE_SIZE) {
+            var old = self.event_queue.swapRemove(0);
+            old.deinit();
         }
+
+        // Allocate copies before append
+        const method_copy = self.allocator.dupe(u8, method) catch return;
+        const payload_copy = self.allocator.dupe(u8, payload) catch {
+            self.allocator.free(method_copy);
+            return;
+        };
+        self.event_queue.append(self.allocator, .{
+            .method = method_copy,
+            .payload = payload_copy,
+            .allocator = self.allocator,
+        }) catch {
+            self.allocator.free(method_copy);
+            self.allocator.free(payload_copy);
+            return;
+        };
     }
 
-    fn handleScreencastFrame(self: *PipeCdpClient, payload: []const u8) !void {
-        const routing_sid = self.extractRoutingSessionId(payload) catch null;
-        const frame_sid = try self.extractFrameSessionId(payload);
-        const data = try self.extractScreencastData(payload);
-        const device_width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
-        const device_height = self.extractMetadataInt(payload, "deviceHeight") catch 0;
+    /// Get next event from queue (non-blocking)
+    pub fn nextEvent(self: *PipeCdpClient) ?EventQueueEntry {
+        self.event_mutex.lock();
+        defer self.event_mutex.unlock();
 
-        // Debug: log raw metadata JSON
-        {
-            // Find metadata object in payload
-            if (std.mem.indexOf(u8, payload, "\"metadata\":{")) |start| {
-                const meta_start = start + 11; // skip "metadata":{
-                if (std.mem.indexOfPos(u8, payload, meta_start, "}")) |end| {
-                    const metadata = payload[meta_start .. end + 1];
-                    if (std.fs.createFileAbsolute("/tmp/screencast_raw.log", .{ .truncate = false })) |f| {
-                        defer f.close();
-                        f.seekFromEnd(0) catch {};
-                        _ = f.write(metadata) catch {};
-                        _ = f.write("\n") catch {};
-                    } else |_| {}
-                }
-            }
-        }
-
-        if (try self.frame_pool.writeFrame(data, frame_sid, device_width, device_height)) |_| {
-            _ = self.frame_count.fetchAdd(1, .monotonic);
-        }
-
-        // ACK immediately - don't block reader thread
-        // Chrome throttles on its side, we just acknowledge receipt
-        self.acknowledgeFrame(routing_sid, frame_sid) catch {};
+        if (self.event_queue.items.len == 0) return null;
+        return self.event_queue.orderedRemove(0);
     }
 
-    /// Flush pending ACK (no-op now, kept for API compatibility)
-    pub fn flushPendingAck(self: *PipeCdpClient) void {
-        _ = self;
+    /// Clear pending responses that will never arrive (call during session reset)
+    /// This prevents waitForResponse from blocking forever on stale request IDs
+    pub fn clearResponseQueue(self: *PipeCdpClient) void {
+        self.response_mutex.lock();
+        defer self.response_mutex.unlock();
+
+        for (self.response_queue.items) |*entry| {
+            self.allocator.free(entry.payload);
+        }
+        self.response_queue.clearRetainingCapacity();
+        logToFile("[PIPE] Response queue cleared\n", .{});
+    }
+
+    /// Clear pending events (call during full session reset)
+    pub fn clearEventQueue(self: *PipeCdpClient) void {
+        self.event_mutex.lock();
+        defer self.event_mutex.unlock();
+
+        for (self.event_queue.items) |*entry| {
+            self.allocator.free(entry.method);
+            self.allocator.free(entry.payload);
+        }
+        self.event_queue.clearRetainingCapacity();
+        logToFile("[PIPE] Event queue cleared\n", .{});
     }
 
     fn handleResponse(self: *PipeCdpClient, payload: []const u8) !void {
@@ -533,56 +596,4 @@ pub const PipeCdpClient = struct {
         return std.fmt.parseInt(u32, payload[start..end], 10);
     }
 
-    fn extractRoutingSessionId(_: *PipeCdpClient, payload: []const u8) ![]const u8 {
-        const marker = "\"sessionId\":\"";
-        const pos = simd.findPattern(payload, marker, 0) orelse return error.NotFound;
-        const start = pos + marker.len;
-        const end = simd.findClosingQuote(payload, start) orelse return error.InvalidFormat;
-        return payload[start..end];
-    }
-
-    fn extractFrameSessionId(_: *PipeCdpClient, payload: []const u8) !u32 {
-        const p_marker = "\"params\":{";
-        const p_pos = simd.findPattern(payload, p_marker, 0) orelse return error.NotFound;
-        const s_marker = "\"sessionId\":";
-        const pos = simd.findPattern(payload, s_marker, p_pos + p_marker.len) orelse return error.NotFound;
-        const start = pos + s_marker.len;
-        var end = start;
-        while (end < payload.len and (payload[end] >= '0' and payload[end] <= '9')) : (end += 1) {}
-        return std.fmt.parseInt(u32, payload[start..end], 10);
-    }
-
-    fn extractScreencastData(_: *PipeCdpClient, payload: []const u8) ![]const u8 {
-        const pos = simd.findPattern(payload, "\"data\":\"", 0) orelse return error.InvalidFormat;
-        const start = pos + "\"data\":\"".len;
-        const end = simd.findClosingQuote(payload, start) orelse return error.InvalidFormat;
-        return payload[start..end];
-    }
-
-    fn extractMetadataInt(self: *PipeCdpClient, payload: []const u8, key: []const u8) !u32 {
-        _ = self;
-        const m_start = std.mem.indexOf(u8, payload, "\"metadata\":{") orelse return error.NotFound;
-        var buf: [64]u8 = undefined;
-        const s_key = std.fmt.bufPrint(&buf, "\"{s}\":", .{key}) catch return error.NotFound;
-        const k_start = std.mem.indexOfPos(u8, payload, m_start, s_key) orelse return error.NotFound;
-        const v_start = k_start + s_key.len;
-        var end = v_start;
-        while (end < payload.len and (payload[end] >= '0' and payload[end] <= '9')) : (end += 1) {}
-        return std.fmt.parseInt(u32, payload[v_start..end], 10);
-    }
-
-    fn acknowledgeFrame(self: *PipeCdpClient, r_sid: ?[]const u8, f_sid: u32) !void {
-        const id = self.next_id.fetchAdd(1, .monotonic);
-        const command = if (r_sid) |rsid| blk: {
-            // Escape session ID for JSON (handles any special chars)
-            var escape_buf: [256]u8 = undefined;
-            const escaped_sid = json.escapeContents(rsid, &escape_buf) catch return error.OutOfMemory;
-            break :blk try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"sessionId\":\"{s}\",\"method\":\"Page.screencastFrameAck\",\"params\":{{\"sessionId\":{d}}}}}\x00", .{ id, escaped_sid, f_sid });
-        } else
-            try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"method\":\"Page.screencastFrameAck\",\"params\":{{\"sessionId\":{d}}}}}\x00", .{ id, f_sid });
-        defer self.allocator.free(command);
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        _ = try self.write_file.writeAll(command);
-    }
 };

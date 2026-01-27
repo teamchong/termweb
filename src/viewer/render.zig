@@ -5,7 +5,10 @@ const config = @import("../config.zig").Config;
 const kitty_mod = @import("../terminal/kitty_graphics.zig");
 const coordinates_mod = @import("../terminal/coordinates.zig");
 const screenshot_api = @import("../chrome/screenshot.zig");
+const cdp_client = @import("../chrome/cdp_client.zig");
 const ui_mod = @import("../ui/mod.zig");
+const turbojpeg = @import("../image/turbojpeg.zig");
+const base64 = std.base64.standard;
 
 const CoordinateMapper = coordinates_mod.CoordinateMapper;
 const Placement = ui_mod.Placement;
@@ -91,7 +94,6 @@ pub fn renderBlankPage(viewer: anytype) void {
     _ = stdout.write(buf[0..offset]) catch {};
 
     viewer.last_content_image_id = null;
-    viewer.last_rendered_generation = 0;
 
     // Mark as showing blank page placeholder to prevent screencast overwrite
     viewer.showing_blank_placeholder = true;
@@ -110,28 +112,83 @@ pub fn getMinFrameInterval(viewer: anytype) i128 {
 /// Try to render latest screencast frame (non-blocking)
 /// Returns true if frame was rendered, false if no new frame
 pub fn tryRenderScreencast(viewer: anytype) !bool {
+    viewer.log("[RENDER] tryRenderScreencast start\n", .{});
+    defer viewer.log("[RENDER] tryRenderScreencast end\n", .{});
+
     // Skip rendering if showing blank page placeholder
     if (viewer.showing_blank_placeholder) {
         // Still consume frames to keep queue clear, but don't render
-        if (screenshot_api.getLatestScreencastFrame(viewer.cdp_client)) |f| {
+        if (viewer.rtc_frame_server.getLatestFrame()) |f| {
             var frame = f;
             frame.deinit();
+        }
+        // Also consume CDP screencast frames
+        if (viewer.cdp_client.getLatestFrame()) |f| {
+            var cdp_frame = f;
+            cdp_frame.deinit();
         }
         return false;
     }
 
     const now = std.time.nanoTimestamp();
 
-    // Get frame with proper ownership - MUST call deinit when done
-    // This also triggers ACK logic for adaptive throttling
-    var frame = screenshot_api.getLatestScreencastFrame(viewer.cdp_client) orelse return false;
-    defer frame.deinit(); // Proper cleanup!
+    // Try RTC frame server first (extension WebRTC), fall back to CDP screencast
+    var rtc_frame = viewer.rtc_frame_server.getLatestFrame();
+    var cdp_frame: ?cdp_client.ScreencastFrame = null;
 
-    // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
-    // Chrome may send different size than requested viewport
-    // IMPORTANT: Always update these, even if we skip rendering, so coord mapping stays current
-    const frame_width = if (frame.device_width > 0) frame.device_width else viewer.viewport_width;
-    const frame_height = if (frame.device_height > 0) frame.device_height else viewer.viewport_height;
+    // Check session_id for RTC frames - ignore frames from old sessions
+    if (rtc_frame) |*f| {
+        if (f.session_id != viewer.rtc_session_id) {
+            viewer.log("[RENDER] Ignoring old session frame: got={} want={}\n", .{ f.session_id, viewer.rtc_session_id });
+            f.deinit();
+            return false;
+        }
+    }
+
+    // If no RTC frame, try CDP screencast
+    if (rtc_frame == null) {
+        cdp_frame = viewer.cdp_client.getLatestFrame();
+        if (cdp_frame == null) {
+            return false; // No frame from either source
+        }
+    }
+
+    // Get frame data - either from RTC or CDP (with base64 decode for CDP)
+    var frame_data: []const u8 = undefined;
+    var frame_width: u32 = 0;
+    var frame_height: u32 = 0;
+    var decoded_data: ?[]u8 = null;
+
+    if (rtc_frame) |*f| {
+        frame_data = f.data;
+        frame_width = if (f.device_width > 0) f.device_width else viewer.viewport_width;
+        frame_height = if (f.device_height > 0) f.device_height else viewer.viewport_height;
+    } else if (cdp_frame) |*f| {
+        // CDP screencast frames are base64 encoded - decode them
+        const decoded_size = base64.Decoder.calcSizeForSlice(f.data) catch {
+            f.deinit();
+            return false;
+        };
+        decoded_data = viewer.allocator.alloc(u8, decoded_size) catch {
+            f.deinit();
+            return false;
+        };
+        _ = base64.Decoder.decode(decoded_data.?, f.data) catch {
+            viewer.allocator.free(decoded_data.?);
+            f.deinit();
+            return false;
+        };
+        frame_data = decoded_data.?;
+        frame_width = if (f.width > 0) f.width else viewer.viewport_width;
+        frame_height = if (f.height > 0) f.height else viewer.viewport_height;
+    }
+
+    // Cleanup at end
+    defer {
+        if (rtc_frame) |*f| f.deinit();
+        if (cdp_frame) |*f| f.deinit();
+        if (decoded_data) |d| viewer.allocator.free(d);
+    }
 
     // Detect frame dimension change and skip first changed frame to avoid visual glitch
     const frame_changed = viewer.last_frame_width > 0 and
@@ -155,35 +212,37 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         }
     }
 
-    // Throttle: Don't re-render the same frame multiple times
-    if (viewer.last_rendered_generation > 0 and frame.generation <= viewer.last_rendered_generation) {
-        return false;
-    }
-
-    // Frame skip detection: Check if we skipped frames
-    if (viewer.last_rendered_generation > 0 and frame.generation > viewer.last_rendered_generation + 1) {
-        const skipped = frame.generation - viewer.last_rendered_generation - 1;
-        viewer.frames_skipped += @intCast(skipped);
-        viewer.log("[RENDER] Skipped {} frames (gen {} -> {})\n", .{
-            skipped,
-            viewer.last_rendered_generation,
-            frame.generation,
-        });
-    }
-    viewer.last_rendered_generation = frame.generation;
-
     // Debug: Log frame dimensions (source of truth for coordinates)
     if (viewer.perf_frame_count < 5) {
-        viewer.log("[FRAME] frame={}x{} (device={}x{})\n", .{
-            frame_width, frame_height, frame.device_width, frame.device_height,
-        });
+        viewer.log("[FRAME] frame={}x{}\n", .{ frame_width, frame_height });
     }
 
     // Profile render time
     const render_start = std.time.nanoTimestamp();
 
-    // Use stored dimensions (single source of truth, already updated above)
-    try displayFrameWithDimensions(viewer, frame.data);
+    // Frame data is raw JPEG - decode to RGBA using turbojpeg
+    const decode_result = turbojpeg.decodeWithError(viewer.allocator, frame_data);
+    viewer.log("[RENDER] decoded\n", .{});
+    if (decode_result.image == null) {
+        // Debug: log first and last few bytes to check JPEG structure
+        if (frame_data.len >= 8) {
+            const last_idx = frame_data.len - 2;
+            viewer.log("[RENDER] JPEG decode failed: {s}, len={}, start={x:0>2}{x:0>2}{x:0>2}{x:0>2}, end={x:0>2}{x:0>2}\n", .{
+                decode_result.error_msg,
+                frame_data.len,
+                frame_data[0], frame_data[1], frame_data[2], frame_data[3],
+                frame_data[last_idx], frame_data[last_idx + 1],
+            });
+        } else {
+            viewer.log("[RENDER] JPEG decode failed: {s}, len={}\n", .{ decode_result.error_msg, frame_data.len });
+        }
+        return false;
+    }
+    var decoded = decode_result.image.?;
+    defer decoded.deinit();
+
+    // Display decoded RGBA directly to Kitty
+    try displayRawRGBAFrame(viewer, decoded.data, decoded.width, decoded.height);
 
     const render_elapsed = std.time.nanoTimestamp() - render_start;
     viewer.perf_frame_count += 1;
@@ -191,6 +250,11 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     if (render_elapsed > viewer.perf_max_render_ns) {
         viewer.perf_max_render_ns = render_elapsed;
     }
+
+    // Record render time for adaptive FPS control - SKIP to avoid crash
+    // if (render_elapsed > 0) {
+    //     viewer.rtc_frame_server.recordRenderTime(@intCast(render_elapsed));
+    // }
 
     // Log performance stats every 5 seconds
     if (now - viewer.perf_last_report_time > 5 * std.time.ns_per_s) {
@@ -200,9 +264,9 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
             0;
         const max_ms = @divFloor(viewer.perf_max_render_ns, @as(i128, std.time.ns_per_ms));
 
-        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}, content_id={?}, cursor_id={?}, gen={}\n", .{
-            viewer.perf_frame_count, avg_ms, max_ms, viewer.target_fps, viewer.frames_skipped,
-            viewer.last_content_image_id, viewer.cursor_image_id, viewer.last_rendered_generation,
+        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, content_id={?}, cursor_id={?}\n", .{
+            viewer.perf_frame_count, avg_ms, max_ms, viewer.target_fps,
+            viewer.last_content_image_id, viewer.cursor_image_id,
         });
 
         // Reset counters
@@ -212,7 +276,14 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         viewer.perf_last_report_time = now;
     }
 
-    viewer.last_frame_time = now;
+    // Only update last_frame_time when we render a NEW frame (different generation)
+    // This ensures stall detection fires when we keep getting the same old frame
+    // For RTC frames, use generation; for CDP frames, always treat as new
+    const frame_generation = if (rtc_frame) |f| f.generation else viewer.last_frame_generation + 1;
+    if (frame_generation != viewer.last_frame_generation) {
+        viewer.last_frame_time = now;
+        viewer.last_frame_generation = frame_generation;
+    }
     return true;
 }
 
@@ -239,20 +310,8 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
     const cell_height: u32 = if (size.rows > 0) size.height_px / size.rows else 20;
     const toolbar_h: u32 = if (viewer.toolbar_renderer) |tr| tr.toolbar_height else cell_height;
 
-    // Chrome coords: Use Chrome's actual window.innerWidth/Height (queried via JS)
-    // This is the true coordinate space for Input.dispatchMouseEvent
-    // Query if not yet available (first frame or after page change)
-    if (viewer.chrome_inner_width == 0 or viewer.chrome_inner_height == 0) {
-        if (screenshot_api.getActualViewport(viewer.cdp_client, viewer.allocator)) |vp| {
-            if (vp.width > 0 and vp.height > 0) {
-                viewer.chrome_inner_width = vp.width;
-                viewer.chrome_inner_height = vp.height;
-                // Save frame dimensions at time of query for change detection
-                viewer.chrome_inner_frame_width = frame_width;
-                viewer.chrome_inner_frame_height = frame_height;
-            }
-        } else |_| {}
-    }
+    // Chrome coords: Use cached viewport - DO NOT query here (blocking CDP call)
+    // Viewport is updated in main loop after navigation completes
 
     // If we have chrome inner dims (from extension resize) but no frame dims yet, capture them now
     if (viewer.chrome_inner_width > 0 and viewer.chrome_inner_height > 0 and
@@ -400,6 +459,78 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
 /// Display a base64 PNG frame (legacy wrapper)
 pub fn displayFrame(viewer: anytype, base64_png: []const u8) !void {
     try displayFrameWithDimensions(viewer, base64_png);
+}
+
+/// Display raw RGBA frame data directly to Kitty
+pub fn displayRawRGBAFrame(viewer: anytype, rgba_data: []const u8, width: u32, height: u32) !void {
+    var stdout_buf: [262144]u8 = undefined;
+    const stdout_file = std.fs.File.stdout();
+    var stdout_writer = stdout_file.writer(&stdout_buf);
+    const writer = &stdout_writer.interface;
+
+    // Get terminal size
+    const size = try viewer.terminal.getSize();
+    const display_cols: u16 = if (size.cols > 0) size.cols else 80;
+
+    // Calculate cell dimensions
+    const cell_width: u32 = if (size.cols > 0) size.width_px / size.cols else 14;
+    const cell_height: u32 = if (size.rows > 0) size.height_px / size.rows else 20;
+    const toolbar_h: u32 = if (viewer.toolbar_renderer) |tr| tr.toolbar_height else cell_height;
+
+    // Content starts at row 2
+    const row_start_pixel = cell_height;
+    const y_offset: u32 = if (toolbar_h > row_start_pixel) toolbar_h - row_start_pixel else 0;
+
+    // Calculate content rows
+    const display_pixel_width: u32 = @as(u32, display_cols) * cell_width;
+    const aspect_pixel_height: u32 = if (width > 0) (display_pixel_width * height) / width else height;
+    const max_content_height: u32 = if (size.height_px > toolbar_h) size.height_px - @as(u16, @intCast(toolbar_h)) else size.height_px;
+    const capped_content_height = @min(aspect_pixel_height, max_content_height);
+    const content_rows: u32 = if (cell_height > 0) capped_content_height / cell_height else 1;
+
+    // Use cached Chrome viewport - DO NOT query here (blocking CDP call)
+    // Viewport is updated in main loop after navigation completes
+
+    // Use Chrome viewport for CDP input, fallback to frame dimensions
+    const chrome_w: u32 = if (viewer.chrome_inner_width > 0) viewer.chrome_inner_width else width;
+    const chrome_h: u32 = if (viewer.chrome_inner_height > 0) viewer.chrome_inner_height else height;
+
+    // Update coordinate mapper for mouse/keyboard input
+    const mapper_content_h: u16 = @intCast(content_rows * cell_height);
+    viewer.coord_mapper = CoordinateMapper.initFull(
+        @intCast(display_pixel_width),
+        size.height_px,
+        size.cols,
+        size.rows,
+        width,
+        height,
+        chrome_w,
+        chrome_h,
+        @intCast(toolbar_h),
+        null,
+        mapper_content_h,
+    );
+
+    // Move cursor to row 2
+    try writer.writeAll("\x1b[2;1H");
+
+    // Display options
+    const z_index: i32 = if (viewer.mode == .hint_mode) -1 else 0;
+    const display_opts = kitty_mod.DisplayOptions{
+        .rows = content_rows,
+        .columns = display_cols,
+        .y_offset = @intCast(y_offset),
+        .image_id = 100,
+        .z = z_index,
+        .width = width,
+        .height = height,
+    };
+
+    // Display raw RGBA
+    const id = try viewer.kitty.displayRawRGBA(writer, rgba_data, width, height, display_opts);
+    viewer.last_content_image_id = id;
+
+    try writer.flush();
 }
 
 /// Render mouse cursor at current mouse position
