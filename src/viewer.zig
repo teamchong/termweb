@@ -794,8 +794,7 @@ pub const Viewer = struct {
             }
             time_after_input = std.time.nanoTimestamp();
 
-            // Tick mouse event bus (dispatch pending events at 30fps)
-            self.event_bus.maybeTick();
+            // Mouse events are now sent immediately (no throttling needed for Chrome)
             time_after_bus = std.time.nanoTimestamp();
 
             // Render new screencast frames (non-blocking) - in all modes

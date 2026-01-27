@@ -233,53 +233,21 @@ pub const MouseEventBus = struct {
                 }
             },
             .wheel => {
-                // Accumulate wheel deltas with capped maximum
-                // - Accumulation filters touchpad jitter (5 down + 1 jitter up = net down)
-                // - Cap limits "momentum" so direction changes are responsive
-                const max_delta: i16 = 120; // 1 wheel tick max - fast direction change
-                if (self.pending_wheel) |*existing| {
-                    existing.delta_y = std.math.clamp(
-                        existing.delta_y + mouse.delta_y,
-                        -max_delta,
-                        max_delta,
-                    );
-                } else {
-                    self.pending_wheel = WheelEvent{
-                        .delta_y = mouse.delta_y,
-                        .viewport_width = viewport_width,
-                        .viewport_height = viewport_height,
-                    };
-                }
+                // Send wheel immediately - Chrome handles high-frequency input fine
+                self.sendWheel(WheelEvent{
+                    .delta_y = mouse.delta_y,
+                    .viewport_width = viewport_width,
+                    .viewport_height = viewport_height,
+                });
             },
             .move, .drag => {
-                // Throttle moves - keep latest only, dispatch on tick
+                // Send move immediately - Chrome handles high-frequency input fine
                 if (mapper.terminalToBrowser(term_x, term_y)) |coords| {
-                    // Debug: log detailed mouse info to file (truncate for fresh data)
-                    if (std.fs.createFileAbsolute("/tmp/mouse_mapper.log", .{ .truncate = true })) |f| {
-                        defer f.close();
-                        var buf: [512]u8 = undefined;
-                        const cell_w = if (mapper.terminal_cols > 0) mapper.terminal_width_px / mapper.terminal_cols else 0;
-                        const display_w = mapper.terminal_cols * cell_w;
-                        const msg = std.fmt.bufPrint(&buf,
-                            "MOUSE DEBUG:\n" ++
-                            "  terminal: ({},{}) of {}x{}\n" ++
-                            "  cols={}, cell_w={}, display_w={}\n" ++
-                            "  chrome:   ({},{}) of {}x{}\n" ++
-                            "  frame:    {}x{}\n" ++
-                            "  MISMATCH: term_w={} vs display_w={}\n", .{
-                            term_x, term_y, mapper.terminal_width_px, mapper.terminal_height_px,
-                            mapper.terminal_cols, cell_w, display_w,
-                            coords.x, coords.y, mapper.chrome_width, mapper.chrome_height,
-                            mapper.frame_width, mapper.frame_height,
-                            mapper.terminal_width_px, display_w,
-                        }) catch "";
-                        _ = f.write(msg) catch {};
-                    } else |_| {}
-                    self.pending_move = MoveEvent{
+                    self.sendMove(MoveEvent{
                         .browser_x = coords.x,
                         .browser_y = coords.y,
                         .buttons_state = self.buttons_state,
-                    };
+                    });
                 }
             },
         }
