@@ -265,8 +265,8 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     //     viewer.rtc_frame_server.recordRenderTime(@intCast(render_elapsed));
     // }
 
-    // Log performance stats every 5 seconds
-    if (now - viewer.perf_last_report_time > 5 * std.time.ns_per_s) {
+    // Log performance stats every 3 seconds (and review adaptive quality)
+    if (now - viewer.perf_last_report_time > 3 * std.time.ns_per_s) {
         const avg_ms = if (viewer.perf_frame_count > 0)
             @divFloor(@divFloor(viewer.perf_total_render_ns, @as(i128, viewer.perf_frame_count)), @as(i128, std.time.ns_per_ms))
         else
