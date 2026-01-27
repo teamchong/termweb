@@ -423,6 +423,15 @@ pub fn launchChromePipe(
     try args_list.append(allocator, "--disable-component-update");
     try args_list.append(allocator, "--disable-extensions");
 
+    // Memory reduction flags (safe, no crashes)
+    try args_list.append(allocator, "--disable-background-networking");
+    try args_list.append(allocator, "--disable-default-apps");
+    try args_list.append(allocator, "--disable-hang-monitor");
+    try args_list.append(allocator, "--disable-domain-reliability");
+    try args_list.append(allocator, "--disable-breakpad");
+    try args_list.append(allocator, "--no-pings");
+    try args_list.append(allocator, "--js-flags=--max-old-space-size=128");
+
     if (options.disable_gpu) {
         try args_list.append(allocator, "--disable-gpu");
         // Headless-friendly flags for server/SSH environments (only with --disable-gpu)
