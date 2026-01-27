@@ -273,9 +273,18 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
             0;
         const max_ms = @divFloor(viewer.perf_max_render_ns, @as(i128, std.time.ns_per_ms));
 
-        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, content_id={?}, cursor_id={?}\n", .{
-            viewer.perf_frame_count, avg_ms, max_ms, viewer.target_fps,
-            viewer.last_content_image_id, viewer.cursor_image_id,
+        // Adaptive quality: adjust every 5s based on avg frame time (only if really needed)
+        const old_quality = viewer.current_quality;
+        const new_quality = config.adjustQualityForSpeed(old_quality, viewer.avg_frame_time_ms);
+        if (new_quality != old_quality) {
+            viewer.current_quality = new_quality;
+            viewer.log("[QUALITY] Adjusted: {} -> {} (avg_frame={}ms)\n", .{ old_quality, new_quality, viewer.avg_frame_time_ms });
+            // Restart CDP screencast with new quality
+            viewer.cdp_client.startScreencast("jpeg", new_quality, viewer.viewport_width, viewer.viewport_height, 1) catch {};
+        }
+
+        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, quality={}\n", .{
+            viewer.perf_frame_count, avg_ms, max_ms, viewer.target_fps, viewer.current_quality,
         });
 
         // Reset counters
