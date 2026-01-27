@@ -126,8 +126,8 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             viewer.ui_dirty = true;
         },
         .reload => {
-            // Reset screencast to recover from any broken state
-            viewer.resetScreencast();
+            // Just trigger reload - restartCapture() will be called on Page.loadEventFired
+            // (Doing it here would inject capture script BEFORE reload destroys it)
             try screenshot_api.reload(viewer.cdp_client, viewer.allocator, false);
             viewer.ui_state.is_loading = true;
             if (viewer.toolbar_renderer) |*tr| {
@@ -224,8 +224,8 @@ pub fn executeAppAction(viewer: anytype, action: AppAction, event: NormalizedKey
             screenshot_api.stopLoading(viewer.cdp_client, viewer.allocator) catch |err| {
                 viewer.log("[NAV] Stop failed: {}\n", .{err});
             };
-            // Reset screencast to recover from any broken state (like reload)
-            viewer.resetScreencast();
+            // Re-inject capture script to recover from any broken state
+            viewer.sendRtcStartMessage();
             viewer.ui_state.is_loading = false;
             if (viewer.toolbar_renderer) |*tr| {
                 tr.is_loading = false;

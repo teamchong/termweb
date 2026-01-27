@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("../config.zig").Config;
 const ShmBuffer = @import("shm.zig").ShmBuffer;
 const decode = @import("../image/decode.zig");
+const zlib = @import("../utils/zlib.zig");
 
 pub const DisplayOptions = struct {
     // Image placement
@@ -204,6 +205,7 @@ pub const KittyGraphics = struct {
         return self.displayBase64ImageWithFormat(writer, base64_data, opts, 100);
     }
     /// Display raw RGBA pixel data from memory
+    /// Uses Zlib-compressed RGB (o=z, f=24) for ~80% smaller payload over SSH
     pub fn displayRawRGBA(
         self: *KittyGraphics,
         writer: anytype,
@@ -212,17 +214,94 @@ pub const KittyGraphics = struct {
         height: u32,
         opts: DisplayOptions,
     ) !u32 {
+        const image_id = opts.image_id orelse blk: {
+            const id = self.next_image_id;
+            self.next_image_id += 1;
+            break :blk id;
+        };
+
+        // Convert RGBA to RGB (drop alpha channel - saves 25%)
+        const num_pixels = rgba_data.len / 4;
+        const rgb_data = try self.allocator.alloc(u8, num_pixels * 3);
+        defer self.allocator.free(rgb_data);
+
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < rgba_data.len) : ({
+            i += 4;
+            j += 3;
+        }) {
+            rgb_data[j] = rgba_data[i]; // R
+            rgb_data[j + 1] = rgba_data[i + 1]; // G
+            rgb_data[j + 2] = rgba_data[i + 2]; // B
+        }
+
+        // Compress with Zlib (level 1 = fast, good for real-time)
+        const compressed = zlib.compressFast(self.allocator, rgb_data) catch {
+            // Fallback to uncompressed base64 if compression fails
+            const encoder = std.base64.standard.Encoder;
+            const encoded_len = encoder.calcSize(rgba_data.len);
+            const encoded = try self.allocator.alloc(u8, encoded_len);
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, rgba_data);
+
+            var local_opts = opts;
+            if (local_opts.width == null) local_opts.width = width;
+            if (local_opts.height == null) local_opts.height = height;
+
+            return self.displayBase64ImageWithFormat(writer, encoded, local_opts, 32);
+        };
+        defer self.allocator.free(compressed);
+
+        // Base64 encode the compressed data
         const encoder = std.base64.standard.Encoder;
-        const encoded_len = encoder.calcSize(rgba_data.len);
+        const encoded_len = encoder.calcSize(compressed.len);
         const encoded = try self.allocator.alloc(u8, encoded_len);
         defer self.allocator.free(encoded);
-        _ = encoder.encode(encoded, rgba_data);
+        _ = encoder.encode(encoded, compressed);
 
-        var local_opts = opts;
-        if (local_opts.width == null) local_opts.width = width;
-        if (local_opts.height == null) local_opts.height = height;
+        // Send in chunks with o=z (zlib compressed), f=24 (24-bit RGB)
+        const CHUNK_SIZE: usize = config.KITTY_CHUNK_SIZE;
+        var offset: usize = 0;
+        var first_chunk = true;
 
-        return self.displayBase64ImageWithFormat(writer, encoded, local_opts, 32);
+        while (offset < encoded.len) {
+            const remaining = encoded.len - offset;
+            const chunk_len = @min(remaining, CHUNK_SIZE);
+            const is_last = (offset + chunk_len >= encoded.len);
+
+            try writer.writeAll("\x1b_G");
+
+            if (first_chunk) {
+                // a=T (transmit+display), f=24 (RGB), o=z (zlib), t=d (direct)
+                try writer.print("a=T,f=24,o=z,t=d,s={d},v={d},i={d},q=2,m={d}", .{
+                    width,
+                    height,
+                    image_id,
+                    if (is_last) @as(u8, 0) else @as(u8, 1),
+                });
+
+                if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
+                if (opts.columns) |c| try writer.print(",c={d}", .{c});
+                if (opts.rows) |r| try writer.print(",r={d}", .{r});
+                if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
+                if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
+                if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
+                try writer.writeAll(",C=1");
+
+                first_chunk = false;
+            } else {
+                try writer.print("m={d}", .{if (is_last) @as(u8, 0) else @as(u8, 1)});
+            }
+
+            try writer.writeByte(';');
+            try writer.writeAll(encoded[offset .. offset + chunk_len]);
+            try writer.writeAll("\x1b\\");
+
+            offset += chunk_len;
+        }
+
+        return image_id;
     }
 
     /// Display raw RGBA data via SHM (t=s)

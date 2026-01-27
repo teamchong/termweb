@@ -67,6 +67,26 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path("src/vendor"));
 
+    // libdeflate for fast zlib compression (Kitty graphics o=z)
+    exe.addIncludePath(b.path("vendor/libdeflate"));
+    const libdeflate_sources = [_][]const u8{
+        "vendor/libdeflate/lib/deflate_compress.c",
+        "vendor/libdeflate/lib/deflate_decompress.c",
+        "vendor/libdeflate/lib/zlib_compress.c",
+        "vendor/libdeflate/lib/zlib_decompress.c",
+        "vendor/libdeflate/lib/adler32.c",
+        "vendor/libdeflate/lib/crc32.c",
+        "vendor/libdeflate/lib/utils.c",
+        "vendor/libdeflate/lib/arm/cpu_features.c",
+        "vendor/libdeflate/lib/x86/cpu_features.c",
+    };
+    for (libdeflate_sources) |src| {
+        exe.addCSourceFile(.{
+            .file = b.path(src),
+            .flags = &.{"-O2"},
+        });
+    }
+
     // Static link libjpeg-turbo for fast JPEG decoding
     if (target.result.os.tag == .macos) {
         // macOS: homebrew on ARM64, /usr/local on x86_64
@@ -87,6 +107,26 @@ pub fn build(b: *std.Build) void {
             exe.addObjectFile(.{ .cwd_relative = "/usr/local/lib/libturbojpeg.a" });
         }
     }
+
+    // Static link libdatachannel for WebRTC DataChannel
+    exe.addIncludePath(b.path("vendor/libdatachannel/include"));
+    exe.addObjectFile(b.path("vendor/libdatachannel/lib/libdatachannel.a"));
+    exe.addObjectFile(b.path("vendor/libdatachannel/lib/libjuice.a"));
+    exe.addObjectFile(b.path("vendor/libdatachannel/lib/libusrsctp.a"));
+
+    // libdatachannel requires OpenSSL
+    if (target.result.os.tag == .macos) {
+        if (target.result.cpu.arch == .aarch64) {
+            exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+        } else {
+            exe.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/openssl@3/lib" });
+        }
+    }
+    exe.linkSystemLibrary("ssl");
+    exe.linkSystemLibrary("crypto");
+
+    // libdatachannel requires C++ standard library
+    exe.linkLibCpp();
 
     exe.linkLibC();
 
@@ -126,6 +166,15 @@ pub fn build(b: *std.Build) void {
     });
     napi.addIncludePath(b.path("src/vendor"));
 
+    // libdeflate for fast zlib compression (Kitty graphics o=z)
+    napi.addIncludePath(b.path("vendor/libdeflate"));
+    for (libdeflate_sources) |src| {
+        napi.addCSourceFile(.{
+            .file = b.path(src),
+            .flags = &.{"-O2"},
+        });
+    }
+
     // libjpeg-turbo
     if (target.result.os.tag == .macos) {
         if (target.result.cpu.arch == .aarch64) {
@@ -145,6 +194,26 @@ pub fn build(b: *std.Build) void {
             napi.addObjectFile(.{ .cwd_relative = "/usr/local/lib/libturbojpeg.a" });
         }
     }
+
+    // Static link libdatachannel for WebRTC DataChannel
+    napi.addIncludePath(b.path("vendor/libdatachannel/include"));
+    napi.addObjectFile(b.path("vendor/libdatachannel/lib/libdatachannel.a"));
+    napi.addObjectFile(b.path("vendor/libdatachannel/lib/libjuice.a"));
+    napi.addObjectFile(b.path("vendor/libdatachannel/lib/libusrsctp.a"));
+
+    // libdatachannel requires OpenSSL
+    if (target.result.os.tag == .macos) {
+        if (target.result.cpu.arch == .aarch64) {
+            napi.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+        } else {
+            napi.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/openssl@3/lib" });
+        }
+    }
+    napi.linkSystemLibrary("ssl");
+    napi.linkSystemLibrary("crypto");
+
+    // libdatachannel requires C++ standard library
+    napi.linkLibCpp();
 
     napi.linkLibC();
     napi.root_module.addImport("json", json_mod);

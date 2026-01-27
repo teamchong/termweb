@@ -5,8 +5,13 @@
 (function() {
   'use strict';
 
+  console.log('__TERMWEB_BRIDGE__:script_start');
+
   // Prevent double installation
-  if (window.__termwebBridgeInstalled) return;
+  if (window.__termwebBridgeInstalled) {
+    console.log('__TERMWEB_BRIDGE__:already_installed');
+    return;
+  }
   window.__termwebBridgeInstalled = true;
 
   // ============================================================================
@@ -490,6 +495,70 @@
       sendToTermweb('__TERMWEB_CLIPBOARD_REQUEST__');
     }
   }, true);
+
+  // ============================================================================
+  // FRAME SERVER WEBSOCKET CONNECTION
+  // ============================================================================
+
+  const FRAME_SERVER_PORT = 9223;
+  let frameServerWs = null;
+  let wsConnectAttempts = 0;
+
+  function connectToFrameServer() {
+    if (frameServerWs && frameServerWs.readyState === WebSocket.OPEN) return;
+
+    wsConnectAttempts++;
+    sendToTermweb('__TERMWEB_CAPTURE__:connecting:' + FRAME_SERVER_PORT + ':attempt:' + wsConnectAttempts);
+
+    try {
+      frameServerWs = new WebSocket('ws://127.0.0.1:' + FRAME_SERVER_PORT);
+      frameServerWs.binaryType = 'arraybuffer';
+
+      frameServerWs.onopen = function() {
+        sendToTermweb('__TERMWEB_CAPTURE__:ws_connected');
+      };
+
+      frameServerWs.onclose = function() {
+        sendToTermweb('__TERMWEB_CAPTURE__:ws_closed');
+        frameServerWs = null;
+        // Retry connection with backoff
+        if (wsConnectAttempts < 10) {
+          setTimeout(connectToFrameServer, 1000);
+        }
+      };
+
+      frameServerWs.onerror = function() {
+        sendToTermweb('__TERMWEB_CAPTURE__:ws_error');
+        frameServerWs = null;
+      };
+
+      frameServerWs.onmessage = function(event) {
+        // Handle commands from frame server (e.g., FPS adjustment)
+        if (typeof event.data === 'string') {
+          sendToTermweb('__TERMWEB_CAPTURE__:server_msg:' + event.data);
+        }
+      };
+    } catch (e) {
+      sendToTermweb('__TERMWEB_CAPTURE__:ws_exception:' + e.message);
+    }
+  }
+
+  // Export function to send frames (will be called by capture code)
+  window.__termwebSendFrame = function(jpegData) {
+    if (frameServerWs && frameServerWs.readyState === WebSocket.OPEN) {
+      frameServerWs.send(jpegData);
+      return true;
+    }
+    return false;
+  };
+
+  // Export connection status
+  window.__termwebFrameServerConnected = function() {
+    return frameServerWs && frameServerWs.readyState === WebSocket.OPEN;
+  };
+
+  // Connect on load
+  connectToFrameServer();
 
   // ============================================================================
   // INITIALIZATION COMPLETE

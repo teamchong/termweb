@@ -127,7 +127,7 @@ pub const Viewer = struct {
     viewport_height: u32,
     original_viewport_width: u32,  // For coordinate mapping
     original_viewport_height: u32,
-    target_fps: u32,  // Target frame rate (affects screencast and mouse tick)
+    max_fps: u32,  // Max frame rate (affects screencast and mouse tick)
     chrome_inner_width: u32,  // Chrome's actual window.innerWidth (queried from JS)
     chrome_inner_height: u32, // Chrome's actual window.innerHeight (queried from JS)
     chrome_inner_frame_width: u32,  // Frame dimensions when chrome_inner was captured
@@ -275,7 +275,7 @@ pub const Viewer = struct {
         original_viewport_width: u32,
         original_viewport_height: u32,
         dpr: u32,
-        target_fps: u32,
+        max_fps: u32,
     ) !Viewer {
         // Set allocator for turbojpeg fast decoding
         decode_mod.setAllocator(allocator);
@@ -330,7 +330,7 @@ pub const Viewer = struct {
             .original_viewport_width = original_viewport_width,
             .original_viewport_height = original_viewport_height,
             .dpr = dpr,
-            .target_fps = target_fps,
+            .max_fps = max_fps,
             .chrome_inner_width = 0, // Will be queried from Chrome after page load
             .chrome_inner_height = 0,
             .chrome_inner_frame_width = 0,
@@ -387,7 +387,7 @@ pub const Viewer = struct {
             .mouse_visible = false,
             .mouse_buttons = 0,
             .cursor_image_id = null,
-            .event_bus = mouse_event_bus.MouseEventBus.initWithFps(cdp_client, allocator, isNaturalScrollEnabled(), target_fps),
+            .event_bus = mouse_event_bus.MouseEventBus.initWithFps(cdp_client, allocator, isNaturalScrollEnabled(), max_fps),
             .last_input_time = 0,
             .last_mouse_move_time = 0,
             .last_content_image_id = null,

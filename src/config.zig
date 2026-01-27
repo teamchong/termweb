@@ -39,8 +39,8 @@ pub const Config = struct {
         return current;
     }
 
-    /// Default screencast frame rate
-    pub const DEFAULT_FPS: u32 = 30;
+    /// Default max frame rate
+    pub const DEFAULT_MAX_FPS: u32 = 30;
 
     /// Calculate mouse tick interval from FPS
     pub fn getMouseTickMs(fps: u32) u64 {

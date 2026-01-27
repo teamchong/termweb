@@ -99,14 +99,14 @@ pub fn renderBlankPage(viewer: anytype) void {
     viewer.showing_blank_placeholder = true;
 }
 
-/// Get maximum FPS (returns viewer's target_fps)
+/// Get maximum FPS (returns viewer's max_fps)
 pub fn getTargetFps(viewer: anytype) u32 {
-    return viewer.target_fps;
+    return viewer.max_fps;
 }
 
 /// Get minimum frame interval based on target FPS
 pub fn getMinFrameInterval(viewer: anytype) i128 {
-    return @divFloor(std.time.ns_per_s, viewer.target_fps);
+    return @divFloor(std.time.ns_per_s, viewer.max_fps);
 }
 
 /// Try to render latest screencast frame (non-blocking)
@@ -284,7 +284,7 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         }
 
         viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, quality={}\n", .{
-            viewer.perf_frame_count, avg_ms, max_ms, viewer.target_fps, viewer.current_quality,
+            viewer.perf_frame_count, avg_ms, max_ms, viewer.max_fps, viewer.current_quality,
         });
 
         // Reset counters

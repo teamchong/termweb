@@ -8,12 +8,20 @@
   if (window.__termwebContentScriptLoaded) return;
   window.__termwebContentScriptLoaded = true;
 
+  // Log that content script is running (this will show in CDP console events)
+  console.log('__TERMWEB_CONTENT__:script_loaded:' + window.location.href);
+
   // Inject the bridge script into the main world (page context)
   // This allows it to override page APIs like showDirectoryPicker
+  console.log('__TERMWEB_CONTENT__:injecting_bridge');
   const script = document.createElement('script');
   script.src = chrome.runtime.getURL('termweb-bridge.js');
   script.onload = function() {
+    console.log('__TERMWEB_CONTENT__:bridge_loaded');
     this.remove();
+  };
+  script.onerror = function(e) {
+    console.log('__TERMWEB_CONTENT__:bridge_error:' + e.message);
   };
   (document.head || document.documentElement).appendChild(script);
 
@@ -78,6 +86,17 @@
     // Forward termweb messages to console for CDP interception
     if (event.data && event.data.type === 'termweb') {
       console.log(event.data.message);
+    }
+
+    // Forward RTC signaling messages to extension background/offscreen
+    if (event.data && event.data.type === '__TERMWEB_RTC__') {
+      console.log('__TERMWEB_CONTENT__:forwarding_rtc_signal:' + JSON.stringify(event.data.data).substring(0, 100));
+      chrome.runtime.sendMessage({
+        type: 'RTC_SIGNAL',
+        data: event.data.data
+      }).catch(e => {
+        console.log('__TERMWEB_CONTENT__:sendMessage_error:' + e.message);
+      });
     }
   });
 })();

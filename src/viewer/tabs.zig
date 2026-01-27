@@ -1,10 +1,15 @@
 /// Tab management for the viewer.
 /// Handles tab creation, switching, and the tab picker dialog.
 const std = @import("std");
-const config = @import("../config.zig").Config;
 const screenshot_api = @import("../chrome/screenshot.zig");
 const ui_mod = @import("../ui/mod.zig");
 const dialog_mod = ui_mod.dialog;
+
+/// Trigger tab capture via extension's tabCapture API
+fn triggerCapture(viewer: anytype) void {
+    const js_code = "window.dispatchEvent(new Event('__termweb_start_capture__'))";
+    viewer.evalJavaScriptAsync(js_code);
+}
 
 /// Add a new tab to the tabs list
 pub fn addTab(viewer: anytype, target_id: []const u8, url: []const u8, title: []const u8) !void {
@@ -67,7 +72,6 @@ fn clearContentArea(viewer: anytype) void {
     const stdout = std.fs.File.stdout();
     _ = stdout.write("\x1b_Ga=d,d=i,i=100\x1b\\") catch {};
     viewer.last_content_image_id = null;
-    viewer.last_rendered_generation = 0; // Reset generation to accept new frames
 }
 
 /// Check if URL is a blank/empty page that won't stream content
@@ -96,31 +100,18 @@ pub fn switchToTab(viewer: anytype, index: usize) !void {
         viewer.showing_blank_placeholder = false;
     }
 
-    // Note: stopScreencast skipped - starting new screencast implicitly handles it
-    // This saves ~50-100ms of blocking time
-
     viewer.cdp_client.switchToTarget(tab.target_id) catch |err| {
         viewer.log("[TABS] switchToTarget failed: {}, falling back to navigation\n", .{err});
         _ = try screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, tab.url);
     };
 
-    // Set viewport and start screencast on new tab
+    // Set viewport on new tab
     screenshot_api.setViewport(viewer.cdp_client, viewer.allocator, viewer.viewport_width, viewer.viewport_height, viewer.dpr) catch |err| {
         viewer.log("[TABS] setViewport failed: {}\n", .{err});
     };
 
-    const tab_total_pixels: u64 = @as(u64, viewer.viewport_width) * @as(u64, viewer.viewport_height);
-    const tab_quality = config.getAdaptiveQuality(tab_total_pixels);
-    const tab_every_nth = config.getEveryNthFrame(viewer.target_fps);
-    screenshot_api.startScreencast(viewer.cdp_client, viewer.allocator, .{
-        .format = viewer.screencast_format,
-        .quality = tab_quality,
-        .width = viewer.viewport_width,
-        .height = viewer.viewport_height,
-        .every_nth_frame = tab_every_nth,
-    }) catch |err| {
-        viewer.log("[TABS] startScreencast failed after switch: {}\n", .{err});
-    };
+    // Trigger capture on new tab via extension tabCapture API
+    triggerCapture(viewer);
 
     // Update UI (non-blocking)
     if (viewer.toolbar_renderer) |*renderer| {
@@ -147,23 +138,13 @@ pub fn createNewTab(viewer: anytype) !void {
     try addTab(viewer, target_id, "about:blank", "New Tab");
     viewer.active_tab_index = viewer.tabs.items.len - 1;
 
-    // Set viewport and start screencast on new tab
+    // Set viewport on new tab
     screenshot_api.setViewport(viewer.cdp_client, viewer.allocator, viewer.viewport_width, viewer.viewport_height, viewer.dpr) catch |err| {
         viewer.log("[TABS] setViewport failed: {}\n", .{err});
     };
 
-    const tab_total_pixels: u64 = @as(u64, viewer.viewport_width) * @as(u64, viewer.viewport_height);
-    const tab_quality = config.getAdaptiveQuality(tab_total_pixels);
-    const tab_every_nth = config.getEveryNthFrame(viewer.target_fps);
-    screenshot_api.startScreencast(viewer.cdp_client, viewer.allocator, .{
-        .format = viewer.screencast_format,
-        .quality = tab_quality,
-        .width = viewer.viewport_width,
-        .height = viewer.viewport_height,
-        .every_nth_frame = tab_every_nth,
-    }) catch |err| {
-        viewer.log("[TABS] startScreencast failed: {}\n", .{err});
-    };
+    // Trigger capture on new tab via extension tabCapture API
+    triggerCapture(viewer);
 
     // Update URL display and auto-focus address bar for immediate typing
     if (viewer.toolbar_renderer) |*renderer| {
@@ -227,19 +208,11 @@ pub fn closeCurrentTab(viewer: anytype) !bool {
         // Update active index (adjusted for removal if needed)
         viewer.active_tab_index = if (current_index > 0) new_index else 0;
 
-        // Set viewport and start screencast
+        // Set viewport on new tab
         screenshot_api.setViewport(viewer.cdp_client, viewer.allocator, viewer.viewport_width, viewer.viewport_height, viewer.dpr) catch {};
 
-        const tab_total_pixels: u64 = @as(u64, viewer.viewport_width) * @as(u64, viewer.viewport_height);
-        const tab_quality = config.getAdaptiveQuality(tab_total_pixels);
-        const tab_every_nth = config.getEveryNthFrame(viewer.target_fps);
-        screenshot_api.startScreencast(viewer.cdp_client, viewer.allocator, .{
-            .format = viewer.screencast_format,
-            .quality = tab_quality,
-            .width = viewer.viewport_width,
-            .height = viewer.viewport_height,
-            .every_nth_frame = tab_every_nth,
-        }) catch {};
+        // Trigger capture on new tab via extension tabCapture API
+        triggerCapture(viewer);
 
         // Update toolbar
         if (viewer.toolbar_renderer) |*renderer| {

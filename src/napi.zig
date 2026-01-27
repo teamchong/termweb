@@ -453,7 +453,7 @@ fn runBrowserAsync(async_data: *AsyncOpenData) !void {
         if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
     } else |_| {}
 
-    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, async_data.url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, dpr, config.DEFAULT_FPS);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, async_data.url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, dpr, config.DEFAULT_MAX_FPS);
     defer viewer.deinit();
 
     if (async_data.no_toolbar) {
@@ -750,7 +750,7 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     } else |_| {}
 
     // Run viewer with original dimensions for coordinate ratio
-    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, dpr, config.DEFAULT_FPS);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, dpr, config.DEFAULT_MAX_FPS);
     defer viewer.deinit();
 
     if (no_toolbar) {
