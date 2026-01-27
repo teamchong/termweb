@@ -217,14 +217,12 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         viewer.log("[FRAME] frame={}x{}\n", .{ frame_width, frame_height });
     }
 
-    // Profile render time
-    const render_start = std.time.nanoTimestamp();
-
-    // Frame data is raw JPEG - decode to RGBA using turbojpeg
+    // Time decode step (Chrome → Zig)
+    const decode_start = std.time.nanoTimestamp();
     const decode_result = turbojpeg.decodeWithError(viewer.allocator, frame_data);
-    viewer.log("[RENDER] decoded\n", .{});
+    const decode_elapsed = std.time.nanoTimestamp() - decode_start;
+
     if (decode_result.image == null) {
-        // Debug: log first and last few bytes to check JPEG structure
         if (frame_data.len >= 8) {
             const last_idx = frame_data.len - 2;
             viewer.log("[RENDER] JPEG decode failed: {s}, len={}, start={x:0>2}{x:0>2}{x:0>2}{x:0>2}, end={x:0>2}{x:0>2}\n", .{
@@ -241,10 +239,12 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     var decoded = decode_result.image.?;
     defer decoded.deinit();
 
-    // Display decoded RGBA directly to Kitty
+    // Time display step (Zig → Terminal, includes zlib compression)
+    const display_start = std.time.nanoTimestamp();
     try displayRawRGBAFrame(viewer, decoded.data, decoded.width, decoded.height);
+    const display_elapsed = std.time.nanoTimestamp() - display_start;
 
-    const render_elapsed = std.time.nanoTimestamp() - render_start;
+    const render_elapsed = decode_elapsed + display_elapsed;
     viewer.perf_frame_count += 1;
     viewer.perf_total_render_ns += render_elapsed;
     if (render_elapsed > viewer.perf_max_render_ns) {

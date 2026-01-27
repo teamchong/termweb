@@ -10,6 +10,7 @@ const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 const toolbar_mod = @import("ui/toolbar.zig");
 const cdp_events = @import("viewer/cdp_events.zig");
+const RtcFrameServer = @import("capture/rtc_frame_server.zig").RtcFrameServer;
 
 const VERSION = build_options.version;
 
@@ -417,16 +418,13 @@ fn runBrowserAsync(async_data: *AsyncOpenData) !void {
     const original_viewport_width: u32 = raw_width / dpr;
     const original_viewport_height: u32 = content_pixel_height / dpr;
 
-    var viewport_width: u32 = original_viewport_width;
-    var viewport_height: u32 = original_viewport_height;
+    // Use terminal size directly (adaptive quality handles performance)
+    const viewport_width: u32 = original_viewport_width;
+    const viewport_height: u32 = original_viewport_height;
 
-    const MAX_PIXELS = config.MAX_PIXELS;
-    const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
-    if (total_pixels > MAX_PIXELS) {
-        const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
-        viewport_width = @intFromFloat(@as(f64, @floatFromInt(viewport_width)) * pixel_scale);
-        viewport_height = @intFromFloat(@as(f64, @floatFromInt(viewport_height)) * pixel_scale);
-    }
+    // Initialize frame server BEFORE Chrome launch so extension can connect
+    const rtc_frame_server = try RtcFrameServer.init(allocator);
+    defer rtc_frame_server.deinit();
 
     // Launch Chrome
     var launch_opts = launcher.LaunchOptions{
@@ -441,7 +439,8 @@ fn runBrowserAsync(async_data: *AsyncOpenData) !void {
     var chrome_instance = try launcher.launchChromePipe(allocator, launch_opts);
     defer chrome_instance.deinit();
 
-    var client = try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
+    // Connect CDP via pipe
+    var client = try cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, 0);
     defer client.deinit();
 
     try screenshot_api.setViewport(client, allocator, viewport_width, viewport_height, dpr);
@@ -454,7 +453,7 @@ fn runBrowserAsync(async_data: *AsyncOpenData) !void {
         if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
     } else |_| {}
 
-    var viewer = try viewer_mod.Viewer.init(allocator, client, async_data.url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, config.DEFAULT_FPS);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, async_data.url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, config.DEFAULT_FPS);
     defer viewer.deinit();
 
     if (async_data.no_toolbar) {
@@ -711,16 +710,13 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     const original_viewport_width: u32 = raw_width / dpr;
     const original_viewport_height: u32 = content_pixel_height / dpr;
 
-    var viewport_width: u32 = original_viewport_width;
-    var viewport_height: u32 = original_viewport_height;
+    // Use terminal size directly (adaptive quality handles performance)
+    const viewport_width: u32 = original_viewport_width;
+    const viewport_height: u32 = original_viewport_height;
 
-    const MAX_PIXELS = config.MAX_PIXELS;
-    const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
-    if (total_pixels > MAX_PIXELS) {
-        const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
-        viewport_width = @intFromFloat(@as(f64, @floatFromInt(viewport_width)) * pixel_scale);
-        viewport_height = @intFromFloat(@as(f64, @floatFromInt(viewport_height)) * pixel_scale);
-    }
+    // Initialize frame server BEFORE Chrome launch so extension can connect
+    const rtc_frame_server = try RtcFrameServer.init(allocator);
+    defer rtc_frame_server.deinit();
 
     // Launch Chrome
     var launch_opts = launcher.LaunchOptions{
@@ -735,8 +731,8 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     var chrome_instance = try launcher.launchChromePipe(allocator, launch_opts);
     defer chrome_instance.deinit();
 
-    // Connect CDP via WebSocket (WebSocket-only mode for extension support)
-    var client = try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
+    // Connect CDP via pipe
+    var client = try cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, 0);
     defer client.deinit();
 
     // Set viewport with matching DPR
@@ -753,8 +749,8 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
         if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
     } else |_| {}
 
-    // Run viewer with original (pre-MAX_PIXELS) dimensions for coordinate ratio
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, config.DEFAULT_FPS);
+    // Run viewer with original dimensions for coordinate ratio
+    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, config.DEFAULT_FPS);
     defer viewer.deinit();
 
     if (no_toolbar) {

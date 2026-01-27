@@ -1,10 +1,16 @@
 /// Global configuration - single source of truth
 pub const Config = struct {
-    /// Maximum viewport pixels (controls resolution cap)
-    pub const MAX_PIXELS: u64 = 2_000_000;
-
     /// Default JPEG quality (used when adaptive not applicable)
-    pub const JPEG_QUALITY: u8 = 20;
+    pub const JPEG_QUALITY: u8 = 60;
+
+    /// Frame server port (for extension tabCapture WebSocket connection)
+    pub const FRAME_SERVER_PORT: u16 = 9223;
+
+    /// FPS configuration for adaptive frame rate
+    pub const MIN_FPS: u32 = 5;
+    pub const MAX_FPS: u32 = 120;
+    pub const FPS_RAMP_UP: u32 = 5; // Increase per adjustment
+    pub const FPS_RAMP_DOWN: u32 = 10; // Decrease per adjustment (faster ramp down)
 
     /// Calculate adaptive JPEG quality based on pixel count
     /// Smaller screens get higher quality, larger screens get more compression
@@ -14,6 +20,23 @@ pub const Config = struct {
         if (total_pixels < 1_000_000) return 45; // Large: balanced
         if (total_pixels < 1_500_000) return 35; // HD: more compression
         return 25;                                // Full HD+: max compression
+    }
+
+    /// Speed-based adaptive quality thresholds
+    pub const QUALITY_MIN: u8 = 30;
+    pub const QUALITY_MAX: u8 = 90;
+    pub const QUALITY_STEP: u8 = 10;
+    pub const FRAME_TIME_FAST_MS: u64 = 20;  // Below this = increase quality
+    pub const FRAME_TIME_SLOW_MS: u64 = 50;  // Above this = decrease quality
+
+    /// Adjust quality based on frame time
+    pub fn adjustQualityForSpeed(current: u8, frame_time_ms: u64) u8 {
+        if (frame_time_ms < FRAME_TIME_FAST_MS and current < QUALITY_MAX) {
+            return current + QUALITY_STEP;
+        } else if (frame_time_ms > FRAME_TIME_SLOW_MS and current > QUALITY_MIN) {
+            return current - QUALITY_STEP;
+        }
+        return current;
     }
 
     /// Default screencast frame rate

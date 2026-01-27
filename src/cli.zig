@@ -10,6 +10,7 @@ const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 const toolbar_mod = @import("ui/toolbar.zig");
 const helpers = @import("viewer/helpers.zig");
+const RtcFrameServer = @import("capture/rtc_frame_server.zig").RtcFrameServer;
 
 /// Version from package.json (single source of truth)
 const VERSION = build_options.version;
@@ -226,25 +227,19 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const original_viewport_width: u32 = raw_width / dpr;
     const original_viewport_height: u32 = content_pixel_height / dpr;
 
-    var viewport_width: u32 = original_viewport_width;
-    var viewport_height: u32 = original_viewport_height;
-
-    // Cap total pixels to improve performance on large displays
-    // 1.5M pixels ≈ 1920x780 or 1600x937 - good balance of quality and speed
-    const MAX_PIXELS = config.MAX_PIXELS;
-    const total_pixels: u64 = @as(u64, viewport_width) * @as(u64, viewport_height);
-    if (total_pixels > MAX_PIXELS) {
-        // Scale down maintaining aspect ratio
-        const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
-        viewport_width = @intFromFloat(@as(f64, @floatFromInt(viewport_width)) * pixel_scale);
-        viewport_height = @intFromFloat(@as(f64, @floatFromInt(viewport_height)) * pixel_scale);
-        std.debug.print("Viewport reduced: {}x{} -> {}x{} (MAX_PIXELS={})\n", .{
-            original_viewport_width, original_viewport_height, viewport_width, viewport_height, MAX_PIXELS,
-        });
-    }
+    // Use terminal size directly (adaptive quality handles performance)
+    const viewport_width: u32 = original_viewport_width;
+    const viewport_height: u32 = original_viewport_height;
 
     // Launch Chrome with Pipe transport
     std.debug.print("Launching browser...\n", .{});
+
+    // Initialize RTC frame server (WebRTC-based frame transport)
+    const rtc_frame_server = RtcFrameServer.init(allocator) catch |err| {
+        std.debug.print("Error initializing RTC frame server: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer rtc_frame_server.deinit();
 
     // Determine profile cloning behavior:
     // Default: fresh profile (no cloning) - avoids Google session logout issues
@@ -277,9 +272,9 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer chrome_instance.deinit();
 
-    // Connect CDP client via WebSocket (WebSocket-only mode for extension support)
-    var client = cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port) catch |err| {
-        std.debug.print("Error connecting to Chrome: {}\n", .{err});
+    // Connect CDP client via pipe (high throughput for screencast)
+    var client = cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, 0) catch |err| {
+        std.debug.print("Error connecting to Chrome via pipe: {}\n", .{err});
         std.process.exit(1);
     };
     defer client.deinit();
@@ -308,17 +303,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (actual_vp.height > 0) actual_viewport_height = actual_vp.height;
     } else |_| {}
 
-    // Ensure actual viewport also respects pixel limit
-    const actual_total_pixels: u64 = @as(u64, actual_viewport_width) * @as(u64, actual_viewport_height);
-    if (actual_total_pixels > MAX_PIXELS) {
-        const actual_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(actual_total_pixels)));
-        actual_viewport_width = @intFromFloat(@as(f64, @floatFromInt(actual_viewport_width)) * actual_scale);
-        actual_viewport_height = @intFromFloat(@as(f64, @floatFromInt(actual_viewport_height)) * actual_scale);
-    }
-
     // Run viewer with Chrome's actual viewport for accurate coordinate mapping
-    // Also pass original (pre-MAX_PIXELS) dimensions for coordinate ratio calculation
-    var viewer = try viewer_mod.Viewer.init(allocator, client, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, fps);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, fps);
     defer viewer.deinit();
 
     // Apply options

@@ -123,9 +123,9 @@ pub const Viewer = struct {
     tabs: std.ArrayList(ui_mod.Tab),
     active_tab_index: usize,
 
-    viewport_width: u32,  // Viewport after MAX_PIXELS limit (what we send to Chrome)
+    viewport_width: u32,  // Viewport sent to Chrome (terminal size / DPR)
     viewport_height: u32,
-    original_viewport_width: u32,  // Viewport BEFORE MAX_PIXELS limit (for coord ratio)
+    original_viewport_width: u32,  // For coordinate mapping
     original_viewport_height: u32,
     target_fps: u32,  // Target frame rate (affects screencast and mouse tick)
     chrome_inner_width: u32,  // Chrome's actual window.innerWidth (queried from JS)
@@ -1017,27 +1017,13 @@ pub const Viewer = struct {
         const content_rows: u32 = available_height / cell_height;
         const content_pixel_height: u32 = content_rows * cell_height;
 
-        // Original viewport (before limits) - for coordinate ratio calculation
-        const original_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
-        const original_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
+        // Viewport based on terminal size (no cap - adaptive quality handles performance)
+        const new_width: u32 = @max(MIN_WIDTH, raw_width / dpr);
+        const new_height: u32 = @max(MIN_HEIGHT, content_pixel_height / dpr);
 
-        // Scale by DPR for browser viewport
-        var new_width: u32 = original_width;
-        var new_height: u32 = original_height;
-
-        // Cap total pixels to improve performance on large displays
-        const MAX_PIXELS = config.MAX_PIXELS;
-        const total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);
-        if (total_pixels > MAX_PIXELS) {
-            const pixel_scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(total_pixels)));
-            new_width = @max(MIN_WIDTH, @as(u32, @intFromFloat(@as(f64, @floatFromInt(new_width)) * pixel_scale)));
-            new_height = @max(MIN_HEIGHT, @as(u32, @intFromFloat(@as(f64, @floatFromInt(new_height)) * pixel_scale)));
-            self.log("[RESIZE] Viewport capped to {}x{} (max {} pixels)\n", .{ new_width, new_height, MAX_PIXELS });
-        }
-
-        // Update original viewport (for coordinate ratio)
-        self.original_viewport_width = original_width;
-        self.original_viewport_height = original_height;
+        // Store for coordinate mapping
+        self.original_viewport_width = new_width;
+        self.original_viewport_height = new_height;
 
         self.log("[RESIZE] New size: {}x{} px, {}x{} cells, toolbar={}px, dpr={} -> viewport {}x{}\n", .{
             size.width_px, size.height_px, size.cols, size.rows, toolbar_height, dpr, new_width, new_height,
