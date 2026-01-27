@@ -304,7 +304,7 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     } else |_| {}
 
     // Run viewer with Chrome's actual viewport for accurate coordinate mapping
-    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, fps);
+    var viewer = try viewer_mod.Viewer.init(allocator, client, rtc_frame_server, url, actual_viewport_width, actual_viewport_height, original_viewport_width, original_viewport_height, @intCast(cell_width), fps);
     defer viewer.deinit();
 
     // Apply options
