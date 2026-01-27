@@ -127,7 +127,6 @@ pub const Viewer = struct {
     viewport_height: u32,
     original_viewport_width: u32,  // For coordinate mapping
     original_viewport_height: u32,
-    cell_width: u16,  // Terminal cell width in pixels (for DPR detection: >14 = Retina)
     target_fps: u32,  // Target frame rate (affects screencast and mouse tick)
     chrome_inner_width: u32,  // Chrome's actual window.innerWidth (queried from JS)
     chrome_inner_height: u32, // Chrome's actual window.innerHeight (queried from JS)
@@ -275,7 +274,7 @@ pub const Viewer = struct {
         viewport_height: u32,
         original_viewport_width: u32,
         original_viewport_height: u32,
-        cell_width: u16,
+        dpr: u32,
         target_fps: u32,
     ) !Viewer {
         // Set allocator for turbojpeg fast decoding
@@ -330,7 +329,7 @@ pub const Viewer = struct {
             .viewport_height = viewport_height,
             .original_viewport_width = original_viewport_width,
             .original_viewport_height = original_viewport_height,
-            .cell_width = cell_width,
+            .dpr = dpr,
             .target_fps = target_fps,
             .chrome_inner_width = 0, // Will be queried from Chrome after page load
             .chrome_inner_height = 0,
@@ -425,7 +424,6 @@ pub const Viewer = struct {
             .natural_scroll = isNaturalScrollEnabled(),
             .is_ghostty = true, // Kitty-compatible terminal required
             .reload_in_progress = false,
-            .dpr = 2, // Default to HiDPI, will be updated on first resize
             .perf_frame_count = 0,
             .perf_total_render_ns = 0,
             .perf_max_render_ns = 0,
@@ -1266,8 +1264,11 @@ pub const Viewer = struct {
                     const filter = grid.getInput();
                     var badge_idx: u32 = 0;
 
-                    // Use terminal DPR detection: cell_width > 14 = Retina/HiDPI = 2x
-                    const use_2x = self.cell_width > 14;
+                    // Use DPR directly for badge scaling
+                    const scale: u32 = self.dpr;
+                    const char_w: u32 = 8 * scale;
+                    const badge_h: u32 = 12 * scale;
+                    const padding: u32 = 3 * scale;
 
                     for (grid.hints) |hint| {
                         if (badge_idx >= MAX_HINT_BADGES) break;
@@ -1284,12 +1285,10 @@ pub const Viewer = struct {
                             if (!matches) continue;
                         }
 
-                        // Calculate badge dimensions based on terminal DPR
-                        const char_w: u32 = if (use_2x) 16 else 8;
-                        const badge_h: u32 = if (use_2x) 24 else 12;
-                        const badge_w: u32 = @as(u32, hint.label_len) * char_w + (if (use_2x) @as(u32, 6) else @as(u32, 4));
+                        // Calculate badge dimensions based on DPR
+                        const badge_w: u32 = @as(u32, hint.label_len) * char_w + padding;
                         const badge_size = badge_w * badge_h * 4;
-                        const render_scale: u8 = if (use_2x) 2 else 1;
+                        const render_scale: u8 = @intCast(self.dpr);
 
                         // Render badge to pre-allocated buffer
                         var badge = &self.hint_badges[badge_idx];
