@@ -200,16 +200,21 @@ pub fn renderHintsOverlay(
     _ = term_width_px;
     _ = term_height_px;
     _ = term_cols;
-    _ = cell_width;
     _ = cell_height;
 
     if (grid.hints.len == 0) return;
 
     const filter = grid.getInput();
 
+    // Determine scale based on cell width (same logic as DPR detection in cli.zig)
+    // cell_width > 14 = Retina/HiDPI = 2x scale, else 1x scale
+    const use_2x: bool = cell_width > 14;
+    const char_px: u32 = if (use_2x) 16 else 8;
+    const badge_h: u32 = if (use_2x) 24 else 12;
+    const badge_padding: u32 = if (use_2x) 6 else 4;
+
     // Badge dimensions - dynamic width, fixed height
-    const badge_h: u32 = 24;
-    const max_badge_w: u32 = 70; // Fits 4 chars (4 * 16 = 64 + 6 padding)
+    const max_badge_w: u32 = 4 * char_px + badge_padding; // Fits 4 chars
     const max_badge_size = max_badge_w * badge_h * 4;
 
     // Create single badge buffer (reused for each hint, sized for max width)
@@ -242,15 +247,18 @@ pub fn renderHintsOverlay(
         }
 
         // Calculate badge width for this hint's label length
-        // 16px per char + 6px padding
-        const badge_w: u32 = @as(u32, hint.label_len) * 16 + 6;
+        const badge_w: u32 = @as(u32, hint.label_len) * char_px + badge_padding;
         const badge_size = badge_w * badge_h * 4;
 
         // Clear badge buffer
         @memset(badge_buf[0..badge_size], 0);
 
-        // Draw badge at (0,0) in the small buffer
-        drawBadge(badge_buf, badge_w, badge_h, 0, 0, badge_w, badge_h, &hint.label, hint.label_len);
+        // Draw badge at appropriate scale
+        if (use_2x) {
+            drawBadge(badge_buf, badge_w, badge_h, 0, 0, badge_w, badge_h, &hint.label, hint.label_len);
+        } else {
+            drawBadge1x(badge_buf, badge_w, badge_h, &hint.label, hint.label_len);
+        }
 
         // Encode badge
         const encoded_len = encoder.calcSize(badge_size);
@@ -281,6 +289,83 @@ pub fn renderHintsOverlay(
 /// Public wrapper for drawing a badge (used by viewer.zig)
 pub fn drawBadgePublic(buf: []u8, w: u32, h: u32, label: *const [4]u8, label_len: u8) void {
     drawBadge(buf, w, h, 0, 0, w, h, label, label_len);
+}
+
+/// Public wrapper for drawing a scaled badge (1x = 8px chars, 2x = 16px chars)
+pub fn drawBadgeScaled(buf: []u8, w: u32, h: u32, label: *const [4]u8, label_len: u8, scale: u8) void {
+    if (scale <= 1) {
+        drawBadge1x(buf, w, h, label, label_len);
+    } else {
+        drawBadge(buf, w, h, 0, 0, w, h, label, label_len);
+    }
+}
+
+/// Draw a hint badge at 1x scale (8px characters)
+fn drawBadge1x(buf: []u8, w: u32, h: u32, label: *const [4]u8, label_len: u8) void {
+    const border: u32 = 1; // 1px border at 1x scale
+
+    // Draw black border first (fill entire badge area)
+    var py: u32 = 0;
+    while (py < h) : (py += 1) {
+        var px: u32 = 0;
+        while (px < w) : (px += 1) {
+            const idx = (py * w + px) * 4;
+            if (idx + 3 >= buf.len) continue;
+            buf[idx] = 0; // R
+            buf[idx + 1] = 0; // G
+            buf[idx + 2] = 0; // B
+            buf[idx + 3] = 255;
+        }
+    }
+
+    // Draw yellow background (inside border)
+    py = border;
+    while (py < h - border) : (py += 1) {
+        var px: u32 = border;
+        while (px < w - border) : (px += 1) {
+            const idx = (py * w + px) * 4;
+            if (idx + 3 >= buf.len) continue;
+            buf[idx] = 255; // R
+            buf[idx + 1] = 220; // G
+            buf[idx + 2] = 0; // B
+            buf[idx + 3] = 230;
+        }
+    }
+
+    // Draw 1x scale text
+    const text_x = border + 1;
+    const text_y = border + 1;
+    const char_width: u32 = 8; // 1x scale
+
+    var i: u8 = 0;
+    while (i < label_len) : (i += 1) {
+        drawChar1x(buf, w, h, label[i], text_x + @as(u32, i) * char_width, text_y, 0, 0, 0);
+    }
+}
+
+/// Draw a character at 1x scale (8x8)
+fn drawChar1x(buf: []u8, stride: u32, height: u32, char: u8, x: u32, y: u32, r: u8, g: u8, b: u8) void {
+    const glyph = getGlyph(char);
+    for (glyph, 0..) |row, dy| {
+        var bit: u8 = 0x80;
+        var dx: u32 = 0;
+        while (dx < 8) : (dx += 1) {
+            if (row & bit != 0) {
+                const px = x + dx;
+                const py = y + @as(u32, @intCast(dy));
+                if (px < stride and py < height) {
+                    const idx = (py * stride + px) * 4;
+                    if (idx + 3 < buf.len) {
+                        buf[idx] = r;
+                        buf[idx + 1] = g;
+                        buf[idx + 2] = b;
+                        buf[idx + 3] = 255;
+                    }
+                }
+            }
+            bit >>= 1;
+        }
+    }
 }
 
 /// Draw a hint badge onto the overlay buffer
