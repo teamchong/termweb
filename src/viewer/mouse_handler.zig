@@ -93,19 +93,20 @@ pub fn handleTabBarClick(viewer: anytype, pixel_x: u32, pixel_y: u32, mapper: Co
             switch (button) {
                 .back => {
                     viewer.log("[CLICK] Back button (can_back={})\n", .{viewer.ui_state.can_go_back});
-                    // Always try to go back even if state says no (state might be stale)
-                    _ = screenshot_api.goBack(viewer.cdp_client, viewer.allocator) catch |err| {
-                        viewer.log("[CLICK] Back failed: {}\n", .{err});
-                        return; // Don't update UI state if command failed
-                    };
-                    // Optimistic update only on success
-                    viewer.ui_state.can_go_forward = true;
-                    viewer.ui_state.is_loading = true;
-                    if (viewer.toolbar_renderer) |*tr| {
-                        tr.is_loading = true;
+                    if (viewer.ui_state.can_go_back) {
+                        _ = screenshot_api.goBack(viewer.cdp_client, viewer.allocator) catch |err| {
+                            viewer.log("[CLICK] Back failed: {}\n", .{err});
+                            return; // Don't update UI state if command failed
+                        };
+                        // Optimistic update only on success
+                        viewer.ui_state.can_go_forward = true;
+                        viewer.ui_state.is_loading = true;
+                        if (viewer.toolbar_renderer) |*tr| {
+                            tr.is_loading = true;
+                        }
+                        viewer.loading_started_at = std.time.nanoTimestamp();
+                        viewer.ui_dirty = true;
                     }
-                    viewer.loading_started_at = std.time.nanoTimestamp();
-                    viewer.ui_dirty = true;
                 },
                 .forward => {
                     viewer.log("[CLICK] Forward button\n", .{});
