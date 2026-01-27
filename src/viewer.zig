@@ -145,6 +145,8 @@ pub const Viewer = struct {
     last_frame_generation: u64, // Track frame generation for stall detection (only update time on NEW frames)
     screencast_started_at: i128, // When screencast was started (for stall detection)
     rtc_session_id: u32, // Unique session ID for WebRTC - ignore frames with old IDs
+    current_quality: u8, // Current JPEG quality (adaptive)
+    avg_frame_time_ms: u64, // Running average frame time for adaptive quality
     last_frame_width: u32,  // Current frame width from screencast
     last_frame_height: u32, // Current frame height from screencast
     baseline_frame_width: u32,  // Frame size after navigate/resize (for coord scaling)
@@ -341,6 +343,8 @@ pub const Viewer = struct {
             .last_frame_generation = 0,
             .screencast_started_at = 0,
             .rtc_session_id = 1,
+            .current_quality = config.JPEG_QUALITY,
+            .avg_frame_time_ms = 0,
             .last_frame_width = viewport_width,
             .last_frame_height = viewport_height,
             .baseline_frame_width = 0,  // Will be set from first screencast frame
@@ -817,10 +821,19 @@ pub const Viewer = struct {
 
                 if (no_frames) {
                     self.rtc_session_id +%= 1; // Increment session ID (wrapping)
-                    self.log("[STALL] No frame for 2s, restarting capture with session_id={}\n", .{self.rtc_session_id});
+
+                    // Adaptive quality: adjust based on recent frame performance
+                    if (self.avg_frame_time_ms > 0) {
+                        self.current_quality = config.adjustQualityForSpeed(self.current_quality, self.avg_frame_time_ms);
+                    }
+
+                    self.log("[STALL] No frame for 2s, restarting capture with session_id={}, quality={}\n", .{ self.rtc_session_id, self.current_quality });
                     self.last_frame_time = now_ns; // Reset to avoid rapid restarts
                     self.last_frame_generation = 0; // Reset so new frames are detected
                     self.sendRtcStartMessage();
+
+                    // Restart CDP screencast with adaptive quality
+                    self.cdp_client.startScreencast("jpeg", self.current_quality, self.viewport_width, self.viewport_height, 1) catch {};
                 }
                 const t2 = std.time.nanoTimestamp();
 

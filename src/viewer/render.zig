@@ -251,6 +251,15 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         viewer.perf_max_render_ns = render_elapsed;
     }
 
+    // Update running average frame time for adaptive quality (exponential moving average)
+    const frame_time_ms: u64 = @intCast(@divFloor(render_elapsed, @as(i128, std.time.ns_per_ms)));
+    if (viewer.avg_frame_time_ms == 0) {
+        viewer.avg_frame_time_ms = frame_time_ms;
+    } else {
+        // EMA: new_avg = old_avg * 0.9 + new_sample * 0.1
+        viewer.avg_frame_time_ms = (viewer.avg_frame_time_ms * 9 + frame_time_ms) / 10;
+    }
+
     // Record render time for adaptive FPS control - SKIP to avoid crash
     // if (render_elapsed > 0) {
     //     viewer.rtc_frame_server.recordRenderTime(@intCast(render_elapsed));
