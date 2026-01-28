@@ -124,6 +124,7 @@ pub const Viewer = struct {
     viewport_height: u32,
     original_viewport_width: u32,  // Viewport BEFORE MAX_PIXELS limit (for coord ratio)
     original_viewport_height: u32,
+    cell_width: u16,  // Terminal cell width in pixels (for DPR detection: >14 = Retina)
     target_fps: u32,  // Target frame rate (affects screencast and mouse tick)
     chrome_inner_width: u32,  // Chrome's actual window.innerWidth (queried from JS)
     chrome_inner_height: u32, // Chrome's actual window.innerHeight (queried from JS)
@@ -257,6 +258,7 @@ pub const Viewer = struct {
         viewport_height: u32,
         original_viewport_width: u32,
         original_viewport_height: u32,
+        cell_width: u16,
         target_fps: u32,
     ) !Viewer {
         // Set allocator for turbojpeg fast decoding
@@ -310,6 +312,7 @@ pub const Viewer = struct {
             .viewport_height = viewport_height,
             .original_viewport_width = original_viewport_width,
             .original_viewport_height = original_viewport_height,
+            .cell_width = cell_width,
             .target_fps = target_fps,
             .chrome_inner_width = 0, // Will be queried from Chrome after page load
             .chrome_inner_height = 0,
@@ -1238,15 +1241,20 @@ pub const Viewer = struct {
                             if (!matches) continue;
                         }
 
-                        // Calculate badge dimensions
-                        const badge_w: u32 = @as(u32, hint.label_len) * 16 + 6;
-                        const badge_h: u32 = 24;
+                        // Calculate badge dimensions based on terminal DPR
+                        // cell_width > 14 = Retina/HiDPI = 2x scale
+                        const use_2x = self.cell_width > 14;
+                        const char_w: u32 = if (use_2x) 16 else 8;
+                        const badge_padding: u32 = if (use_2x) 6 else 4;
+                        const badge_w: u32 = @as(u32, hint.label_len) * char_w + badge_padding;
+                        const badge_h: u32 = if (use_2x) 24 else 12;
                         const badge_size = badge_w * badge_h * 4;
+                        const render_scale: u8 = if (use_2x) 2 else 1;
 
                         // Render badge to pre-allocated buffer
                         var badge = &self.hint_badges[badge_idx];
                         @memset(&badge.rgba, 0);
-                        ui_mod.hints.drawBadgePublic(&badge.rgba, badge_w, badge_h, &hint.label, hint.label_len);
+                        ui_mod.hints.drawBadgeScaled(&badge.rgba, badge_w, badge_h, &hint.label, hint.label_len, render_scale);
 
                         badge.width = badge_w;
                         badge.height = badge_h;
