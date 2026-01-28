@@ -915,7 +915,7 @@ pub const CdpClient = struct {
                 self.allocator.free(activate_result);
             }
 
-            // Close and reconnect page_ws (will connect to new target)
+            // Close and reconnect page_ws (hold mutex throughout to prevent race)
             {
                 self.page_ws_mutex.lock();
                 defer self.page_ws_mutex.unlock();
@@ -923,9 +923,9 @@ pub const CdpClient = struct {
                     ws.deinit();
                     self.page_ws = null;
                 }
+                // Reconnect immediately (needed for screencast)
+                try self.reconnectPageWebSocket();
             }
-            // Reconnect immediately (needed for screencast)
-            try self.reconnectPageWebSocket();
             logToFile("[CDP switchToTarget] END success (WS-only mode)\n", .{});
             return;
         }
@@ -1097,7 +1097,7 @@ pub const CdpClient = struct {
             }
             self.current_target_id = try self.allocator.dupe(u8, target_id);
 
-            // Close and reconnect page_ws
+            // Close and reconnect page_ws (hold mutex throughout to prevent race)
             {
                 self.page_ws_mutex.lock();
                 defer self.page_ws_mutex.unlock();
@@ -1105,8 +1105,8 @@ pub const CdpClient = struct {
                     ws.deinit();
                     self.page_ws = null;
                 }
+                try self.reconnectPageWebSocket();
             }
-            try self.reconnectPageWebSocket();
             logToFile("[CDP createAndAttach] END success (WS-only mode)\n", .{});
             return try self.allocator.dupe(u8, target_id);
         }
