@@ -1,6 +1,6 @@
 {
   "name": "termweb-dashboard",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Terminal-based system monitoring dashboard powered by termweb",
   "bin": {
     "termweb-dashboard": "bin/cli.js"
