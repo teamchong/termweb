@@ -526,8 +526,7 @@ function renderDetailView(type) {
   } else if (type === 'network') {
     content = `
       <div class="detail-chart"><canvas id="detail-chart-canvas"></canvas></div>
-      <div id="detail-net-info"></div>
-      <div id="detail-net-connections" class="distribution-chart"></div>
+      <div id="detail-net-connections" class="distribution-chart" style="flex:1;min-height:200px;"></div>
     `;
   } else if (type === 'disk') {
     content = `
@@ -1088,20 +1087,6 @@ function updateDetailView(type, data) {
       detailChart.data.datasets[1].data.push(netTx);
       detailChart.data.datasets[1].data.shift();
       detailChart.update('none');
-    }
-    const info = document.getElementById('detail-net-info');
-    if (info) {
-      info.innerHTML = `
-        <div class="stat-row" style="margin-bottom: 8px;">
-          <span class="stat-label">Total</span>
-          <span class="stat-value">↓ ${formatBps(netRx)} / ↑ ${formatBps(netTx)}</span>
-        </div>
-      ` + data.network.map(n => `
-        <div class="stat-row">
-          <span class="stat-label">${n.iface}</span>
-          <span class="stat-value">↓ ${formatBps(n.rx_sec || 0)} / ↑ ${formatBps(n.tx_sec || 0)}</span>
-        </div>
-      `).join('') || '<div class="stat-row"><span class="stat-label">No active interfaces</span></div>';
     }
     // Render connections treemap
     renderConnectionsTreemap('detail-net-connections');
