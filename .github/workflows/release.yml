@@ -235,26 +235,12 @@ jobs:
           git pull --rebase origin main
           git push
 
-  publish-dashboard:
+  check-dashboard:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
-
       - name: Check if dashboard needs publishing
         id: check
         run: |
@@ -268,14 +254,85 @@ jobs:
             echo "should_publish=false" >> $GITHUB_OUTPUT
           fi
 
+  build-dashboard-native:
+    needs: check-dashboard
+    if: needs.check-dashboard.outputs.should_publish == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-macos
+            name: darwin-arm64
+          - os: macos-latest
+            target: x86_64-macos
+            name: darwin-x64
+          - os: ubuntu-latest
+            target: x86_64-linux-gnu
+            name: linux-x64
+          - os: ubuntu-latest
+            target: aarch64-linux-gnu
+            name: linux-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build dashboard native addon
+        run: |
+          cd packages/dashboard/native
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+          mv zig-out/lib/metrics.node metrics-${{ matrix.name }}.node
+          ls -la
+
+      - name: Upload native addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-native-${{ matrix.name }}
+          path: packages/dashboard/native/metrics-${{ matrix.name }}.node
+
+  publish-dashboard:
+    needs: [check-dashboard, build-dashboard-native]
+    if: needs.check-dashboard.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all native addons
+        uses: actions/download-artifact@v4
+        with:
+          path: packages/dashboard/native/prebuilt
+          pattern: dashboard-native-*
+          merge-multiple: true
+
+      - name: List prebuilt binaries
+        run: ls -la packages/dashboard/native/prebuilt/
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
       - name: Install dependencies
-        if: steps.check.outputs.should_publish == 'true'
         run: pnpm install
 
       - name: Build dashboard
-        if: steps.check.outputs.should_publish == 'true'
         run: cd packages/dashboard && pnpm run build
 
       - name: Publish dashboard to npm
-        if: steps.check.outputs.should_publish == 'true'
         run: cd packages/dashboard && npm publish --provenance --access public
