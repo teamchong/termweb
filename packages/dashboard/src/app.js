@@ -36,6 +36,22 @@ let currentDiskPath = '/'; // Current folder path for disk drill-down
 let folderData = []; // Folder sizes for current path
 let selectedFolderIndex = 0; // Selected folder in disk treemap
 
+// Persistent stats history (collected continuously, survives view changes)
+// 1 minute at 5s interval = 12 data points
+const HISTORY_SIZE = 12;
+const statsHistory = {
+  cpu: { load: [], perCore: [] },
+  memory: { percent: [], used: [] },
+  network: { rx: [], tx: [] },
+  disk: null, // Latest disk info only
+  processes: null // Latest process list only
+};
+
+function pushHistory(arr, value) {
+  arr.push(value);
+  if (arr.length > HISTORY_SIZE) arr.shift();
+}
+
 const SORT_COLUMNS = ['pid', 'name', 'cpu', 'mem', 'port'];
 const FULLSCREEN_ROW_HEIGHT = 20;
 
@@ -512,14 +528,20 @@ function renderDetailView(type) {
   // Create chart only for network (line chart)
   const canvas = document.getElementById('detail-chart-canvas');
   if (canvas && type === 'network') {
+    // Pre-fill with history data (pad with zeros if not enough history)
+    const historyRx = [...statsHistory.network.rx];
+    const historyTx = [...statsHistory.network.tx];
+    while (historyRx.length < HISTORY_SIZE) historyRx.unshift(0);
+    while (historyTx.length < HISTORY_SIZE) historyTx.unshift(0);
+
     detailChart = new Chart(canvas, {
       type: 'line',
       data: {
-        labels: Array(60).fill(''),
+        labels: Array(HISTORY_SIZE).fill(''),
         datasets: [
           {
             label: 'Download',
-            data: Array(60).fill(0),
+            data: historyRx,
             borderColor: 'rgb(106, 153, 85)',
             backgroundColor: 'rgba(106, 153, 85, 0.1)',
             fill: true,
@@ -529,7 +551,7 @@ function renderDetailView(type) {
           },
           {
             label: 'Upload',
-            data: Array(60).fill(0),
+            data: historyTx,
             borderColor: 'rgb(206, 145, 120)',
             backgroundColor: 'rgba(206, 145, 120, 0.1)',
             fill: true,
@@ -1054,6 +1076,33 @@ function updateHints() {
 }
 
 function updateUI(data, isFull) {
+  // Always persist to history (regardless of current view)
+  if (data.cpu) {
+    pushHistory(statsHistory.cpu.load, data.cpu.load);
+    if (data.cpu.loadPerCore) {
+      pushHistory(statsHistory.cpu.perCore, [...data.cpu.loadPerCore]);
+    }
+  }
+  if (data.memory) {
+    const memTotal = isFull ? data.memory.total : (data.memory.used + data.memory.free);
+    const memPercent = (data.memory.used / memTotal) * 100;
+    pushHistory(statsHistory.memory.percent, memPercent);
+    pushHistory(statsHistory.memory.used, data.memory.used);
+  }
+  if (data.network) {
+    const netRx = data.network.reduce((sum, n) => sum + (n.rx_sec || 0), 0);
+    const netTx = data.network.reduce((sum, n) => sum + (n.tx_sec || 0), 0);
+    pushHistory(statsHistory.network.rx, netRx);
+    pushHistory(statsHistory.network.tx, netTx);
+  }
+  if (isFull && data.disk) {
+    statsHistory.disk = data.disk;
+  }
+  if (isFull && data.processes) {
+    statsHistory.processes = data.processes;
+  }
+
+  // Update UI for current view
   if (currentView === 'main') {
     // CPU
     pushChartData(cpuChart, data.cpu.load);
