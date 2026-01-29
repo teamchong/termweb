@@ -1830,7 +1830,7 @@ pub const Viewer = struct {
     }
 
     /// Handle clipboard sync - copy browser clipboard to system clipboard
-    fn handleClipboardSync(self: *Viewer, payload: []const u8, start: usize) !void {
+    pub fn handleClipboardSync(self: *Viewer, payload: []const u8, start: usize) !void {
         // Find the end of the clipboard text (look for closing quote in JSON, handling escapes)
         var end = start;
         while (end < payload.len) : (end += 1) {
@@ -1965,7 +1965,7 @@ pub const Viewer = struct {
 
     /// Handle clipboard read request - browser wants host clipboard
     /// Called when browser's navigator.clipboard.readText() is invoked
-    fn handleClipboardReadRequest(self: *Viewer) void {
+    pub fn handleClipboardReadRequest(self: *Viewer) void {
         const toolbar = @import("ui/toolbar.zig");
 
         // Read from system clipboard (pbpaste on macOS, xclip on Linux)

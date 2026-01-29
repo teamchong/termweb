@@ -256,12 +256,43 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
     }
 }
 
-/// Handle console messages - look for resize and IPC markers
+/// Handle console messages - look for termweb markers
 pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
     // Check for resize marker (from ResizeObserver in isolated world)
     const resize_marker = "__TERMWEB_RESIZE__:";
     if (std.mem.indexOf(u8, payload, resize_marker)) |resize_pos| {
         handleResizeEvent(viewer, payload, resize_pos + resize_marker.len);
+        return;
+    }
+
+    // Check for clipboard sync marker - browser clipboard → system clipboard
+    const clipboard_marker = "__TERMWEB_CLIPBOARD__:";
+    if (std.mem.indexOf(u8, payload, clipboard_marker)) |clip_pos| {
+        viewer.log("[CONSOLE MSG] Found clipboard marker\n", .{});
+        try viewer.handleClipboardSync(payload, clip_pos + clipboard_marker.len);
+        return;
+    }
+
+    // Check for clipboard read request - browser wants host clipboard
+    const clipboard_request = "__TERMWEB_CLIPBOARD_REQUEST__";
+    if (std.mem.indexOf(u8, payload, clipboard_request) != null) {
+        viewer.log("[CONSOLE MSG] Clipboard read request - syncing from host\n", .{});
+        viewer.handleClipboardReadRequest();
+        return;
+    }
+
+    // Check for File System API marker
+    const fs_marker = "__TERMWEB_FS__:";
+    if (std.mem.indexOf(u8, payload, fs_marker)) |fs_pos| {
+        try viewer.handleFsRequest(payload, fs_pos + fs_marker.len);
+        return;
+    }
+
+    // Check for file picker marker
+    const picker_marker = "__TERMWEB_PICKER__:";
+    if (std.mem.indexOf(u8, payload, picker_marker)) |picker_pos| {
+        viewer.log("[CONSOLE MSG] Found picker marker\n", .{});
+        try viewer.handlePickerRequest(payload, picker_pos + picker_marker.len);
         return;
     }
 
