@@ -560,7 +560,10 @@ pub const WebSocketCdpClient = struct {
         }
 
         // ACK immediately - don't block reader thread
-        self.acknowledgeFrame(frame_sid) catch {};
+        // Check if still running to avoid sending after socket closed
+        if (self.running.load(.acquire)) {
+            self.acknowledgeFrame(frame_sid) catch {};
+        }
     }
 
     /// Get latest screencast frame (zero-copy)
