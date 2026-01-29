@@ -120,6 +120,10 @@ async function renderCurrentView() {
     } else if (currentView === 'disk') {
       initDiskSelectedPath();
       folderData = [];
+      // Request fresh metrics to ensure disk stats are available
+      if (ws && wsConnected) {
+        ws.send(JSON.stringify({ type: 'refresh' }));
+      }
       requestFolderSizes(currentDiskPath);
     }
   }
@@ -699,23 +703,24 @@ function squarify(items, x, y, w, h, result = []) {
 }
 
 // Render treemap for top consumers
-function renderTreemap(containerId, processes, valueKey, label) {
+// systemUsedPct: actual system usage percentage (shown in label only, not in treemap)
+function renderTreemap(containerId, processes, valueKey, label, systemUsedPct = null) {
   const container = document.getElementById(containerId);
   if (!container || !processes || processes.length === 0) return;
 
-  // Get top 15 by value
+  // Get all processes with significant usage, sorted by value
   const sorted = [...processes]
     .filter(p => p[valueKey] > 0.1)
-    .sort((a, b) => b[valueKey] - a[valueKey])
-    .slice(0, 15);
+    .sort((a, b) => b[valueKey] - a[valueKey]);
 
-  const total = sorted.reduce((sum, p) => sum + p[valueKey], 0);
-  if (total === 0) {
+  const processTotal = sorted.reduce((sum, p) => sum + p[valueKey], 0);
+  if (processTotal === 0) {
     container.innerHTML = '<div style="color: #888; padding: 16px;">No significant usage</div>';
     return;
   }
 
-  // Prepare items with normalized values
+  // Show processes relative to each other (no System/Free cells)
+  // This is how htop/btop display - processes only, system usage in header
   const items = sorted.map((p, i) => ({
     name: p.name,
     pid: p.pid,
@@ -729,8 +734,11 @@ function renderTreemap(containerId, processes, valueKey, label) {
   // Calculate layout (use percentage-based coordinates)
   const layout = squarify(items, 0, 0, 100, 100);
 
-  // Build treemap HTML
-  let html = `<div class="treemap-label">${label} - Top Consumers</div><div class="treemap-2d">`;
+  // Build treemap HTML - show system usage in label
+  const usedLabel = systemUsedPct !== null
+    ? `${systemUsedPct.toFixed(1)}% system used, ${processTotal.toFixed(1)}% by visible processes`
+    : `${processTotal.toFixed(1)}% by processes`;
+  let html = `<div class="treemap-label">${label} (${usedLabel})</div><div class="treemap-2d">`;
   for (const item of layout) {
     const showLabel = item.w > 8 && item.h > 12;
     const showValue = item.w > 5 && item.h > 8;
@@ -801,6 +809,21 @@ function renderConnectionsTreemap(containerId) {
   container.innerHTML = html;
 }
 
+// Get disk capacity for current path
+function getDiskCapacity() {
+  if (!statsHistory.disk || statsHistory.disk.length === 0) return null;
+  // Find the disk that best matches currentDiskPath (longest matching mount point)
+  let bestMatch = null;
+  let bestLen = 0;
+  for (const d of statsHistory.disk) {
+    if (currentDiskPath.startsWith(d.mount) && d.mount.length > bestLen) {
+      bestMatch = d;
+      bestLen = d.mount.length;
+    }
+  }
+  return bestMatch;
+}
+
 // Render folder treemap with drill-down
 function renderFolderTreemap(containerId) {
   const container = document.getElementById(containerId);
@@ -816,39 +839,80 @@ function renderFolderTreemap(containerId) {
     selectedFolderIndex = Math.max(0, folderData.length - 1);
   }
 
-  const confirmedCount = folderData.filter(f => f.confirmed).length;
-  const total = folderData.reduce((sum, f) => sum + f.size, 0);
+  const confirmedFolders = folderData.filter(f => f.confirmed);
+  const unconfirmedFolders = folderData.filter(f => !f.confirmed);
+  const confirmedTotal = confirmedFolders.reduce((sum, f) => sum + f.size, 0);
+  const disk = getDiskCapacity();
+  const diskTotal = disk ? disk.size : (confirmedTotal + unconfirmedFolders.length * 1000000000); // Fallback estimate
+
+  // Calculate remaining space for unconfirmed folders to share equally
+  const remainingSpace = Math.max(0, diskTotal - confirmedTotal);
+  const unconfirmedShare = unconfirmedFolders.length > 0 ? remainingSpace / unconfirmedFolders.length : 0;
+
+  // Build items list - confirmed use actual size, unconfirmed share remaining space equally
   const items = folderData.map((f, i) => ({
     name: f.name,
     path: f.path,
-    value: f.size,
-    size: f.size,
+    value: f.confirmed ? f.size : unconfirmedShare, // Unconfirmed share remaining space
+    size: f.size, // Keep actual/estimated size for display
     confirmed: f.confirmed,
     index: i,
+    isOther: false,
     color: TREEMAP_COLORS[i % TREEMAP_COLORS.length]
   }));
 
+  // Add "Other / Free" only when all folders are confirmed (at root level)
+  const folderTotal = folderData.reduce((sum, f) => sum + f.size, 0);
+  if (disk && currentDiskPath === '/' && unconfirmedFolders.length === 0) {
+    const otherSize = Math.max(0, diskTotal - folderTotal);
+    if (otherSize > 0) {
+      items.push({
+        name: 'Other / Free',
+        path: '',
+        value: otherSize,
+        size: otherSize,
+        confirmed: true,
+        index: -1,
+        isOther: true,
+        color: '#3c3c3c' // Dark gray for free space
+      });
+    }
+  }
+
   const layout = squarify(items, 0, 0, 100, 100);
 
-  const scanningText = confirmedCount < folderData.length ? ` (scanning ${confirmedCount}/${folderData.length})` : '';
-  let html = `<div class="treemap-label">Folder Sizes (${formatBytes(total)} total)${scanningText}</div><div class="treemap-2d">`;
+  const scanningText = unconfirmedFolders.length > 0 ? ` (scanning ${confirmedFolders.length}/${folderData.length})` : '';
+  const diskInfo = disk ? ` of ${formatBytes(diskTotal)}` : '';
+  let html = `<div class="treemap-label">Folder Sizes (${formatBytes(confirmedTotal)}${diskInfo})${scanningText}</div><div class="treemap-2d">`;
   for (const item of layout) {
     const showLabel = item.w > 8 && item.h > 12;
     const showValue = item.w > 5 && item.h > 8;
-    const pct = total > 0 ? (item.size / total * 100).toFixed(1) : 0;
-    const status = item.confirmed ? '' : ' (estimated)';
-    const tip = `${item.path} | ${formatBytes(item.size)}${status} (${pct}%)`;
-    const isSelected = item.index === selectedFolderIndex;
-    // Unconfirmed items have striped pattern overlay
-    const opacity = item.confirmed ? 1 : 0.6;
-    const pattern = item.confirmed ? '' : 'background-image: repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.1) 5px, rgba(0,0,0,0.1) 10px);';
-    const selectedStyle = isSelected ? 'outline: 3px solid #fff; outline-offset: -3px; z-index: 10;' : '';
-    html += `
-      <div class="treemap-cell folder-cell${isSelected ? ' selected' : ''}" style="left:${item.x}%;top:${item.y}%;width:${item.w}%;height:${item.h}%;background-color:${item.color};opacity:${opacity};${pattern}${selectedStyle}" data-tip="${tip}" data-path="${item.path}" data-index="${item.index}">
-        ${showLabel ? `<span class="treemap-name">${item.name}</span>` : ''}
-        ${showValue ? `<span class="treemap-value">${item.confirmed ? formatBytes(item.size) : '~' + formatBytes(item.size)}</span>` : ''}
-      </div>
-    `;
+    const pct = diskTotal > 0 ? (item.size / diskTotal * 100).toFixed(1) : 0;
+
+    if (item.isOther) {
+      // "Other / Free" cell - not clickable, different styling
+      const tip = `Free space: ${formatBytes(item.size)} (${pct}% of disk)`;
+      html += `
+        <div class="treemap-cell" style="left:${item.x}%;top:${item.y}%;width:${item.w}%;height:${item.h}%;background-color:${item.color};opacity:0.5;cursor:default;" data-tip="${tip}">
+          ${showLabel ? `<span class="treemap-name" style="color:#888;">${item.name}</span>` : ''}
+          ${showValue ? `<span class="treemap-value" style="color:#666;">${formatBytes(item.size)}</span>` : ''}
+        </div>
+      `;
+    } else {
+      const status = item.confirmed ? '' : ' (scanning...)';
+      const tip = `${item.path} | ${item.confirmed ? formatBytes(item.size) : 'scanning...'}${status}${item.confirmed ? ` (${pct}% of disk)` : ''}`;
+      const isSelected = item.index === selectedFolderIndex;
+      // Unconfirmed items have striped pattern overlay
+      const opacity = item.confirmed ? 1 : 0.6;
+      const pattern = item.confirmed ? '' : 'background-image: repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.1) 5px, rgba(0,0,0,0.1) 10px);';
+      const selectedStyle = isSelected ? 'outline: 3px solid #fff; outline-offset: -3px; z-index: 10;' : '';
+      html += `
+        <div class="treemap-cell folder-cell${isSelected ? ' selected' : ''}" style="left:${item.x}%;top:${item.y}%;width:${item.w}%;height:${item.h}%;background-color:${item.color};opacity:${opacity};${pattern}${selectedStyle}" data-tip="${tip}" data-path="${item.path}" data-index="${item.index}">
+          ${showLabel ? `<span class="treemap-name">${item.name}</span>` : ''}
+          ${showValue ? `<span class="treemap-value">${item.confirmed ? formatBytes(item.size) : '...'}</span>` : ''}
+        </div>
+      `;
+    }
   }
   html += '</div>';
   container.innerHTML = html;
@@ -1024,7 +1088,7 @@ function updateDetailView(type, data) {
     }
     // Treemap of top CPU consumers
     if (data.processes?.list) {
-      renderTreemap('detail-cpu-dist', data.processes.list, 'cpu', 'CPU');
+      renderTreemap('detail-cpu-dist', data.processes.list, 'cpu', 'CPU', data.cpu.load);
     }
   } else if (type === 'memory' && data.memory) {
     const mem = data.memory;
@@ -1075,7 +1139,7 @@ function updateDetailView(type, data) {
     }
     // Treemap of top memory consumers
     if (data.processes?.list) {
-      renderTreemap('detail-mem-dist', data.processes.list, 'mem', 'Memory');
+      renderTreemap('detail-mem-dist', data.processes.list, 'mem', 'Memory', memPercent);
     }
   } else if (type === 'network' && data.network) {
     const netRx = data.network.reduce((sum, n) => sum + (n.rx_sec || 0), 0);
@@ -1151,7 +1215,8 @@ function updateUI(data, isFull) {
     }
   }
   if (data.memory) {
-    const memTotal = isFull ? data.memory.total : (data.memory.used + data.memory.free);
+    // Always use total for accurate percentage (used + free != total due to cached/buffers)
+    const memTotal = data.memory.total || (data.memory.used + data.memory.free);
     const memPercent = (data.memory.used / memTotal) * 100;
     pushHistory(statsHistory.memory.percent, memPercent);
     pushHistory(statsHistory.memory.used, data.memory.used);
@@ -1201,8 +1266,8 @@ function updateUI(data, isFull) {
       `).join('');
     }
 
-    // Memory
-    const memPercent = (data.memory.used / (isFull ? data.memory.total : (data.memory.used + data.memory.free))) * 100;
+    // Memory - always use total for accurate percentage
+    const memPercent = (data.memory.used / (data.memory.total || (data.memory.used + data.memory.free))) * 100;
     pushChartData(memChart, memPercent);
     document.getElementById('mem-bar').style.width = memPercent.toFixed(1) + '%';
 
@@ -1718,6 +1783,14 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('network-card').addEventListener('click', () => switchView('network'));
   document.getElementById('disk-card').addEventListener('click', () => switchView('disk'));
   document.getElementById('processes').addEventListener('click', () => switchView('processes'));
+
+  // Click header to go back to main view
+  document.getElementById('header').addEventListener('click', () => {
+    if (currentView !== 'main') {
+      hideDetailView();
+    }
+  });
+  document.getElementById('header').style.cursor = 'pointer';
 
   updateHints();
 

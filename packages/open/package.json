@@ -1,0 +1,47 @@
+{
+  "name": "termweb-open",
+  "version": "0.1.0",
+  "description": "Universal file opener - routes to the appropriate termweb viewer/editor",
+  "bin": {
+    "termweb-open": "bin/cli.js"
+  },
+  "scripts": {
+    "build": "esbuild src/app.js --bundle --minify --outfile=dist/app.bundle.js",
+    "start": "node bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "dist/"
+  ],
+  "keywords": [
+    "terminal",
+    "file",
+    "viewer",
+    "open",
+    "universal",
+    "cli"
+  ],
+  "author": "teamchong",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/termweb.git",
+    "directory": "packages/open"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "termweb": "^0.9.8"
+  },
+  "devDependencies": {
+    "esbuild": "^0.19.0"
+  },
+  "optionalDependencies": {
+    "termweb-pdf": "^0.1.0",
+    "termweb-markdown": "^0.1.0",
+    "termweb-notebook": "^0.1.0",
+    "termweb-json": "^0.1.0",
+    "termweb-editor": "^0.1.0"
+  }
+}

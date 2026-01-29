@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Image Viewer</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #1e1e1e;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      cursor: grab;
+      background:
+        linear-gradient(45deg, #2a2a2a 25%, transparent 25%),
+        linear-gradient(-45deg, #2a2a2a 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #2a2a2a 75%),
+        linear-gradient(-45deg, transparent 75%, #2a2a2a 75%);
+      background-size: 20px 20px;
+      background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+    }
+
+    #image {
+      max-width: none;
+      max-height: none;
+      transform-origin: center center;
+      transition: transform 0.1s ease-out;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    #info {
+      background: rgba(0, 0, 0, 0.8);
+      padding: 8px 16px;
+      font-size: 12px;
+      text-align: center;
+      border-top: 1px solid #333;
+    }
+
+    #help {
+      position: fixed;
+      bottom: 40px;
+      right: 10px;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      line-height: 1.5;
+      opacity: 0.7;
+    }
+
+    #help:hover {
+      opacity: 1;
+    }
+
+    kbd {
+      background: #444;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <img id="image" alt="Image">
+  </div>
+  <div id="info">Loading...</div>
+  <div id="help">
+    <kbd>+</kbd>/<kbd>-</kbd> Zoom &nbsp;
+    <kbd>0</kbd> Reset &nbsp;
+    <kbd>f</kbd> Fit &nbsp;
+    <kbd>hjkl</kbd> Pan
+  </div>
+  <script src="app.bundle.js"></script>
+</body>
+</html>
