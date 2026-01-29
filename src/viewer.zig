@@ -1679,98 +1679,6 @@ pub const Viewer = struct {
         }
     }
 
-    /// Handle console messages - look for __TERMWEB_PICKER__ or __TERMWEB_FS__ markers
-    fn handleConsoleMessage(self: *Viewer, payload: []const u8) !void {
-        // Check for clipboard marker - sync browser clipboard to system clipboard
-        const clipboard_marker = "__TERMWEB_CLIPBOARD__:";
-        if (std.mem.indexOf(u8, payload, clipboard_marker)) |clip_pos| {
-            self.log("[CONSOLE MSG] Found clipboard marker\n", .{});
-            try self.handleClipboardSync(payload, clip_pos + clipboard_marker.len);
-            return;
-        }
-
-        // Check for clipboard read request - browser wants host clipboard
-        const clipboard_request = "__TERMWEB_CLIPBOARD_REQUEST__";
-        if (std.mem.indexOf(u8, payload, clipboard_request) != null) {
-            self.log("[CONSOLE MSG] Clipboard read request - syncing from host\n", .{});
-            self.handleClipboardReadRequest();
-            return;
-        }
-
-        // Check for file system operation marker
-        const fs_marker = "__TERMWEB_FS__:";
-        if (std.mem.indexOf(u8, payload, fs_marker)) |fs_pos| {
-            self.log("[CONSOLE MSG] Found FS marker at {d}\n", .{fs_pos});
-            try self.handleFsRequest(payload, fs_pos + fs_marker.len);
-            return;
-        }
-
-        // Check for picker marker
-        const picker_marker = "__TERMWEB_PICKER__:";
-        const marker_pos = std.mem.indexOf(u8, payload, picker_marker) orelse {
-            self.log("[CONSOLE MSG] No picker marker found\n", .{});
-            return;
-        };
-        self.log("[CONSOLE MSG] Found picker marker at {d}\n", .{marker_pos});
-
-        // Extract picker type: file, directory, or save
-        const type_start = marker_pos + picker_marker.len;
-        const type_end = std.mem.indexOfPos(u8, payload, type_start, ":") orelse
-            std.mem.indexOfPos(u8, payload, type_start, "\"") orelse return;
-        const picker_type = payload[type_start..type_end];
-
-        self.log("[PICKER] type={s}\n", .{picker_type});
-
-        // Determine native picker mode
-        const mode: FilePickerMode = if (std.mem.eql(u8, picker_type, "directory"))
-            .folder
-        else if (std.mem.eql(u8, picker_type, "file"))
-            .single
-        else if (std.mem.eql(u8, picker_type, "save"))
-            .single // save uses single file picker
-        else
-            return;
-
-        // Show native OS file picker
-        const file_path = try dialog_mod.showNativeFilePicker(self.allocator, mode);
-        defer if (file_path) |p| self.allocator.free(p);
-
-        // Send result back to JavaScript
-        if (file_path) |path| {
-            // Remove trailing slash if present
-            const trimmed_path = if (path.len > 1 and path[path.len - 1] == '/')
-                path[0 .. path.len - 1]
-            else
-                path;
-
-            // Extract just the name from the path
-            const name = if (std.mem.lastIndexOfScalar(u8, trimmed_path, '/')) |idx|
-                trimmed_path[idx + 1 ..]
-            else
-                trimmed_path;
-
-            const is_dir = mode == .folder;
-
-            // Add to allowed roots for security (only selected directories/files can be accessed)
-            // Use trimmed path (without trailing slash) for consistency
-            const path_copy = try self.allocator.dupe(u8, trimmed_path);
-            try self.allowed_fs_roots.append(self.allocator, path_copy);
-            self.log("[PICKER] Added allowed root: {s}\n", .{trimmed_path});
-
-            // Call the JavaScript callback
-            var script_buf: [4096]u8 = undefined;
-            const script = std.fmt.bufPrint(&script_buf,
-                "window.__termwebPickerResult(true, '{s}', '{s}', {s})",
-                .{ trimmed_path, name, if (is_dir) "true" else "false" },
-            ) catch return;
-
-            try self.evalJavaScript(script);
-        } else {
-            // User cancelled
-            try self.evalJavaScript("window.__termwebPickerResult(false)");
-        }
-    }
-
     /// Handle picker request from File System Access API polyfill
     pub fn handlePickerRequest(self: *Viewer, payload: []const u8, start: usize) !void {
         // Extract picker type: file, directory, or save
@@ -1815,11 +1723,16 @@ pub const Viewer = struct {
             try self.allowed_fs_roots.append(self.allocator, path_copy);
             self.log("[PICKER] Added allowed root: {s}\n", .{trimmed_path});
 
-            // Call the JavaScript callback
+            // Call the JavaScript callback (escape single quotes in path/name)
+            var escaped_path_buf: [2048]u8 = undefined;
+            var escaped_name_buf: [512]u8 = undefined;
+            const escaped_path = escapeSingleQuotes(trimmed_path, &escaped_path_buf);
+            const escaped_name = escapeSingleQuotes(name, &escaped_name_buf);
+
             var script_buf: [4096]u8 = undefined;
             const script = std.fmt.bufPrint(&script_buf,
                 "window.__termwebPickerResult(true, '{s}', '{s}', {s})",
-                .{ trimmed_path, name, if (is_dir) "true" else "false" },
+                .{ escaped_path, escaped_name, if (is_dir) "true" else "false" },
             ) catch return;
 
             try self.evalJavaScript(script);
@@ -1864,6 +1777,27 @@ pub const Viewer = struct {
         const toolbar = @import("ui/toolbar.zig");
         toolbar.copyToClipboard(self.allocator, unescaped);
         self.log("[CLIPBOARD] Copied to system clipboard\n", .{});
+    }
+
+    /// Escape single quotes for JavaScript string literals
+    fn escapeSingleQuotes(input: []const u8, buf: []u8) []const u8 {
+        var j: usize = 0;
+        for (input) |c| {
+            if (j + 2 > buf.len) break;
+            if (c == '\'') {
+                buf[j] = '\\';
+                buf[j + 1] = '\'';
+                j += 2;
+            } else if (c == '\\') {
+                buf[j] = '\\';
+                buf[j + 1] = '\\';
+                j += 2;
+            } else {
+                buf[j] = c;
+                j += 1;
+            }
+        }
+        return buf[0..j];
     }
 
     /// Unescape a JSON string, handling \n, \t, \\, \", and \uXXXX sequences
