@@ -248,15 +248,145 @@ pub const KittyGraphics = struct {
         return image_id;
     }
 
-    /// Display already base64-encoded image data directly
-    /// Uses chunked transfer for large images (Kitty protocol requirement)
+    /// Display base64-encoded JPEG image by decoding to RGBA first
+    /// Kitty doesn't support JPEG directly, so we must decode to raw pixels
     pub fn displayBase64Image(
         self: *KittyGraphics,
         writer: anytype,
         base64_data: []const u8,
         opts: DisplayOptions,
     ) !u32 {
-        return self.displayBase64ImageWithFormat(writer, base64_data, opts, 32);
+        // Decode base64 to get raw JPEG bytes
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(base64_data) catch return error.InvalidBase64;
+
+        // Use stack buffer for small images, allocate for large
+        var stack_buf: [256 * 1024]u8 = undefined;
+        var decoded: []u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |buf| self.allocator.free(buf);
+
+        if (decoded_len <= stack_buf.len) {
+            decoded = stack_buf[0..decoded_len];
+        } else {
+            heap_buf = try self.allocator.alloc(u8, decoded_len);
+            decoded = heap_buf.?;
+        }
+
+        decoder.decode(decoded, base64_data) catch return error.InvalidBase64;
+
+        // Decode JPEG to RGBA
+        var img = decode.decode(decoded) orelse return error.ImageDecodeFailed;
+        defer img.deinit();
+
+        // Compress RGBA with zlib for smaller transfer
+        const compressor = libdeflate.libdeflate_alloc_compressor(6);
+        if (compressor == null) {
+            // Fallback: send uncompressed RGBA as base64
+            const rgba_base64 = std.base64.standard.Encoder.calcSize(img.data.len);
+            const rgba_buf = try self.allocator.alloc(u8, rgba_base64);
+            defer self.allocator.free(rgba_buf);
+            _ = std.base64.standard.Encoder.encode(rgba_buf, img.data);
+            return self.displayBase64RawRGBA(writer, rgba_buf, img.width, img.height, false, opts);
+        }
+        defer libdeflate.libdeflate_free_compressor(compressor);
+
+        const max_compressed = libdeflate.libdeflate_zlib_compress_bound(compressor, img.data.len);
+        const compressed_buf = try self.allocator.alloc(u8, max_compressed);
+        defer self.allocator.free(compressed_buf);
+
+        const compressed_len = libdeflate.libdeflate_zlib_compress(
+            compressor,
+            img.data.ptr,
+            img.data.len,
+            compressed_buf.ptr,
+            max_compressed,
+        );
+
+        if (compressed_len == 0) {
+            // Fallback: send uncompressed
+            const rgba_base64 = std.base64.standard.Encoder.calcSize(img.data.len);
+            const rgba_buf = try self.allocator.alloc(u8, rgba_base64);
+            defer self.allocator.free(rgba_buf);
+            _ = std.base64.standard.Encoder.encode(rgba_buf, img.data);
+            return self.displayBase64RawRGBA(writer, rgba_buf, img.width, img.height, false, opts);
+        }
+
+        // Base64 encode compressed data
+        const compressed_base64_len = std.base64.standard.Encoder.calcSize(compressed_len);
+        const compressed_base64 = try self.allocator.alloc(u8, compressed_base64_len);
+        defer self.allocator.free(compressed_base64);
+        _ = std.base64.standard.Encoder.encode(compressed_base64, compressed_buf[0..compressed_len]);
+
+        return self.displayBase64RawRGBA(writer, compressed_base64, img.width, img.height, true, opts);
+    }
+
+    /// Display base64-encoded raw RGBA data (with optional zlib compression)
+    fn displayBase64RawRGBA(
+        self: *KittyGraphics,
+        writer: anytype,
+        base64_data: []const u8,
+        width: u32,
+        height: u32,
+        compressed: bool,
+        opts: DisplayOptions,
+    ) !u32 {
+        const image_id = opts.image_id orelse blk: {
+            const id = self.next_image_id;
+            self.next_image_id += 1;
+            break :blk id;
+        };
+
+        const CHUNK_SIZE: usize = config.KITTY_CHUNK_SIZE;
+        var offset: usize = 0;
+        var first_chunk = true;
+
+        while (offset < base64_data.len) {
+            const remaining = base64_data.len - offset;
+            const chunk_len = @min(remaining, CHUNK_SIZE);
+            const is_last = (offset + chunk_len >= base64_data.len);
+
+            try writer.writeAll("\x1b_G");
+
+            if (first_chunk) {
+                // f=32 for RGBA, o=z if compressed
+                if (compressed) {
+                    try writer.print("a=T,f=32,o=z,s={d},v={d},t=d,i={d},q=2,m={d}", .{
+                        width,
+                        height,
+                        image_id,
+                        if (is_last) @as(u8, 0) else @as(u8, 1),
+                    });
+                } else {
+                    try writer.print("a=T,f=32,s={d},v={d},t=d,i={d},q=2,m={d}", .{
+                        width,
+                        height,
+                        image_id,
+                        if (is_last) @as(u8, 0) else @as(u8, 1),
+                    });
+                }
+
+                if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
+                if (opts.columns) |c| try writer.print(",c={d}", .{c});
+                if (opts.rows) |r| try writer.print(",r={d}", .{r});
+                if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
+                if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
+                if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
+                try writer.writeAll(",C=1");
+
+                first_chunk = false;
+            } else {
+                try writer.print("m={d}", .{if (is_last) @as(u8, 0) else @as(u8, 1)});
+            }
+
+            try writer.writeByte(';');
+            try writer.writeAll(base64_data[offset .. offset + chunk_len]);
+            try writer.writeAll("\x1b\\");
+
+            offset += chunk_len;
+        }
+
+        return image_id;
     }
 
     /// Alias for backwards compatibility
