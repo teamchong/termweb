@@ -717,11 +717,10 @@ pub const CdpClient = struct {
         height: u32,
         every_nth_frame: u8,
     ) !void {
-        // WebSocket-only mode: initialize frame pool and start reader thread
+        // WebSocket-only mode: initialize frame pool (reader thread already started at connect)
         if (self.pipe_client == null) {
             if (self.page_ws) |ws| {
                 try ws.initFramePool();
-                try ws.startReaderThread();
             } else {
                 return CdpError.WebSocketConnectionFailed;
             }
