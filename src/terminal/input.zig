@@ -398,43 +398,68 @@ pub const InputReader = struct {
         return null; // Incomplete
     }
 
-    /// Parse Kitty keyboard protocol sequence (ESC [ code u or ESC [ code ; modifiers u)
+    /// Parse Kitty keyboard protocol sequence
+    /// Formats:
+    ///   ESC [ code u
+    ///   ESC [ code ; modifiers u
+    ///   ESC [ code ; modifiers : event-type u
+    ///   ESC [ code ; modifiers ; text u  (with flag 16 - text reporting)
+    ///   ESC [ code ; modifiers : event-type ; text u
     fn parseKittyKeyboard(self: *InputReader) !?Input {
         // Log the raw escape sequence for debugging
         inputDebugLog("[KITTY] Parsing: len={d} buf='{s}'", .{ self.escape_len, self.escape_buffer[0..self.escape_len] });
 
-        // Format: ESC [ code u  or  ESC [ code ; modifiers u  or  ESC [ code ; modifiers : event-type u
-        // Find semicolons and colons
-        var semi_idx: ?usize = null;
-        var colon_idx: ?usize = null;
         const term_idx = self.escape_len - 1; // 'u' position
 
+        // Find all semicolons and first colon
+        var semi1_idx: ?usize = null;
+        var semi2_idx: ?usize = null;
+        var colon_idx: ?usize = null;
+
         for (self.escape_buffer[2..term_idx], 0..) |byte, i| {
-            if (byte == ';' and semi_idx == null) {
-                semi_idx = i + 2;
+            if (byte == ';') {
+                if (semi1_idx == null) {
+                    semi1_idx = i + 2;
+                } else if (semi2_idx == null) {
+                    semi2_idx = i + 2;
+                }
             } else if (byte == ':' and colon_idx == null) {
                 colon_idx = i + 2;
             }
         }
 
-        // Parse the unicode codepoint
-        const code_end = semi_idx orelse term_idx;
+        // Parse the unicode codepoint (base key)
+        const code_end = semi1_idx orelse term_idx;
         const code_str = self.escape_buffer[2..code_end];
         const code = std.fmt.parseInt(u32, code_str, 10) catch return null;
 
         // Parse modifiers if present (1=none, 2=shift, 4=ctrl, 8=alt, etc.)
         var modifiers: u8 = 1;
-        if (semi_idx) |si| {
-            const mod_end = colon_idx orelse term_idx;
+        var event_type: u8 = 1; // Default: press
+
+        if (semi1_idx) |si| {
+            // Modifiers section ends at colon (event-type), second semicolon (text), or terminator
+            const mod_end = colon_idx orelse semi2_idx orelse term_idx;
             const mod_str = self.escape_buffer[si + 1 .. mod_end];
             modifiers = std.fmt.parseInt(u8, mod_str, 10) catch 1;
+
+            // Parse event type if colon present (1=press, 2=repeat, 3=release)
+            if (colon_idx) |ci| {
+                const event_end = semi2_idx orelse term_idx;
+                if (event_end > ci + 1) {
+                    const event_str = self.escape_buffer[ci + 1 .. event_end];
+                    event_type = std.fmt.parseInt(u8, event_str, 10) catch 1;
+                }
+            }
         }
 
-        // Parse event type if present (1=press, 2=repeat, 3=release)
-        var event_type: u8 = 1; // Default: press
-        if (colon_idx) |ci| {
-            const event_str = self.escape_buffer[ci + 1 .. term_idx];
-            event_type = std.fmt.parseInt(u8, event_str, 10) catch 1;
+        // Parse text field if present (flag 16 - actual produced character)
+        var text_code: ?u32 = null;
+        if (semi2_idx) |si2| {
+            if (term_idx > si2 + 1) {
+                const text_str = self.escape_buffer[si2 + 1 .. term_idx];
+                text_code = std.fmt.parseInt(u32, text_str, 10) catch null;
+            }
         }
 
         // Only handle key press events (event_type 1) and repeat (event_type 2)
@@ -454,14 +479,24 @@ pub const InputReader = struct {
             (if (alt) @as(u8, 1) else 0) |
             (if (super) @as(u8, 4) else 0);
 
-        inputDebugLog("[KITTY] Parsed: code={d} char='{c}' raw_mod={d} mod_bits={d} cdp_mods={d} super={}", .{
+        // Use text code if available (actual produced character), otherwise base code
+        const effective_code = text_code orelse code;
+
+        inputDebugLog("[KITTY] Parsed: code={d} text={?d} effective='{c}' raw_mod={d} cdp_mods={d}", .{
             code,
-            if (code >= 32 and code < 127) @as(u8, @intCast(code)) else '.',
+            text_code,
+            if (effective_code >= 32 and effective_code < 127) @as(u8, @intCast(effective_code)) else '.',
             modifiers,
-            mod_bits,
             cdp_mods,
-            super,
         });
+
+        // When text is provided, use it directly (already shifted/composed)
+        // Otherwise fall back to unicodeToKey which handles special keys
+        if (text_code) |tc| {
+            if (tc >= 32 and tc <= 126) {
+                return .{ .key = .{ .key = .{ .char = @intCast(tc) }, .modifiers = cdp_mods } };
+            }
+        }
         return .{ .key = .{ .key = self.unicodeToKey(code, mod_bits), .modifiers = cdp_mods } };
     }
 

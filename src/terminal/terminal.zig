@@ -148,9 +148,10 @@ pub const Terminal = struct {
         // Enable SGR pixel mouse mode (actual pixel coordinates, not cells)
         try writer.writeAll("\x1b[?1016h");
 
-        // Enable Kitty keyboard protocol (flags: 1=disambiguate, 8=report all keys)
+        // Enable Kitty keyboard protocol (flags: 1=disambiguate, 8=report all keys, 16=report text)
         // Flag 8 is needed for Cmd+letter keys to be reported instead of intercepted
-        try writer.writeAll("\x1b[>9u");
+        // Flag 16 reports the actual produced text (handles shift+key correctly for any keyboard layout)
+        try writer.writeAll("\x1b[>25u");
 
         // Enable bracketed paste mode (for proper paste handling)
         try writer.writeAll("\x1b[?2004h");
