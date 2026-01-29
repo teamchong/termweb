@@ -223,8 +223,11 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const content_pixel_height: u32 = content_rows * cell_height;
 
     // Original viewport (before any limits) - used for coordinate ratio calculation
-    const original_viewport_width: u32 = raw_width / dpr;
-    const original_viewport_height: u32 = content_pixel_height / dpr;
+    // Use sensible defaults if terminal pixel detection fails (common over SSH)
+    const MIN_WIDTH: u32 = 800;
+    const MIN_HEIGHT: u32 = 600;
+    const original_viewport_width: u32 = @max(raw_width / dpr, MIN_WIDTH);
+    const original_viewport_height: u32 = @max(content_pixel_height / dpr, MIN_HEIGHT);
 
     var viewport_width: u32 = original_viewport_width;
     var viewport_height: u32 = original_viewport_height;
