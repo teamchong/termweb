@@ -823,6 +823,8 @@ pub const CdpClient = struct {
                         .device_width = ws_frame.device_width,
                         .device_height = ws_frame.device_height,
                         .generation = ws_frame.generation,
+                        .chrome_timestamp_ms = ws_frame.chrome_timestamp_ms,
+                        .receive_timestamp_ns = ws_frame.receive_timestamp_ns,
                     };
                 }
             }

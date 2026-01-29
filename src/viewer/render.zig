@@ -6,6 +6,7 @@ const kitty_mod = @import("../terminal/kitty_graphics.zig");
 const coordinates_mod = @import("../terminal/coordinates.zig");
 const screenshot_api = @import("../chrome/screenshot.zig");
 const ui_mod = @import("../ui/mod.zig");
+const adaptive = @import("adaptive.zig");
 
 const CoordinateMapper = coordinates_mod.CoordinateMapper;
 const Placement = ui_mod.Placement;
@@ -192,6 +193,28 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
         viewer.perf_max_render_ns = render_elapsed;
     }
 
+    // Calculate write latency (Zig processing + terminal write)
+    const write_latency_ms: f32 = @floatFromInt(@divFloor(render_elapsed, std.time.ns_per_ms));
+
+    // Update adaptive quality controller with latency data
+    const tier_changed = viewer.adaptive_state.processFrame(frame.chrome_timestamp_ms, write_latency_ms);
+
+    // If tier changed, restart screencast with new quality settings
+    if (tier_changed) {
+        viewer.log("[ADAPTIVE] Tier changed to {} ({s}), quality={}, everyNth={}, latency_ema={d:.1}ms\n", .{
+            viewer.adaptive_state.tier,
+            viewer.adaptive_state.getName(),
+            viewer.adaptive_state.getQuality(),
+            viewer.adaptive_state.getEveryNth(),
+            viewer.adaptive_state.latency_ema_ms,
+        });
+
+        // Restart screencast with new quality settings
+        restartScreencastWithTier(viewer) catch |err| {
+            viewer.log("[ADAPTIVE] Failed to restart screencast: {}\n", .{err});
+        };
+    }
+
     // Log performance stats every 5 seconds
     if (now - viewer.perf_last_report_time > 5 * std.time.ns_per_s) {
         const avg_ms = if (viewer.perf_frame_count > 0)
@@ -200,9 +223,15 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
             0;
         const max_ms = @divFloor(viewer.perf_max_render_ns, @as(i128, std.time.ns_per_ms));
 
-        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}, content_id={?}, cursor_id={?}, gen={}\n", .{
-            viewer.perf_frame_count, avg_ms, max_ms, viewer.target_fps, viewer.frames_skipped,
-            viewer.last_content_image_id, viewer.cursor_image_id, viewer.last_rendered_generation,
+        viewer.log("[PERF] {} frames, avg={}ms, max={}ms, target={}fps, skipped={}, tier={} ({s}), latency_ema={d:.1}ms\n", .{
+            viewer.perf_frame_count,
+            avg_ms,
+            max_ms,
+            viewer.target_fps,
+            viewer.frames_skipped,
+            viewer.adaptive_state.tier,
+            viewer.adaptive_state.getName(),
+            viewer.adaptive_state.latency_ema_ms,
         });
 
         // Reset counters
@@ -400,4 +429,18 @@ pub fn renderToolbar(viewer: anytype, writer: anytype) !void {
         renderer.setUrl(viewer.current_url);
         try renderer.render(writer);
     }
+}
+
+/// Restart screencast with current adaptive quality tier settings
+fn restartScreencastWithTier(viewer: anytype) !void {
+    const quality = viewer.adaptive_state.getQuality();
+    const every_nth = viewer.adaptive_state.getEveryNth();
+
+    try screenshot_api.startScreencast(viewer.cdp_client, viewer.allocator, .{
+        .format = viewer.screencast_format,
+        .quality = quality,
+        .width = viewer.viewport_width,
+        .height = viewer.viewport_height,
+        .every_nth_frame = every_nth,
+    });
 }

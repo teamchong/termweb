@@ -232,6 +232,9 @@ pub const Viewer = struct {
     // Device pixel ratio (1 for standard displays, 2 for HiDPI/Retina)
     dpr: u32,
 
+    // Adaptive quality state (latency-based tier adjustment)
+    adaptive_state: viewer_mod.adaptive.AdaptiveState,
+
     // Performance profiling
     perf_frame_count: u64,
     perf_total_render_ns: i128,
@@ -389,6 +392,7 @@ pub const Viewer = struct {
             .natural_scroll = isNaturalScrollEnabled(),
             .is_ghostty = true, // Kitty-compatible terminal required
             .dpr = 2, // Default to HiDPI, will be updated on first resize
+            .adaptive_state = .{}, // Default tier 1 (normal)
             .perf_frame_count = 0,
             .perf_total_render_ns = 0,
             .perf_max_render_ns = 0,

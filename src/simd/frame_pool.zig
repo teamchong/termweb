@@ -14,6 +14,10 @@ pub const FrameSlot = struct {
     device_height: u32,
     /// Generation counter for invalidation checking
     generation: u64,
+    /// Chrome's timestamp from screencast metadata (ms since epoch, 0 if not available)
+    chrome_timestamp_ms: i64 = 0,
+    /// When Zig received the frame (nanoseconds from nanoTimestamp)
+    receive_timestamp_ns: i128 = 0,
     /// Reference count - non-zero means slot is being read (don't overwrite)
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -76,6 +80,8 @@ pub const FramePool = struct {
             slot.device_width = 0;
             slot.device_height = 0;
             slot.generation = 0;
+            slot.chrome_timestamp_ms = 0;
+            slot.receive_timestamp_ns = 0;
             slot.ref_count = std.atomic.Value(u32).init(0);
         }
 
@@ -108,6 +114,21 @@ pub const FramePool = struct {
         device_width: u32,
         device_height: u32,
     ) !?u64 {
+        return self.writeFrameWithTimestamp(data, session_id, device_width, device_height, 0, 0);
+    }
+
+    /// Write a frame with timestamp information for latency tracking
+    /// chrome_timestamp_ms: Chrome's timestamp from screencast metadata (ms since epoch)
+    /// receive_timestamp_ns: When Zig received the frame (from nanoTimestamp)
+    pub fn writeFrameWithTimestamp(
+        self: *FramePool,
+        data: []const u8,
+        session_id: u32,
+        device_width: u32,
+        device_height: u32,
+        chrome_timestamp_ms: i64,
+        receive_timestamp_ns: i128,
+    ) !?u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -135,6 +156,8 @@ pub const FramePool = struct {
                 slot.device_width = device_width;
                 slot.device_height = device_height;
                 slot.generation = gen;
+                slot.chrome_timestamp_ms = chrome_timestamp_ms;
+                slot.receive_timestamp_ns = receive_timestamp_ns;
 
                 // Advance write pointer (ring buffer)
                 self.write_idx = (self.write_idx + 1) % self.slots.len;

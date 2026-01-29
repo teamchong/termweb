@@ -60,12 +60,16 @@ pub const PipeError = error{
 
 /// Screencast frame structure with zero-copy reference to pool slot
 pub const ScreencastFrame = struct {
-    data: []const u8, 
-    slot: *FrameSlot, 
+    data: []const u8,
+    slot: *FrameSlot,
     session_id: u32,
     device_width: u32,
     device_height: u32,
     generation: u64,
+    /// Chrome's timestamp from screencast metadata (ms since epoch, 0 if not available)
+    chrome_timestamp_ms: i64,
+    /// When Zig received the frame (nanoseconds from nanoTimestamp)
+    receive_timestamp_ns: i128,
 
     /// Release the pool slot reference
     pub fn deinit(self: *ScreencastFrame) void {
@@ -478,6 +482,8 @@ pub const PipeCdpClient = struct {
             .device_width = slot.device_width,
             .device_height = slot.device_height,
             .generation = slot.generation,
+            .chrome_timestamp_ms = slot.chrome_timestamp_ms,
+            .receive_timestamp_ns = slot.receive_timestamp_ns,
         };
     }
 
@@ -528,6 +534,10 @@ pub const PipeCdpClient = struct {
         const device_width = self.extractMetadataInt(payload, "deviceWidth") catch 0;
         const device_height = self.extractMetadataInt(payload, "deviceHeight") catch 0;
 
+        // Extract Chrome's timestamp for latency measurement
+        const chrome_timestamp_ms = self.extractMetadataTimestamp(payload);
+        const receive_timestamp_ns = std.time.nanoTimestamp();
+
         // Debug: log raw metadata JSON
         {
             // Find metadata object in payload
@@ -545,7 +555,7 @@ pub const PipeCdpClient = struct {
             }
         }
 
-        if (try self.frame_pool.writeFrame(data, frame_sid, device_width, device_height)) |_| {
+        if (try self.frame_pool.writeFrameWithTimestamp(data, frame_sid, device_width, device_height, chrome_timestamp_ms, receive_timestamp_ns)) |_| {
             _ = self.frame_count.fetchAdd(1, .monotonic);
         }
 
@@ -631,6 +641,32 @@ pub const PipeCdpClient = struct {
         var end = v_start;
         while (end < payload.len and (payload[end] >= '0' and payload[end] <= '9')) : (end += 1) {}
         return std.fmt.parseInt(u32, payload[v_start..end], 10);
+    }
+
+    /// Extract Chrome's timestamp from metadata (seconds since epoch as float)
+    /// Returns milliseconds since epoch, or 0 if not found
+    fn extractMetadataTimestamp(self: *PipeCdpClient, payload: []const u8) i64 {
+        _ = self;
+        const m_start = std.mem.indexOf(u8, payload, "\"metadata\":{") orelse return 0;
+        const key = "\"timestamp\":";
+        const k_start = std.mem.indexOfPos(u8, payload, m_start, key) orelse return 0;
+        const v_start = k_start + key.len;
+
+        // Find end of number (may include decimal point and exponent)
+        var end = v_start;
+        while (end < payload.len) : (end += 1) {
+            const c = payload[end];
+            if ((c >= '0' and c <= '9') or c == '.' or c == 'e' or c == 'E' or c == '+' or c == '-') {
+                continue;
+            }
+            break;
+        }
+
+        if (end == v_start) return 0;
+
+        // Parse as float (seconds since epoch) and convert to milliseconds
+        const timestamp_f = std.fmt.parseFloat(f64, payload[v_start..end]) catch return 0;
+        return @intFromFloat(timestamp_f * 1000.0);
     }
 
     fn acknowledgeFrame(self: *PipeCdpClient, r_sid: ?[]const u8, f_sid: u32) !void {

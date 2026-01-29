@@ -17,6 +17,7 @@ pub const input_handler = @import("input_handler.zig");
 pub const mouse_handler = @import("mouse_handler.zig");
 pub const cdp_events = @import("cdp_events.zig");
 pub const tabs = @import("tabs.zig");
+pub const adaptive = @import("adaptive.zig");
 
 // Re-export commonly used types
 pub const getMimeType = helpers.getMimeType;
