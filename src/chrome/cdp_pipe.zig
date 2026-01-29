@@ -344,7 +344,8 @@ pub const PipeCdpClient = struct {
 
     fn waitForResponse(self: *PipeCdpClient, id: u32) ![]u8 {
         if (self.reader_thread != null) {
-            const timeout_ns = 5 * std.time.ns_per_s;
+            // Longer timeout for SSH/server environments where Chrome may be slower
+            const timeout_ns = 30 * std.time.ns_per_s;
             const start_time = std.time.nanoTimestamp();
 
             while (true) {

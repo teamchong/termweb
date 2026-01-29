@@ -390,21 +390,8 @@ pub fn launchChromePipe(
     try args_list.append(allocator, chrome_bin.path);
 
     if (options.headless) {
-        // On Linux via SSH, skip headless mode and use the desktop's display instead
-        // Chrome headless on Linux doesn't support screencast
-        const is_ssh = std.posix.getenv("SSH_CONNECTION") != null or std.posix.getenv("SSH_CLIENT") != null;
-        const has_display = std.posix.getenv("DISPLAY") != null;
-
-        if (builtin.os.tag == .linux and is_ssh and has_display) {
-            // SSH with display available - don't use headless, Chrome will use DISPLAY
-            // This allows screencast to work over SSH when desktop is running
-        } else if (builtin.os.tag == .linux and is_ssh) {
-            // SSH without display - set DISPLAY=:0 to use desktop's display
-            const setenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = "setenv" });
-            _ = setenv("DISPLAY", ":0", 1);
-        } else {
-            try args_list.append(allocator, "--headless=new");
-        }
+        // Always use headless=new - it supports screencast on all platforms
+        try args_list.append(allocator, "--headless=new");
     }
 
     // Use pipe for high-bandwidth screencast, WebSocket for commands
@@ -449,8 +436,9 @@ pub fn launchChromePipe(
         try args_list.append(allocator, "--disable-software-rasterizer");
     }
 
-    // Linux headless: minimal flags (avoid --disable-gpu which blocks screencast)
+    // Linux headless: add flags needed for server/SSH environments
     if (builtin.os.tag == .linux and options.headless) {
+        try args_list.append(allocator, "--no-sandbox");
         try args_list.append(allocator, "--disable-dev-shm-usage");
     }
 
