@@ -254,7 +254,7 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
         } else |_| {}
     }
 
-    // If we have chrome inner dims (from extension resize) but no frame dims yet, capture them now
+    // If we have chrome inner dims but no frame dims yet, capture them now
     if (viewer.chrome_inner_width > 0 and viewer.chrome_inner_height > 0 and
         (viewer.chrome_inner_frame_width == 0 or viewer.chrome_inner_frame_height == 0))
     {

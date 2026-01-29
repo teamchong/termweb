@@ -62,7 +62,7 @@ pub const CdpEvent = struct {
 /// - page_ws: all page-level commands (mouse, keyboard, navigation, events)
 /// - browser_ws: browser-level commands (downloads)
 ///
-/// WebSocket-only mode (for extension support in headless):
+/// WebSocket-only mode:
 /// - pipe_client: null
 /// - page_ws: handles EVERYTHING including screencast frames
 /// - browser_ws: browser-level commands (downloads)
@@ -117,7 +117,6 @@ pub const CdpClient = struct {
         };
 
         // Inject File System Access API polyfill with full file system bridge
-        // Note: In non-headless mode, the termweb extension handles this instead
         // Security: Only allows access to directories user explicitly selected via picker
         const polyfill_script = @embedFile("fs_polyfill.js");
         var polyfill_json_buf: [65536]u8 = undefined;
@@ -134,7 +133,6 @@ pub const CdpClient = struct {
         if (perm_result) |r| allocator.free(r);
 
         // Inject Clipboard interceptor polyfill - runs in all frames (including iframes)
-        // Note: In non-headless mode, the termweb extension handles this instead
         // This enables bidirectional clipboard sync between browser and host
         const clipboard_script = @embedFile("clipboard_polyfill.js");
         var clipboard_json_buf: [16384]u8 = undefined;
@@ -204,8 +202,7 @@ pub const CdpClient = struct {
         return client;
     }
 
-    /// Initialize CDP client using WebSocket-only mode (for extension support in headless)
-    /// This mode allows extensions to run because Chrome doesn't enter pipe mode
+    /// Initialize CDP client using WebSocket-only mode
     /// All CDP communication including screencast goes through WebSocket
     pub fn initFromWebSocket(allocator: std.mem.Allocator, debug_port: u16) !*CdpClient {
         const client = try allocator.create(CdpClient);
@@ -270,7 +267,6 @@ pub const CdpClient = struct {
             if (perm_result) |r| allocator.free(r);
 
             // Inject polyfills via Page.addScriptToEvaluateOnNewDocument
-            // Note: In extension mode, the extension handles this, but we inject as backup
             const polyfill_script = @embedFile("fs_polyfill.js");
             var polyfill_json_buf: [65536]u8 = undefined;
             const polyfill_json = json_utils.escapeString(polyfill_script, &polyfill_json_buf) catch return CdpError.OutOfMemory;
