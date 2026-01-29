@@ -277,14 +277,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer chrome_instance.deinit();
 
-    // Connect CDP client - use WebSocket for SSH (pipe doesn't work over SSH)
-    const is_ssh = std.posix.getenv("SSH_CONNECTION") != null or std.posix.getenv("SSH_CLIENT") != null;
-    var client = if (is_ssh)
-        cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port) catch |err| {
-            std.debug.print("Error connecting to Chrome: {}\n", .{err});
-            std.process.exit(1);
-        }
-    else if (chrome_instance.read_fd >= 0 and chrome_instance.write_fd >= 0)
+    // Connect CDP client - prefer pipe when available (faster), fallback to WebSocket
+    var client = if (chrome_instance.read_fd >= 0 and chrome_instance.write_fd >= 0)
         cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port) catch |err| {
             std.debug.print("Error connecting to Chrome via pipe: {}\n", .{err});
             std.process.exit(1);
