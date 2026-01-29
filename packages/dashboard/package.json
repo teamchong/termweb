@@ -38,7 +38,7 @@
   "dependencies": {
     "chart.js": "^4.4.1",
     "systeminformation": "^5.21.0",
-    "termweb": "^0.9.8",
+    "termweb": "^0.9.10",
     "ws": "^8.14.0"
   },
   "devDependencies": {
