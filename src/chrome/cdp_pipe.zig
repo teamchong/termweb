@@ -213,6 +213,68 @@ pub const PipeCdpClient = struct {
         _ = try self.write_file.writeAll(command);
     }
 
+    /// Send command async and return ID for later await
+    pub fn sendCommandAsyncWithId(self: *PipeCdpClient, method: []const u8, params: ?[]const u8) !u32 {
+        const id = self.next_id.fetchAdd(1, .monotonic);
+
+        const command = if (params) |p|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}\x00",
+                .{ id, method, p },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":{d},\"method\":\"{s}\"}}\x00",
+                .{ id, method },
+            );
+        defer self.allocator.free(command);
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        _ = try self.write_file.writeAll(command);
+        return id;
+    }
+
+    /// Send session command async and return ID for later await
+    pub fn sendSessionCommandAsyncWithId(self: *PipeCdpClient, session_id: []const u8, method: []const u8, params: ?[]const u8) !u32 {
+        const id = self.next_id.fetchAdd(1, .monotonic);
+
+        const command = if (params) |p|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":{d},\"sessionId\":\"{s}\",\"method\":\"{s}\",\"params\":{s}}}\x00",
+                .{ id, session_id, method, p },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":{d},\"sessionId\":\"{s}\",\"method\":\"{s}\"}}\x00",
+                .{ id, session_id, method },
+            );
+        defer self.allocator.free(command);
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        _ = try self.write_file.writeAll(command);
+        return id;
+    }
+
+    /// Await response by command ID (blocking)
+    pub fn awaitResponse(self: *PipeCdpClient, id: u32) ![]u8 {
+        return self.waitForResponse(id);
+    }
+
+    /// Await multiple responses (blocking)
+    /// Like Promise.all - waits for all IDs, discards responses
+    pub fn awaitAll(self: *PipeCdpClient, ids: []const u32) void {
+        for (ids) |id| {
+            const response = self.waitForResponse(id) catch continue;
+            self.allocator.free(response);
+        }
+    }
+
     pub fn sendSessionCommand(self: *PipeCdpClient, session_id: []const u8, method: []const u8, params: ?[]const u8) ![]u8 {
         const id = self.next_id.fetchAdd(1, .monotonic);
 

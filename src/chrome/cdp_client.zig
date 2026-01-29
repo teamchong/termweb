@@ -99,59 +99,67 @@ pub const CdpClient = struct {
         // Attach to page target to enable page-level commands
         try client.attachToPageTarget();
 
-        // Enable domains for consistent event delivery
-        const page_enable = try client.sendCommand("Page.enable", null);
-        allocator.free(page_enable);
-        const network_enable = try client.sendCommand("Network.enable", null);
-        allocator.free(network_enable);
-
-        // Intercept file chooser dialogs (CDP-only feature for <input type="file">)
-        const intercept_file = try client.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
-        allocator.free(intercept_file);
-
-        // Create downloads directory (actual download setup happens on page_ws later)
+        // Create downloads directory
         std.fs.makeDirAbsolute("/tmp/termweb-downloads") catch |err| {
             if (err != error.PathAlreadyExists) {
                 logToFile("[CDP] Failed to create download dir: {}\n", .{err});
             }
         };
 
-        // Inject File System Access API polyfill with full file system bridge
-        // Security: Only allows access to directories user explicitly selected via picker
+        // === ASYNC INIT: Fire commands in parallel, await only what's needed ===
+
+        // Send Page.enable async (need to await before scripts)
+        const page_enable_id = try client.pipe_client.?.sendSessionCommandAsyncWithId(
+            client.session_id.?,
+            "Page.enable",
+            null,
+        );
+
+        // Fire-and-forget: domain enables and permissions (parallel with Page.enable)
+        client.sendCommandAsync("Network.enable", null) catch |err| {
+            logToFile("[CDP] Network.enable async failed: {}\n", .{err});
+        };
+        client.sendCommandAsync("Page.setInterceptFileChooserDialog", "{\"enabled\":true}") catch |err| {
+            logToFile("[CDP] setInterceptFileChooserDialog async failed: {}\n", .{err});
+        };
+        client.pipe_client.?.sendCommandAsync("Browser.grantPermissions", "{\"permissions\":[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]}") catch |err| {
+            logToFile("[CDP] grantPermissions async failed: {}\n", .{err});
+        };
+
+        // Await Page.enable before injecting scripts
+        const page_enable_response = client.pipe_client.?.awaitResponse(page_enable_id) catch |err| {
+            logToFile("[CDP] Page.enable await failed: {}\n", .{err});
+            return err;
+        };
+        allocator.free(page_enable_response);
+
+        // Fire-and-forget: polyfill injections (Chrome queues them in order)
         const polyfill_script = @embedFile("fs_polyfill.js");
         var polyfill_json_buf: [65536]u8 = undefined;
         const polyfill_json = json_utils.escapeString(polyfill_script, &polyfill_json_buf) catch return error.OutOfMemory;
-
         var polyfill_params_buf: [65536]u8 = undefined;
         const polyfill_params = std.fmt.bufPrint(&polyfill_params_buf, "{{\"source\":{s}}}", .{polyfill_json}) catch return error.OutOfMemory;
-        const polyfill_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
-        allocator.free(polyfill_result);
+        client.sendCommandAsync("Page.addScriptToEvaluateOnNewDocument", polyfill_params) catch |err| {
+            logToFile("[CDP] fs_polyfill inject failed: {}\n", .{err});
+        };
 
-        // Grant clipboard permissions for read/write access
-        // This allows navigator.clipboard.readText() to work without user gesture
-        const perm_result = client.sendCommand("Browser.grantPermissions", "{\"permissions\":[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]}") catch null;
-        if (perm_result) |r| allocator.free(r);
-
-        // Inject Clipboard interceptor polyfill - runs in all frames (including iframes)
-        // This enables bidirectional clipboard sync between browser and host
         const clipboard_script = @embedFile("clipboard_polyfill.js");
         var clipboard_json_buf: [16384]u8 = undefined;
         const clipboard_json = json_utils.escapeString(clipboard_script, &clipboard_json_buf) catch return error.OutOfMemory;
-
         var clipboard_params_buf: [32768]u8 = undefined;
         const clipboard_params = std.fmt.bufPrint(&clipboard_params_buf, "{{\"source\":{s}}}", .{clipboard_json}) catch return error.OutOfMemory;
-        const clipboard_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
-        allocator.free(clipboard_result);
+        client.sendCommandAsync("Page.addScriptToEvaluateOnNewDocument", clipboard_params) catch |err| {
+            logToFile("[CDP] clipboard_polyfill inject failed: {}\n", .{err});
+        };
 
-        // Inject ResizeObserver polyfill in isolated world - reports viewport changes
         const resize_script = @embedFile("resize_polyfill.js");
         var resize_json_buf: [4096]u8 = undefined;
         const resize_json = json_utils.escapeString(resize_script, &resize_json_buf) catch return error.OutOfMemory;
-
         var resize_params_buf: [8192]u8 = undefined;
         const resize_params = std.fmt.bufPrint(&resize_params_buf, "{{\"source\":{s},\"worldName\":\"termweb\"}}", .{resize_json}) catch return error.OutOfMemory;
-        const resize_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", resize_params);
-        allocator.free(resize_result);
+        client.sendCommandAsync("Page.addScriptToEvaluateOnNewDocument", resize_params) catch |err| {
+            logToFile("[CDP] resize_polyfill inject failed: {}\n", .{err});
+        };
 
         // NOTE: Runtime.enable is called on page_ws after WebSocket connect (not on pipe)
         // Pipe is ONLY for screencast frames - events come from page_ws
@@ -180,17 +188,10 @@ pub const CdpClient = struct {
             client.page_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
             try client.page_ws.?.startReaderThread();
 
-            // Enable Runtime domain to receive console events
-            const runtime_result = try client.page_ws.?.sendCommand("Runtime.enable", null);
-            allocator.free(runtime_result);
-
-            // Enable Page domain to receive navigation events
-            const page_result = try client.page_ws.?.sendCommand("Page.enable", null);
-            allocator.free(page_result);
-
-            // Enable file chooser interception on page_ws (events come from here)
-            const file_result = try client.page_ws.?.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
-            allocator.free(file_result);
+            // Fire-and-forget: enable domains on page_ws (WebSocket async returns void)
+            client.page_ws.?.sendCommandAsync("Runtime.enable", null);
+            client.page_ws.?.sendCommandAsync("Page.enable", null);
+            client.page_ws.?.sendCommandAsync("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
         }
 
         // Connect browser_ws for Browser domain events (downloads)
@@ -929,31 +930,25 @@ pub const CdpClient = struct {
         }
 
         // Pipe mode: use session-based attach/detach
-        // Detach from current session first (if any) to allow clean re-attach
+        // Detach from current session (async - don't wait, OK if fails)
         if (self.session_id) |old_sid| {
-            logToFile("[CDP switchToTarget] Detaching from session: {s}\n", .{old_sid});
+            logToFile("[CDP switchToTarget] Detaching from session (async): {s}\n", .{old_sid});
             var detach_buf: [256]u8 = undefined;
             const detach_params = std.fmt.bufPrint(&detach_buf, "{{\"sessionId\":\"{s}\"}}", .{old_sid}) catch "";
             if (detach_params.len > 0) {
-                if (self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params)) |detach_result| {
-                    self.allocator.free(detach_result);
-                } else |err| {
-                    logToFile("[CDP switchToTarget] Detach failed (continuing): {}\n", .{err});
-                }
+                self.pipe_client.?.sendCommandAsync("Target.detachFromTarget", detach_params) catch |err| {
+                    logToFile("[CDP switchToTarget] Detach async failed (OK): {}\n", .{err});
+                };
             }
-            logToFile("[CDP switchToTarget] Detach done\n", .{});
         }
 
-        // Activate the target in Chrome (brings it to focus)
-        logToFile("[CDP switchToTarget] Activating target...\n", .{});
+        // Activate the target (async - just brings tab to focus)
+        logToFile("[CDP switchToTarget] Activating target (async)...\n", .{});
         var activate_buf: [256]u8 = undefined;
         const activate_params = std.fmt.bufPrint(&activate_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
-        const activate_result = self.pipe_client.?.sendCommand("Target.activateTarget", activate_params) catch |err| {
-            logToFile("[CDP switchToTarget] Target.activateTarget FAILED: {}\n", .{err});
-            return err;
+        self.pipe_client.?.sendCommandAsync("Target.activateTarget", activate_params) catch |err| {
+            logToFile("[CDP switchToTarget] Activate async failed: {}\n", .{err});
         };
-        self.allocator.free(activate_result);
-        logToFile("[CDP switchToTarget] Activate done\n", .{});
 
         // Attach to the target to get a new session
         logToFile("[CDP switchToTarget] Attaching to target...\n", .{});
@@ -993,14 +988,11 @@ pub const CdpClient = struct {
 
         logToFile("[CDP switchToTarget] Switched to target, new session: {s}\n", .{new_session_id});
 
-        // Re-enable Page domain on the new session
-        logToFile("[CDP switchToTarget] Enabling Page domain...\n", .{});
-        const page_result = self.sendCommand("Page.enable", null) catch |err| {
-            logToFile("[CDP switchToTarget] Page.enable FAILED: {}\n", .{err});
-            return err;
+        // Re-enable Page domain on the new session (async - don't block UI)
+        logToFile("[CDP switchToTarget] Enabling Page domain (async)...\n", .{});
+        self.sendCommandAsync("Page.enable", null) catch |err| {
+            logToFile("[CDP switchToTarget] Page.enable async failed: {}\n", .{err});
         };
-        self.allocator.free(page_result);
-        logToFile("[CDP switchToTarget] Page.enable done\n", .{});
 
         // WebSocket reconnection is deferred - lazy recovery will handle it when input is needed
         // This avoids blocking tab switch on slow WebSocket handshake (~200-500ms)
