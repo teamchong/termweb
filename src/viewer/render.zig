@@ -140,6 +140,13 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     else
         viewer.viewport_height;
 
+    // Debug: Log dimension decision
+    viewer.log("[DIM] device={}x{}, viewport={}x{}, using={}x{}\n", .{
+        frame.device_width, frame.device_height,
+        viewer.viewport_width, viewer.viewport_height,
+        frame_width, frame_height,
+    });
+
     // Detect frame dimension change and skip first changed frame to avoid visual glitch
     const frame_changed = viewer.last_frame_width > 0 and
         (frame_width != viewer.last_frame_width or frame_height != viewer.last_frame_height);
