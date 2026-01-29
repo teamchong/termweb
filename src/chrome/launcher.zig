@@ -506,12 +506,8 @@ pub fn launchChromePipe(
         const path = path_z;
 
         // Unset DISPLAY to prevent X11 connection attempts in headless mode
-        // But keep DISPLAY on Linux via SSH so Chrome can use the desktop's display
-        const is_ssh_child = std.posix.getenv("SSH_CONNECTION") != null or std.posix.getenv("SSH_CLIENT") != null;
-        if (!(builtin.os.tag == .linux and is_ssh_child)) {
-            const unsetenv = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = "unsetenv" });
-            _ = unsetenv("DISPLAY");
-        }
+        const unsetenv = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = "unsetenv" });
+        _ = unsetenv("DISPLAY");
 
         const envp = std.c.environ;
 
