@@ -264,35 +264,27 @@ pub const CdpClient = struct {
             client.page_ws.?.sendCommandAsync("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
             client.page_ws.?.sendCommandAsync("Browser.grantPermissions", "{\"permissions\":[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]}");
 
-            // Inject polyfills via Page.addScriptToEvaluateOnNewDocument
+            // Inject polyfills async (Chrome processes in order)
             const polyfill_script = @embedFile("fs_polyfill.js");
             var polyfill_json_buf: [65536]u8 = undefined;
             const polyfill_json = json_utils.escapeString(polyfill_script, &polyfill_json_buf) catch return CdpError.OutOfMemory;
-
             var polyfill_params_buf: [65536]u8 = undefined;
             const polyfill_params = std.fmt.bufPrint(&polyfill_params_buf, "{{\"source\":{s}}}", .{polyfill_json}) catch return CdpError.OutOfMemory;
-            const polyfill_result = try client.page_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
-            allocator.free(polyfill_result);
+            client.page_ws.?.sendCommandAsync("Page.addScriptToEvaluateOnNewDocument", polyfill_params);
 
-            // Inject clipboard polyfill
             const clipboard_script = @embedFile("clipboard_polyfill.js");
             var clipboard_json_buf: [16384]u8 = undefined;
             const clipboard_json = json_utils.escapeString(clipboard_script, &clipboard_json_buf) catch return CdpError.OutOfMemory;
-
             var clipboard_params_buf: [32768]u8 = undefined;
             const clipboard_params = std.fmt.bufPrint(&clipboard_params_buf, "{{\"source\":{s}}}", .{clipboard_json}) catch return CdpError.OutOfMemory;
-            const clipboard_result = try client.page_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
-            allocator.free(clipboard_result);
+            client.page_ws.?.sendCommandAsync("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
 
-            // Inject ResizeObserver polyfill in isolated world
             const resize_script = @embedFile("resize_polyfill.js");
             var resize_json_buf: [4096]u8 = undefined;
             const resize_json = json_utils.escapeString(resize_script, &resize_json_buf) catch return CdpError.OutOfMemory;
-
             var resize_params_buf: [8192]u8 = undefined;
             const resize_params = std.fmt.bufPrint(&resize_params_buf, "{{\"source\":{s},\"worldName\":\"termweb\"}}", .{resize_json}) catch return CdpError.OutOfMemory;
-            const resize_result = try client.page_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", resize_params);
-            allocator.free(resize_result);
+            client.page_ws.?.sendCommandAsync("Page.addScriptToEvaluateOnNewDocument", resize_params);
         }
 
         // Connect browser_ws for Browser domain events (downloads)
@@ -301,13 +293,9 @@ pub const CdpClient = struct {
             client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch null;
             if (client.browser_ws) |bws| {
                 try bws.startReaderThread();
-                const download_params = "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}";
-                const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
-                allocator.free(download_result);
-
-                // Enable target discovery to detect new tabs/popups
-                const target_result = try bws.sendCommand("Target.setDiscoverTargets", "{\"discover\":true}");
-                allocator.free(target_result);
+                // Async - no need to wait for response
+                bws.sendCommandAsync("Browser.setDownloadBehavior", "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}");
+                bws.sendCommandAsync("Target.setDiscoverTargets", "{\"discover\":true}");
             }
         } else |_| {}
 
