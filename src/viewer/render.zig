@@ -196,24 +196,9 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     // Calculate write latency (Zig processing + terminal write)
     const write_latency_ms: f32 = @floatFromInt(@divFloor(render_elapsed, std.time.ns_per_ms));
 
-    // Update adaptive quality controller with latency data
-    const tier_changed = viewer.adaptive_state.processFrame(frame.chrome_timestamp_ms, write_latency_ms);
-
-    // If tier changed, restart screencast with new quality settings
-    if (tier_changed) {
-        viewer.log("[ADAPTIVE] Tier changed to {} ({s}), quality={}, everyNth={}, latency_ema={d:.1}ms\n", .{
-            viewer.adaptive_state.tier,
-            viewer.adaptive_state.getName(),
-            viewer.adaptive_state.getQuality(),
-            viewer.adaptive_state.getEveryNth(),
-            viewer.adaptive_state.latency_ema_ms,
-        });
-
-        // Restart screencast with new quality settings
-        restartScreencastWithTier(viewer) catch |err| {
-            viewer.log("[ADAPTIVE] Failed to restart screencast: {}\n", .{err});
-        };
-    }
+    // Update adaptive quality controller with latency data (but don't restart - disabled for debugging)
+    _ = viewer.adaptive_state.processFrame(frame.chrome_timestamp_ms, write_latency_ms);
+    // Adaptive tier restart disabled - was causing display issues
 
     // Log performance stats every 5 seconds
     if (now - viewer.perf_last_report_time > 5 * std.time.ns_per_s) {
@@ -269,9 +254,9 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
     const toolbar_h: u32 = if (viewer.toolbar_renderer) |tr| tr.toolbar_height else cell_height;
 
     // Chrome coords: Use Chrome's actual window.innerWidth/Height
-    // Updated by ResizeObserver polyfill in isolated world
-    const chrome_width: u32 = viewer.chrome_inner_width;
-    const chrome_height: u32 = viewer.chrome_inner_height;
+    // Fall back to frame dimensions if not yet set (before ResizeObserver fires)
+    const chrome_width: u32 = if (viewer.chrome_inner_width > 0) viewer.chrome_inner_width else frame_width;
+    const chrome_height: u32 = if (viewer.chrome_inner_height > 0) viewer.chrome_inner_height else frame_height;
 
     // Content starts at row 2, with y_offset to align with toolbar bottom
     // This avoids gaps between toolbar and content

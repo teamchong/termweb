@@ -290,7 +290,8 @@ pub const Viewer = struct {
         const is_ssh = std.posix.getenv("SSH_CONNECTION") != null or std.posix.getenv("SSH_CLIENT") != null;
         const shm_size = viewport_width * viewport_height * 4;
         const shm_buffer = if (is_ssh) null else ShmBuffer.init(shm_size) catch null;
-        const screencast_format: screenshot_api.ScreenshotFormat = if (shm_buffer == null) .png else .jpeg;
+        // Always use JPEG for screencast - more efficient and works better over SSH
+        const screencast_format: screenshot_api.ScreenshotFormat = .jpeg;
 
         // Frame dimensions from screencast are the source of truth for coordinate mapping
         // (initialized to viewport, updated when frames arrive)

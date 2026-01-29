@@ -177,10 +177,11 @@ pub const WebSocketCdpClient = struct {
         // Close stream
         self.stream.close();
 
-        // On Linux, detach thread (join hangs even after shutdown)
-        // On macOS, join works properly after shutdown
+        // Wait for reader thread to stop
         if (self.reader_thread) |thread| {
             if (comptime builtin.os.tag == .linux) {
+                // On Linux, give thread time to exit after shutdown signal
+                std.Thread.sleep(100 * std.time.ns_per_ms);
                 thread.detach();
             } else {
                 thread.join();
