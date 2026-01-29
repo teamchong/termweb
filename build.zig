@@ -67,6 +67,25 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path("src/vendor"));
 
+    // libdeflate for zlib compression (Kitty graphics)
+    exe.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/deflate_compress.c"),
+        .flags = &.{"-O2"},
+    });
+    exe.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/zlib_compress.c"),
+        .flags = &.{"-O2"},
+    });
+    exe.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/adler32.c"),
+        .flags = &.{"-O2"},
+    });
+    exe.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/utils.c"),
+        .flags = &.{"-O2"},
+    });
+    exe.addIncludePath(b.path("vendor/libdeflate"));
+
     // Static link libjpeg-turbo for fast JPEG decoding
     if (target.result.os.tag == .macos) {
         // macOS: homebrew on ARM64, /usr/local on x86_64
@@ -125,6 +144,25 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-O2", "-fno-strict-aliasing" },
     });
     napi.addIncludePath(b.path("src/vendor"));
+
+    // libdeflate for zlib compression (Kitty graphics)
+    napi.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/deflate_compress.c"),
+        .flags = &.{"-O2"},
+    });
+    napi.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/zlib_compress.c"),
+        .flags = &.{"-O2"},
+    });
+    napi.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/adler32.c"),
+        .flags = &.{"-O2"},
+    });
+    napi.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/utils.c"),
+        .flags = &.{"-O2"},
+    });
+    napi.addIncludePath(b.path("vendor/libdeflate"));
 
     // libjpeg-turbo
     if (target.result.os.tag == .macos) {

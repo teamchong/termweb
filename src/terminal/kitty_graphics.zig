@@ -3,6 +3,11 @@ const config = @import("../config.zig").Config;
 const ShmBuffer = @import("shm.zig").ShmBuffer;
 const decode = @import("../image/decode.zig");
 
+// libdeflate for zlib compression
+const libdeflate = @cImport({
+    @cInclude("libdeflate.h");
+});
+
 pub const DisplayOptions = struct {
     // Image placement
     columns: ?u32 = null, // Terminal columns to span
@@ -183,6 +188,66 @@ pub const KittyGraphics = struct {
         return image_id;
     }
 
+    /// Display base64-encoded zlib-compressed image data
+    /// Same as displayBase64ImageWithFormat but adds o=z flag
+    fn displayBase64ImageWithFormatCompressed(
+        self: *KittyGraphics,
+        writer: anytype,
+        base64_data: []const u8,
+        opts: DisplayOptions,
+        format_code: u32,
+    ) !u32 {
+        const image_id = opts.image_id orelse blk: {
+            const id = self.next_image_id;
+            self.next_image_id += 1;
+            break :blk id;
+        };
+
+        const CHUNK_SIZE: usize = config.KITTY_CHUNK_SIZE;
+
+        var offset: usize = 0;
+        var first_chunk = true;
+
+        while (offset < base64_data.len) {
+            const remaining = base64_data.len - offset;
+            const chunk_len = @min(remaining, CHUNK_SIZE);
+            const is_last = (offset + chunk_len >= base64_data.len);
+
+            try writer.writeAll("\x1b_G");
+
+            if (first_chunk) {
+                // o=z indicates zlib compression
+                try writer.print("a=T,f={d},o=z,t=d,i={d},q=2,m={d}", .{
+                    format_code,
+                    image_id,
+                    if (is_last) @as(u8, 0) else @as(u8, 1),
+                });
+
+                if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
+                if (opts.columns) |c_val| try writer.print(",c={d}", .{c_val});
+                if (opts.rows) |r| try writer.print(",r={d}", .{r});
+                if (opts.width) |w| try writer.print(",s={d}", .{w});
+                if (opts.height) |h| try writer.print(",v={d}", .{h});
+                if (opts.z != 0) try writer.print(",z={d}", .{opts.z});
+                if (opts.x_offset) |xo| try writer.print(",X={d}", .{xo});
+                if (opts.y_offset) |yo| try writer.print(",Y={d}", .{yo});
+
+                try writer.writeAll(",C=1");
+                first_chunk = false;
+            } else {
+                try writer.print("m={d}", .{if (is_last) @as(u8, 0) else @as(u8, 1)});
+            }
+
+            try writer.writeByte(';');
+            try writer.writeAll(base64_data[offset..offset + chunk_len]);
+            try writer.writeAll("\x1b\\");
+
+            offset += chunk_len;
+        }
+
+        return image_id;
+    }
+
     /// Display already base64-encoded image data directly
     /// Uses chunked transfer for large images (Kitty protocol requirement)
     pub fn displayBase64Image(
@@ -203,8 +268,61 @@ pub const KittyGraphics = struct {
     ) !u32 {
         return self.displayBase64ImageWithFormat(writer, base64_data, opts, 100);
     }
-    /// Display raw RGBA pixel data from memory
+    /// Display raw RGBA pixel data from memory (with zlib compression)
     pub fn displayRawRGBA(
+        self: *KittyGraphics,
+        writer: anytype,
+        rgba_data: []const u8,
+        width: u32,
+        height: u32,
+        opts: DisplayOptions,
+    ) !u32 {
+        // Compress RGBA data with zlib using libdeflate
+        const compressor = libdeflate.libdeflate_alloc_compressor(6); // Level 6 = good balance
+        if (compressor == null) {
+            // Fallback to uncompressed if compressor allocation fails
+            return self.displayRawRGBAUncompressed(writer, rgba_data, width, height, opts);
+        }
+        defer libdeflate.libdeflate_free_compressor(compressor);
+
+        // Get worst-case compressed size
+        const max_compressed = libdeflate.libdeflate_zlib_compress_bound(compressor, rgba_data.len);
+        const compressed_buf = self.allocator.alloc(u8, max_compressed) catch {
+            return self.displayRawRGBAUncompressed(writer, rgba_data, width, height, opts);
+        };
+        defer self.allocator.free(compressed_buf);
+
+        // Compress
+        const compressed_len = libdeflate.libdeflate_zlib_compress(
+            compressor,
+            rgba_data.ptr,
+            rgba_data.len,
+            compressed_buf.ptr,
+            max_compressed,
+        );
+
+        if (compressed_len == 0) {
+            // Compression failed, fallback to uncompressed
+            return self.displayRawRGBAUncompressed(writer, rgba_data, width, height, opts);
+        }
+
+        // Base64 encode compressed data
+        const encoder = std.base64.standard.Encoder;
+        const encoded_len = encoder.calcSize(compressed_len);
+        const encoded = try self.allocator.alloc(u8, encoded_len);
+        defer self.allocator.free(encoded);
+        _ = encoder.encode(encoded, compressed_buf[0..compressed_len]);
+
+        var local_opts = opts;
+        if (local_opts.width == null) local_opts.width = width;
+        if (local_opts.height == null) local_opts.height = height;
+
+        // Send with o=z flag to indicate zlib compression
+        return self.displayBase64ImageWithFormatCompressed(writer, encoded, local_opts, 32);
+    }
+
+    /// Display raw RGBA without compression (fallback)
+    fn displayRawRGBAUncompressed(
         self: *KittyGraphics,
         writer: anytype,
         rgba_data: []const u8,
@@ -225,14 +343,30 @@ pub const KittyGraphics = struct {
         return self.displayBase64ImageWithFormat(writer, encoded, local_opts, 32);
     }
 
-    /// Display raw RGBA data via SHM (t=s)
+    /// Display raw RGBA data via SHM (t=s) - uncompressed
     /// Uses fixed image_id to replace existing image data (no delete needed)
+    /// Note: For compression, use displayBase64ImageViaSHM which compresses automatically
     pub fn displayRGBA(
         self: *KittyGraphics,
         writer: anytype,
         shm: *const ShmBuffer,
         width: u32,
         height: u32,
+        opts: DisplayOptions,
+    ) !u32 {
+        // Caller wrote raw data to SHM, send uncompressed
+        return self.displayRGBAWithSize(writer, shm, width, height, null, false, opts);
+    }
+
+    /// Display raw RGBA data via SHM with explicit size and compression flag
+    fn displayRGBAWithSize(
+        self: *KittyGraphics,
+        writer: anytype,
+        shm: *const ShmBuffer,
+        width: u32,
+        height: u32,
+        data_size: ?usize,
+        compressed: bool,
         opts: DisplayOptions,
     ) !u32 {
         const image_id = opts.image_id orelse blk: {
@@ -250,7 +384,16 @@ pub const KittyGraphics = struct {
 
         // a=T (transmit + display), f=32 = raw RGBA, t=s = shared memory
         // Using same image_id replaces existing image data
-        try writer.print("a=T,f=32,t=s,s={d},v={d},i={d},q=2", .{ width, height, image_id });
+        if (compressed) {
+            try writer.print("a=T,f=32,o=z,t=s,s={d},v={d},i={d},q=2", .{ width, height, image_id });
+        } else {
+            try writer.print("a=T,f=32,t=s,s={d},v={d},i={d},q=2", .{ width, height, image_id });
+        }
+
+        // If we have explicit data size (for compressed data), include it
+        if (data_size) |size| {
+            try writer.print(",S={d}", .{size});
+        }
 
         // Placement options
         if (opts.placement_id) |p| try writer.print(",p={d}", .{p});
@@ -306,10 +449,41 @@ pub const KittyGraphics = struct {
         var img = decode.decode(decoded) orelse return null;
         defer img.deinit();
 
-        // Write RGBA to SHM
-        shm.write(img.data);
+        // Compress RGBA data with zlib
+        const compressor = libdeflate.libdeflate_alloc_compressor(6);
+        if (compressor == null) {
+            // Fallback to uncompressed
+            shm.write(img.data);
+            return try self.displayRGBAWithSize(writer, shm, img.width, img.height, null, false, opts);
+        }
+        defer libdeflate.libdeflate_free_compressor(compressor);
 
-        // Display via SHM
-        return try self.displayRGBA(writer, shm, img.width, img.height, opts);
+        const max_compressed = libdeflate.libdeflate_zlib_compress_bound(compressor, img.data.len);
+        const compressed_buf = self.allocator.alloc(u8, max_compressed) catch {
+            // Fallback to uncompressed
+            shm.write(img.data);
+            return try self.displayRGBAWithSize(writer, shm, img.width, img.height, null, false, opts);
+        };
+        defer self.allocator.free(compressed_buf);
+
+        const compressed_len = libdeflate.libdeflate_zlib_compress(
+            compressor,
+            img.data.ptr,
+            img.data.len,
+            compressed_buf.ptr,
+            max_compressed,
+        );
+
+        if (compressed_len == 0) {
+            // Fallback to uncompressed
+            shm.write(img.data);
+            return try self.displayRGBAWithSize(writer, shm, img.width, img.height, null, false, opts);
+        }
+
+        // Write compressed data to SHM
+        shm.write(compressed_buf[0..compressed_len]);
+
+        // Display via SHM with compression flag and actual size
+        return try self.displayRGBAWithSize(writer, shm, img.width, img.height, compressed_len, true, opts);
     }
 };
