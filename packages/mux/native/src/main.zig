@@ -242,7 +242,7 @@ const Panel = struct {
     width: u32,
     height: u32,
     scale: f64,
-    streaming: bool,
+    streaming: std.atomic.Value(bool),
     force_keyframe: bool,
     connection: ?*ws.Connection,
     allocator: std.mem.Allocator,
@@ -292,7 +292,7 @@ const Panel = struct {
             .width = width,
             .height = height,
             .scale = scale,
-            .streaming = false, // Start paused until connected
+            .streaming = std.atomic.Value(bool).init(false), // Start paused until connected
             .force_keyframe = true,
             .connection = null,
             .allocator = allocator,
@@ -316,10 +316,10 @@ const Panel = struct {
         defer self.mutex.unlock();
         self.connection = conn;
         if (conn != null) {
-            self.streaming = true;
+            self.streaming.store(true, .release);
             self.force_keyframe = true;
         } else {
-            self.streaming = false;
+            self.streaming.store(false, .release);
         }
     }
 
@@ -336,11 +336,11 @@ const Panel = struct {
     }
 
     fn pause(self: *Panel) void {
-        self.streaming = false;
+        self.streaming.store(false, .release);
     }
 
     fn resumeStream(self: *Panel) void {
-        self.streaming = true;
+        self.streaming.store(true, .release);
         self.force_keyframe = true;
     }
 
@@ -623,6 +623,11 @@ const PanelRequest = struct {
     height: u32,
 };
 
+// Panel destruction request (to be processed on main thread)
+const PanelDestroyRequest = struct {
+    id: u32,
+};
+
 const Server = struct {
     app: c.ghostty_app_t,
     config: c.ghostty_config_t,
@@ -630,6 +635,7 @@ const Server = struct {
     panel_connections: std.AutoHashMap(*ws.Connection, *Panel),
     control_connections: std.ArrayList(*ws.Connection),
     pending_panels: std.ArrayList(PanelRequest),
+    pending_destroys: std.ArrayList(PanelDestroyRequest),
     next_panel_id: u32,
     panel_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
@@ -688,6 +694,7 @@ const Server = struct {
             .panel_connections = std.AutoHashMap(*ws.Connection, *Panel).init(allocator),
             .control_connections = .{},
             .pending_panels = .{},
+            .pending_destroys = .{},
             .next_panel_id = 1,
             .http_server = http_srv,
             .panel_ws_server = panel_ws,
@@ -712,6 +719,7 @@ const Server = struct {
         self.panel_connections.deinit();
         self.control_connections.deinit(self.allocator);
         self.pending_panels.deinit(self.allocator);
+        self.pending_destroys.deinit(self.allocator);
 
         self.http_server.deinit();
         self.panel_ws_server.deinit();
@@ -846,18 +854,21 @@ const Server = struct {
         // In production, use proper JSON parser
 
         if (std.mem.indexOf(u8, data, "\"create_panel\"")) |_| {
-            const panel = self.createPanel(800, 600) catch return;
-            self.broadcastPanelCreated(panel.id);
+            // Queue panel creation for main thread (don't create ghostty surface here!)
+            // For now, panels are auto-created when panel WS connects
+            // This message type could be used for creating additional panels
+            std.debug.print("create_panel request received (panels auto-create on connect)\n", .{});
         } else if (std.mem.indexOf(u8, data, "\"close_panel\"")) |_| {
-            // Extract panel_id from JSON (simplified)
+            // Queue panel destruction for main thread
             if (std.mem.indexOf(u8, data, "\"panel_id\":")) |idx| {
                 const start = idx + 11;
                 var end = start;
                 while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
                 if (end > start) {
                     const id = std.fmt.parseInt(u32, data[start..end], 10) catch return;
-                    self.destroyPanel(id);
-                    self.broadcastPanelClosed(id);
+                    self.mutex.lock();
+                    self.pending_destroys.append(self.allocator, .{ .id = id }) catch {};
+                    self.mutex.unlock();
                 }
             }
         }
@@ -989,6 +1000,31 @@ const Server = struct {
         self.allocator.free(pending);
     }
 
+    // Process pending panel destruction requests (must run on main thread)
+    fn processPendingDestroys(self: *Server) void {
+        self.mutex.lock();
+        const pending = self.pending_destroys.toOwnedSlice(self.allocator) catch {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+
+        for (pending) |req| {
+            self.mutex.lock();
+            if (self.panels.fetchRemove(req.id)) |entry| {
+                const panel = entry.value;
+                self.mutex.unlock();
+                panel.deinit();
+                std.debug.print("Destroyed panel {}\n", .{req.id});
+                self.broadcastPanelClosed(req.id);
+            } else {
+                self.mutex.unlock();
+            }
+        }
+
+        self.allocator.free(pending);
+    }
+
     // Main render loop
     fn runRenderLoop(self: *Server) void {
         const target_fps: u64 = 30;
@@ -997,8 +1033,9 @@ const Server = struct {
         while (self.running.load(.acquire)) {
             const start = std.time.nanoTimestamp();
 
-            // Process pending panel creations (NSWindow must be on main thread)
+            // Process pending panel creations/destructions (NSWindow/ghostty must be on main thread)
             self.processPendingPanels();
+            self.processPendingDestroys();
 
             // Tick ghostty
             self.tick();
@@ -1010,7 +1047,7 @@ const Server = struct {
                 const panel = panel_ptr.*;
                 // Process input queue for all panels (not just streaming ones)
                 panel.processInputQueue();
-                if (!panel.streaming) continue;
+                if (!panel.streaming.load(.acquire)) continue;
                 panel.tick();
             }
             self.mutex.unlock();
@@ -1023,7 +1060,7 @@ const Server = struct {
             panel_it = self.panels.valueIterator();
             while (panel_it.next()) |panel_ptr| {
                 const panel = panel_ptr.*;
-                if (!panel.streaming) continue;
+                if (!panel.streaming.load(.acquire)) continue;
 
                 if (panel.getIOSurface()) |iosurface| {
                     // Debug IOSurface info

@@ -626,8 +626,8 @@ class App {
           this.switchToPanel(id);
         }
       }
-      // ⌘T for new tab
-      if (e.metaKey && e.key === 't') {
+      // ⌘/ for new tab
+      if (e.metaKey && e.key === '/') {
         e.preventDefault();
         this.createPanel();
       }
