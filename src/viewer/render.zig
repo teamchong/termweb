@@ -130,9 +130,15 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
 
     // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
     // Chrome may send different size than requested viewport
-    // IMPORTANT: Always update these, even if we skip rendering, so coord mapping stays current
-    const frame_width = if (frame.device_width > 0) frame.device_width else viewer.viewport_width;
-    const frame_height = if (frame.device_height > 0) frame.device_height else viewer.viewport_height;
+    // If Chrome returns suspicious dimensions (height < 100), use viewport dimensions instead
+    const frame_width = if (frame.device_width > 0 and frame.device_height >= 100)
+        frame.device_width
+    else
+        viewer.viewport_width;
+    const frame_height = if (frame.device_height >= 100)
+        frame.device_height
+    else
+        viewer.viewport_height;
 
     // Detect frame dimension change and skip first changed frame to avoid visual glitch
     const frame_changed = viewer.last_frame_width > 0 and
