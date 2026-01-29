@@ -269,14 +269,23 @@ pub const ToolbarRenderer = struct {
 
     /// Generate URL bar RGBA for compositing
     fn generateUrlBarRgba(self: *ToolbarRenderer, width: u32) ![]u8 {
-        const display_text = if (self.url_focused)
+        // Copy text to avoid race condition with main thread updating current_url
+        const source_text = if (self.url_focused)
             self.url_buffer[0..self.url_len]
         else
             self.current_url;
+
+        // Make a safe copy - if source is empty or invalid, use empty string
+        const text_copy = if (source_text.len > 0 and source_text.len < 8192)
+            self.allocator.dupe(u8, source_text) catch ""
+        else
+            "";
+        defer if (text_copy.len > 0) self.allocator.free(text_copy);
+
         return self.generateUrlBarWithText(
             width,
             self.url_bar_height,
-            display_text,
+            text_copy,
             if (self.url_focused) self.url_cursor else null,
             self.getSelectionBounds(),
         );
