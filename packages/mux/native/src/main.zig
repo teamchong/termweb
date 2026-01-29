@@ -214,6 +214,19 @@ const Compressor = struct {
 };
 
 // ============================================================================
+// Input Event Queue (for thread-safe input to ghostty)
+// ============================================================================
+
+const InputEvent = union(enum) {
+    key: c.ghostty_input_key_s,
+    text: struct { data: [256]u8, len: usize },
+    mouse_pos: struct { x: f64, y: f64, mods: c.ghostty_input_mods_e },
+    mouse_button: struct { state: c.ghostty_input_mouse_state_e, button: c.ghostty_input_mouse_button_e, mods: c.ghostty_input_mods_e },
+    mouse_scroll: struct { x: f64, y: f64, dx: f64, dy: f64 },
+    resize: struct { width: u32, height: u32 },
+};
+
+// ============================================================================
 // Panel - One ghostty surface + streamer + websocket connection
 // ============================================================================
 
@@ -234,6 +247,7 @@ const Panel = struct {
     connection: ?*ws.Connection,
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
+    input_queue: std.ArrayList(InputEvent),
 
     const KEYFRAME_INTERVAL_MS = 2000;
 
@@ -283,6 +297,7 @@ const Panel = struct {
             .connection = null,
             .allocator = allocator,
             .mutex = .{},
+            .input_queue = .{},
         };
 
         return panel;
@@ -292,6 +307,7 @@ const Panel = struct {
         c.ghostty_surface_free(self.surface);
         self.frame_buffer.deinit();
         self.compressor.deinit();
+        self.input_queue.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -307,10 +323,8 @@ const Panel = struct {
         }
     }
 
-    fn resize(self: *Panel, width: u32, height: u32) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+    // Internal resize - called from main thread only (via processInputQueue)
+    fn resizeInternal(self: *Panel, width: u32, height: u32) !void {
         self.width = width;
         self.height = height;
         c.ghostty_surface_set_size(self.surface, width, height);
@@ -408,6 +422,48 @@ const Panel = struct {
         };
     }
 
+    // Process queued input events (must be called from main thread)
+    fn processInputQueue(self: *Panel) void {
+        self.mutex.lock();
+        // Process events directly from items slice, then clear
+        const items = self.input_queue.items;
+        const count = items.len;
+        if (count == 0) {
+            self.mutex.unlock();
+            return;
+        }
+        // Copy events locally to release mutex quickly
+        var events_buf: [256]InputEvent = undefined;
+        const events_count = @min(count, events_buf.len);
+        @memcpy(events_buf[0..events_count], items[0..events_count]);
+        self.input_queue.clearRetainingCapacity();
+        self.mutex.unlock();
+
+        for (events_buf[0..events_count]) |event| {
+            switch (event) {
+                .key => |key_input| {
+                    _ = c.ghostty_surface_key(self.surface, key_input);
+                },
+                .text => |text| {
+                    c.ghostty_surface_text(self.surface, &text.data, text.len);
+                },
+                .mouse_pos => |pos| {
+                    c.ghostty_surface_mouse_pos(self.surface, pos.x, pos.y, pos.mods);
+                },
+                .mouse_button => |btn| {
+                    _ = c.ghostty_surface_mouse_button(self.surface, btn.state, btn.button, btn.mods);
+                },
+                .mouse_scroll => |scroll| {
+                    c.ghostty_surface_mouse_pos(self.surface, scroll.x, scroll.y, 0);
+                    c.ghostty_surface_mouse_scroll(self.surface, scroll.dx, scroll.dy, 0);
+                },
+                .resize => |size| {
+                    self.resizeInternal(size.width, size.height) catch {};
+                },
+            }
+        }
+    }
+
     fn tick(self: *Panel) void {
         c.ghostty_surface_draw(self.surface);
     }
@@ -438,7 +494,7 @@ const Panel = struct {
         return @intCast(mods);
     }
 
-    // Handle keyboard input from client
+    // Handle keyboard input from client (queues event for main thread)
     fn handleKeyInput(self: *Panel, data: []const u8) void {
         if (data.len < @sizeOf(KeyInputMsg)) return;
 
@@ -459,17 +515,24 @@ const Panel = struct {
             .composing = false,
         };
 
-        _ = c.ghostty_surface_key(self.surface, key_input);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.input_queue.append(self.allocator, .{ .key = key_input }) catch {};
     }
 
-    // Handle text input (for IME, paste, etc.)
+    // Handle text input (for IME, paste, etc.) - queues event for main thread
     fn handleTextInput(self: *Panel, data: []const u8) void {
         if (data.len == 0) return;
-        // data is UTF-8 text
-        c.ghostty_surface_text(self.surface, data.ptr, data.len);
+
+        var text_event: InputEvent = .{ .text = .{ .data = undefined, .len = @min(data.len, 256) } };
+        @memcpy(text_event.text.data[0..text_event.text.len], data[0..text_event.text.len]);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.input_queue.append(self.allocator, text_event) catch {};
     }
 
-    // Handle mouse button input from client
+    // Handle mouse button input from client - queues events for main thread
     fn handleMouseButton(self: *Panel, data: []const u8) void {
         if (data.len < @sizeOf(MouseButtonMsg)) return;
 
@@ -487,37 +550,37 @@ const Panel = struct {
             else => c.GHOSTTY_MOUSE_LEFT,
         };
 
-        // Update mouse position first
-        c.ghostty_surface_mouse_pos(self.surface, msg.x, msg.y, convertMods(msg.mods));
+        const mods = convertMods(msg.mods);
 
-        // Then send button event
-        _ = c.ghostty_surface_mouse_button(self.surface, state, button, convertMods(msg.mods));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Queue position update first, then button event
+        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = msg.x, .y = msg.y, .mods = mods } }) catch {};
+        self.input_queue.append(self.allocator, .{ .mouse_button = .{ .state = state, .button = button, .mods = mods } }) catch {};
     }
 
-    // Handle mouse move
+    // Handle mouse move - queues event for main thread
     fn handleMouseMove(self: *Panel, data: []const u8) void {
         if (data.len < @sizeOf(MouseMoveMsg)) return;
 
         const msg: *const MouseMoveMsg = @ptrCast(@alignCast(data.ptr));
-        c.ghostty_surface_mouse_pos(self.surface, msg.x, msg.y, convertMods(msg.mods));
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = msg.x, .y = msg.y, .mods = convertMods(msg.mods) } }) catch {};
     }
 
-    // Handle mouse scroll
+    // Handle mouse scroll - queues events for main thread
     fn handleMouseScroll(self: *Panel, data: []const u8) void {
         if (data.len < @sizeOf(MouseScrollMsg)) return;
 
         const msg: *const MouseScrollMsg = @ptrCast(@alignCast(data.ptr));
 
-        // Update position first
-        c.ghostty_surface_mouse_pos(self.surface, msg.x, msg.y, convertMods(msg.mods));
-
-        // Send scroll event
-        c.ghostty_surface_mouse_scroll(
-            self.surface,
-            msg.scroll_x,
-            msg.scroll_y,
-            0, // scroll_mods (precision flags)
-        );
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Queue position update first, then scroll event
+        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = msg.x, .y = msg.y, .mods = convertMods(msg.mods) } }) catch {};
+        self.input_queue.append(self.allocator, .{ .mouse_scroll = .{ .x = msg.x, .y = msg.y, .dx = msg.scroll_x, .dy = msg.scroll_y } }) catch {};
     }
 
     // Handle client message
@@ -537,7 +600,9 @@ const Panel = struct {
                 if (payload.len >= 4) {
                     const w = std.mem.readInt(u16, payload[0..2], .little);
                     const h = std.mem.readInt(u16, payload[2..4], .little);
-                    self.resize(w, h) catch {};
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    self.input_queue.append(self.allocator, .{ .resize = .{ .width = w, .height = h } }) catch {};
                 }
             },
             .request_keyframe => self.requestKeyframe(),
@@ -938,13 +1003,14 @@ const Server = struct {
             // Tick ghostty
             self.tick();
 
-            // Process all streaming panels
+            // Process input and render all streaming panels
             self.mutex.lock();
             var panel_it = self.panels.valueIterator();
             while (panel_it.next()) |panel_ptr| {
                 const panel = panel_ptr.*;
+                // Process input queue for all panels (not just streaming ones)
+                panel.processInputQueue();
                 if (!panel.streaming) continue;
-
                 panel.tick();
             }
             self.mutex.unlock();
