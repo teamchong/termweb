@@ -200,14 +200,9 @@ pub const CdpClient = struct {
             client.browser_ws = websocket_cdp.WebSocketCdpClient.connect(allocator, browser_url) catch null;
             if (client.browser_ws) |bws| {
                 try bws.startReaderThread();
-                const download_params = try std.fmt.allocPrint(allocator, "{{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}}", .{});
-                defer allocator.free(download_params);
-                const download_result = try bws.sendCommand("Browser.setDownloadBehavior", download_params);
-                allocator.free(download_result);
-
-                // Enable target discovery to detect new tabs/popups
-                const target_result = try bws.sendCommand("Target.setDiscoverTargets", "{\"discover\":true}");
-                allocator.free(target_result);
+                // Async - no need to wait
+                bws.sendCommandAsync("Browser.setDownloadBehavior", "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}");
+                bws.sendCommandAsync("Target.setDiscoverTargets", "{\"discover\":true}");
             }
         } else |_| {}
         return client;
@@ -630,14 +625,9 @@ pub const CdpClient = struct {
         self.browser_ws = try websocket_cdp.WebSocketCdpClient.connect(self.allocator, browser_url);
         try self.browser_ws.?.startReaderThread();
 
-        // Re-enable download behavior
-        const download_params = "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}";
-        const download_result = try self.browser_ws.?.sendCommand("Browser.setDownloadBehavior", download_params);
-        self.allocator.free(download_result);
-
-        // Re-enable target discovery
-        const target_result = try self.browser_ws.?.sendCommand("Target.setDiscoverTargets", "{\"discover\":true}");
-        self.allocator.free(target_result);
+        // Re-enable async - no need to wait
+        self.browser_ws.?.sendCommandAsync("Browser.setDownloadBehavior", "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}");
+        self.browser_ws.?.sendCommandAsync("Target.setDiscoverTargets", "{\"discover\":true}");
 
         logToFile("[CDP reconnectBrowserWS] Done\n", .{});
     }
@@ -667,20 +657,11 @@ pub const CdpClient = struct {
         try self.page_ws.?.startReaderThread();
         logToFile("[CDP reconnectWS] Connected\n", .{});
 
-        // Re-enable Runtime domain for console events
-        logToFile("[CDP reconnectWS] Enabling Runtime domain...\n", .{});
-        const runtime_result = try self.page_ws.?.sendCommand("Runtime.enable", null);
-        self.allocator.free(runtime_result);
-
-        // Re-enable Page domain for navigation events
-        logToFile("[CDP reconnectWS] Enabling Page domain...\n", .{});
-        const page_result = try self.page_ws.?.sendCommand("Page.enable", null);
-        self.allocator.free(page_result);
-
-        // Re-enable file chooser interception
-        logToFile("[CDP reconnectWS] Enabling file chooser interception...\n", .{});
-        const file_result = try self.page_ws.?.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
-        self.allocator.free(file_result);
+        // Re-enable domains async
+        logToFile("[CDP reconnectWS] Enabling domains async...\n", .{});
+        self.page_ws.?.sendCommandAsync("Runtime.enable", null);
+        self.page_ws.?.sendCommandAsync("Page.enable", null);
+        self.page_ws.?.sendCommandAsync("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
 
         logToFile("[CDP reconnectWS] Done\n", .{});
     }
@@ -757,17 +738,15 @@ pub const CdpClient = struct {
         );
         defer self.allocator.free(params);
 
-        const result = try self.sendCommand("Page.startScreencast", params);
-        self.allocator.free(result);
+        // Async - Chrome will start sending frames
+        self.sendCommandAsync("Page.startScreencast", params) catch {};
     }
 
     /// Stop screencast streaming (for resize - keeps reader thread alive)
     /// Call stopScreencastFull for complete shutdown
     pub fn stopScreencast(self: *CdpClient) !void {
-        // Send Page.stopScreencast to Chrome to stop frames
-        // Don't stop the reader thread - we need it for the next startScreencast
-        const result = self.sendCommand("Page.stopScreencast", null) catch null;
-        if (result) |r| self.allocator.free(r);
+        // Async - Chrome will stop frames
+        self.sendCommandAsync("Page.stopScreencast", null) catch {};
     }
 
     /// Stop screencast completely including reader thread (for shutdown)
@@ -880,15 +859,11 @@ pub const CdpClient = struct {
             }
             self.current_target_id = try self.allocator.dupe(u8, target_id);
 
-            // Activate target via browser_ws
+            // Activate target via browser_ws (async - no need to wait)
             if (self.browser_ws) |bws| {
                 var activate_buf: [256]u8 = undefined;
                 const activate_params = std.fmt.bufPrint(&activate_buf, "{{\"targetId\":\"{s}\"}}", .{target_id}) catch return error.OutOfMemory;
-                const activate_result = bws.sendCommand("Target.activateTarget", activate_params) catch |err| {
-                    logToFile("[CDP switchToTarget] Target.activateTarget FAILED: {}\n", .{err});
-                    return err;
-                };
-                self.allocator.free(activate_result);
+                bws.sendCommandAsync("Target.activateTarget", activate_params);
             }
 
             // Close and reconnect page_ws (hold mutex throughout to prevent race)
@@ -1079,14 +1054,12 @@ pub const CdpClient = struct {
         }
 
         // Pipe mode: use session-based attach
-        // Detach from current session (if any)
+        // Detach from current session async (if any)
         if (self.session_id) |old_sid| {
             var detach_buf: [256]u8 = undefined;
             const detach_params = std.fmt.bufPrint(&detach_buf, "{{\"sessionId\":\"{s}\"}}", .{old_sid}) catch "";
             if (detach_params.len > 0) {
-                if (self.pipe_client.?.sendCommand("Target.detachFromTarget", detach_params)) |r| {
-                    self.allocator.free(r);
-                } else |_| {}
+                self.pipe_client.?.sendCommandAsync("Target.detachFromTarget", detach_params) catch {};
             }
             self.allocator.free(old_sid);
             self.session_id = null;
@@ -1117,12 +1090,8 @@ pub const CdpClient = struct {
         }
         self.current_target_id = try self.allocator.dupe(u8, target_id);
 
-        // Enable Page domain
-        const page_result = self.sendCommand("Page.enable", null) catch |err| {
-            logToFile("[CDP createAndAttach] Page.enable failed: {}\n", .{err});
-            return err;
-        };
-        self.allocator.free(page_result);
+        // Enable Page domain async
+        self.sendCommandAsync("Page.enable", null) catch {};
 
         // Clear old WebSocket (lazy recovery will handle reconnection when needed)
         {
