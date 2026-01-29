@@ -797,9 +797,8 @@ pub const CdpClient = struct {
 
     /// Stop screencast completely including reader thread (for shutdown)
     pub fn stopScreencastFull(self: *CdpClient) !void {
-        // Send stop command first
-        const result = self.sendCommand("Page.stopScreencast", null) catch null;
-        if (result) |r| self.allocator.free(r);
+        // Send stop command async (don't wait for response - we're shutting down)
+        self.sendCommandAsync("Page.stopScreencast", null) catch {};
 
         // Now stop the reader thread (pipe mode only)
         if (self.pipe_client) |pc| {
