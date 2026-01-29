@@ -174,6 +174,18 @@ pub fn build(b: *std.Build) void {
         .file = b.path("vendor/libdeflate/lib/utils.c"),
         .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
+    // CPU features: use arm/ for ARM, x86/ for x86
+    if (target.result.cpu.arch == .aarch64) {
+        napi.addCSourceFile(.{
+            .file = b.path("vendor/libdeflate/lib/arm/cpu_features.c"),
+            .flags = &.{"-O2"},
+        });
+    } else {
+        napi.addCSourceFile(.{
+            .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"),
+            .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
+        });
+    }
     napi.addIncludePath(b.path("vendor/libdeflate"));
 
     // libjpeg-turbo
