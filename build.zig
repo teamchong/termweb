@@ -55,11 +55,11 @@ pub fn build(b: *std.Build) void {
     // Add C libraries
     exe.addCSourceFile(.{
         .file = b.path("src/vendor/stb_image.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     exe.addCSourceFile(.{
         .file = b.path("src/vendor/stb_truetype.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     exe.addCSourceFile(.{
         .file = b.path("src/vendor/nanosvg.c"),
@@ -70,19 +70,23 @@ pub fn build(b: *std.Build) void {
     // libdeflate for zlib compression (Kitty graphics)
     exe.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/deflate_compress.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     exe.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/zlib_compress.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     exe.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/adler32.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     exe.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/utils.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
+    });
+    exe.addCSourceFile(.{
+        .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"),
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     exe.addIncludePath(b.path("vendor/libdeflate"));
 
@@ -133,11 +137,11 @@ pub fn build(b: *std.Build) void {
     // Add C libraries
     napi.addCSourceFile(.{
         .file = b.path("src/vendor/stb_image.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     napi.addCSourceFile(.{
         .file = b.path("src/vendor/stb_truetype.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     napi.addCSourceFile(.{
         .file = b.path("src/vendor/nanosvg.c"),
@@ -148,19 +152,19 @@ pub fn build(b: *std.Build) void {
     // libdeflate for zlib compression (Kitty graphics)
     napi.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/deflate_compress.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     napi.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/zlib_compress.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     napi.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/adler32.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     napi.addCSourceFile(.{
         .file = b.path("vendor/libdeflate/lib/utils.c"),
-        .flags = &.{"-O2"},
+        .flags = &.{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" },
     });
     napi.addIncludePath(b.path("vendor/libdeflate"));
 
