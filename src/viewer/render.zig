@@ -128,24 +128,9 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     var frame = screenshot_api.getLatestScreencastFrame(viewer.cdp_client) orelse return false;
     defer frame.deinit(); // Proper cleanup!
 
-    // Use ACTUAL frame dimensions from CDP metadata for coordinate mapping
-    // Chrome may send different size than requested viewport
-    // If Chrome returns suspicious dimensions (height < 100), use viewport dimensions instead
-    const frame_width = if (frame.device_width > 0 and frame.device_height >= 100)
-        frame.device_width
-    else
-        viewer.viewport_width;
-    const frame_height = if (frame.device_height >= 100)
-        frame.device_height
-    else
-        viewer.viewport_height;
-
-    // Debug: Log dimension decision
-    viewer.log("[DIM] device={}x{}, viewport={}x{}, using={}x{}\n", .{
-        frame.device_width, frame.device_height,
-        viewer.viewport_width, viewer.viewport_height,
-        frame_width, frame_height,
-    });
+    // Always use viewport dimensions for display (Chrome metadata can be wrong over SSH)
+    const frame_width = viewer.viewport_width;
+    const frame_height = viewer.viewport_height;
 
     // Detect frame dimension change and skip first changed frame to avoid visual glitch
     const frame_changed = viewer.last_frame_width > 0 and
