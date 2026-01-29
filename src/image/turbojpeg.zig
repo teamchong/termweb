@@ -49,13 +49,13 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) ?DecodedImage {
 
     const w: u32 = @intCast(width);
     const h: u32 = @intCast(height);
-    const size = w * h * 4;
+    const size = w * h * 3; // RGB = 3 bytes per pixel
 
     // Allocate output buffer
     const output = allocator.alloc(u8, size) catch return null;
     errdefer allocator.free(output);
 
-    // Decode to RGBA
+    // Decode to RGB (no alpha needed for screencast, 25% smaller)
     if (c.tjDecompress2(
         handle,
         data.ptr,
@@ -64,7 +64,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) ?DecodedImage {
         width,
         0, // pitch (0 = tight packing)
         height,
-        c.TJPF_RGBA,
+        c.TJPF_RGB,
         0, // flags
     ) != 0) {
         allocator.free(output);
