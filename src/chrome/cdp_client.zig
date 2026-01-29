@@ -532,15 +532,6 @@ pub const CdpClient = struct {
 
         if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
-            return;
-        }
-        // Fallback to pipe if websocket not connected
-        if (self.pipe_client) |pc| {
-            if (self.session_id != null) {
-                pc.sendSessionCommandAsync(self.session_id.?, method, params) catch {};
-                return;
-            }
-            pc.sendCommandAsync(method, params) catch {};
         }
     }
 
@@ -556,15 +547,6 @@ pub const CdpClient = struct {
 
         if (self.page_ws) |ws| {
             ws.sendCommandAsync(method, params);
-            return;
-        }
-        // Fallback to pipe if websocket not connected
-        if (self.pipe_client) |pc| {
-            if (self.session_id != null) {
-                pc.sendSessionCommandAsync(self.session_id.?, method, params) catch {};
-                return;
-            }
-            pc.sendCommandAsync(method, params) catch {};
         }
     }
 

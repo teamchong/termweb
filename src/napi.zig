@@ -441,7 +441,11 @@ fn runBrowserAsync(async_data: *AsyncOpenData) !void {
     var chrome_instance = try launcher.launchChromePipe(allocator, launch_opts);
     defer chrome_instance.deinit();
 
-    var client = try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
+    // Use pipe if available, otherwise WebSocket
+    var client = if (chrome_instance.read_fd >= 0 and chrome_instance.write_fd >= 0)
+        try cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port)
+    else
+        try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
     defer client.deinit();
 
     try screenshot_api.setViewport(client, allocator, viewport_width, viewport_height, dpr);
@@ -735,8 +739,11 @@ fn runBrowser(allocator: std.mem.Allocator, url: []const u8, no_toolbar: bool, d
     var chrome_instance = try launcher.launchChromePipe(allocator, launch_opts);
     defer chrome_instance.deinit();
 
-    // Connect CDP via WebSocket (WebSocket-only mode for extension support)
-    var client = try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
+    // Use pipe if available, otherwise WebSocket
+    var client = if (chrome_instance.read_fd >= 0 and chrome_instance.write_fd >= 0)
+        try cdp.CdpClient.initFromPipe(allocator, chrome_instance.read_fd, chrome_instance.write_fd, chrome_instance.debug_port)
+    else
+        try cdp.CdpClient.initFromWebSocket(allocator, chrome_instance.debug_port);
     defer client.deinit();
 
     // Set viewport with matching DPR

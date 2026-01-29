@@ -391,11 +391,12 @@ pub fn launchChromePipe(
     // We need two pipes:
     // - pipe_to_chrome: Parent writes -> Chrome reads (Chrome's FD 3)
     // - pipe_from_chrome: Chrome writes -> Parent reads (Chrome's FD 4)
-    const pipe_to_chrome = try std.posix.pipe(); // [0]=read, [1]=write
-    const pipe_from_chrome = try std.posix.pipe(); // [0]=read, [1]=write
+    // Use pipe2 WITHOUT O_CLOEXEC so FDs are inherited across exec
+    const pipe_to_chrome = try std.posix.pipe2(.{}); // [0]=read, [1]=write
+    const pipe_from_chrome = try std.posix.pipe2(.{}); // [0]=read, [1]=write
 
     // Stderr pipe to capture "DevTools listening on ws://..." for port discovery
-    const stderr_pipe = try std.posix.pipe(); // [0]=read (parent), [1]=write (child)
+    const stderr_pipe = try std.posix.pipe2(.{}); // [0]=read (parent), [1]=write (child)
 
     // 4. Build Chrome arguments
     var args_list = try std.ArrayList([]const u8).initCapacity(allocator, 16);
@@ -421,9 +422,8 @@ pub fn launchChromePipe(
         }
     }
 
-    // NOTE: Using WebSocket only (no pipe) to allow extensions in headless mode
-    // Pipe mode doesn't support extensions ("Multiple targets not supported")
-    // try args_list.append(allocator, "--remote-debugging-pipe");
+    // Use pipe for high-bandwidth screencast, WebSocket for commands
+    try args_list.append(allocator, "--remote-debugging-pipe");
     try args_list.append(allocator, "--remote-debugging-port=0");
     try args_list.append(allocator, "--remote-allow-origins=*");
 
@@ -509,12 +509,21 @@ pub fn launchChromePipe(
         std.posix.close(pipe_from_chrome[0]); // Parent's read end
         std.posix.close(stderr_pipe[0]); // Parent's read end of stderr
 
-        // NOTE: WebSocket-only mode - do NOT set up FD 3/4 for pipe
-        // Chrome auto-detects pipe mode if FD 3/4 are open, which triggers
-        // "Multiple targets not supported" error when extensions are loaded
-        // Just close the pipe FDs - we'll use WebSocket for all CDP communication
-        std.posix.close(pipe_to_chrome[0]);
-        std.posix.close(pipe_from_chrome[1]);
+        // Set up pipe FDs for Chrome's --remote-debugging-pipe
+        // Chrome expects: FD 3 = read commands, FD 4 = write responses
+        // Only dup2 if the FD isn't already 3 or 4, then close original only if different
+        if (pipe_to_chrome[0] != 3) {
+            std.posix.dup2(pipe_to_chrome[0], 3) catch std.posix.exit(1);
+            std.posix.close(pipe_to_chrome[0]);
+        }
+        if (pipe_from_chrome[1] != 4) {
+            std.posix.dup2(pipe_from_chrome[1], 4) catch std.posix.exit(1);
+            std.posix.close(pipe_from_chrome[1]);
+        }
+
+        // Clear CLOEXEC flag so FDs survive exec
+        _ = std.c.fcntl(3, std.posix.F.SETFD, @as(c_int, 0));
+        _ = std.c.fcntl(4, std.posix.F.SETFD, @as(c_int, 0));
 
         // Redirect stdout to /dev/null
         const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(1);
@@ -551,10 +560,9 @@ pub fn launchChromePipe(
     std.posix.close(pipe_from_chrome[1]); // Chrome's write end
     std.posix.close(stderr_pipe[1]); // Child's write end of stderr
 
-    // Close parent ends too - we're using WebSocket-only mode, not pipe mode
-    // These FDs are not used anymore since Chrome doesn't use --remote-debugging-pipe
-    std.posix.close(pipe_to_chrome[1]); // Parent's write end (unused)
-    std.posix.close(pipe_from_chrome[0]); // Parent's read end (unused)
+    // Keep parent ends open for pipe communication with Chrome
+    // pipe_to_chrome[1] = parent writes to Chrome (Chrome's FD 3)
+    // pipe_from_chrome[0] = parent reads from Chrome (Chrome's FD 4)
 
     // Read Chrome's stderr to find "DevTools listening on ws://127.0.0.1:PORT/..."
     const debug_port = extractDebugPort(stderr_pipe[0]) catch |err| {
@@ -573,12 +581,11 @@ pub fn launchChromePipe(
         std.debug.print("Chrome debugging on port {}\n", .{debug_port});
     }
 
-    // In WebSocket-only mode, we don't use pipe FDs
-    // Set them to -1 to indicate they're not valid
+    // Return pipe FDs for CDP pipe communication
     return ChromePipeInstance{
         .pid = pid,
-        .write_fd = -1, // Not used in WebSocket-only mode
-        .read_fd = -1, // Not used in WebSocket-only mode
+        .write_fd = pipe_to_chrome[1], // Parent writes to Chrome
+        .read_fd = pipe_from_chrome[0], // Parent reads from Chrome
         .user_data_dir = try allocator.dupe(u8, user_data_dir),
         .extension_dir = builtin_extension_dir, // Already allocated by setupExtension
         .debug_port = debug_port,
