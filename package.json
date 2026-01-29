@@ -1,6 +1,6 @@
 {
   "name": "termweb",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "description": "Web browser in your terminal using Kitty graphics protocol. SDK for building terminal apps with web technologies.",
   "main": "./lib/index.js",
   "bin": {
