@@ -257,25 +257,12 @@ pub const CdpClient = struct {
             client.page_ws = try websocket_cdp.WebSocketCdpClient.connect(allocator, url);
             try client.page_ws.?.startReaderThread();
 
-            // Enable Runtime domain for console events
-            const runtime_result = try client.page_ws.?.sendCommand("Runtime.enable", null);
-            allocator.free(runtime_result);
-
-            // Enable Page domain for navigation events
-            const page_result = try client.page_ws.?.sendCommand("Page.enable", null);
-            allocator.free(page_result);
-
-            // Enable Network domain
-            const network_result = try client.page_ws.?.sendCommand("Network.enable", null);
-            allocator.free(network_result);
-
-            // Intercept file chooser dialogs
-            const file_result = try client.page_ws.?.sendCommand("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
-            allocator.free(file_result);
-
-            // Grant clipboard permissions
-            const perm_result = client.page_ws.?.sendCommand("Browser.grantPermissions", "{\"permissions\":[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]}") catch null;
-            if (perm_result) |r| allocator.free(r);
+            // Enable domains async (fire-and-forget, faster startup)
+            client.page_ws.?.sendCommandAsync("Runtime.enable", null);
+            client.page_ws.?.sendCommandAsync("Page.enable", null);
+            client.page_ws.?.sendCommandAsync("Network.enable", null);
+            client.page_ws.?.sendCommandAsync("Page.setInterceptFileChooserDialog", "{\"enabled\":true}");
+            client.page_ws.?.sendCommandAsync("Browser.grantPermissions", "{\"permissions\":[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]}");
 
             // Inject polyfills via Page.addScriptToEvaluateOnNewDocument
             const polyfill_script = @embedFile("fs_polyfill.js");
