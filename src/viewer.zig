@@ -126,10 +126,8 @@ pub const Viewer = struct {
     original_viewport_height: u32,
     cell_width: u16,  // Terminal cell width in pixels (for DPR detection: >14 = Retina)
     target_fps: u32,  // Target frame rate (affects screencast and mouse tick)
-    chrome_inner_width: u32,  // Chrome's actual window.innerWidth (queried from JS)
-    chrome_inner_height: u32, // Chrome's actual window.innerHeight (queried from JS)
-    chrome_inner_frame_width: u32,  // Frame dimensions when chrome_inner was captured
-    chrome_inner_frame_height: u32, // Used to detect frame changes (download bar)
+    chrome_inner_width: u32,  // Chrome's actual window.innerWidth (from ResizeObserver)
+    chrome_inner_height: u32, // Chrome's actual window.innerHeight (from ResizeObserver)
     // Note: For coordinate mapping, use last_frame_width/height (the actual rendered frame)
     coord_mapper: ?CoordinateMapper,
     last_click: ?struct { term_x: u16, term_y: u16, browser_x: u32, browser_y: u32 },
@@ -314,10 +312,8 @@ pub const Viewer = struct {
             .original_viewport_height = original_viewport_height,
             .cell_width = cell_width,
             .target_fps = target_fps,
-            .chrome_inner_width = 0, // Will be queried from Chrome after page load
-            .chrome_inner_height = 0,
-            .chrome_inner_frame_width = 0,
-            .chrome_inner_frame_height = 0,
+            .chrome_inner_width = viewport_width, // Updated by ResizeObserver polyfill
+            .chrome_inner_height = viewport_height,
             .coord_mapper = null,
             .last_click = null,
             .screencast_mode = false,
@@ -848,14 +844,7 @@ pub const Viewer = struct {
             if (self.needs_nav_state_update) {
                 self.needs_nav_state_update = false;
                 self.forceUpdateNavigationState();
-                // Also update viewport
-                if (screenshot_api.getActualViewport(self.cdp_client, self.allocator)) |vp| {
-                    if (vp.width > 0 and vp.height > 0) {
-                        self.chrome_inner_width = vp.width;
-                        self.chrome_inner_height = vp.height;
-                        self.log("[NAV] Chrome viewport after load: {}x{}\n", .{ vp.width, vp.height });
-                    }
-                } else |_| {}
+                // Note: viewport is updated by ResizeObserver polyfill
             }
 
             // Flush pending ACK (no-op, kept for API compatibility)
@@ -1018,12 +1007,9 @@ pub const Viewer = struct {
         // Small yield to let Chrome process viewport change before starting screencast
         std.Thread.sleep(20 * std.time.ns_per_ms);
 
-        // Reset chrome viewport cache - will be re-queried on next frame render
-        // This lazy-cache approach avoids blocking resize on viewport query
-        self.chrome_inner_width = 0;
-        self.chrome_inner_height = 0;
-        self.chrome_inner_frame_width = 0;
-        self.chrome_inner_frame_height = 0;
+        // Update viewport to new size - ResizeObserver will confirm
+        self.chrome_inner_width = new_width;
+        self.chrome_inner_height = new_height;
 
         // Restart screencast with new dimensions and adaptive quality
         const resize_total_pixels: u64 = @as(u64, new_width) * @as(u64, new_height);

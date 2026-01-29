@@ -239,81 +239,34 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
     const cell_height: u32 = if (size.rows > 0) size.height_px / size.rows else 20;
     const toolbar_h: u32 = if (viewer.toolbar_renderer) |tr| tr.toolbar_height else cell_height;
 
-    // Chrome coords: Use Chrome's actual window.innerWidth/Height (queried via JS)
-    // This is the true coordinate space for Input.dispatchMouseEvent
-    // Query if not yet available (first frame or after page change)
-    if (viewer.chrome_inner_width == 0 or viewer.chrome_inner_height == 0) {
-        if (screenshot_api.getActualViewport(viewer.cdp_client, viewer.allocator)) |vp| {
-            if (vp.width > 0 and vp.height > 0) {
-                viewer.chrome_inner_width = vp.width;
-                viewer.chrome_inner_height = vp.height;
-                // Save frame dimensions at time of query for change detection
-                viewer.chrome_inner_frame_width = frame_width;
-                viewer.chrome_inner_frame_height = frame_height;
-            }
-        } else |_| {}
-    }
-
-    // If we have chrome inner dims but no frame dims yet, capture them now
-    if (viewer.chrome_inner_width > 0 and viewer.chrome_inner_height > 0 and
-        (viewer.chrome_inner_frame_width == 0 or viewer.chrome_inner_frame_height == 0))
-    {
-        viewer.chrome_inner_frame_width = frame_width;
-        viewer.chrome_inner_frame_height = frame_height;
-    }
-
-    // Adjust chrome dimensions if frame changed (e.g., download bar appeared)
-    // Apply ratio: new_chrome = old_chrome * new_frame / old_frame
-    var chrome_width: u32 = if (viewer.chrome_inner_width > 0) viewer.chrome_inner_width else frame_width;
-    var chrome_height: u32 = if (viewer.chrome_inner_height > 0) viewer.chrome_inner_height else frame_height;
-    if (viewer.chrome_inner_frame_width > 0 and viewer.chrome_inner_frame_height > 0) {
-        if (frame_width != viewer.chrome_inner_frame_width or frame_height != viewer.chrome_inner_frame_height) {
-            chrome_width = (viewer.chrome_inner_width * frame_width) / viewer.chrome_inner_frame_width;
-            chrome_height = (viewer.chrome_inner_height * frame_height) / viewer.chrome_inner_frame_height;
-        }
-    }
+    // Chrome coords: Use Chrome's actual window.innerWidth/Height
+    // Updated by ResizeObserver polyfill in isolated world
+    const chrome_width: u32 = viewer.chrome_inner_width;
+    const chrome_height: u32 = viewer.chrome_inner_height;
 
     // Content starts at row 2, with y_offset to align with toolbar bottom
     // This avoids gaps between toolbar and content
     const row_start_pixel = cell_height; // Row 2 starts at 1 * cell_height
     const y_offset: u32 = if (toolbar_h > row_start_pixel) toolbar_h - row_start_pixel else 0;
 
-    // Calculate content rows based on FRAME aspect ratio to avoid stretching
-    // When frame height changes (download bar), we adjust rows proportionally
+    // Calculate content rows based on frame aspect ratio (no stretching)
     const display_pixel_width: u32 = @as(u32, display_cols) * cell_width;
     const aspect_pixel_height: u32 = if (frame_width > 0)
         (display_pixel_width * frame_height) / frame_width
     else
         frame_height;
 
-    // Cap content to what fits in actual terminal (prevent rendering beyond terminal)
+    // Cap to terminal height, preserve aspect ratio
     const max_content_height: u32 = if (size.height_px > toolbar_h)
         size.height_px - @as(u16, @intCast(toolbar_h))
     else
         size.height_px;
-    const capped_content_height = @min(aspect_pixel_height, max_content_height);
-    const content_rows: u32 = if (cell_height > 0) capped_content_height / cell_height else 1;
-
-    // Debug: log to file - compare all dimensions
-    if (std.fs.createFileAbsolute("/tmp/render_debug.log", .{ .truncate = false })) |f| {
-        defer f.close();
-        f.seekFromEnd(0) catch {};
-        var buf: [512]u8 = undefined;
-        const actual_content_h = content_rows * cell_height;
-        const msg = std.fmt.bufPrint(&buf, "term={}x{} display_w={} frame={}x{} chrome={}x{} inner={}x{} content_h={}\n", .{
-            size.width_px, size.height_px,
-            display_pixel_width,
-            frame_width, frame_height,
-            chrome_width, chrome_height,
-            viewer.chrome_inner_width, viewer.chrome_inner_height,
-            actual_content_h,
-        }) catch "";
-        _ = f.write(msg) catch {};
-    } else |_| {}
+    const content_height = @min(aspect_pixel_height, max_content_height);
+    const content_rows: u32 = if (cell_height > 0) content_height / cell_height else 1;
 
     // Update coordinate mapper using DISPLAY dimensions (where content is actually shown)
     // Content width = display_cols * cell_width (may be less than terminal width)
-    // Content height = content_rows * cell_height (calculated from frame aspect ratio)
+    // Content height = content_rows * cell_height (preserves frame aspect ratio)
     const mapper_content_h: u16 = @intCast(content_rows * cell_height);
     viewer.coord_mapper = CoordinateMapper.initFull(
         @intCast(display_pixel_width), // Display width, not terminal width

@@ -143,6 +143,16 @@ pub const CdpClient = struct {
         const clipboard_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
         allocator.free(clipboard_result);
 
+        // Inject ResizeObserver polyfill in isolated world - reports viewport changes
+        const resize_script = @embedFile("resize_polyfill.js");
+        var resize_json_buf: [4096]u8 = undefined;
+        const resize_json = json_utils.escapeString(resize_script, &resize_json_buf) catch return error.OutOfMemory;
+
+        var resize_params_buf: [8192]u8 = undefined;
+        const resize_params = std.fmt.bufPrint(&resize_params_buf, "{{\"source\":{s},\"worldName\":\"termweb\"}}", .{resize_json}) catch return error.OutOfMemory;
+        const resize_result = try client.sendCommand("Page.addScriptToEvaluateOnNewDocument", resize_params);
+        allocator.free(resize_result);
+
         // NOTE: Runtime.enable is called on page_ws after WebSocket connect (not on pipe)
         // Pipe is ONLY for screencast frames - events come from page_ws
 
@@ -285,6 +295,16 @@ pub const CdpClient = struct {
             const clipboard_params = std.fmt.bufPrint(&clipboard_params_buf, "{{\"source\":{s}}}", .{clipboard_json}) catch return CdpError.OutOfMemory;
             const clipboard_result = try client.page_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", clipboard_params);
             allocator.free(clipboard_result);
+
+            // Inject ResizeObserver polyfill in isolated world
+            const resize_script = @embedFile("resize_polyfill.js");
+            var resize_json_buf: [4096]u8 = undefined;
+            const resize_json = json_utils.escapeString(resize_script, &resize_json_buf) catch return CdpError.OutOfMemory;
+
+            var resize_params_buf: [8192]u8 = undefined;
+            const resize_params = std.fmt.bufPrint(&resize_params_buf, "{{\"source\":{s},\"worldName\":\"termweb\"}}", .{resize_json}) catch return CdpError.OutOfMemory;
+            const resize_result = try client.page_ws.?.sendCommand("Page.addScriptToEvaluateOnNewDocument", resize_params);
+            allocator.free(resize_result);
         }
 
         // Connect browser_ws for Browser domain events (downloads)

@@ -43,11 +43,7 @@ pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
         // Reset baseline - next frame will set it for this page
         viewer.baseline_frame_width = 0;
         viewer.baseline_frame_height = 0;
-        // Reset viewport cache - will be re-queried from main loop
-        viewer.chrome_inner_width = 0;
-        viewer.chrome_inner_height = 0;
-        viewer.chrome_inner_frame_width = 0;
-        viewer.chrome_inner_frame_height = 0;
+        // Note: viewport is updated by ResizeObserver polyfill
     } else if (std.mem.eql(u8, event.method, "Page.navigatedWithinDocument")) {
         handleNavigatedWithinDocument(viewer, event.payload);
     } else if (std.mem.eql(u8, event.method, "Target.targetCreated")) {
@@ -55,8 +51,6 @@ pub fn handleCdpEvent(viewer: anytype, event: *cdp.CdpEvent) !void {
     } else if (std.mem.eql(u8, event.method, "Target.targetInfoChanged")) {
         handleTargetInfoChanged(viewer, event.payload);
     }
-    // NOTE: Frame changes (download bar, etc.) are detected by comparing current frame
-    // dimensions to chrome_inner_frame_width/height and applying ratio adjustment
 }
 
 /// Handle Page.frameNavigated - actual page load, show loading for main frame
@@ -68,11 +62,7 @@ pub fn handleFrameNavigated(viewer: anytype, payload: []const u8) void {
 
     if (!is_main_frame) return;
 
-    // Reset viewport cache on main frame navigation - different pages may have different viewports
-    viewer.chrome_inner_width = 0;
-    viewer.chrome_inner_height = 0;
-    viewer.chrome_inner_frame_width = 0;
-    viewer.chrome_inner_frame_height = 0;
+    // Note: viewport is updated by ResizeObserver polyfill
 
     if (!viewer.ui_state.is_loading) {
         viewer.ui_state.is_loading = true;
@@ -266,8 +256,15 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
     }
 }
 
-/// Handle console messages - look for IPC markers
+/// Handle console messages - look for resize and IPC markers
 pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
+    // Check for resize marker (from ResizeObserver in isolated world)
+    const resize_marker = "__TERMWEB_RESIZE__:";
+    if (std.mem.indexOf(u8, payload, resize_marker)) |resize_pos| {
+        handleResizeEvent(viewer, payload, resize_pos + resize_marker.len);
+        return;
+    }
+
     // Check for IPC message marker - forward to registered callback (if any)
     const ipc_marker = "__TERMWEB_IPC__:";
     if (std.mem.indexOf(u8, payload, ipc_marker)) |ipc_pos| {
@@ -289,6 +286,34 @@ pub fn handleConsoleMessage(viewer: anytype, payload: []const u8) !void {
         }
         return;
     }
+}
+
+/// Handle resize event from ResizeObserver - format: W:H
+fn handleResizeEvent(viewer: anytype, payload: []const u8, start: usize) void {
+    // Parse width:height format
+    const data_start = start;
+    var data_end = start;
+    for (payload[start..]) |c| {
+        if (c == '"' or c == '\n' or c == '\r' or c == ' ') break;
+        data_end += 1;
+    }
+
+    if (data_end <= data_start) return;
+    const dimensions = payload[data_start..data_end];
+
+    // Split on ':'
+    const sep_pos = std.mem.indexOf(u8, dimensions, ":") orelse return;
+    const width_str = dimensions[0..sep_pos];
+    const height_str = dimensions[sep_pos + 1 ..];
+
+    const width = std.fmt.parseInt(u32, width_str, 10) catch return;
+    const height = std.fmt.parseInt(u32, height_str, 10) catch return;
+
+    viewer.log("[RESIZE] ResizeObserver reported viewport: {d}x{d}\n", .{ width, height });
+
+    // Update chrome inner dimensions (used for coordinate mapping)
+    viewer.chrome_inner_width = width;
+    viewer.chrome_inner_height = height;
 }
 
 /// Show file chooser dialog - delegates to viewer.showFileChooser
