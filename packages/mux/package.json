@@ -1,0 +1,41 @@
+{
+  "name": "termweb-mux",
+  "version": "0.1.0",
+  "description": "Remote terminal multiplexer - run ghostty on server, view in browser",
+  "bin": {
+    "termweb-mux": "bin/cli.js"
+  },
+  "scripts": {
+    "build:native": "cd native && zig build -Doptimize=ReleaseFast",
+    "start": "node bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "web/",
+    "native/zig-out/bin/"
+  ],
+  "keywords": [
+    "terminal",
+    "multiplexer",
+    "ghostty",
+    "remote",
+    "browser",
+    "websocket",
+    "cli"
+  ],
+  "author": "teamchong",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/termweb.git",
+    "directory": "packages/mux"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64", "x64"],
+  "engines": {
+    "node": ">=16"
+  }
+}

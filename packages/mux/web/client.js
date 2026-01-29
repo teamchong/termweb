@@ -1,0 +1,939 @@
+// termweb-mux browser client
+// Connects to server, receives frames, renders to canvas, sends input
+
+// WebSocket ports are fetched from /config endpoint
+let PANEL_PORT = 0;
+let CONTROL_PORT = 0;
+
+// Message types (must match server)
+const ClientMsg = {
+  KEY_INPUT: 0x01,
+  MOUSE_INPUT: 0x02,
+  MOUSE_MOVE: 0x03,
+  MOUSE_SCROLL: 0x04,
+  TEXT_INPUT: 0x05,
+  RESIZE: 0x10,
+  REQUEST_KEYFRAME: 0x11,
+  PAUSE_STREAM: 0x12,
+  RESUME_STREAM: 0x13,
+};
+
+const FrameType = {
+  KEYFRAME: 0x01,
+  DELTA: 0x02,
+};
+
+// ============================================================================
+// Panel - one terminal panel with its own WebSocket
+// ============================================================================
+
+class Panel {
+  constructor(id, container) {
+    this.id = id;
+    this.container = container;
+    this.ws = null;
+    this.canvas = document.createElement('canvas');
+    this.width = 0;
+    this.height = 0;
+    this.sequence = 0;
+
+    // WebGPU state
+    this.device = null;
+    this.context = null;
+    this.pipeline = null;
+    this.xorPipeline = null;
+    this.rgbToRgbaPipeline = null;
+    this.prevBuffer = null;
+    this.diffBuffer = null;
+    this.texture = null;
+    this.sampler = null;
+
+    this.element = document.createElement('div');
+    this.element.className = 'panel';
+    this.element.appendChild(this.canvas);
+    container.appendChild(this.element);
+
+    this.setupInputHandlers();
+    this.initGPU();
+  }
+
+  async initGPU() {
+    if (!navigator.gpu) {
+      console.error('WebGPU not supported');
+      return;
+    }
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      console.error('No WebGPU adapter');
+      return;
+    }
+
+    this.device = await adapter.requestDevice();
+    this.context = this.canvas.getContext('webgpu');
+
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    this.context.configure({
+      device: this.device,
+      format: format,
+      alphaMode: 'opaque',
+    });
+
+    // XOR compute shader
+    const xorShader = this.device.createShaderModule({
+      code: `
+        @group(0) @binding(0) var<storage, read> diff: array<u32>;
+        @group(0) @binding(1) var<storage, read_write> prev: array<u32>;
+
+        @compute @workgroup_size(256)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          let idx = id.x;
+          if (idx < arrayLength(&prev)) {
+            prev[idx] = prev[idx] ^ diff[idx];
+          }
+        }
+      `
+    });
+
+    this.xorPipeline = this.device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: xorShader, entryPoint: 'main' }
+    });
+
+    // RGB to RGBA compute shader
+    const convertShader = this.device.createShaderModule({
+      code: `
+        @group(0) @binding(0) var<storage, read> rgb: array<u32>;
+        @group(0) @binding(1) var outTex: texture_storage_2d<rgba8unorm, write>;
+
+        @compute @workgroup_size(16, 16)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          let dims = textureDimensions(outTex);
+          if (id.x >= dims.x || id.y >= dims.y) { return; }
+
+          let pixelIdx = id.y * dims.x + id.x;
+          let byteIdx = pixelIdx * 3u;
+          let wordIdx = byteIdx / 4u;
+          let byteOff = byteIdx % 4u;
+
+          let w0 = rgb[wordIdx];
+          let w1 = rgb[wordIdx + 1u];
+
+          var r: u32; var g: u32; var b: u32;
+          if (byteOff == 0u) {
+            r = (w0 >> 0u) & 0xFFu;
+            g = (w0 >> 8u) & 0xFFu;
+            b = (w0 >> 16u) & 0xFFu;
+          } else if (byteOff == 1u) {
+            r = (w0 >> 8u) & 0xFFu;
+            g = (w0 >> 16u) & 0xFFu;
+            b = (w0 >> 24u) & 0xFFu;
+          } else if (byteOff == 2u) {
+            r = (w0 >> 16u) & 0xFFu;
+            g = (w0 >> 24u) & 0xFFu;
+            b = (w1 >> 0u) & 0xFFu;
+          } else {
+            r = (w0 >> 24u) & 0xFFu;
+            g = (w1 >> 0u) & 0xFFu;
+            b = (w1 >> 8u) & 0xFFu;
+          }
+
+          let color = vec4<f32>(f32(r) / 255.0, f32(g) / 255.0, f32(b) / 255.0, 1.0);
+          textureStore(outTex, vec2<i32>(i32(id.x), i32(id.y)), color);
+        }
+      `
+    });
+
+    this.rgbToRgbaPipeline = this.device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: convertShader, entryPoint: 'main' }
+    });
+
+    // Fullscreen quad render
+    const quadShader = this.device.createShaderModule({
+      code: `
+        @group(0) @binding(0) var tex: texture_2d<f32>;
+        @group(0) @binding(1) var samp: sampler;
+
+        struct VSOut {
+          @builtin(position) pos: vec4<f32>,
+          @location(0) uv: vec2<f32>,
+        };
+
+        @vertex
+        fn vs(@builtin(vertex_index) idx: u32) -> VSOut {
+          var pos = array<vec2<f32>, 4>(
+            vec2(-1.0, 1.0), vec2(1.0, 1.0), vec2(-1.0, -1.0), vec2(1.0, -1.0)
+          );
+          var uv = array<vec2<f32>, 4>(
+            vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(1.0, 1.0)
+          );
+          var out: VSOut;
+          out.pos = vec4(pos[idx], 0.0, 1.0);
+          out.uv = uv[idx];
+          return out;
+        }
+
+        @fragment
+        fn fs(in: VSOut) -> @location(0) vec4<f32> {
+          return textureSample(tex, samp, in.uv);
+        }
+      `
+    });
+
+    this.pipeline = this.device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: quadShader, entryPoint: 'vs' },
+      fragment: {
+        module: quadShader,
+        entryPoint: 'fs',
+        targets: [{ format: format }]
+      },
+      primitive: { topology: 'triangle-strip' }
+    });
+
+    this.sampler = this.device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
+    console.log('WebGPU initialized');
+  }
+  
+  connect(host = 'localhost') {
+    this.ws = new WebSocket(`ws://${host}:${PANEL_PORT}`);
+    this.ws.binaryType = 'arraybuffer';
+    
+    this.ws.onopen = () => {
+      console.log(`Panel ${this.id}: Connected`);
+      this.sendResize();
+    };
+    
+    this.ws.onmessage = (event) => {
+      this.handleFrame(event.data);
+    };
+    
+    this.ws.onclose = () => {
+      console.log(`Panel ${this.id}: Disconnected`);
+    };
+    
+    this.ws.onerror = (err) => {
+      console.error(`Panel ${this.id}: Error`, err);
+    };
+  }
+  
+  disconnect() {
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+  
+  async handleFrame(data) {
+    if (!this.device) {
+      console.log('handleFrame: device not ready');
+      return;
+    }
+
+    const view = new DataView(data);
+
+    // Parse header (13 bytes)
+    const frameType = view.getUint8(0);
+    const sequence = view.getUint32(1, true);
+    const width = view.getUint16(5, true);
+    const height = view.getUint16(7, true);
+    const compressedSize = view.getUint32(9, true);
+
+    if (sequence % 100 === 0) {
+      console.log(`Frame ${sequence}: ${width}x${height}, type=${frameType}, compressed=${compressedSize}`);
+    }
+
+    // Resize GPU resources if needed
+    if (width !== this.width || height !== this.height) {
+      console.log(`Resizing to ${width}x${height}`);
+      this.width = width;
+      this.height = height;
+      this.canvas.width = width;
+      this.canvas.height = height;
+      this.createGPUBuffers(width, height);
+    }
+
+    // Decompress RGB data
+    const compressed = new Uint8Array(data, 13, compressedSize);
+    let rgb;
+    try {
+      rgb = await this.decompress(compressed);
+      if (sequence % 100 === 0) {
+        console.log(`Decompressed: ${rgb.length} bytes`);
+      }
+    } catch (e) {
+      console.error('Decompress failed:', e);
+      return;
+    }
+
+    // Verify size matches
+    const expectedSize = width * height * 3;
+    if (rgb.length !== expectedSize) {
+      console.error(`Size mismatch: got ${rgb.length}, expected ${expectedSize}`);
+      return;
+    }
+
+    // Upload to GPU and process
+    if (frameType === FrameType.KEYFRAME) {
+      this.device.queue.writeBuffer(this.prevBuffer, 0, rgb);
+    } else {
+      this.device.queue.writeBuffer(this.diffBuffer, 0, rgb);
+
+      const commandEncoder = this.device.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(this.xorPipeline);
+      pass.setBindGroup(0, this.xorBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(rgb.length / 4 / 256));
+      pass.end();
+      this.device.queue.submit([commandEncoder.finish()]);
+    }
+
+    // Convert RGB→RGBA and render
+    this.renderFrame();
+    this.sequence = sequence;
+  }
+
+  createGPUBuffers(width, height) {
+    const rgbSize = width * height * 3;
+    const rgbAligned = Math.ceil(rgbSize / 4) * 4; // Align to 4 bytes
+
+    this.prevBuffer = this.device.createBuffer({
+      size: rgbAligned,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.diffBuffer = this.device.createBuffer({
+      size: rgbAligned,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.texture = this.device.createTexture({
+      size: [width, height],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+
+    // XOR bind group
+    this.xorBindGroup = this.device.createBindGroup({
+      layout: this.xorPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.diffBuffer } },
+        { binding: 1, resource: { buffer: this.prevBuffer } },
+      ],
+    });
+
+    // RGB→RGBA bind group
+    this.convertBindGroup = this.device.createBindGroup({
+      layout: this.rgbToRgbaPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.prevBuffer } },
+        { binding: 1, resource: this.texture.createView() },
+      ],
+    });
+
+    // Render bind group
+    this.renderBindGroup = this.device.createBindGroup({
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.texture.createView() },
+        { binding: 1, resource: this.sampler },
+      ],
+    });
+  }
+
+  renderFrame() {
+    const commandEncoder = this.device.createCommandEncoder();
+
+    // RGB→RGBA compute pass
+    const computePass = commandEncoder.beginComputePass();
+    computePass.setPipeline(this.rgbToRgbaPipeline);
+    computePass.setBindGroup(0, this.convertBindGroup);
+    computePass.dispatchWorkgroups(
+      Math.ceil(this.width / 16),
+      Math.ceil(this.height / 16)
+    );
+    computePass.end();
+
+    // Render pass
+    const renderPass = commandEncoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.context.getCurrentTexture().createView(),
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    renderPass.setPipeline(this.pipeline);
+    renderPass.setBindGroup(0, this.renderBindGroup);
+    renderPass.draw(4);
+    renderPass.end();
+
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  async decompress(compressed) {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    writer.write(compressed);
+    writer.close();
+    const chunks = [];
+    const reader = ds.readable.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    const totalLen = chunks.reduce((a, c) => a + c.length, 0);
+    const result = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return result;
+  }
+  
+  setupInputHandlers() {
+    // Focus handling
+    this.canvas.tabIndex = 1;
+    
+    // Keyboard
+    this.canvas.addEventListener('keydown', (e) => {
+      e.preventDefault();
+      this.sendKeyInput(e, 1); // press
+    });
+    
+    this.canvas.addEventListener('keyup', (e) => {
+      e.preventDefault();
+      this.sendKeyInput(e, 0); // release
+    });
+    
+    // Mouse
+    this.canvas.addEventListener('mousedown', (e) => {
+      this.canvas.focus();
+      this.sendMouseButton(e, 1);
+    });
+    
+    this.canvas.addEventListener('mouseup', (e) => {
+      this.sendMouseButton(e, 0);
+    });
+    
+    this.canvas.addEventListener('mousemove', (e) => {
+      this.sendMouseMove(e);
+    });
+    
+    this.canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      this.sendMouseScroll(e);
+    });
+    
+    // Prevent context menu
+    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+  
+  getModifiers(e) {
+    let mods = 0;
+    if (e.shiftKey) mods |= 0x01;
+    if (e.ctrlKey) mods |= 0x02;
+    if (e.altKey) mods |= 0x04;
+    if (e.metaKey) mods |= 0x08;
+    return mods;
+  }
+  
+  getCanvasCoords(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const scaleX = this.canvas.width / rect.width;
+    const scaleY = this.canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY
+    };
+  }
+  
+  sendKeyInput(e, action) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    
+    const keyCode = keyCodeMap[e.code] || 0;
+    if (keyCode === 0) return;
+    
+    const buf = new ArrayBuffer(7);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.KEY_INPUT);
+    view.setUint32(1, keyCode, true);
+    view.setUint8(5, action);
+    view.setUint8(6, this.getModifiers(e));
+    this.ws.send(buf);
+  }
+  
+  sendMouseButton(e, state) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    
+    const coords = this.getCanvasCoords(e);
+    const buf = new ArrayBuffer(20);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.MOUSE_INPUT);
+    view.setFloat64(1, coords.x, true);
+    view.setFloat64(9, coords.y, true);
+    view.setUint8(17, e.button);
+    view.setUint8(18, state);
+    view.setUint8(19, this.getModifiers(e));
+    this.ws.send(buf);
+  }
+  
+  sendMouseMove(e) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    
+    const coords = this.getCanvasCoords(e);
+    const buf = new ArrayBuffer(18);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.MOUSE_MOVE);
+    view.setFloat64(1, coords.x, true);
+    view.setFloat64(9, coords.y, true);
+    view.setUint8(17, this.getModifiers(e));
+    this.ws.send(buf);
+  }
+  
+  sendMouseScroll(e) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    
+    const coords = this.getCanvasCoords(e);
+    const buf = new ArrayBuffer(34);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.MOUSE_SCROLL);
+    view.setFloat64(1, coords.x, true);
+    view.setFloat64(9, coords.y, true);
+    view.setFloat64(17, e.deltaX, true);
+    view.setFloat64(25, e.deltaY, true);
+    view.setUint8(33, this.getModifiers(e));
+    this.ws.send(buf);
+  }
+  
+  sendResize() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    
+    const rect = this.canvas.getBoundingClientRect();
+    // Account for device pixel ratio
+    const width = Math.floor(rect.width * window.devicePixelRatio);
+    const height = Math.floor(rect.height * window.devicePixelRatio);
+    
+    const buf = new ArrayBuffer(5);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.RESIZE);
+    view.setUint16(1, width, true);
+    view.setUint16(3, height, true);
+    this.ws.send(buf);
+  }
+  
+  requestKeyframe() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(new Uint8Array([ClientMsg.REQUEST_KEYFRAME]));
+  }
+  
+  pause() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(new Uint8Array([ClientMsg.PAUSE_STREAM]));
+  }
+  
+  resume() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(new Uint8Array([ClientMsg.RESUME_STREAM]));
+    this.requestKeyframe();
+  }
+  
+  show() {
+    this.element.classList.add('active');
+    this.canvas.focus();
+    this.resume();
+  }
+  
+  hide() {
+    this.element.classList.remove('active');
+    this.pause();
+  }
+  
+  destroy() {
+    this.disconnect();
+    this.element.remove();
+  }
+}
+
+// ============================================================================
+// Key code mapping (JavaScript code -> ghostty key code)
+// ============================================================================
+
+const keyCodeMap = {
+  'KeyA': 4, 'KeyB': 5, 'KeyC': 6, 'KeyD': 7, 'KeyE': 8, 'KeyF': 9,
+  'KeyG': 10, 'KeyH': 11, 'KeyI': 12, 'KeyJ': 13, 'KeyK': 14, 'KeyL': 15,
+  'KeyM': 16, 'KeyN': 17, 'KeyO': 18, 'KeyP': 19, 'KeyQ': 20, 'KeyR': 21,
+  'KeyS': 22, 'KeyT': 23, 'KeyU': 24, 'KeyV': 25, 'KeyW': 26, 'KeyX': 27,
+  'KeyY': 28, 'KeyZ': 29,
+  'Digit1': 30, 'Digit2': 31, 'Digit3': 32, 'Digit4': 33, 'Digit5': 34,
+  'Digit6': 35, 'Digit7': 36, 'Digit8': 37, 'Digit9': 38, 'Digit0': 39,
+  'Enter': 40, 'Escape': 41, 'Backspace': 42, 'Tab': 43, 'Space': 44,
+  'Minus': 45, 'Equal': 46, 'BracketLeft': 47, 'BracketRight': 48,
+  'Backslash': 49, 'Semicolon': 51, 'Quote': 52, 'Backquote': 53,
+  'Comma': 54, 'Period': 55, 'Slash': 56, 'CapsLock': 57,
+  'F1': 58, 'F2': 59, 'F3': 60, 'F4': 61, 'F5': 62, 'F6': 63,
+  'F7': 64, 'F8': 65, 'F9': 66, 'F10': 67, 'F11': 68, 'F12': 69,
+  'PrintScreen': 70, 'ScrollLock': 71, 'Pause': 72,
+  'Insert': 73, 'Home': 74, 'PageUp': 75, 'Delete': 76, 'End': 77, 'PageDown': 78,
+  'ArrowRight': 79, 'ArrowLeft': 80, 'ArrowDown': 81, 'ArrowUp': 82,
+  'NumLock': 83,
+  'NumpadDivide': 84, 'NumpadMultiply': 85, 'NumpadSubtract': 86,
+  'NumpadAdd': 87, 'NumpadEnter': 88,
+  'Numpad1': 89, 'Numpad2': 90, 'Numpad3': 91, 'Numpad4': 92, 'Numpad5': 93,
+  'Numpad6': 94, 'Numpad7': 95, 'Numpad8': 96, 'Numpad9': 97, 'Numpad0': 98,
+  'NumpadDecimal': 99,
+  'ControlLeft': 224, 'ShiftLeft': 225, 'AltLeft': 226, 'MetaLeft': 227,
+  'ControlRight': 228, 'ShiftRight': 229, 'AltRight': 230, 'MetaRight': 231,
+};
+
+// ============================================================================
+// App - manages control connection and panels
+// ============================================================================
+
+class App {
+  constructor() {
+    this.controlWs = null;
+    this.panels = new Map();
+    this.activePanel = null;
+    this.nextLocalId = 1;
+    
+    this.tabsEl = document.getElementById('tabs');
+    this.panelsEl = document.getElementById('panels');
+    this.statusEl = document.getElementById('status');
+    
+    document.getElementById('new-tab').addEventListener('click', () => {
+      this.createPanel();
+    });
+    
+    // Handle resize
+    window.addEventListener('resize', () => {
+      if (this.activePanel) {
+        this.activePanel.sendResize();
+      }
+    });
+
+    // Global keyboard shortcuts
+    window.addEventListener('keydown', (e) => {
+      // ⌘1-9 to switch tabs
+      if (e.metaKey && e.key >= '1' && e.key <= '9') {
+        e.preventDefault();
+        const index = parseInt(e.key) - 1;
+        const tabs = Array.from(this.tabsEl.children);
+        if (index < tabs.length) {
+          const id = parseInt(tabs[index].dataset.id);
+          this.switchToPanel(id);
+        }
+      }
+      // ⌘T for new tab
+      if (e.metaKey && e.key === 't') {
+        e.preventDefault();
+        this.createPanel();
+      }
+      // ⌘W to close tab
+      if (e.metaKey && e.key === 'w') {
+        e.preventDefault();
+        if (this.activePanel) {
+          this.removePanel(this.activePanel.id);
+        }
+      }
+    });
+  }
+  
+  connect(host = 'localhost') {
+    this.controlWs = new WebSocket(`ws://${host}:${CONTROL_PORT}`);
+    
+    this.controlWs.onopen = () => {
+      this.statusEl.textContent = 'Connected';
+      console.log('Control channel connected');
+      // Auto-create first panel
+      if (this.panels.size === 0) {
+        this.createPanel();
+      }
+    };
+    
+    this.controlWs.onmessage = (event) => {
+      this.handleControlMessage(JSON.parse(event.data));
+    };
+    
+    this.controlWs.onclose = () => {
+      this.statusEl.textContent = 'Disconnected';
+      console.log('Control channel disconnected');
+    };
+    
+    this.controlWs.onerror = (err) => {
+      this.statusEl.textContent = 'Connection error';
+      console.error('Control error:', err);
+    };
+  }
+  
+  handleControlMessage(msg) {
+    console.log('Control message:', msg);
+    
+    switch (msg.type) {
+      case 'panel_list':
+        // Initial panel list
+        for (const p of msg.panels) {
+          if (!this.panels.has(p.id)) {
+            this.addPanel(p.id);
+          }
+        }
+        break;
+        
+      case 'panel_created':
+        // New panel created on server
+        break;
+        
+      case 'panel_closed':
+        this.removePanel(msg.panel_id);
+        break;
+        
+      case 'panel_title':
+        this.updatePanelTitle(msg.panel_id, msg.title);
+        break;
+
+      case 'panel_bell':
+        this.handlePanelBell(msg.panel_id);
+        break;
+    }
+  }
+  
+  createPanel() {
+    // Create panel locally and connect
+    const panel = new Panel(this.nextLocalId++, this.panelsEl);
+    panel.connect();
+    this.panels.set(panel.id, panel);
+    this.addTab(panel.id, `Panel ${panel.id}`);
+    this.switchToPanel(panel.id);
+  }
+  
+  addPanel(id) {
+    if (this.panels.has(id)) return;
+    
+    const panel = new Panel(id, this.panelsEl);
+    panel.connect();
+    this.panels.set(id, panel);
+    this.addTab(id, `Panel ${id}`);
+    
+    if (!this.activePanel) {
+      this.switchToPanel(id);
+    }
+  }
+  
+  removePanel(id) {
+    const panel = this.panels.get(id);
+    if (!panel) return;
+    
+    panel.destroy();
+    this.panels.delete(id);
+    this.removeTab(id);
+    
+    if (this.activePanel === panel) {
+      this.activePanel = null;
+      // Switch to another panel if available
+      const remaining = this.panels.keys().next();
+      if (!remaining.done) {
+        this.switchToPanel(remaining.value);
+      }
+    }
+  }
+  
+  switchToPanel(id) {
+    // Hide current
+    if (this.activePanel) {
+      this.activePanel.hide();
+    }
+    
+    // Show new
+    const panel = this.panels.get(id);
+    if (panel) {
+      panel.show();
+      this.activePanel = panel;
+      this.updateTabActive(id);
+    }
+  }
+  
+  addTab(id, title) {
+    const tab = document.createElement('div');
+    tab.className = 'tab';
+    tab.dataset.id = id;
+
+    // Get tab index for hotkey (1-9)
+    const tabIndex = this.tabsEl.children.length + 1;
+    const hotkeyHint = tabIndex <= 9 ? `⌘${tabIndex}` : '';
+
+    tab.innerHTML = `<span class="close">×</span><span class="title">${title}</span><span class="hotkey">${hotkeyHint}</span>`;
+
+    tab.addEventListener('click', (e) => {
+      if (!e.target.classList.contains('close')) {
+        this.switchToPanel(id);
+      }
+    });
+
+    tab.querySelector('.close').addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.removePanel(id);
+    });
+
+    this.tabsEl.appendChild(tab);
+  }
+  
+  removeTab(id) {
+    const tab = this.tabsEl.querySelector(`[data-id="${id}"]`);
+    if (tab) tab.remove();
+    this.updateHotkeyHints();
+  }
+
+  updateHotkeyHints() {
+    const tabs = this.tabsEl.querySelectorAll('.tab');
+    tabs.forEach((tab, index) => {
+      const hotkey = tab.querySelector('.hotkey');
+      if (hotkey) {
+        hotkey.textContent = index < 9 ? `⌘${index + 1}` : '';
+      }
+    });
+  }
+  
+  updateTabActive(id) {
+    for (const tab of this.tabsEl.children) {
+      tab.classList.toggle('active', tab.dataset.id == id);
+    }
+  }
+  
+  updatePanelTitle(id, title) {
+    const tab = this.tabsEl.querySelector(`[data-id="${id}"] .title`);
+    if (tab) tab.textContent = title;
+  }
+
+  handlePanelBell(id) {
+    // Flash the tab if not active
+    const tab = this.tabsEl.querySelector(`[data-id="${id}"]`);
+    if (tab && !tab.classList.contains('active')) {
+      tab.classList.add('bell');
+      setTimeout(() => tab.classList.remove('bell'), 500);
+    }
+  }
+}
+
+// ============================================================================
+// Init
+// ============================================================================
+
+// Parse hex color to RGB
+function hexToRgb(hex) {
+  const m = hex.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
+  return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : null;
+}
+
+// RGB to hex
+function rgbToHex(r, g, b) {
+  return `#${Math.round(r).toString(16).padStart(2,'0')}${Math.round(g).toString(16).padStart(2,'0')}${Math.round(b).toString(16).padStart(2,'0')}`;
+}
+
+// Calculate luminance (same formula as ghostty)
+function luminance(hex) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return 0;
+  return (0.299 * rgb.r / 255) + (0.587 * rgb.g / 255) + (0.114 * rgb.b / 255);
+}
+
+// Check if color is light (luminance > 0.5)
+function isLightColor(hex) {
+  return luminance(hex) > 0.5;
+}
+
+// Check if very dark (luminance < 0.05) - same as ghostty
+function isVeryDark(hex) {
+  return luminance(hex) < 0.05;
+}
+
+// Highlight color by level (like NSColor.highlight(withLevel:))
+// Moves color toward white by the given fraction
+function highlightColor(hex, level) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex;
+  const r = rgb.r + (255 - rgb.r) * level;
+  const g = rgb.g + (255 - rgb.g) * level;
+  const b = rgb.b + (255 - rgb.b) * level;
+  return rgbToHex(r, g, b);
+}
+
+// Shadow color by level (like NSColor.shadow(withLevel:))
+// Moves color toward black by the given fraction
+function shadowColor(hex, level) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex;
+  const r = rgb.r * (1 - level);
+  const g = rgb.g * (1 - level);
+  const b = rgb.b * (1 - level);
+  return rgbToHex(r, g, b);
+}
+
+// Blend color with black at given alpha (like ghostty's systemOverlayColor blend)
+function blendWithBlack(hex, alpha) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex;
+  const r = rgb.r * (1 - alpha);
+  const g = rgb.g * (1 - alpha);
+  const b = rgb.b * (1 - alpha);
+  return rgbToHex(r, g, b);
+}
+
+// Apply ghostty colors to CSS variables (all derived from config)
+function applyColors(colors) {
+  const root = document.documentElement;
+  const bg = colors.background || '#282c34';
+  const fg = colors.foreground || '#ffffff';
+  const isLight = isLightColor(bg);
+  const veryDark = isVeryDark(bg);
+
+  // Terminal background - toolbar matches it (like ghostty's transparent titlebar)
+  root.style.setProperty('--bg', bg);
+  root.style.setProperty('--toolbar-bg', bg);
+
+  // Tabbar slightly darker than toolbar background
+  // Active tab is lighter (original background)
+  const tabbarBg = shadowColor(bg, 0.1);
+  root.style.setProperty('--tabbar-bg', tabbarBg);
+
+  // Active tab is the original background
+  root.style.setProperty('--tab-active', bg);
+
+  // Text colors from foreground config
+  root.style.setProperty('--text', fg);
+
+  // Overlay colors based on theme
+  const overlay = isLight ? '0,0,0' : '255,255,255';
+  root.style.setProperty('--tab-hover', `rgba(${overlay},0.08)`);
+  root.style.setProperty('--close-hover', `rgba(${overlay},0.1)`);
+  root.style.setProperty('--text-dim', `rgba(${overlay},0.5)`);
+
+  // Accent from foreground
+  root.style.setProperty('--accent', fg);
+}
+
+async function init() {
+  // Fetch config to get WebSocket ports and colors
+  try {
+    const response = await fetch('/config');
+    const config = await response.json();
+    PANEL_PORT = config.panelWsPort;
+    CONTROL_PORT = config.controlWsPort;
+    console.log('Config loaded:', config);
+
+    // Apply colors from ghostty config
+    if (config.colors) {
+      applyColors(config.colors);
+    }
+  } catch (e) {
+    console.error('Failed to fetch config:', e);
+    return;
+  }
+
+  // No external dependencies - uses native DecompressionStream
+  window.app = new App();
+  window.app.connect();
+}
+
+init();
