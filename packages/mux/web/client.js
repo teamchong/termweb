@@ -340,11 +340,19 @@ class Panel {
       return;
     }
 
+    // Pad RGB data to multiple of 4 bytes for WebGPU
+    const alignedSize = Math.ceil(rgb.length / 4) * 4;
+    let rgbAligned = rgb;
+    if (rgb.length !== alignedSize) {
+      rgbAligned = new Uint8Array(alignedSize);
+      rgbAligned.set(rgb);
+    }
+
     // Upload to GPU and process
     if (frameType === FrameType.KEYFRAME) {
-      this.device.queue.writeBuffer(this.prevBuffer, 0, rgb);
+      this.device.queue.writeBuffer(this.prevBuffer, 0, rgbAligned);
     } else {
-      this.device.queue.writeBuffer(this.diffBuffer, 0, rgb);
+      this.device.queue.writeBuffer(this.diffBuffer, 0, rgbAligned);
 
       const commandEncoder = this.device.createCommandEncoder();
       const pass = commandEncoder.beginComputePass();
@@ -465,11 +473,19 @@ class Panel {
     
     // Keyboard
     this.canvas.addEventListener('keydown', (e) => {
+      // Allow browser zoom shortcuts (Cmd+-, Cmd+=, Cmd+0)
+      if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
+        return;
+      }
       e.preventDefault();
       this.sendKeyInput(e, 1); // press
     });
-    
+
     this.canvas.addEventListener('keyup', (e) => {
+      // Allow browser zoom shortcuts
+      if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
+        return;
+      }
       e.preventDefault();
       this.sendKeyInput(e, 0); // release
     });
