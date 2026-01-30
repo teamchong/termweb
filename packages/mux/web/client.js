@@ -16,6 +16,8 @@ const ClientMsg = {
   REQUEST_KEYFRAME: 0x11,
   PAUSE_STREAM: 0x12,
   RESUME_STREAM: 0x13,
+  CONNECT_PANEL: 0x20,
+  CREATE_PANEL: 0x21,
 };
 
 const FrameType = {
@@ -28,8 +30,9 @@ const FrameType = {
 // ============================================================================
 
 class Panel {
-  constructor(id, container) {
-    this.id = id;
+  constructor(id, container, serverId = null) {
+    this.id = id;                    // Local client ID
+    this.serverId = serverId;        // Server panel ID (null = create new)
     this.container = container;
     this.ws = null;
     this.canvas = document.createElement('canvas');
@@ -199,23 +202,55 @@ class Panel {
   connect(host = 'localhost') {
     this.ws = new WebSocket(`ws://${host}:${PANEL_PORT}`);
     this.ws.binaryType = 'arraybuffer';
-    
+
     this.ws.onopen = () => {
       console.log(`Panel ${this.id}: Connected`);
-      this.sendResize();
+      if (this.serverId !== null) {
+        // Connect to existing server panel
+        this.sendConnectPanel(this.serverId);
+      } else {
+        // Request new panel creation
+        this.sendCreatePanel();
+      }
     };
-    
+
     this.ws.onmessage = (event) => {
       this.handleFrame(event.data);
     };
-    
+
     this.ws.onclose = () => {
       console.log(`Panel ${this.id}: Disconnected`);
     };
-    
+
     this.ws.onerror = (err) => {
       console.error(`Panel ${this.id}: Error`, err);
     };
+  }
+
+  sendConnectPanel(panelId) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const buf = new ArrayBuffer(5);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.CONNECT_PANEL);
+    view.setUint32(1, panelId, true);
+    this.ws.send(buf);
+    console.log(`Panel ${this.id}: Connecting to server panel ${panelId}`);
+    // Send resize after connecting
+    setTimeout(() => this.sendResize(), 100);
+  }
+
+  sendCreatePanel() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const rect = this.canvas.getBoundingClientRect();
+    const width = Math.floor(rect.width) || 800;
+    const height = Math.floor(rect.height) || 600;
+    const buf = new ArrayBuffer(5);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.CREATE_PANEL);
+    view.setUint16(1, width, true);
+    view.setUint16(3, height, true);
+    this.ws.send(buf);
+    console.log(`Panel ${this.id}: Requesting new panel (${width}x${height})`);
   }
   
   disconnect() {
@@ -510,12 +545,12 @@ class Panel {
   
   sendResize() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    
+
     const rect = this.canvas.getBoundingClientRect();
-    // Account for device pixel ratio
-    const width = Math.floor(rect.width * window.devicePixelRatio);
-    const height = Math.floor(rect.height * window.devicePixelRatio);
-    
+    // Send CSS dimensions - server will apply its own scale for pixel rendering
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+
     const buf = new ArrayBuffer(5);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.RESIZE);
@@ -647,10 +682,7 @@ class App {
     this.controlWs.onopen = () => {
       this.statusEl.textContent = 'Connected';
       console.log('Control channel connected');
-      // Auto-create first panel
-      if (this.panels.size === 0) {
-        this.createPanel();
-      }
+      // Wait for panel_list to decide whether to create or connect
     };
     
     this.controlWs.onmessage = (event) => {
@@ -670,19 +702,33 @@ class App {
   
   handleControlMessage(msg) {
     console.log('Control message:', msg);
-    
+
     switch (msg.type) {
       case 'panel_list':
-        // Initial panel list
-        for (const p of msg.panels) {
-          if (!this.panels.has(p.id)) {
-            this.addPanel(p.id);
+        // Initial panel list from server
+        console.log('Panel list received:', msg.panels);
+        if (msg.panels && msg.panels.length > 0) {
+          // Connect to existing panels
+          console.log('Connecting to', msg.panels.length, 'existing panels');
+          for (const p of msg.panels) {
+            this.connectToPanel(p.id);
           }
+        } else {
+          // No panels on server - create one
+          console.log('No panels on server, creating new one');
+          this.createPanel();
         }
         break;
-        
+
       case 'panel_created':
-        // New panel created on server
+        // New panel created on server - update local panel's serverId
+        for (const [, panel] of this.panels) {
+          if (panel.serverId === null) {
+            panel.serverId = msg.panel_id;
+            console.log(`Local panel ${panel.id} assigned server ID ${msg.panel_id}`);
+            break;
+          }
+        }
         break;
         
       case 'panel_closed':
@@ -700,25 +746,29 @@ class App {
   }
   
   createPanel() {
-    this.hideWelcome();
-    // Create panel locally and connect
-    const panel = new Panel(this.nextLocalId++, this.panelsEl);
+    // Create new panel on server
+    const localId = this.nextLocalId++;
+    const panel = new Panel(localId, this.panelsEl, null);  // null = create new
     panel.connect();
-    this.panels.set(panel.id, panel);
-    this.addTab(panel.id, `Panel ${panel.id}`);
-    this.switchToPanel(panel.id);
+    this.panels.set(localId, panel);
+    this.addTab(localId, `Terminal`);
+    this.switchToPanel(localId);
   }
-  
-  addPanel(id) {
-    if (this.panels.has(id)) return;
-    
-    const panel = new Panel(id, this.panelsEl);
+
+  connectToPanel(serverId) {
+    // Check if already connected to this server panel
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === serverId) return;
+    }
+
+    const localId = this.nextLocalId++;
+    const panel = new Panel(localId, this.panelsEl, serverId);  // serverId = connect to existing
     panel.connect();
-    this.panels.set(id, panel);
-    this.addTab(id, `Panel ${id}`);
-    
+    this.panels.set(localId, panel);
+    this.addTab(localId, `Terminal`);
+
     if (!this.activePanel) {
-      this.switchToPanel(id);
+      this.switchToPanel(localId);
     }
   }
   
@@ -726,46 +776,35 @@ class App {
     const panel = this.panels.get(id);
     if (!panel) return;
 
+    // If this is the last panel, create a new one first
+    if (this.panels.size === 1) {
+      this.createPanel();
+    }
+
+    // Tell server to destroy the panel (if we know the server ID)
+    if (panel.serverId !== null) {
+      this.sendClosePanel(panel.serverId);
+    }
+
     panel.destroy();
     this.panels.delete(id);
     this.removeTab(id);
 
     if (this.activePanel === panel) {
       this.activePanel = null;
-      // Switch to another panel if available
+      // Switch to another panel
       const remaining = this.panels.keys().next();
       if (!remaining.done) {
         this.switchToPanel(remaining.value);
-      } else {
-        // Last tab closed - show welcome screen
-        this.showWelcome();
       }
     }
   }
 
-  showWelcome() {
-    this.hideWelcome();
-    const welcome = document.createElement('div');
-    welcome.id = 'welcome';
-    welcome.innerHTML = `
-      <h1>termweb-mux</h1>
-      <div class="shortcuts">
-        <div class="shortcut"><span class="key">⌘/</span> New Tab</div>
-        <div class="shortcut"><span class="key">⌘.</span> Close Tab</div>
-        <div class="shortcut"><span class="key">⌘1-9</span> Switch Tab</div>
-      </div>
-      <button id="welcome-new">+ New Terminal</button>
-    `;
-    this.panelsEl.appendChild(welcome);
-    document.getElementById('welcome-new').addEventListener('click', () => {
-      this.hideWelcome();
-      this.createPanel();
-    });
-  }
-
-  hideWelcome() {
-    const welcome = document.getElementById('welcome');
-    if (welcome) welcome.remove();
+  sendClosePanel(serverId) {
+    if (!this.controlWs || this.controlWs.readyState !== WebSocket.OPEN) return;
+    const msg = JSON.stringify({ type: 'close_panel', panel_id: serverId });
+    this.controlWs.send(msg);
+    console.log('Sent close_panel for server panel', serverId);
   }
   
   switchToPanel(id) {

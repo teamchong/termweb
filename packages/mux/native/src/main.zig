@@ -42,6 +42,8 @@ pub const ClientMsg = enum(u8) {
     request_keyframe = 0x11,
     pause_stream = 0x12,
     resume_stream = 0x13,
+    connect_panel = 0x20,  // Connect to existing panel by ID
+    create_panel = 0x21,   // Request new panel creation
 };
 
 // Key input message format (from browser)
@@ -608,6 +610,8 @@ const Panel = struct {
             .request_keyframe => self.requestKeyframe(),
             .pause_stream => self.pause(),
             .resume_stream => self.resumeStream(),
+            // Connection-level commands - handled in Server.onPanelMessage before reaching panel
+            .connect_panel, .create_panel => {},
         }
     }
 };
@@ -805,26 +809,58 @@ const Server = struct {
     // ========== Panel WebSocket callbacks ==========
 
     fn onPanelConnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
-
-        // Queue panel creation request (must be created on main thread)
-        self.mutex.lock();
-        self.pending_panels.append(self.allocator, .{
-            .conn = conn,
-            .width = 800,
-            .height = 600,
-        }) catch {};
-        self.mutex.unlock();
-
-        std.debug.print("Panel client connected, queued for creation\n", .{});
+        _ = conn;
+        // Don't auto-create panel - wait for connect_panel or create_panel message
+        std.debug.print("Panel client connected, waiting for panel command\n", .{});
     }
 
     fn onPanelMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
         _ = is_binary;
+        const self = global_server orelse return;
 
         if (conn.user_data) |ud| {
+            // Already connected to a panel - forward message
             const panel: *Panel = @ptrCast(@alignCast(ud));
             panel.handleMessage(data);
+        } else {
+            // Not connected to panel yet - handle connect/create commands
+            if (data.len == 0) return;
+            const msg_type: ClientMsg = @enumFromInt(data[0]);
+
+            switch (msg_type) {
+                .connect_panel => {
+                    // Connect to existing panel: [msg_type:u8][panel_id:u32]
+                    if (data.len >= 5) {
+                        const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                        self.mutex.lock();
+                        if (self.panels.get(panel_id)) |panel| {
+                            panel.setConnection(conn);
+                            conn.user_data = panel;
+                            self.panel_connections.put(conn, panel) catch {};
+                            std.debug.print("Client connected to existing panel {}\n", .{panel_id});
+                        }
+                        self.mutex.unlock();
+                    }
+                },
+                .create_panel => {
+                    // Create new panel: [msg_type:u8][width:u16][height:u16]
+                    var width: u32 = 800;
+                    var height: u32 = 600;
+                    if (data.len >= 5) {
+                        width = std.mem.readInt(u16, data[1..3], .little);
+                        height = std.mem.readInt(u16, data[3..5], .little);
+                    }
+                    self.mutex.lock();
+                    self.pending_panels.append(self.allocator, .{
+                        .conn = conn,
+                        .width = width,
+                        .height = height,
+                    }) catch {};
+                    self.mutex.unlock();
+                    std.debug.print("Panel creation queued ({}x{})\n", .{ width, height });
+                },
+                else => {},
+            }
         }
     }
 
@@ -836,12 +872,7 @@ const Server = struct {
             const panel = entry.value;
             const panel_id = panel.id;
             panel.setConnection(null);
-            std.debug.print("Panel client disconnected from panel {}\n", .{panel_id});
-
-            // Notify control clients
-            self.mutex.unlock();
-            self.broadcastPanelClosed(panel_id);
-            return;
+            std.debug.print("Panel client disconnected from panel {} (panel persists)\n", .{panel_id});
         }
         self.mutex.unlock();
     }
@@ -866,6 +897,7 @@ const Server = struct {
                 while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
                 if (end > start) {
                     const id = std.fmt.parseInt(u32, data[start..end], 10) catch return;
+                    std.debug.print("Queueing destruction of panel {}\n", .{id});
                     self.mutex.lock();
                     self.pending_destroys.append(self.allocator, .{ .id = id }) catch {};
                     self.mutex.unlock();
@@ -877,6 +909,8 @@ const Server = struct {
     fn sendPanelList(self: *Server, conn: *ws.Connection) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        std.debug.print("Sending panel list, {} panels exist\n", .{self.panels.count()});
 
         // Build JSON panel list
         var buf: [4096]u8 = undefined;
@@ -1013,9 +1047,28 @@ const Server = struct {
             self.mutex.lock();
             if (self.panels.fetchRemove(req.id)) |entry| {
                 const panel = entry.value;
+
+                // Find and close the panel's WebSocket connection
+                var conn_to_remove: ?*ws.Connection = null;
+                var it = self.panel_connections.iterator();
+                while (it.next()) |conn_entry| {
+                    if (conn_entry.value_ptr.* == panel) {
+                        conn_to_remove = conn_entry.key_ptr.*;
+                        break;
+                    }
+                }
+                if (conn_to_remove) |conn| {
+                    _ = self.panel_connections.remove(conn);
+                    conn.sendClose() catch {};
+                }
+
                 self.mutex.unlock();
+
+                // Destroy ghostty surface and panel
                 panel.deinit();
-                std.debug.print("Destroyed panel {}\n", .{req.id});
+                std.debug.print("Destroyed panel {} (ghostty surface freed)\n", .{req.id});
+
+                // Notify clients
                 self.broadcastPanelClosed(req.id);
             } else {
                 self.mutex.unlock();
