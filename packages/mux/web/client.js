@@ -717,7 +717,7 @@ class App {
     });
 
     // Global keyboard shortcuts (use capture phase to run before canvas handler)
-    window.addEventListener('keydown', (e) => {
+    document.addEventListener('keydown', (e) => {
       // ⌘1-9 to switch tabs
       if (e.metaKey && e.key >= '1' && e.key <= '9') {
         e.preventDefault();
@@ -788,7 +788,41 @@ class App {
         });
         return;
       }
+      // ⌘C for copy - send to ghostty
+      if (e.metaKey && !e.shiftKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          this.sendViewAction(this.activePanel.serverId, 'copy_to_clipboard');
+        }
+        return;
+      }
+      // Font size shortcuts
+      if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          if (e.key === '=') this.sendViewAction(this.activePanel.serverId, 'increase_font_size:1');
+          else if (e.key === '-') this.sendViewAction(this.activePanel.serverId, 'decrease_font_size:1');
+          else if (e.key === '0') this.sendViewAction(this.activePanel.serverId, 'reset_font_size');
+        }
+        return;
+      }
+      // Forward all other keys to active panel
+      if (this.activePanel) {
+        e.preventDefault();
+        this.activePanel.sendKeyInput(e, 1); // press
+      }
     }, true);  // true = capture phase
+
+    // Also capture keyup at window level
+    document.addEventListener('keyup', (e) => {
+      if (e.metaKey) return;
+      if (this.activePanel) {
+        e.preventDefault();
+        this.activePanel.sendKeyInput(e, 0); // release
+      }
+    }, true);
   }
   
   connect(host = 'localhost') {
