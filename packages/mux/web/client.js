@@ -1583,6 +1583,13 @@ class App {
 
   // Close the active panel (or tab if last panel in tab)
   closeActivePanel() {
+    // If quick terminal is visible, close it first
+    const quickTerminal = document.getElementById('quick-terminal');
+    if (quickTerminal?.classList.contains('visible')) {
+      this.toggleQuickTerminal();
+      return;
+    }
+
     if (!this.activePanel || this.activeTab === null) return;
 
     const tab = this.tabs.get(this.activeTab);
@@ -2559,14 +2566,8 @@ class App {
     if (!container) return;
 
     if (container.classList.contains('visible')) {
-      // Hide quick terminal
+      // Hide quick terminal (keep panel alive for persistence)
       container.classList.remove('visible');
-      // Destroy the panel
-      if (this.quickTerminalPanel) {
-        this.quickTerminalPanel.destroy();
-        this.panels.delete(this.quickTerminalPanel.id);
-        this.quickTerminalPanel = null;
-      }
       // Refocus main terminal
       if (this.activePanel && this.activePanel.canvas) {
         this.activePanel.canvas.focus();
@@ -2574,14 +2575,17 @@ class App {
     } else {
       // Show quick terminal
       container.classList.add('visible');
-      // Create a new panel for quick terminal
-      const content = container.querySelector('.quick-terminal-content');
-      content.innerHTML = '';
-      const panel = this.createPanel(content, null);
-      this.quickTerminalPanel = panel;
-      // Focus it after a short delay for animation
+      // Create panel only if not already created
+      if (!this.quickTerminalPanel) {
+        const content = container.querySelector('.quick-terminal-content');
+        content.innerHTML = '';
+        this.quickTerminalPanel = this.createPanel(content, null);
+      }
+      // Focus after animation starts
       setTimeout(() => {
-        if (panel.canvas) panel.canvas.focus();
+        if (this.quickTerminalPanel?.canvas) {
+          this.quickTerminalPanel.canvas.focus();
+        }
       }, 50);
     }
   }
