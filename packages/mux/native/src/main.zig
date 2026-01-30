@@ -1602,18 +1602,32 @@ const Server = struct {
             if (!first) writer.writeAll(",") catch return;
             first = false;
             const panel = entry.value_ptr.*;
-            writer.print("{{\"id\":{},\"width\":{},\"height\":{},\"title\":\"{s}\",\"pwd\":\"{s}\"}}", .{
+            writer.print("{{\"id\":{},\"width\":{},\"height\":{}}}", .{
                 panel.id,
                 panel.width,
                 panel.height,
-                panel.title,
-                panel.pwd,
             }) catch return;
         }
 
         writer.print("],\"layout\":{s}}}", .{layout_json}) catch return;
 
         conn.sendText(stream.getWritten()) catch {};
+
+        // Send title/pwd for each panel so client can update UI
+        var it2 = self.panels.iterator();
+        while (it2.next()) |entry| {
+            const panel = entry.value_ptr.*;
+            if (panel.title.len > 0) {
+                var title_buf: [512]u8 = undefined;
+                const title_msg = std.fmt.bufPrint(&title_buf, "{{\"type\":\"panel_title\",\"panel_id\":{},\"title\":\"{s}\"}}", .{ panel.id, panel.title }) catch continue;
+                conn.sendText(title_msg) catch {};
+            }
+            if (panel.pwd.len > 0) {
+                var pwd_buf: [1024]u8 = undefined;
+                const pwd_msg = std.fmt.bufPrint(&pwd_buf, "{{\"type\":\"panel_pwd\",\"panel_id\":{},\"pwd\":\"{s}\"}}", .{ panel.id, panel.pwd }) catch continue;
+                conn.sendText(pwd_msg) catch {};
+            }
+        }
     }
 
     fn broadcastPanelCreated(self: *Server, panel_id: u32) void {

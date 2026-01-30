@@ -1109,13 +1109,6 @@ class App {
       case 'panel_list':
         // Initial panel list from server with layout
         console.log('Panel list received:', msg.panels, 'layout:', msg.layout);
-        // Build panel info map for restoring title/pwd
-        this.serverPanelInfo = new Map();
-        if (msg.panels) {
-          for (const p of msg.panels) {
-            this.serverPanelInfo.set(p.id, { title: p.title || '', pwd: p.pwd || '' });
-          }
-        }
         if (msg.layout && msg.layout.tabs && msg.layout.tabs.length > 0) {
           // Restore layout from server
           console.log('Restoring layout from server');
@@ -1129,6 +1122,7 @@ class App {
           console.log('No panels on server, creating new one');
           this.createTab();
         }
+        // Server will send panel_title/panel_pwd messages after this
         break;
 
       case 'layout_update':
@@ -1397,17 +1391,6 @@ class App {
     if (node.type === 'leaf' && node.panelId !== undefined) {
       // Leaf node - create panel
       const panel = this.createPanel(parentContainer, node.panelId);
-
-      // Restore title/pwd from server panel info
-      if (this.serverPanelInfo && this.serverPanelInfo.has(node.panelId)) {
-        const info = this.serverPanelInfo.get(node.panelId);
-        panel.pwd = info.pwd || null;
-        // Update tab title if we have one
-        if (info.title) {
-          this.updatePanelTitle(node.panelId, info.title);
-        }
-      }
-
       return SplitContainer.createLeaf(panel, null);
     }
 
