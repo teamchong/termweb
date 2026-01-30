@@ -2241,8 +2241,15 @@ fn writeClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_
 }
 
 fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c) void {
-    _ = userdata;
     _ = needs_confirm;
+    // userdata is the Panel pointer (set via surface_config.userdata)
+    const panel: *Panel = @ptrCast(@alignCast(userdata orelse return));
+    const self = Server.global_server orelse return;
+
+    // Queue the panel for destruction on main thread
+    self.mutex.lock();
+    self.pending_destroys.append(self.allocator, .{ .id = panel.id }) catch {};
+    self.mutex.unlock();
 }
 
 // ============================================================================
