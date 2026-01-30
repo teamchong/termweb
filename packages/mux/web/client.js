@@ -672,6 +672,21 @@ class Panel {
   reparent(newContainer) {
     this.container = newContainer;
     newContainer.appendChild(this.element);
+
+    // Force resize check after reparenting since container changed
+    setTimeout(() => {
+      const rect = this.container.getBoundingClientRect();
+      const width = Math.floor(rect.width);
+      const height = Math.floor(rect.height);
+      if (width > 0 && height > 0 &&
+          (width !== this.lastReportedWidth || height !== this.lastReportedHeight)) {
+        this.lastReportedWidth = width;
+        this.lastReportedHeight = height;
+        if (this.serverId !== null && this.onResize) {
+          this.onResize(this.serverId, width, height);
+        }
+      }
+    }, 50);  // Wait for layout to settle
   }
 }
 
@@ -1011,6 +1026,14 @@ class App {
         e.preventDefault();
         e.stopPropagation();
         this.closeAllTabs();
+        return;
+      }
+      // ⌘⇧A to show all tabs
+      if (e.metaKey && e.shiftKey && (e.key === 'a' || e.key === 'A')) {
+        console.log('Show all tabs shortcut triggered');
+        e.preventDefault();
+        e.stopPropagation();
+        this.showTabOverview();
         return;
       }
       // ⌘A for select all
@@ -1908,9 +1931,10 @@ class App {
     const tabIndex = this.tabsEl.children.length + 1;
     const hotkeyHint = tabIndex <= 9 ? `⌘${tabIndex}` : '';
 
-    // Show ghost emoji if title is empty
+    // Show ghost emoji if title is empty, • indicator for idle (no title yet means idle)
     const displayTitle = title || '👻';
-    tab.innerHTML = `<span class="close">×</span><span class="title">${displayTitle}</span><span class="hotkey">${hotkeyHint}</span>`;
+    const indicator = title ? '*' : '•';  // * when has title (command running), • when idle
+    tab.innerHTML = `<span class="close">×</span><span class="title-wrapper"><span class="indicator">${indicator}</span><span class="title">${displayTitle}</span></span><span class="hotkey">${hotkeyHint}</span>`;
 
     tab.addEventListener('click', (e) => {
       if (!e.target.classList.contains('close')) {
@@ -1976,6 +2000,13 @@ class App {
       const tabEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .title`);
       if (tabEl) tabEl.textContent = title;
 
+      // Update tab indicator (• for at prompt, * for command running)
+      const indicatorEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .indicator`);
+      if (indicatorEl) {
+        const isAtPrompt = this.isAtPrompt(targetPanel, title);
+        indicatorEl.textContent = isAtPrompt ? '•' : '*';
+      }
+
       // Update tab data
       const tab = this.tabs.get(tabId);
       if (tab) tab.title = title;
@@ -1988,6 +2019,15 @@ class App {
       if (appTitle) appTitle.textContent = title;
       this.updateIndicatorForPanel(targetPanel, title);
     }
+  }
+
+  // Check if terminal is at prompt (title matches pwd) or running a command
+  isAtPrompt(panel, title) {
+    if (!panel || !panel.pwd || !title) return true;  // No pwd yet = at prompt
+    const pwd = panel.pwd;
+    const dirName = pwd.split('/').pop() || pwd;
+    // At prompt if title contains the directory name or looks like a path
+    return title.includes(dirName) || title.includes('/') || title === pwd;
   }
 
   updatePanelPwd(serverId, pwd) {
@@ -2073,6 +2113,211 @@ class App {
         const appTitle = document.getElementById('app-title');
         this.updateIndicatorForPanel(targetPanel, appTitle ? appTitle.textContent : '');
       }, 2000);
+    }
+  }
+
+  // Show all tabs overview with live scaled previews
+  showTabOverview() {
+    const overlay = document.getElementById('tab-overview');
+    const grid = document.getElementById('tab-overview-grid');
+    if (!overlay || !grid) return;
+
+    // Clear existing previews
+    grid.innerHTML = '';
+
+    // Store original parent to restore tabs later
+    this.tabOverviewOriginalParent = this.panelsEl;
+    this.tabOverviewTabs = [];
+
+    // Disable resize observers during overview to prevent backend resize
+    for (const [, panel] of this.panels) {
+      if (panel.resizeObserver) {
+        panel.resizeObserver.disconnect();
+      }
+    }
+
+    // Get panels container dimensions for scaling
+    const panelsRect = this.panelsEl.getBoundingClientRect();
+    const previewWidth = 400;
+    const previewHeight = 250;
+    const scale = Math.min(previewWidth / panelsRect.width, previewHeight / panelsRect.height);
+    const scaledWidth = panelsRect.width * scale;
+    const scaledHeight = panelsRect.height * scale;
+
+    // Create preview for each tab with live content
+    for (const [tabId, tab] of this.tabs) {
+      const preview = document.createElement('div');
+      preview.className = 'tab-preview';
+      if (tabId === this.activeTab) {
+        preview.classList.add('active');
+      }
+
+      // Create content wrapper that will hold the scaled tab
+      const content = document.createElement('div');
+      content.className = 'tab-preview-content';
+      content.style.cssText = `overflow: hidden; position: relative; width: ${scaledWidth}px; height: ${scaledHeight}px;`;
+
+      // Create a container for the scaled content
+      const scaleWrapper = document.createElement('div');
+      scaleWrapper.style.cssText = `
+        width: ${panelsRect.width}px;
+        height: ${panelsRect.height}px;
+        transform: scale(${scale});
+        transform-origin: top left;
+        pointer-events: none;
+        position: absolute;
+        top: 0;
+        left: 0;
+      `;
+
+      // Move the actual tab element into the preview (will restore later)
+      tab.element.style.display = 'flex';
+      tab.element.style.position = 'relative';
+      tab.element.style.width = '100%';
+      tab.element.style.height = '100%';
+      scaleWrapper.appendChild(tab.element);
+      content.appendChild(scaleWrapper);
+
+      // Store for restoration
+      this.tabOverviewTabs.push({ tabId, tab, element: tab.element });
+
+      // Create title bar (on top)
+      const titleBar = document.createElement('div');
+      titleBar.className = 'tab-preview-title';
+
+      const titleText = document.createElement('span');
+      titleText.className = 'tab-preview-title-text';
+
+      // Add indicator (• for idle at prompt, * for running command)
+      const indicator = document.createElement('span');
+      indicator.className = 'tab-preview-indicator';
+      const panels = tab.root.getAllPanels();
+      const firstPanel = panels[0];
+      // Check if command is running by comparing title to pwd
+      const isAtPrompt = firstPanel && firstPanel.pwd && tab.title &&
+        (tab.title.includes(firstPanel.pwd) || tab.title.endsWith(firstPanel.pwd.split('/').pop()));
+      indicator.textContent = isAtPrompt ? '•' : '*';
+
+      const titleLabel = document.createElement('span');
+      titleLabel.className = 'tab-preview-title-label';
+      titleLabel.textContent = tab.title || '👻';
+
+      titleText.appendChild(indicator);
+      titleText.appendChild(titleLabel);
+
+      const closeBtn = document.createElement('span');
+      closeBtn.className = 'tab-preview-close';
+      closeBtn.textContent = '✕';
+      closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Restore tabs first before closing
+        this.restoreTabsFromOverview();
+        this.closeTab(tabId);
+        // Refresh the overview if still open
+        if (this.tabs.size > 0) {
+          this.showTabOverview();
+        } else {
+          this.hideTabOverview();
+        }
+      });
+
+      titleBar.appendChild(titleText);
+      titleBar.appendChild(closeBtn);
+
+      // Title on top, content below
+      preview.appendChild(titleBar);
+      preview.appendChild(content);
+
+      // Click to switch to tab
+      preview.addEventListener('click', () => {
+        this.hideTabOverview();
+        this.switchToTab(tabId);
+      });
+
+      grid.appendChild(preview);
+    }
+
+    // Add "+" new tab card at the end (match preview size)
+    const newTabCard = document.createElement('div');
+    newTabCard.className = 'tab-preview-new';
+    newTabCard.style.cssText = `width: ${scaledWidth}px; height: ${scaledHeight + 44}px;`;
+    const newTabIcon = document.createElement('span');
+    newTabIcon.className = 'tab-preview-new-icon';
+    newTabIcon.textContent = '+';
+    newTabCard.appendChild(newTabIcon);
+    newTabCard.addEventListener('click', () => {
+      this.hideTabOverview();
+      this.createTab();
+    });
+    grid.appendChild(newTabCard);
+
+    // Show overlay
+    overlay.classList.add('visible');
+
+    // Close on escape or click outside
+    this.tabOverviewCloseHandler = (e) => {
+      if (e.key === 'Escape' || e.target === overlay) {
+        this.hideTabOverview();
+      }
+    };
+    document.addEventListener('keydown', this.tabOverviewCloseHandler);
+    overlay.addEventListener('click', this.tabOverviewCloseHandler);
+  }
+
+  // Restore tab elements back to panels container
+  restoreTabsFromOverview() {
+    if (!this.tabOverviewTabs) return;
+
+    for (const { tab, element } of this.tabOverviewTabs) {
+      // Reset styles
+      element.style.display = '';
+      element.style.position = '';
+      element.style.width = '';
+      element.style.height = '';
+      // Move back to panels container
+      this.panelsEl.appendChild(element);
+    }
+    this.tabOverviewTabs = null;
+
+    // Re-enable resize observers
+    for (const [, panel] of this.panels) {
+      if (panel.resizeObserver && panel.element) {
+        panel.resizeObserver.observe(panel.element);
+      }
+    }
+  }
+
+  hideTabOverview() {
+    // Restore tabs first
+    this.restoreTabsFromOverview();
+
+    const overlay = document.getElementById('tab-overview');
+    if (overlay) {
+      overlay.classList.remove('visible');
+      overlay.querySelector('#tab-overview-grid').innerHTML = '';
+      // Remove event listeners
+      if (this.tabOverviewCloseHandler) {
+        document.removeEventListener('keydown', this.tabOverviewCloseHandler);
+        overlay.removeEventListener('click', this.tabOverviewCloseHandler);
+        this.tabOverviewCloseHandler = null;
+      }
+    }
+
+    // Re-apply active state and refocus
+    if (this.activeTab !== null) {
+      const tab = this.tabs.get(this.activeTab);
+      if (tab) {
+        // Hide all tabs, show active
+        for (const [, t] of this.tabs) {
+          t.element.classList.remove('active');
+        }
+        tab.element.classList.add('active');
+      }
+    }
+
+    // Refocus the active panel
+    if (this.activePanel && this.activePanel.canvas) {
+      this.activePanel.canvas.focus();
     }
   }
 }
@@ -2258,6 +2503,9 @@ function setupMenus() {
           if (app.activePanel?.serverId !== null) {
             app.sendViewAction(app.activePanel.serverId, 'reset_font_size');
           }
+          break;
+        case 'show-all-tabs':
+          app.showTabOverview();
           break;
       }
 
