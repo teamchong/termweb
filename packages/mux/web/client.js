@@ -1827,6 +1827,11 @@ class App {
       return;
     }
 
+    // Clear previousActivePanel if it's the panel being closed
+    if (this.previousActivePanel === targetPanel) {
+      this.previousActivePanel = null;
+    }
+
     // Find which tab this panel belongs to
     const tabId = this.findTabForPanel(targetPanel);
     if (tabId === null) return;
