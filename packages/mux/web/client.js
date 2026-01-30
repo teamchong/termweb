@@ -44,6 +44,7 @@ class Panel {
     this.lastReportedWidth = 0;
     this.lastReportedHeight = 0;
     this.resizeTimeout = null;
+    this.skipNextResize = false;     // Skip resize event after show()
     this.pwd = null;                 // Current working directory
 
     // WebGPU state
@@ -69,6 +70,12 @@ class Panel {
 
   setupResizeObserver() {
     this.resizeObserver = new ResizeObserver(() => {
+      // Skip resize events triggered by show() - the panel already has correct size
+      if (this.skipNextResize) {
+        this.skipNextResize = false;
+        return;
+      }
+
       // Debounce resize to avoid flooding server during drag
       if (this.resizeTimeout) {
         clearTimeout(this.resizeTimeout);
@@ -660,6 +667,8 @@ class Panel {
   }
   
   show() {
+    // Skip the resize event that fires when panel becomes visible
+    this.skipNextResize = true;
     this.element.classList.add('active');
     this.canvas.focus();
     this.resume();
