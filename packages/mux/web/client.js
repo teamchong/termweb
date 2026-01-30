@@ -491,6 +491,13 @@ class Panel {
         }
         return;
       }
+      // Alt+Cmd+I for terminal inspector
+      if (e.metaKey && e.altKey && e.code === 'KeyI') {
+        if (this.serverId !== null && this.onFontAction) {
+          this.onFontAction(this.serverId, 'inspector:toggle');
+        }
+        return;
+      }
       this.sendKeyInput(e, 1); // press
     });
 
