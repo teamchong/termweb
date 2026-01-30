@@ -103,6 +103,279 @@ pub const ControlMsgType = enum {
     close_panel,     // Close a panel
     focus_panel,     // Set active panel
     split_panel,     // Split current panel
+    create_tab,      // Create new tab
+    close_tab,       // Close a tab
+};
+
+// ============================================================================
+// Layout Management (persisted to disk)
+// ============================================================================
+
+pub const SplitDirection = enum {
+    horizontal,
+    vertical,
+};
+
+// A node in the split tree - either a leaf (panel) or a split (two children)
+pub const SplitNode = struct {
+    // For leaf nodes
+    panel_id: ?u32 = null,
+
+    // For split nodes
+    direction: ?SplitDirection = null,
+    ratio: f32 = 0.5,
+    first: ?*SplitNode = null,
+    second: ?*SplitNode = null,
+
+    pub fn isLeaf(self: *const SplitNode) bool {
+        return self.panel_id != null;
+    }
+
+    pub fn deinit(self: *SplitNode, allocator: std.mem.Allocator) void {
+        if (self.first) |first| {
+            first.deinit(allocator);
+            allocator.destroy(first);
+        }
+        if (self.second) |second| {
+            second.deinit(allocator);
+            allocator.destroy(second);
+        }
+    }
+};
+
+pub const Tab = struct {
+    id: u32,
+    root: *SplitNode,
+    title: []const u8,
+
+    pub fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
+        self.root.deinit(allocator);
+        allocator.destroy(self.root);
+        if (self.title.len > 0) {
+            allocator.free(self.title);
+        }
+    }
+
+    // Get all panel IDs in this tab
+    pub fn getAllPanelIds(self: *const Tab, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(u32) {
+        var list: std.ArrayListUnmanaged(u32) = .{};
+        try collectPanelIds(allocator, self.root, &list);
+        return list;
+    }
+
+    fn collectPanelIds(allocator: std.mem.Allocator, node: *const SplitNode, list: *std.ArrayListUnmanaged(u32)) !void {
+        if (node.panel_id) |pid| {
+            try list.append(allocator, pid);
+        }
+        if (node.first) |first| {
+            try collectPanelIds(allocator, first, list);
+        }
+        if (node.second) |second| {
+            try collectPanelIds(allocator, second, list);
+        }
+    }
+};
+
+pub const Layout = struct {
+    tabs: std.ArrayListUnmanaged(*Tab),
+    active_tab_id: u32,
+    next_tab_id: u32,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) Layout {
+        return .{
+            .tabs = .{},
+            .active_tab_id = 0,
+            .next_tab_id = 1,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Layout) void {
+        for (self.tabs.items) |tab| {
+            tab.deinit(self.allocator);
+            self.allocator.destroy(tab);
+        }
+        self.tabs.deinit(self.allocator);
+    }
+
+    // Create a new tab with a single panel
+    pub fn createTab(self: *Layout, panel_id: u32) !*Tab {
+        const tab = try self.allocator.create(Tab);
+        const root = try self.allocator.create(SplitNode);
+        root.* = .{ .panel_id = panel_id };
+
+        tab.* = .{
+            .id = self.next_tab_id,
+            .root = root,
+            .title = try self.allocator.dupe(u8, "Terminal"),
+        };
+        self.next_tab_id += 1;
+
+        try self.tabs.append(self.allocator, tab);
+        self.active_tab_id = tab.id;
+        return tab;
+    }
+
+    // Find the tab containing a panel
+    pub fn findTabByPanel(self: *const Layout, panel_id: u32) ?*Tab {
+        for (self.tabs.items) |tab| {
+            if (containsPanel(tab.root, panel_id)) {
+                return tab;
+            }
+        }
+        return null;
+    }
+
+    fn containsPanel(node: *const SplitNode, panel_id: u32) bool {
+        if (node.panel_id) |pid| {
+            if (pid == panel_id) return true;
+        }
+        if (node.first) |first| {
+            if (containsPanel(first, panel_id)) return true;
+        }
+        if (node.second) |second| {
+            if (containsPanel(second, panel_id)) return true;
+        }
+        return false;
+    }
+
+    // Split a panel in a direction, returns the new panel's expected position
+    pub fn splitPanel(self: *Layout, panel_id: u32, direction: SplitDirection, new_panel_id: u32) !void {
+        const tab = self.findTabByPanel(panel_id) orelse return error.PanelNotFound;
+        try splitNode(self.allocator, tab.root, panel_id, direction, new_panel_id);
+    }
+
+    fn splitNode(allocator: std.mem.Allocator, node: *SplitNode, panel_id: u32, direction: SplitDirection, new_panel_id: u32) !void {
+        if (node.panel_id) |pid| {
+            if (pid == panel_id) {
+                // This is the node to split
+                const first = try allocator.create(SplitNode);
+                const second = try allocator.create(SplitNode);
+
+                first.* = .{ .panel_id = panel_id };
+                second.* = .{ .panel_id = new_panel_id };
+
+                node.panel_id = null;
+                node.direction = direction;
+                node.ratio = 0.5;
+                node.first = first;
+                node.second = second;
+                return;
+            }
+        }
+
+        // Recurse into children
+        if (node.first) |first| {
+            splitNode(allocator, first, panel_id, direction, new_panel_id) catch {};
+        }
+        if (node.second) |second| {
+            splitNode(allocator, second, panel_id, direction, new_panel_id) catch {};
+        }
+    }
+
+    // Remove a panel from the layout, collapsing splits as needed
+    pub fn removePanel(self: *Layout, panel_id: u32) void {
+        for (self.tabs.items, 0..) |tab, i| {
+            if (removePanelFromNode(self.allocator, &tab.root, panel_id)) {
+                // If tab is now empty, remove it
+                if (tab.root.panel_id == null and tab.root.first == null) {
+                    tab.deinit(self.allocator);
+                    self.allocator.destroy(tab);
+                    _ = self.tabs.orderedRemove(i);
+                }
+                return;
+            }
+        }
+    }
+
+    fn removePanelFromNode(allocator: std.mem.Allocator, node_ptr: **SplitNode, panel_id: u32) bool {
+        const node = node_ptr.*;
+
+        if (node.panel_id) |pid| {
+            if (pid == panel_id) {
+                // This is a leaf node with the panel - mark as empty
+                node.panel_id = null;
+                return true;
+            }
+            return false;
+        }
+
+        // Check children
+        if (node.first) |first| {
+            if (first.panel_id) |pid| {
+                if (pid == panel_id) {
+                    // Remove first child, promote second
+                    if (node.second) |second| {
+                        allocator.destroy(first);
+                        node.* = second.*;
+                        allocator.destroy(second);
+                    }
+                    return true;
+                }
+            } else if (removePanelFromNode(allocator, &node.first.?, panel_id)) {
+                return true;
+            }
+        }
+
+        if (node.second) |second| {
+            if (second.panel_id) |pid| {
+                if (pid == panel_id) {
+                    // Remove second child, promote first
+                    if (node.first) |first| {
+                        allocator.destroy(second);
+                        node.* = first.*;
+                        allocator.destroy(first);
+                    }
+                    return true;
+                }
+            } else if (removePanelFromNode(allocator, &node.second.?, panel_id)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Serialize layout to JSON string
+    pub fn toJson(self: *const Layout, allocator: std.mem.Allocator) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        const writer = buf.writer(allocator);
+
+        try writer.writeAll("{\"tabs\":[");
+        for (self.tabs.items, 0..) |tab, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.print("{{\"id\":{},\"root\":", .{tab.id});
+            try writeNodeJson(writer, tab.root);
+            try writer.writeAll("}");
+        }
+        try writer.print("],\"activeTabId\":{}}}", .{self.active_tab_id});
+
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn writeNodeJson(writer: anytype, node: *const SplitNode) !void {
+        if (node.panel_id) |pid| {
+            try writer.print("{{\"type\":\"leaf\",\"panelId\":{}}}", .{pid});
+        } else if (node.direction) |dir| {
+            const dir_str = if (dir == .horizontal) "horizontal" else "vertical";
+            try writer.print("{{\"type\":\"split\",\"direction\":\"{s}\",\"ratio\":{d:.2},\"first\":", .{ dir_str, node.ratio });
+            if (node.first) |first| {
+                try writeNodeJson(writer, first);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.writeAll(",\"second\":");
+            if (node.second) |second| {
+                try writeNodeJson(writer, second);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.writeAll("}");
+        } else {
+            try writer.writeAll("null");
+        }
+    }
 };
 
 const IOSurfacePtr = *c.struct___IOSurface;
@@ -898,15 +1171,26 @@ const PanelResizeRequest = struct {
     height: u32,
 };
 
+// Panel split request (to be processed on main thread)
+const PanelSplitRequest = struct {
+    parent_panel_id: u32,
+    direction: SplitDirection,
+    width: u32,
+    height: u32,
+    scale: f64,
+};
+
 const Server = struct {
     app: c.ghostty_app_t,
     config: c.ghostty_config_t,
     panels: std.AutoHashMap(u32, *Panel),
     panel_connections: std.AutoHashMap(*ws.Connection, *Panel),
     control_connections: std.ArrayList(*ws.Connection),
+    layout: Layout,
     pending_panels: std.ArrayList(PanelRequest),
     pending_destroys: std.ArrayList(PanelDestroyRequest),
     pending_resizes: std.ArrayList(PanelResizeRequest),
+    pending_splits: std.ArrayList(PanelSplitRequest),
     next_panel_id: u32,
     panel_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
@@ -965,9 +1249,11 @@ const Server = struct {
             .panels = std.AutoHashMap(u32, *Panel).init(allocator),
             .panel_connections = std.AutoHashMap(*ws.Connection, *Panel).init(allocator),
             .control_connections = .{},
+            .layout = Layout.init(allocator),
             .pending_panels = .{},
             .pending_destroys = .{},
             .pending_resizes = .{},
+            .pending_splits = .{},
             .next_panel_id = 1,
             .http_server = http_srv,
             .panel_ws_server = panel_ws,
@@ -992,9 +1278,11 @@ const Server = struct {
         self.panels.deinit();
         self.panel_connections.deinit();
         self.control_connections.deinit(self.allocator);
+        self.layout.deinit();
         self.pending_panels.deinit(self.allocator);
         self.pending_destroys.deinit(self.allocator);
         self.pending_resizes.deinit(self.allocator);
+        self.pending_splits.deinit(self.allocator);
 
         self.http_server.deinit();
         self.panel_ws_server.deinit();
@@ -1014,6 +1302,31 @@ const Server = struct {
 
         const panel = try Panel.init(self.allocator, self.app, id, width, height, scale);
         try self.panels.put(id, panel);
+
+        // Add to layout as a new tab (default behavior for new panels)
+        _ = self.layout.createTab(id) catch {};
+
+        return panel;
+    }
+
+    // Create a panel as a split of an existing panel (doesn't create a new tab)
+    fn createPanelAsSplit(self: *Server, width: u32, height: u32, scale: f64, parent_panel_id: u32, direction: SplitDirection) !*Panel {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const id = self.next_panel_id;
+        self.next_panel_id += 1;
+
+        const panel = try Panel.init(self.allocator, self.app, id, width, height, scale);
+        try self.panels.put(id, panel);
+
+        // Add to layout as a split of the parent panel
+        self.layout.splitPanel(parent_panel_id, direction, id) catch |err| {
+            std.debug.print("Failed to split panel in layout: {}\n", .{err});
+            // Fall back to creating a new tab
+            _ = self.layout.createTab(id) catch {};
+        };
+
         return panel;
     }
 
@@ -1144,7 +1457,7 @@ const Server = struct {
     // ========== Control message handling ==========
 
     fn handleControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        _ = conn;
+        _ = conn; // Control connection not used directly here
         // Simple JSON parsing (look for "type" field)
         // In production, use proper JSON parser
 
@@ -1162,6 +1475,26 @@ const Server = struct {
             const height = self.parseJsonInt(data, "height") orelse return;
             self.mutex.lock();
             self.pending_resizes.append(self.allocator, .{ .id = id, .width = width, .height = height }) catch {};
+            self.mutex.unlock();
+        } else if (std.mem.indexOf(u8, data, "\"split_panel\"")) |_| {
+            // Split an existing panel
+            // {"type":"split_panel","panel_id":1,"direction":"horizontal","width":800,"height":600,"scale":2.0}
+            const parent_id = self.parseJsonInt(data, "panel_id") orelse return;
+            const width = self.parseJsonInt(data, "width") orelse 800;
+            const height = self.parseJsonInt(data, "height") orelse 600;
+            const scale = self.parseJsonFloat(data, "scale") orelse 2.0;
+
+            const dir_str = self.parseJsonString(data, "direction") orelse "horizontal";
+            const direction: SplitDirection = if (std.mem.eql(u8, dir_str, "vertical")) .vertical else .horizontal;
+
+            self.mutex.lock();
+            self.pending_splits.append(self.allocator, .{
+                .parent_panel_id = parent_id,
+                .direction = direction,
+                .width = width,
+                .height = height,
+                .scale = scale,
+            }) catch {};
             self.mutex.unlock();
         } else if (std.mem.indexOf(u8, data, "\"view_action\"")) |_| {
             const id = self.parseJsonInt(data, "panel_id") orelse return;
@@ -1212,12 +1545,37 @@ const Server = struct {
         return null;
     }
 
+    fn parseJsonFloat(self: *Server, data: []const u8, key: []const u8) ?f64 {
+        _ = self;
+        // Build search pattern: "key":
+        var pattern_buf: [64]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":", .{key}) catch return null;
+
+        const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
+        var start = idx + pattern.len;
+
+        // Skip whitespace
+        while (start < data.len and (data[start] == ' ' or data[start] == '\t')) : (start += 1) {}
+
+        var end = start;
+        while (end < data.len and (data[end] == '.' or data[end] == '-' or (data[end] >= '0' and data[end] <= '9'))) : (end += 1) {}
+
+        if (end > start) {
+            return std.fmt.parseFloat(f64, data[start..end]) catch null;
+        }
+        return null;
+    }
+
     fn sendPanelList(self: *Server, conn: *ws.Connection) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Build JSON panel list
-        var buf: [4096]u8 = undefined;
+        // Get layout JSON
+        const layout_json = self.layout.toJson(self.allocator) catch return;
+        defer self.allocator.free(layout_json);
+
+        // Build JSON panel list with layout
+        var buf: [8192]u8 = undefined;
         var stream = std.io.fixedBufferStream(&buf);
         const writer = stream.writer();
 
@@ -1235,7 +1593,7 @@ const Server = struct {
             }) catch return;
         }
 
-        writer.writeAll("]}") catch return;
+        writer.print("],\"layout\":{s}}}", .{layout_json}) catch return;
 
         conn.sendText(stream.getWritten()) catch {};
     }
@@ -1298,6 +1656,27 @@ const Server = struct {
         for (self.control_connections.items) |conn| {
             conn.sendText(msg) catch {};
         }
+    }
+
+    fn broadcastLayoutUpdate(self: *Server) void {
+        self.mutex.lock();
+        const layout_json = self.layout.toJson(self.allocator) catch {
+            self.mutex.unlock();
+            return;
+        };
+        defer self.allocator.free(layout_json);
+
+        // Build message
+        var buf: [8192]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"layout_update\",\"layout\":{s}}}", .{layout_json}) catch {
+            self.mutex.unlock();
+            return;
+        };
+
+        for (self.control_connections.items) |conn| {
+            conn.sendText(msg) catch {};
+        }
+        self.mutex.unlock();
     }
 
     fn broadcastClipboard(self: *Server, text: []const u8) void {
@@ -1368,6 +1747,7 @@ const Server = struct {
             self.mutex.unlock();
 
             self.broadcastPanelCreated(panel.id);
+            self.broadcastLayoutUpdate();
         }
 
         self.allocator.free(pending);
@@ -1386,6 +1766,9 @@ const Server = struct {
             self.mutex.lock();
             if (self.panels.fetchRemove(req.id)) |entry| {
                 const panel = entry.value;
+
+                // Remove from layout
+                self.layout.removePanel(req.id);
 
                 // Find and close the panel's WebSocket connection
                 var conn_to_remove: ?*ws.Connection = null;
@@ -1407,6 +1790,9 @@ const Server = struct {
 
                 // Notify clients
                 self.broadcastPanelClosed(req.id);
+
+                // Broadcast updated layout
+                self.broadcastLayoutUpdate();
             } else {
                 self.mutex.unlock();
             }
@@ -1436,6 +1822,29 @@ const Server = struct {
         self.allocator.free(pending);
     }
 
+    // Process pending panel split requests (must run on main thread)
+    fn processPendingSplits(self: *Server) void {
+        self.mutex.lock();
+        const pending = self.pending_splits.toOwnedSlice(self.allocator) catch {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+
+        for (pending) |req| {
+            const panel = self.createPanelAsSplit(req.width, req.height, req.scale, req.parent_panel_id, req.direction) catch |err| {
+                std.debug.print("Failed to create split panel: {}\n", .{err});
+                continue;
+            };
+
+            // Panel connection will be established when client connects via panel WS with CONNECT_PANEL
+            self.broadcastPanelCreated(panel.id);
+            self.broadcastLayoutUpdate();
+        }
+
+        self.allocator.free(pending);
+    }
+
     // Main render loop
     fn runRenderLoop(self: *Server) void {
         const target_fps: u64 = 30;
@@ -1447,10 +1856,11 @@ const Server = struct {
         while (self.running.load(.acquire)) {
             const now = std.time.nanoTimestamp();
 
-            // Process pending panel creations/destructions/resizes (NSWindow/ghostty must be on main thread)
+            // Process pending panel creations/destructions/resizes/splits (NSWindow/ghostty must be on main thread)
             self.processPendingPanels();
             self.processPendingDestroys();
             self.processPendingResizes();
+            self.processPendingSplits();
 
             // Tick ghostty
             self.tick();

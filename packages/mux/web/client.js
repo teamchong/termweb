@@ -925,6 +925,7 @@ class App {
     this.activeTab = null;          // Current tab ID
     this.nextLocalId = 1;
     this.nextTabId = 1;
+    this.pendingSplit = null;       // Pending split operation waiting for panel_created
 
     this.tabsEl = document.getElementById('tabs');
     this.panelsEl = document.getElementById('panels');
@@ -1106,11 +1107,15 @@ class App {
 
     switch (msg.type) {
       case 'panel_list':
-        // Initial panel list from server
-        console.log('Panel list received:', msg.panels);
-        if (msg.panels && msg.panels.length > 0) {
-          // Connect to existing panels - put them all in one tab with splits
-          console.log('Connecting to', msg.panels.length, 'existing panels');
+        // Initial panel list from server with layout
+        console.log('Panel list received:', msg.panels, 'layout:', msg.layout);
+        if (msg.layout && msg.layout.tabs && msg.layout.tabs.length > 0) {
+          // Restore layout from server
+          console.log('Restoring layout from server');
+          this.restoreLayoutFromServer(msg.layout);
+        } else if (msg.panels && msg.panels.length > 0) {
+          // Fallback: put all panels in one tab with splits
+          console.log('Connecting to', msg.panels.length, 'existing panels (no layout)');
           this.reconnectPanelsAsSplits(msg.panels);
         } else {
           // No panels on server - create one
@@ -1119,13 +1124,25 @@ class App {
         }
         break;
 
+      case 'layout_update':
+        // Layout changed on server
+        console.log('Layout update received:', msg.layout);
+        // TODO: Update local layout to match server (for multi-client sync)
+        break;
+
       case 'panel_created':
-        // New panel created on server - update local panel's serverId
-        for (const [, panel] of this.panels) {
-          if (panel.serverId === null) {
-            panel.serverId = msg.panel_id;
-            console.log(`Local panel ${panel.id} assigned server ID ${msg.panel_id}`);
-            break;
+        // Check if this is from a pending split
+        if (this.pendingSplit) {
+          console.log(`Completing pending split with new panel ${msg.panel_id}`);
+          this.completePendingSplit(msg.panel_id);
+        } else {
+          // New panel created on server - update local panel's serverId
+          for (const [, panel] of this.panels) {
+            if (panel.serverId === null) {
+              panel.serverId = msg.panel_id;
+              console.log(`Local panel ${panel.id} assigned server ID ${msg.panel_id}`);
+              break;
+            }
           }
         }
         break;
@@ -1304,9 +1321,118 @@ class App {
     }
   }
 
+  // Restore layout from server (tabs and splits)
+  restoreLayoutFromServer(layout) {
+    console.log('restoreLayoutFromServer:', layout);
+
+    // Clear any existing panels/tabs
+    for (const [tabId, tab] of this.tabs) {
+      tab.root.destroy();
+      tab.element.remove();
+      this.removeTabUI(tabId);
+    }
+    this.tabs.clear();
+    this.panels.clear();
+    this.activeTab = null;
+    this.activePanel = null;
+
+    // Restore each tab from server layout
+    for (const serverTab of layout.tabs) {
+      const tabId = this.nextTabId++;
+
+      // Create tab content container
+      const tabContent = document.createElement('div');
+      tabContent.className = 'tab-content';
+      tabContent.dataset.tabId = tabId;
+      this.panelsEl.appendChild(tabContent);
+
+      // Build split tree from server node
+      const root = this.buildSplitTreeFromNode(serverTab.root, tabContent);
+      if (!root) {
+        tabContent.remove();
+        continue;
+      }
+
+      tabContent.appendChild(root.element);
+
+      // Store tab info
+      this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+
+      // Add tab to tab bar
+      this.addTabUI(tabId, 'Terminal');
+    }
+
+    // Switch to active tab (or first tab)
+    const activeTabId = layout.activeTabId;
+    let targetTabId = null;
+
+    // Find matching tab (server tab IDs may not match client IDs)
+    if (this.tabs.size > 0) {
+      targetTabId = this.tabs.keys().next().value;
+    }
+
+    if (targetTabId !== null) {
+      this.switchToTab(targetTabId);
+    } else {
+      // No tabs restored - create a new one
+      this.createTab();
+    }
+  }
+
+  // Build a SplitContainer tree from a server node
+  buildSplitTreeFromNode(node, parentContainer) {
+    if (!node) return null;
+
+    if (node.type === 'leaf' && node.panelId !== undefined) {
+      // Leaf node - create panel
+      const panel = this.createPanel(parentContainer, node.panelId);
+      return SplitContainer.createLeaf(panel, null);
+    }
+
+    if (node.type === 'split' && node.first && node.second) {
+      // Split node - create container with children
+      const container = new SplitContainer(null);
+      container.direction = node.direction || 'horizontal';
+      container.ratio = node.ratio || 0.5;
+
+      // Create first child
+      const first = this.buildSplitTreeFromNode(node.first, parentContainer);
+      if (!first) return null;
+      first.parent = container;
+
+      // Create second child
+      const second = this.buildSplitTreeFromNode(node.second, parentContainer);
+      if (!second) return null;
+      second.parent = container;
+
+      container.first = first;
+      container.second = second;
+
+      // Build DOM for split container
+      container.element = document.createElement('div');
+      container.element.className = `split-container ${container.direction}`;
+
+      container.element.appendChild(first.element);
+
+      container.divider = document.createElement('div');
+      container.divider.className = 'split-divider';
+      container.setupDividerDrag();
+      container.element.appendChild(container.divider);
+
+      container.element.appendChild(second.element);
+
+      container.applyRatio();
+
+      return container;
+    }
+
+    return null;
+  }
+
   // Split the active panel
   splitActivePanel(direction) {
     if (!this.activePanel || this.activeTab === null) return;
+    if (this.activePanel.serverId === null) return; // Can't split if not connected
 
     const tab = this.tabs.get(this.activeTab);
     if (!tab) return;
@@ -1315,11 +1441,57 @@ class App {
     const container = tab.root.findContainer(this.activePanel);
     if (!container) return;
 
-    // Create new panel for the split
-    const newPanel = this.createPanel(document.createElement('div'), null);
+    // Get container dimensions for the new panel
+    const rect = container.element.getBoundingClientRect();
+    const width = Math.floor(rect.width / 2) || 400;
+    const height = Math.floor(rect.height / 2) || 300;
+    const scale = window.devicePixelRatio || 1;
 
-    // Perform the split
-    const newContainer = container.split(direction, newPanel);
+    // Map client direction to server direction
+    const serverDirection = (direction === 'left' || direction === 'right') ? 'horizontal' : 'vertical';
+
+    // Store pending split info - will complete when panel_created arrives
+    this.pendingSplit = {
+      parentPanelId: this.activePanel.serverId,
+      direction: direction,
+      container: container,
+      tabId: this.activeTab
+    };
+
+    // Send split request to server
+    this.sendSplitPanel(this.activePanel.serverId, serverDirection, width, height, scale);
+  }
+
+  // Send split_panel request to server
+  sendSplitPanel(parentPanelId, direction, width, height, scale) {
+    if (!this.controlWs || this.controlWs.readyState !== WebSocket.OPEN) return;
+    const msg = JSON.stringify({
+      type: 'split_panel',
+      panel_id: parentPanelId,
+      direction: direction,
+      width: width,
+      height: height,
+      scale: scale
+    });
+    this.controlWs.send(msg);
+    console.log(`Sent split_panel: parent=${parentPanelId}, direction=${direction}`);
+  }
+
+  // Complete a pending split when panel_created arrives
+  completePendingSplit(newPanelId) {
+    const split = this.pendingSplit;
+    this.pendingSplit = null;
+
+    if (!split) return;
+
+    const tab = this.tabs.get(split.tabId);
+    if (!tab) return;
+
+    // Create new panel connected to the server panel
+    const newPanel = this.createPanel(document.createElement('div'), newPanelId);
+
+    // Perform the local split
+    const newContainer = split.container.split(split.direction, newPanel);
     if (newContainer) {
       // Focus the new panel
       this.setActivePanel(newPanel);
