@@ -100,8 +100,6 @@ pub const HttpServer = struct {
             return;
         }
 
-        std.debug.print("HTTP request: {s}\n", .{path});
-
         // Handle /config endpoint - returns WebSocket ports
         if (std.mem.eql(u8, path, "/config")) {
             self.sendConfig(stream);

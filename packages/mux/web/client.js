@@ -472,12 +472,12 @@ class Panel {
   setupInputHandlers() {
     // Focus handling
     this.canvas.tabIndex = 1;
-    
+
     // Keyboard - intercept all keys including Cmd+/-/= for ghostty font scaling
     this.canvas.addEventListener('keydown', (e) => {
-      e.preventDefault();
       // Handle font size shortcuts via control channel
       if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
+        e.preventDefault();
         if (this.serverId !== null && this.onViewAction) {
           if (e.key === '=') this.onViewAction(this.serverId, 'increase_font_size:1');
           else if (e.key === '-') this.onViewAction(this.serverId, 'decrease_font_size:1');
@@ -485,28 +485,59 @@ class Panel {
         }
         return;
       }
-      // Let global shortcuts bubble up (handled by window listener)
+
+      // Local shortcuts handled by window capture handler - don't interfere
       if (e.metaKey && !e.shiftKey && (e.key === '/' || e.key === '.' || e.key === 'a')) {
-        return;  // Don't send to terminal, let window handler process
+        return;
       }
-      if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.' || e.key === 'v')) {
-        return;  // Close all tabs / paste selection - let window handler process
+      if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.' || e.key === 'v' || e.key === 'V')) {
+        return;
       }
       if (e.metaKey && e.key >= '1' && e.key <= '9') {
-        return;  // Tab switching - let window handler process
+        return;
       }
-      // NOTE: Command palette and inspector open as separate floating windows
-      // that are outside our IOSurface capture - they won't render in the browser
-      this.sendKeyInput(e, 1); // press
+      // ⌘C for copy - let browser handle
+      if (e.metaKey && (e.key === 'c' || e.key === 'C')) {
+        return;
+      }
+      // ⌘V for paste - handle via paste event
+      if (e.metaKey && (e.key === 'v' || e.key === 'V')) {
+        return;
+      }
+
+      e.preventDefault();
+
+      // Check if it's a special key that needs KEY_INPUT
+      const keyCode = keyCodeMap[e.code];
+      if (keyCode) {
+        this.sendKeyInput(e, 1); // press
+      } else if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
+        // Printable character - send as text
+        this.sendTextInput(e.key);
+      } else if (e.ctrlKey && e.key.length === 1) {
+        // Ctrl+key combination - send as key input if mapped
+        this.sendKeyInput(e, 1);
+      }
     });
 
     this.canvas.addEventListener('keyup', (e) => {
-      e.preventDefault();
-      // Skip font size shortcuts on keyup
-      if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
-        return;
+      // Skip shortcuts on keyup
+      if (e.metaKey) return;
+
+      const keyCode = keyCodeMap[e.code];
+      if (keyCode) {
+        e.preventDefault();
+        this.sendKeyInput(e, 0); // release
       }
-      this.sendKeyInput(e, 0); // release
+    });
+
+    // Handle paste event
+    this.canvas.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = e.clipboardData.getData('text');
+      if (text) {
+        this.sendTextInput(text);
+      }
     });
     
     // Mouse
@@ -553,16 +584,28 @@ class Panel {
   
   sendKeyInput(e, action) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    
+
     const keyCode = keyCodeMap[e.code] || 0;
     if (keyCode === 0) return;
-    
+
     const buf = new ArrayBuffer(7);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.KEY_INPUT);
     view.setUint32(1, keyCode, true);
     view.setUint8(5, action);
     view.setUint8(6, this.getModifiers(e));
+    this.ws.send(buf);
+  }
+
+  sendTextInput(text) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const encoder = new TextEncoder();
+    const textBytes = encoder.encode(text);
+    const buf = new ArrayBuffer(1 + textBytes.length);
+    const view = new Uint8Array(buf);
+    view[0] = ClientMsg.TEXT_INPUT;
+    view.set(textBytes, 1);
     this.ws.send(buf);
   }
   

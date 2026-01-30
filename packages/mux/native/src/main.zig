@@ -759,8 +759,6 @@ const Server = struct {
 
         const panel = try Panel.init(self.allocator, self.app, id, width, height, scale);
         try self.panels.put(id, panel);
-
-        std.debug.print("Created panel {} ({}x{})\n", .{ id, width, height });
         return panel;
     }
 
@@ -770,7 +768,6 @@ const Server = struct {
 
         if (self.panels.fetchRemove(id)) |entry| {
             entry.value.deinit();
-            std.debug.print("Destroyed panel {}\n", .{id});
         }
     }
 
@@ -792,8 +789,6 @@ const Server = struct {
         self.mutex.lock();
         self.control_connections.append(self.allocator, conn) catch {};
         self.mutex.unlock();
-
-        std.debug.print("Control client connected\n", .{});
 
         // Send current panel list
         self.sendPanelList(conn);
@@ -818,16 +813,12 @@ const Server = struct {
             }
         }
         self.mutex.unlock();
-
-        std.debug.print("Control client disconnected\n", .{});
     }
 
     // ========== Panel WebSocket callbacks ==========
 
     fn onPanelConnect(conn: *ws.Connection) void {
         _ = conn;
-        // Don't auto-create panel - wait for connect_panel or create_panel message
-        std.debug.print("Panel client connected, waiting for panel command\n", .{});
     }
 
     fn onPanelMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
@@ -853,7 +844,6 @@ const Server = struct {
                             panel.setConnection(conn);
                             conn.user_data = panel;
                             self.panel_connections.put(conn, panel) catch {};
-                            std.debug.print("Client connected to existing panel {}\n", .{panel_id});
                         }
                         self.mutex.unlock();
                     }
@@ -879,7 +869,6 @@ const Server = struct {
                         .scale = scale,
                     }) catch {};
                     self.mutex.unlock();
-                    std.debug.print("Panel creation queued ({}x{} @{d:.1}x)\n", .{ width, height, scale });
                 },
                 else => {},
             }
@@ -892,9 +881,7 @@ const Server = struct {
         self.mutex.lock();
         if (self.panel_connections.fetchRemove(conn)) |entry| {
             const panel = entry.value;
-            const panel_id = panel.id;
             panel.setConnection(null);
-            std.debug.print("Panel client disconnected from panel {} (panel persists)\n", .{panel_id});
         }
         self.mutex.unlock();
     }
@@ -907,40 +894,29 @@ const Server = struct {
         // In production, use proper JSON parser
 
         if (std.mem.indexOf(u8, data, "\"create_panel\"")) |_| {
-            // Queue panel creation for main thread (don't create ghostty surface here!)
-            // For now, panels are auto-created when panel WS connects
-            // This message type could be used for creating additional panels
-            std.debug.print("create_panel request received (panels auto-create on connect)\n", .{});
+            // Panels are auto-created when panel WS connects
         } else if (std.mem.indexOf(u8, data, "\"close_panel\"")) |_| {
-            // Queue panel destruction for main thread
             if (self.parseJsonInt(data, "panel_id")) |id| {
-                std.debug.print("Queueing destruction of panel {}\n", .{id});
                 self.mutex.lock();
                 self.pending_destroys.append(self.allocator, .{ .id = id }) catch {};
                 self.mutex.unlock();
             }
         } else if (std.mem.indexOf(u8, data, "\"resize_panel\"")) |_| {
-            // Queue panel resize for main thread
             const id = self.parseJsonInt(data, "panel_id") orelse return;
             const width = self.parseJsonInt(data, "width") orelse return;
             const height = self.parseJsonInt(data, "height") orelse return;
-            std.debug.print("Queueing resize of panel {} to {}x{}\n", .{ id, width, height });
             self.mutex.lock();
             self.pending_resizes.append(self.allocator, .{ .id = id, .width = width, .height = height }) catch {};
             self.mutex.unlock();
         } else if (std.mem.indexOf(u8, data, "\"view_action\"")) |_| {
-            // Execute view action on panel
             const id = self.parseJsonInt(data, "panel_id") orelse return;
             const action = self.parseJsonString(data, "action") orelse return;
-            std.debug.print("View action on panel {}: {s} (len={})\n", .{ id, action, action.len });
             self.mutex.lock();
             if (self.panels.get(id)) |panel| {
                 self.mutex.unlock();
-                const result = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
-                std.debug.print("View action result: {}\n", .{result});
+                _ = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
             } else {
                 self.mutex.unlock();
-                std.debug.print("Panel {} not found\n", .{id});
             }
         }
     }
@@ -984,8 +960,6 @@ const Server = struct {
     fn sendPanelList(self: *Server, conn: *ws.Connection) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        std.debug.print("Sending panel list, {} panels exist\n", .{self.panels.count()});
 
         // Build JSON panel list
         var buf: [4096]u8 = undefined;
@@ -1114,7 +1088,6 @@ const Server = struct {
             self.panel_connections.put(req.conn, panel) catch {};
             self.mutex.unlock();
 
-            std.debug.print("Panel {} created for connection\n", .{panel.id});
             self.broadcastPanelCreated(panel.id);
         }
 
@@ -1151,9 +1124,7 @@ const Server = struct {
 
                 self.mutex.unlock();
 
-                // Destroy ghostty surface and panel
                 panel.deinit();
-                std.debug.print("Destroyed panel {} (ghostty surface freed)\n", .{req.id});
 
                 // Notify clients
                 self.broadcastPanelClosed(req.id);
@@ -1177,10 +1148,7 @@ const Server = struct {
             self.mutex.lock();
             if (self.panels.get(req.id)) |panel| {
                 self.mutex.unlock();
-                panel.resizeInternal(req.width, req.height) catch |err| {
-                    std.debug.print("Resize error for panel {}: {}\n", .{ req.id, err });
-                };
-                std.debug.print("Resized panel {} to {}x{}\n", .{ req.id, req.width, req.height });
+                panel.resizeInternal(req.width, req.height) catch {};
             } else {
                 self.mutex.unlock();
             }
@@ -1228,35 +1196,9 @@ const Server = struct {
                 if (!panel.streaming.load(.acquire)) continue;
 
                 if (panel.getIOSurface()) |iosurface| {
-                    // Debug IOSurface info
-                    if (panel.sequence % 100 == 0) {
-                        const w = c.IOSurfaceGetWidth(iosurface);
-                        const h = c.IOSurfaceGetHeight(iosurface);
-                        const bpr = c.IOSurfaceGetBytesPerRow(iosurface);
-                        const fmt = c.IOSurfaceGetPixelFormat(iosurface);
-                        std.debug.print("[DEBUG] IOSurface: {}x{}, bpr={}, fmt=0x{X}\n", .{ w, h, bpr, fmt });
-                    }
-
-                    panel.captureFromIOSurface(iosurface) catch |err| {
-                        std.debug.print("Capture error: {}\n", .{err});
-                        continue;
-                    };
-                    const result = panel.prepareFrame() catch |err| {
-                        std.debug.print("PrepareFrame error: {}\n", .{err});
-                        continue;
-                    };
-
-                    if (panel.sequence % 100 == 1 or panel.force_keyframe) {
-                        std.debug.print("[DEBUG] Frame {}: {}x{}, {} bytes, keyframe={}\n", .{ panel.sequence, panel.frame_buffer.width, panel.frame_buffer.height, result.data.len, result.is_keyframe });
-                    }
-
-                    panel.sendFrame(result.data) catch |err| {
-                        std.debug.print("SendFrame error: {}\n", .{err});
-                    };
-                } else {
-                    if (panel.sequence == 0) {
-                        std.debug.print("Panel {}: No IOSurface yet\n", .{panel.id});
-                    }
+                    panel.captureFromIOSurface(iosurface) catch continue;
+                    const result = panel.prepareFrame() catch continue;
+                    panel.sendFrame(result.data) catch {};
                 }
             }
             self.mutex.unlock();
@@ -1370,78 +1312,34 @@ fn resizeWindow(window: objc.id, width: u32, height: u32) void {
     setFrame(window, sel("setFrame:display:"), rect, true);
 }
 
-var debug_frame_count: u32 = 0;
-
 fn getIOSurfaceFromView(nsview: objc.id) ?IOSurfacePtr {
-    debug_frame_count += 1;
-    const should_log = (debug_frame_count % 100 == 1); // Log every 100 frames
-
-    if (nsview == null) {
-        if (should_log) std.debug.print("[DEBUG] nsview is null\n", .{});
-        return null;
-    }
+    if (nsview == null) return null;
 
     const layer = msgSendId()(nsview, sel("layer"));
-    if (layer == null) {
-        if (should_log) std.debug.print("[DEBUG] view has no layer\n", .{});
-        return null;
-    }
-
-    // Get layer class name for debugging
-    if (should_log) {
-        const class_fn: *const fn (objc.id, objc.SEL) callconv(.c) objc.id = @ptrCast(&objc.objc_msgSend);
-        const cls = class_fn(layer, sel("class"));
-        if (cls != null) {
-            const name_fn: *const fn (objc.id, objc.SEL) callconv(.c) [*:0]const u8 = @ptrCast(&objc.objc_msgSend);
-            const class_name = name_fn(cls, sel("description"));
-            std.debug.print("[DEBUG] layer class: {s}\n", .{class_name});
-        }
-    }
+    if (layer == null) return null;
 
     // Try to get contents directly from the layer first
     const contents = msgSendId()(layer, sel("contents"));
-    if (contents != null) {
-        if (should_log) std.debug.print("[DEBUG] found contents on main layer\n", .{});
-        return @ptrCast(contents);
-    }
+    if (contents != null) return @ptrCast(contents);
 
     // Check sublayers
     const sublayers = msgSendId()(layer, sel("sublayers"));
-    if (sublayers == null) {
-        if (should_log) std.debug.print("[DEBUG] no sublayers\n", .{});
-        return null;
-    }
+    if (sublayers == null) return null;
 
     const count_fn: *const fn (objc.id, objc.SEL) callconv(.c) u64 = @ptrCast(&objc.objc_msgSend);
     const count = count_fn(sublayers, sel("count"));
-    if (should_log) std.debug.print("[DEBUG] sublayer count: {}\n", .{count});
-
     if (count == 0) return null;
 
-    // Check each sublayer
+    // Check each sublayer for contents
     var i: u64 = 0;
     while (i < count) : (i += 1) {
         const sublayer = msgSendIndex()(sublayers, sel("objectAtIndex:"), i);
         if (sublayer == null) continue;
 
-        if (should_log) {
-            const class_fn: *const fn (objc.id, objc.SEL) callconv(.c) objc.id = @ptrCast(&objc.objc_msgSend);
-            const cls = class_fn(sublayer, sel("class"));
-            if (cls != null) {
-                const name_fn: *const fn (objc.id, objc.SEL) callconv(.c) [*:0]const u8 = @ptrCast(&objc.objc_msgSend);
-                const class_name = name_fn(cls, sel("description"));
-                std.debug.print("[DEBUG] sublayer[{}] class: {s}\n", .{ i, class_name });
-            }
-        }
-
         const sublayer_contents = msgSendId()(sublayer, sel("contents"));
-        if (sublayer_contents != null) {
-            if (should_log) std.debug.print("[DEBUG] found contents on sublayer[{}]\n", .{i});
-            return @ptrCast(sublayer_contents);
-        }
+        if (sublayer_contents != null) return @ptrCast(sublayer_contents);
     }
 
-    if (should_log) std.debug.print("[DEBUG] no contents found in any layer\n", .{});
     return null;
 }
 
