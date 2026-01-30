@@ -1597,19 +1597,18 @@ class App {
 
   // Switch to a tab
   switchToTab(tabId) {
-    // Hide current tab
-    if (this.activeTab !== null) {
-      const oldTab = this.tabs.get(this.activeTab);
-      if (oldTab) {
-        oldTab.element.classList.remove('active');
-        // Pause all panels in old tab
-        for (const panel of oldTab.root.getAllPanels()) {
+    // Hide ALL tabs first (ensures clean state)
+    for (const [tid, t] of this.tabs) {
+      t.element.classList.remove('active');
+      if (tid !== tabId) {
+        // Pause panels in non-active tabs
+        for (const panel of t.root.getAllPanels()) {
           panel.hide();
         }
       }
     }
 
-    // Show new tab
+    // Show the target tab
     const tab = this.tabs.get(tabId);
     if (tab) {
       tab.element.classList.add('active');
