@@ -757,8 +757,17 @@ class App {
         }
         return;
       }
-      // ⌘⇧V for paste selection (same as paste for web)
+      // ⌘⇧V for paste selection - use ghostty's selection clipboard
       if (e.metaKey && e.shiftKey && e.key === 'v') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          this.sendViewAction(this.activePanel.serverId, 'paste_from_selection');
+        }
+        return;
+      }
+      // ⌘V for paste from system clipboard
+      if (e.metaKey && !e.shiftKey && e.key === 'v') {
         e.preventDefault();
         e.stopPropagation();
         navigator.clipboard.readText().then(text => {
@@ -1230,18 +1239,10 @@ function setupMenus() {
           });
           break;
         case 'paste-selection':
-          // Paste from selection (same as paste for web)
-          navigator.clipboard.readText().then(text => {
-            if (app.activePanel && app.activePanel.ws) {
-              const encoder = new TextEncoder();
-              const textBytes = encoder.encode(text);
-              const buf = new ArrayBuffer(1 + textBytes.length);
-              const view = new Uint8Array(buf);
-              view[0] = 0x05; // TEXT_INPUT
-              view.set(textBytes, 1);
-              app.activePanel.ws.send(buf);
-            }
-          });
+          // Paste from ghostty's selection clipboard
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'paste_from_selection');
+          }
           break;
         case 'select-all':
           if (app.activePanel?.serverId !== null) {

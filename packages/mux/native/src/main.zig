@@ -275,6 +275,8 @@ const Panel = struct {
         surface_config.platform.macos.nsview = @ptrCast(window_view.view);
         // Use actual scale factor - ghostty will render at retina resolution
         surface_config.scale_factor = scale;
+        // Set userdata to panel pointer for clipboard callbacks
+        surface_config.userdata = panel;
         // Use default shell (null = user's shell from /etc/passwd)
         surface_config.command = null;
         surface_config.working_directory = null;
@@ -833,6 +835,7 @@ const Server = struct {
     running: std.atomic.Value(bool),
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
+    selection_clipboard: ?[]u8,  // Selection clipboard buffer
 
     var global_server: ?*Server = null;
 
@@ -851,7 +854,7 @@ const Server = struct {
 
         const runtime_config = c.ghostty_runtime_config_s{
             .userdata = null,
-            .supports_selection_clipboard = false,
+            .supports_selection_clipboard = true,
             .wakeup_cb = wakeupCallback,
             .action_cb = actionCallback,
             .read_clipboard_cb = readClipboardCallback,
@@ -893,6 +896,7 @@ const Server = struct {
             .running = std.atomic.Value(bool).init(false),
             .allocator = allocator,
             .mutex = .{},
+            .selection_clipboard = null,
         };
 
         global_server = server;
@@ -1616,9 +1620,25 @@ fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.gh
 }
 
 fn readClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_e, context: ?*anyopaque) callconv(.c) void {
-    _ = userdata;
-    _ = clipboard;
-    _ = context;
+    // userdata is the Panel pointer (set via surface_config.userdata)
+    const panel: *Panel = @ptrCast(@alignCast(userdata orelse return));
+
+    const self = Server.global_server orelse return;
+
+    // Only handle selection clipboard
+    if (clipboard == c.GHOSTTY_CLIPBOARD_SELECTION) {
+        self.mutex.lock();
+        const selection = self.selection_clipboard;
+        self.mutex.unlock();
+
+        if (selection) |sel_text| {
+            c.ghostty_surface_complete_clipboard_request(panel.surface, sel_text.ptr, context, true);
+            return;
+        }
+    }
+
+    // Complete with empty string if no selection
+    c.ghostty_surface_complete_clipboard_request(panel.surface, "", context, true);
 }
 
 fn confirmReadClipboardCallback(userdata: ?*anyopaque, data: [*c]const u8, context: ?*anyopaque, request: c.ghostty_clipboard_request_e) callconv(.c) void {
@@ -1630,10 +1650,37 @@ fn confirmReadClipboardCallback(userdata: ?*anyopaque, data: [*c]const u8, conte
 
 fn writeClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_e, content: [*c]const c.ghostty_clipboard_content_s, count: usize, protected: bool) callconv(.c) void {
     _ = userdata;
-    _ = clipboard;
-    _ = content;
-    _ = count;
     _ = protected;
+
+    const self = Server.global_server orelse return;
+
+    // Only handle selection clipboard writes
+    if (clipboard != c.GHOSTTY_CLIPBOARD_SELECTION) return;
+    if (count == 0 or content == null) return;
+
+    // Get the text/plain content
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const item = content[i];
+        if (item.mime != null and item.data != null) {
+            const mime = std.mem.span(item.mime);
+            if (std.mem.eql(u8, mime, "text/plain")) {
+                const data = std.mem.span(item.data);
+
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                // Free old selection
+                if (self.selection_clipboard) |old| {
+                    self.allocator.free(old);
+                }
+
+                // Store new selection
+                self.selection_clipboard = self.allocator.dupe(u8, data) catch null;
+                return;
+            }
+        }
+    }
 }
 
 fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c) void {
