@@ -256,8 +256,12 @@ class Panel {
       console.log(`Panel ${this.id}: Disconnected`);
     };
 
-    this.ws.onerror = (err) => {
-      console.error(`Panel ${this.id}: Error`, err);
+    this.ws.onerror = () => {
+      // Ignore errors during close (race between client/server closing)
+      if (this.ws?.readyState === WebSocket.CLOSING || this.ws?.readyState === WebSocket.CLOSED) {
+        return;
+      }
+      console.error(`Panel ${this.id}: WebSocket error`);
     };
   }
 
@@ -1806,10 +1810,19 @@ class App {
       targetPanel.destroy();
       this.panels.delete(targetPanel.id);
       this.quickTerminalPanel = null;
-      // Restore previous active panel
+      // Restore previous active panel or current active tab's panel
       if (this.previousActivePanel) {
         this.setActivePanel(this.previousActivePanel);
         this.previousActivePanel = null;
+      } else if (this.activeTab !== null) {
+        // Update title for current active tab
+        const tab = this.tabs.get(this.activeTab);
+        if (tab) {
+          const tabPanels = tab.root.getAllPanels();
+          if (tabPanels.length > 0) {
+            this.setActivePanel(tabPanels[0]);
+          }
+        }
       }
       return;
     }
