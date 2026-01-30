@@ -1861,13 +1861,14 @@ class App {
         panel.show();
       }
 
-      // Set active panel to first panel if none set
+      // Set active panel to first panel if none set (use setActivePanel to notify server)
       if (!this.activePanel || !tabPanels.includes(this.activePanel)) {
-        this.activePanel = tabPanels[0] || null;
-      }
-
-      // Update title
-      if (this.activePanel) {
+        this.setActivePanel(tabPanels[0] || null);
+      } else {
+        // Still notify server of the focus change even if panel didn't change
+        if (this.activePanel && this.activePanel.serverId !== null) {
+          this.sendFocusPanel(this.activePanel.serverId);
+        }
         this.updateTitleForPanel(this.activePanel);
       }
     }
