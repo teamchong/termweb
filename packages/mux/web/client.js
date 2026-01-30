@@ -2553,6 +2553,38 @@ class App {
       }
     }
   }
+
+  toggleQuickTerminal() {
+    const container = document.getElementById('quick-terminal');
+    if (!container) return;
+
+    if (container.classList.contains('visible')) {
+      // Hide quick terminal
+      container.classList.remove('visible');
+      // Destroy the panel
+      if (this.quickTerminalPanel) {
+        this.quickTerminalPanel.destroy();
+        this.panels.delete(this.quickTerminalPanel.id);
+        this.quickTerminalPanel = null;
+      }
+      // Refocus main terminal
+      if (this.activePanel && this.activePanel.canvas) {
+        this.activePanel.canvas.focus();
+      }
+    } else {
+      // Show quick terminal
+      container.classList.add('visible');
+      // Create a new panel for quick terminal
+      const content = container.querySelector('.quick-terminal-content');
+      content.innerHTML = '';
+      const panel = this.createPanel(content, null);
+      this.quickTerminalPanel = panel;
+      // Focus it after a short delay for animation
+      setTimeout(() => {
+        if (panel.canvas) panel.canvas.focus();
+      }, 50);
+    }
+  }
 }
 
 // ============================================================================
@@ -2745,6 +2777,9 @@ function setupMenus() {
           break;
         case 'change-title':
           app.promptChangeTitle();
+          break;
+        case 'quick-terminal':
+          app.toggleQuickTerminal();
           break;
       }
 
