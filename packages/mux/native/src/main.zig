@@ -625,11 +625,19 @@ const PanelRequest = struct {
     conn: *ws.Connection,
     width: u32,
     height: u32,
+    scale: f64,
 };
 
 // Panel destruction request (to be processed on main thread)
 const PanelDestroyRequest = struct {
     id: u32,
+};
+
+// Panel resize request (to be processed on main thread)
+const PanelResizeRequest = struct {
+    id: u32,
+    width: u32,
+    height: u32,
 };
 
 const Server = struct {
@@ -640,6 +648,7 @@ const Server = struct {
     control_connections: std.ArrayList(*ws.Connection),
     pending_panels: std.ArrayList(PanelRequest),
     pending_destroys: std.ArrayList(PanelDestroyRequest),
+    pending_resizes: std.ArrayList(PanelResizeRequest),
     next_panel_id: u32,
     panel_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
@@ -699,6 +708,7 @@ const Server = struct {
             .control_connections = .{},
             .pending_panels = .{},
             .pending_destroys = .{},
+            .pending_resizes = .{},
             .next_panel_id = 1,
             .http_server = http_srv,
             .panel_ws_server = panel_ws,
@@ -724,6 +734,7 @@ const Server = struct {
         self.control_connections.deinit(self.allocator);
         self.pending_panels.deinit(self.allocator);
         self.pending_destroys.deinit(self.allocator);
+        self.pending_resizes.deinit(self.allocator);
 
         self.http_server.deinit();
         self.panel_ws_server.deinit();
@@ -734,14 +745,14 @@ const Server = struct {
         self.allocator.destroy(self);
     }
 
-    fn createPanel(self: *Server, width: u32, height: u32) !*Panel {
+    fn createPanel(self: *Server, width: u32, height: u32, scale: f64) !*Panel {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const id = self.next_panel_id;
         self.next_panel_id += 1;
 
-        const panel = try Panel.init(self.allocator, self.app, id, width, height, 2.0);
+        const panel = try Panel.init(self.allocator, self.app, id, width, height, scale);
         try self.panels.put(id, panel);
 
         std.debug.print("Created panel {} ({}x{})\n", .{ id, width, height });
@@ -843,21 +854,27 @@ const Server = struct {
                     }
                 },
                 .create_panel => {
-                    // Create new panel: [msg_type:u8][width:u16][height:u16]
+                    // Create new panel: [msg_type:u8][width:u16][height:u16][scale:f32]
                     var width: u32 = 800;
                     var height: u32 = 600;
+                    var scale: f64 = 2.0;
                     if (data.len >= 5) {
                         width = std.mem.readInt(u16, data[1..3], .little);
                         height = std.mem.readInt(u16, data[3..5], .little);
+                    }
+                    if (data.len >= 9) {
+                        const scale_f32: f32 = @bitCast(std.mem.readInt(u32, data[5..9], .little));
+                        scale = @floatCast(scale_f32);
                     }
                     self.mutex.lock();
                     self.pending_panels.append(self.allocator, .{
                         .conn = conn,
                         .width = width,
                         .height = height,
+                        .scale = scale,
                     }) catch {};
                     self.mutex.unlock();
-                    std.debug.print("Panel creation queued ({}x{})\n", .{ width, height });
+                    std.debug.print("Panel creation queued ({}x{} @{d:.1}x)\n", .{ width, height, scale });
                 },
                 else => {},
             }
@@ -891,19 +908,43 @@ const Server = struct {
             std.debug.print("create_panel request received (panels auto-create on connect)\n", .{});
         } else if (std.mem.indexOf(u8, data, "\"close_panel\"")) |_| {
             // Queue panel destruction for main thread
-            if (std.mem.indexOf(u8, data, "\"panel_id\":")) |idx| {
-                const start = idx + 11;
-                var end = start;
-                while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
-                if (end > start) {
-                    const id = std.fmt.parseInt(u32, data[start..end], 10) catch return;
-                    std.debug.print("Queueing destruction of panel {}\n", .{id});
-                    self.mutex.lock();
-                    self.pending_destroys.append(self.allocator, .{ .id = id }) catch {};
-                    self.mutex.unlock();
-                }
+            if (self.parseJsonInt(data, "panel_id")) |id| {
+                std.debug.print("Queueing destruction of panel {}\n", .{id});
+                self.mutex.lock();
+                self.pending_destroys.append(self.allocator, .{ .id = id }) catch {};
+                self.mutex.unlock();
             }
+        } else if (std.mem.indexOf(u8, data, "\"resize_panel\"")) |_| {
+            // Queue panel resize for main thread
+            const id = self.parseJsonInt(data, "panel_id") orelse return;
+            const width = self.parseJsonInt(data, "width") orelse return;
+            const height = self.parseJsonInt(data, "height") orelse return;
+            std.debug.print("Queueing resize of panel {} to {}x{}\n", .{ id, width, height });
+            self.mutex.lock();
+            self.pending_resizes.append(self.allocator, .{ .id = id, .width = width, .height = height }) catch {};
+            self.mutex.unlock();
         }
+    }
+
+    fn parseJsonInt(self: *Server, data: []const u8, key: []const u8) ?u32 {
+        _ = self;
+        // Build search pattern: "key":
+        var pattern_buf: [64]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":", .{key}) catch return null;
+
+        const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
+        var start = idx + pattern.len;
+
+        // Skip whitespace
+        while (start < data.len and (data[start] == ' ' or data[start] == '\t')) : (start += 1) {}
+
+        var end = start;
+        while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
+
+        if (end > start) {
+            return std.fmt.parseInt(u32, data[start..end], 10) catch null;
+        }
+        return null;
     }
 
     fn sendPanelList(self: *Server, conn: *ws.Connection) void {
@@ -1015,7 +1056,7 @@ const Server = struct {
         self.mutex.unlock();
 
         for (pending) |req| {
-            const panel = self.createPanel(req.width, req.height) catch |err| {
+            const panel = self.createPanel(req.width, req.height, req.scale) catch |err| {
                 std.debug.print("Failed to create panel: {}\n", .{err});
                 continue;
             };
@@ -1078,6 +1119,30 @@ const Server = struct {
         self.allocator.free(pending);
     }
 
+    fn processPendingResizes(self: *Server) void {
+        self.mutex.lock();
+        const pending = self.pending_resizes.toOwnedSlice(self.allocator) catch {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+
+        for (pending) |req| {
+            self.mutex.lock();
+            if (self.panels.get(req.id)) |panel| {
+                self.mutex.unlock();
+                panel.resizeInternal(req.width, req.height) catch |err| {
+                    std.debug.print("Resize error for panel {}: {}\n", .{ req.id, err });
+                };
+                std.debug.print("Resized panel {} to {}x{}\n", .{ req.id, req.width, req.height });
+            } else {
+                self.mutex.unlock();
+            }
+        }
+
+        self.allocator.free(pending);
+    }
+
     // Main render loop
     fn runRenderLoop(self: *Server) void {
         const target_fps: u64 = 30;
@@ -1086,9 +1151,10 @@ const Server = struct {
         while (self.running.load(.acquire)) {
             const start = std.time.nanoTimestamp();
 
-            // Process pending panel creations/destructions (NSWindow/ghostty must be on main thread)
+            // Process pending panel creations/destructions/resizes (NSWindow/ghostty must be on main thread)
             self.processPendingPanels();
             self.processPendingDestroys();
+            self.processPendingResizes();
 
             // Tick ghostty
             self.tick();

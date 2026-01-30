@@ -30,15 +30,19 @@ const FrameType = {
 // ============================================================================
 
 class Panel {
-  constructor(id, container, serverId = null) {
+  constructor(id, container, serverId = null, onResize = null) {
     this.id = id;                    // Local client ID
     this.serverId = serverId;        // Server panel ID (null = create new)
     this.container = container;
+    this.onResize = onResize;        // Callback for resize events
     this.ws = null;
     this.canvas = document.createElement('canvas');
     this.width = 0;
     this.height = 0;
     this.sequence = 0;
+    this.lastReportedWidth = 0;
+    this.lastReportedHeight = 0;
+    this.resizeTimeout = null;
 
     // WebGPU state
     this.device = null;
@@ -58,6 +62,32 @@ class Panel {
 
     this.setupInputHandlers();
     this.initGPU();
+    this.setupResizeObserver();
+  }
+
+  setupResizeObserver() {
+    this.resizeObserver = new ResizeObserver(() => {
+      // Debounce resize to avoid flooding server during drag
+      if (this.resizeTimeout) {
+        clearTimeout(this.resizeTimeout);
+      }
+      this.resizeTimeout = setTimeout(() => {
+        const rect = this.element.getBoundingClientRect();
+        const width = Math.floor(rect.width);
+        const height = Math.floor(rect.height);
+
+        // Only send if size actually changed
+        if (width !== this.lastReportedWidth || height !== this.lastReportedHeight) {
+          this.lastReportedWidth = width;
+          this.lastReportedHeight = height;
+
+          if (this.serverId !== null && this.onResize) {
+            this.onResize(this.serverId, width, height);
+          }
+        }
+      }, 100);
+    });
+    this.resizeObserver.observe(this.element);
   }
 
   async initGPU() {
@@ -235,8 +265,7 @@ class Panel {
     view.setUint32(1, panelId, true);
     this.ws.send(buf);
     console.log(`Panel ${this.id}: Connecting to server panel ${panelId}`);
-    // Send resize after connecting
-    setTimeout(() => this.sendResize(), 100);
+    // ResizeObserver will send resize via control WS
   }
 
   sendCreatePanel() {
@@ -244,13 +273,15 @@ class Panel {
     const rect = this.canvas.getBoundingClientRect();
     const width = Math.floor(rect.width) || 800;
     const height = Math.floor(rect.height) || 600;
-    const buf = new ArrayBuffer(5);
+    const scale = window.devicePixelRatio || 1;
+    const buf = new ArrayBuffer(9);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.CREATE_PANEL);
     view.setUint16(1, width, true);
     view.setUint16(3, height, true);
+    view.setFloat32(5, scale, true);
     this.ws.send(buf);
-    console.log(`Panel ${this.id}: Requesting new panel (${width}x${height})`);
+    console.log(`Panel ${this.id}: Requesting new panel (${width}x${height} @${scale}x)`);
   }
   
   disconnect() {
@@ -543,22 +574,6 @@ class Panel {
     this.ws.send(buf);
   }
   
-  sendResize() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-    const rect = this.canvas.getBoundingClientRect();
-    // Send CSS dimensions - server will apply its own scale for pixel rendering
-    const width = Math.floor(rect.width);
-    const height = Math.floor(rect.height);
-
-    const buf = new ArrayBuffer(5);
-    const view = new DataView(buf);
-    view.setUint8(0, ClientMsg.RESIZE);
-    view.setUint16(1, width, true);
-    view.setUint16(3, height, true);
-    this.ws.send(buf);
-  }
-  
   requestKeyframe() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(new Uint8Array([ClientMsg.REQUEST_KEYFRAME]));
@@ -587,6 +602,9 @@ class Panel {
   }
   
   destroy() {
+    if (this.resizeObserver) {
+      this.resizeObserver.disconnect();
+    }
     this.disconnect();
     this.element.remove();
   }
@@ -640,13 +658,6 @@ class App {
     
     document.getElementById('new-tab').addEventListener('click', () => {
       this.createPanel();
-    });
-    
-    // Handle resize
-    window.addEventListener('resize', () => {
-      if (this.activePanel) {
-        this.activePanel.sendResize();
-      }
     });
 
     // Global keyboard shortcuts
@@ -748,7 +759,8 @@ class App {
   createPanel() {
     // Create new panel on server
     const localId = this.nextLocalId++;
-    const panel = new Panel(localId, this.panelsEl, null);  // null = create new
+    const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
+    const panel = new Panel(localId, this.panelsEl, null, onResize);  // null = create new
     panel.connect();
     this.panels.set(localId, panel);
     this.addTab(localId, `Terminal`);
@@ -762,7 +774,8 @@ class App {
     }
 
     const localId = this.nextLocalId++;
-    const panel = new Panel(localId, this.panelsEl, serverId);  // serverId = connect to existing
+    const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
+    const panel = new Panel(localId, this.panelsEl, serverId, onResize);  // serverId = connect to existing
     panel.connect();
     this.panels.set(localId, panel);
     this.addTab(localId, `Terminal`);
@@ -806,7 +819,14 @@ class App {
     this.controlWs.send(msg);
     console.log('Sent close_panel for server panel', serverId);
   }
-  
+
+  sendResizePanel(serverId, width, height) {
+    if (!this.controlWs || this.controlWs.readyState !== WebSocket.OPEN) return;
+    const msg = JSON.stringify({ type: 'resize_panel', panel_id: serverId, width, height });
+    this.controlWs.send(msg);
+    console.log(`Sent resize_panel for server panel ${serverId}: ${width}x${height}`);
+  }
+
   switchToPanel(id) {
     // Hide current
     if (this.activePanel) {
