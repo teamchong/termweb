@@ -995,6 +995,12 @@ class App {
 
     // Global keyboard shortcuts (use capture phase to run before canvas handler)
     document.addEventListener('keydown', (e) => {
+      // Skip if command palette is open (let user type)
+      const commandPalette = document.getElementById('command-palette');
+      if (commandPalette && commandPalette.classList.contains('visible')) {
+        return;
+      }
+
       // ⌘1-9 to switch tabs
       if (e.metaKey && e.key >= '1' && e.key <= '9') {
         e.preventDefault();
@@ -1030,10 +1036,16 @@ class App {
       }
       // ⌘⇧A to show all tabs
       if (e.metaKey && e.shiftKey && (e.key === 'a' || e.key === 'A')) {
-        console.log('Show all tabs shortcut triggered');
         e.preventDefault();
         e.stopPropagation();
         this.showTabOverview();
+        return;
+      }
+      // ⌘⇧P to show command palette
+      if (e.metaKey && e.shiftKey && (e.key === 'p' || e.key === 'P')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.showCommandPalette();
         return;
       }
       // ⌘A for select all
@@ -2326,6 +2338,195 @@ class App {
       this.activePanel.canvas.focus();
     }
   }
+
+  // Command Palette
+  getCommands() {
+    const commands = [
+      // Text Operations
+      { title: 'Copy to Clipboard', action: 'copy_to_clipboard', description: 'Copy selected text' },
+      { title: 'Paste from Clipboard', action: 'paste_from_clipboard', description: 'Paste contents of clipboard' },
+      { title: 'Paste from Selection', action: 'paste_from_selection', description: 'Paste from selection clipboard' },
+      { title: 'Select All', action: 'select_all', description: 'Select all text' },
+
+      // Font Control
+      { title: 'Increase Font Size', action: 'increase_font_size:1', description: 'Make text larger', shortcut: '⌘=' },
+      { title: 'Decrease Font Size', action: 'decrease_font_size:1', description: 'Make text smaller', shortcut: '⌘-' },
+      { title: 'Reset Font Size', action: 'reset_font_size', description: 'Reset to default size', shortcut: '⌘0' },
+
+      // Screen Operations
+      { title: 'Clear Screen', action: 'clear_screen', description: 'Clear screen and scrollback' },
+      { title: 'Scroll to Top', action: 'scroll_to_top', description: 'Scroll to top of buffer' },
+      { title: 'Scroll to Bottom', action: 'scroll_to_bottom', description: 'Scroll to bottom of buffer' },
+      { title: 'Scroll Page Up', action: 'scroll_page_up', description: 'Scroll up one page' },
+      { title: 'Scroll Page Down', action: 'scroll_page_down', description: 'Scroll down one page' },
+
+      // Tab Management (local)
+      { title: 'New Tab', action: '_new_tab', description: 'Open a new tab', shortcut: '⌘/' },
+      { title: 'Close Tab', action: '_close_tab', description: 'Close current tab', shortcut: '⌘.' },
+      { title: 'Show All Tabs', action: '_show_all_tabs', description: 'Show tab overview', shortcut: '⌘⇧A' },
+
+      // Split Management (local)
+      { title: 'Split Right', action: '_split_right', description: 'Split pane to the right', shortcut: '⌘D' },
+      { title: 'Split Down', action: '_split_down', description: 'Split pane downward', shortcut: '⌘⇧D' },
+      { title: 'Split Left', action: '_split_left', description: 'Split pane to the left' },
+      { title: 'Split Up', action: '_split_up', description: 'Split pane upward' },
+
+      // Navigation
+      { title: 'Focus Split: Left', action: 'goto_split:left', description: 'Focus left split' },
+      { title: 'Focus Split: Right', action: 'goto_split:right', description: 'Focus right split' },
+      { title: 'Focus Split: Up', action: 'goto_split:up', description: 'Focus split above' },
+      { title: 'Focus Split: Down', action: 'goto_split:down', description: 'Focus split below' },
+      { title: 'Focus Split: Previous', action: 'goto_split:previous', description: 'Focus previous split' },
+      { title: 'Focus Split: Next', action: 'goto_split:next', description: 'Focus next split' },
+      { title: 'Toggle Split Zoom', action: 'toggle_split_zoom', description: 'Toggle zoom on current split' },
+      { title: 'Equalize Splits', action: 'equalize_splits', description: 'Make all splits equal size' },
+
+      // Terminal Control
+      { title: 'Reset Terminal', action: 'reset', description: 'Reset terminal state' },
+      { title: 'Toggle Read-Only Mode', action: 'toggle_readonly', description: 'Toggle read-only mode' },
+
+      // Config
+      { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration' },
+      { title: 'Toggle Inspector', action: 'inspector:toggle', description: 'Toggle terminal inspector' },
+
+      // Fun
+      { title: 'Ghostty', action: 'text:👻', description: 'Add a little ghost to your terminal' },
+    ];
+    // Sort alphabetically by title
+    return commands.sort((a, b) => a.title.localeCompare(b.title));
+  }
+
+  showCommandPalette() {
+    const overlay = document.getElementById('command-palette');
+    const input = document.getElementById('command-palette-input');
+    const list = document.getElementById('command-palette-list');
+    if (!overlay || !input || !list) return;
+
+    this.commandPaletteSelectedIndex = 0;
+    this.commandPaletteCommands = this.getCommands();
+
+    // Render commands
+    this.renderCommandList('');
+
+    // Show overlay
+    overlay.classList.add('visible');
+    input.value = '';
+    input.focus();
+
+    // Handle input
+    input.oninput = () => {
+      this.commandPaletteSelectedIndex = 0;
+      this.renderCommandList(input.value);
+    };
+
+    // Handle keyboard
+    input.onkeydown = (e) => {
+      const items = list.querySelectorAll('.command-item');
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        this.commandPaletteSelectedIndex = Math.min(this.commandPaletteSelectedIndex + 1, items.length - 1);
+        this.updateCommandSelection();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        this.commandPaletteSelectedIndex = Math.max(this.commandPaletteSelectedIndex - 1, 0);
+        this.updateCommandSelection();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const selected = items[this.commandPaletteSelectedIndex];
+        if (selected) {
+          this.executeCommand(selected.dataset.action);
+          this.hideCommandPalette();
+        }
+      } else if (e.key === 'Escape') {
+        this.hideCommandPalette();
+      }
+    };
+
+    // Click outside to close
+    overlay.onclick = (e) => {
+      if (e.target === overlay) {
+        this.hideCommandPalette();
+      }
+    };
+  }
+
+  renderCommandList(filter) {
+    const list = document.getElementById('command-palette-list');
+    if (!list) return;
+
+    const filterLower = filter.toLowerCase();
+    const filtered = this.commandPaletteCommands.filter(cmd =>
+      cmd.title.toLowerCase().includes(filterLower) ||
+      (cmd.description && cmd.description.toLowerCase().includes(filterLower))
+    );
+
+    list.innerHTML = filtered.map((cmd, i) => `
+      <div class="command-item${i === this.commandPaletteSelectedIndex ? ' selected' : ''}" data-action="${cmd.action}">
+        <div>
+          <div class="command-item-title">${cmd.title}</div>
+          ${cmd.description ? `<div class="command-item-description">${cmd.description}</div>` : ''}
+        </div>
+        ${cmd.shortcut ? `<span class="command-item-shortcut">${cmd.shortcut}</span>` : ''}
+      </div>
+    `).join('');
+
+    // Add click handlers
+    list.querySelectorAll('.command-item').forEach((item, i) => {
+      item.onclick = () => {
+        this.executeCommand(item.dataset.action);
+        this.hideCommandPalette();
+      };
+      item.onmouseenter = () => {
+        this.commandPaletteSelectedIndex = i;
+        this.updateCommandSelection();
+      };
+    });
+  }
+
+  updateCommandSelection() {
+    const list = document.getElementById('command-palette-list');
+    if (!list) return;
+    list.querySelectorAll('.command-item').forEach((item, i) => {
+      item.classList.toggle('selected', i === this.commandPaletteSelectedIndex);
+    });
+    // Scroll into view
+    const selected = list.querySelector('.command-item.selected');
+    if (selected) {
+      selected.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  executeCommand(action) {
+    // Local actions (start with _)
+    if (action.startsWith('_')) {
+      switch (action) {
+        case '_new_tab': this.createTab(); break;
+        case '_close_tab': this.closeActivePanel(); break;
+        case '_show_all_tabs': this.showTabOverview(); break;
+        case '_split_right': this.splitActivePanel('right'); break;
+        case '_split_down': this.splitActivePanel('down'); break;
+        case '_split_left': this.splitActivePanel('left'); break;
+        case '_split_up': this.splitActivePanel('up'); break;
+      }
+      return;
+    }
+
+    // Send to server
+    if (this.activePanel?.serverId !== null) {
+      this.sendViewAction(this.activePanel.serverId, action);
+    }
+  }
+
+  hideCommandPalette() {
+    const overlay = document.getElementById('command-palette');
+    if (overlay) {
+      overlay.classList.remove('visible');
+    }
+    // Refocus terminal
+    if (this.activePanel && this.activePanel.canvas) {
+      this.activePanel.canvas.focus();
+    }
+  }
 }
 
 // ============================================================================
@@ -2512,6 +2713,9 @@ function setupMenus() {
           break;
         case 'show-all-tabs':
           app.showTabOverview();
+          break;
+        case 'command-palette':
+          app.showCommandPalette();
           break;
       }
 
