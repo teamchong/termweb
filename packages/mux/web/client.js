@@ -30,11 +30,12 @@ const FrameType = {
 // ============================================================================
 
 class Panel {
-  constructor(id, container, serverId = null, onResize = null) {
+  constructor(id, container, serverId = null, onResize = null, onFontAction = null) {
     this.id = id;                    // Local client ID
     this.serverId = serverId;        // Server panel ID (null = create new)
     this.container = container;
     this.onResize = onResize;        // Callback for resize events
+    this.onFontAction = onFontAction; // Callback for font size actions
     this.ws = null;
     this.canvas = document.createElement('canvas');
     this.width = 0;
@@ -471,22 +472,27 @@ class Panel {
     // Focus handling
     this.canvas.tabIndex = 1;
     
-    // Keyboard
+    // Keyboard - intercept all keys including Cmd+/-/= for ghostty font scaling
     this.canvas.addEventListener('keydown', (e) => {
-      // Allow browser zoom shortcuts (Cmd+-, Cmd+=, Cmd+0)
+      e.preventDefault();
+      // Handle font size shortcuts via control channel
       if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
+        if (this.serverId !== null && this.onFontAction) {
+          if (e.key === '=') this.onFontAction(this.serverId, 'increase_font_size:1');
+          else if (e.key === '-') this.onFontAction(this.serverId, 'decrease_font_size:1');
+          else if (e.key === '0') this.onFontAction(this.serverId, 'reset_font_size');
+        }
         return;
       }
-      e.preventDefault();
       this.sendKeyInput(e, 1); // press
     });
 
     this.canvas.addEventListener('keyup', (e) => {
-      // Allow browser zoom shortcuts
+      e.preventDefault();
+      // Skip font size shortcuts on keyup
       if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
         return;
       }
-      e.preventDefault();
       this.sendKeyInput(e, 0); // release
     });
     
@@ -776,7 +782,8 @@ class App {
     // Create new panel on server
     const localId = this.nextLocalId++;
     const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
-    const panel = new Panel(localId, this.panelsEl, null, onResize);  // null = create new
+    const onFontAction = (serverId, action) => this.sendFontAction(serverId, action);
+    const panel = new Panel(localId, this.panelsEl, null, onResize, onFontAction);  // null = create new
     panel.connect();
     this.panels.set(localId, panel);
     this.addTab(localId, `Terminal`);
@@ -791,7 +798,8 @@ class App {
 
     const localId = this.nextLocalId++;
     const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
-    const panel = new Panel(localId, this.panelsEl, serverId, onResize);  // serverId = connect to existing
+    const onFontAction = (serverId, action) => this.sendFontAction(serverId, action);
+    const panel = new Panel(localId, this.panelsEl, serverId, onResize, onFontAction);  // serverId = connect to existing
     panel.connect();
     this.panels.set(localId, panel);
     this.addTab(localId, `Terminal`);
@@ -841,6 +849,13 @@ class App {
     const msg = JSON.stringify({ type: 'resize_panel', panel_id: serverId, width, height });
     this.controlWs.send(msg);
     console.log(`Sent resize_panel for server panel ${serverId}: ${width}x${height}`);
+  }
+
+  sendFontAction(serverId, action) {
+    if (!this.controlWs || this.controlWs.readyState !== WebSocket.OPEN) return;
+    const msg = JSON.stringify({ type: 'font_action', panel_id: serverId, action });
+    this.controlWs.send(msg);
+    console.log(`Sent font_action for server panel ${serverId}: ${action}`);
   }
 
   switchToPanel(id) {

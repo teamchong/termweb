@@ -923,7 +923,34 @@ const Server = struct {
             self.mutex.lock();
             self.pending_resizes.append(self.allocator, .{ .id = id, .width = width, .height = height }) catch {};
             self.mutex.unlock();
+        } else if (std.mem.indexOf(u8, data, "\"font_action\"")) |_| {
+            // Execute font action on panel
+            const id = self.parseJsonInt(data, "panel_id") orelse return;
+            const action = self.parseJsonString(data, "action") orelse return;
+            std.debug.print("Font action on panel {}: {s}\n", .{ id, action });
+            self.mutex.lock();
+            if (self.panels.get(id)) |panel| {
+                self.mutex.unlock();
+                _ = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
+            } else {
+                self.mutex.unlock();
+            }
         }
+    }
+
+    fn parseJsonString(self: *Server, data: []const u8, key: []const u8) ?[]const u8 {
+        _ = self;
+        // Build search pattern: "key":"
+        var pattern_buf: [64]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":\"", .{key}) catch return null;
+
+        const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
+        const start = idx + pattern.len;
+
+        // Find closing quote
+        const end = std.mem.indexOfPos(u8, data, start, "\"") orelse return null;
+
+        return data[start..end];
     }
 
     fn parseJsonInt(self: *Server, data: []const u8, key: []const u8) ?u32 {
