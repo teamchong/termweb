@@ -110,8 +110,8 @@
       }
       #hamburger {
         display: block;
-        font-size: 28px;
-        padding: 10px 14px;
+        font-size: 22px;
+        padding: 6px 10px;
       }
       #title-right {
         position: relative;
@@ -128,7 +128,7 @@
         flex-direction: column;
         z-index: 100;
         box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-        min-width: 260px;
+        min-width: 280px;
         gap: 4px;
       }
       #menubar.open {
@@ -163,22 +163,36 @@
       .menu-item .shortcut {
         font-size: 14px;
       }
+      .menu-icon {
+        width: 24px;
+        font-size: 16px;
+      }
     }
     .menu-item {
       display: flex;
-      justify-content: space-between;
+      align-items: center;
       padding: 6px 12px;
       font-size: 12px;
       color: var(--text);
       cursor: pointer;
       transition: background 0.1s;
+      gap: 8px;
+    }
+    .menu-icon {
+      width: 18px;
+      text-align: center;
+      flex-shrink: 0;
+      font-size: 11px;
+    }
+    .menu-text {
+      flex: 1;
     }
     .menu-item:hover {
       background: var(--tab-hover);
     }
     .menu-item .shortcut {
       color: var(--text-dim);
-      margin-left: 20px;
+      margin-left: auto;
     }
     #toolbar {
       background: var(--toolbar-bg);
@@ -315,24 +329,26 @@
         <div class="menu">
           <span class="menu-label">File</span>
           <div class="menu-dropdown">
-            <div class="menu-item" data-action="new-tab">New Tab<span class="shortcut">⌘/</span></div>
-            <div class="menu-item" data-action="close-tab">Close Tab<span class="shortcut">⌘.</span></div>
-            <div class="menu-item" data-action="close-all-tabs">Close All Tabs<span class="shortcut">⌘⇧.</span></div>
+            <div class="menu-item" data-action="new-tab"><span class="menu-icon">⊞</span><span class="menu-text">New Tab</span><span class="shortcut">⌘/</span></div>
+            <div class="menu-item" data-action="close-tab"><span class="menu-icon">✕</span><span class="menu-text">Close Tab</span><span class="shortcut">⌘.</span></div>
+            <div class="menu-item" data-action="close-all-tabs"><span class="menu-icon">⊠</span><span class="menu-text">Close All Tabs</span><span class="shortcut">⌘⇧.</span></div>
           </div>
         </div>
         <div class="menu">
           <span class="menu-label">Edit</span>
           <div class="menu-dropdown">
-            <div class="menu-item" data-action="copy">Copy<span class="shortcut">⌘C</span></div>
-            <div class="menu-item" data-action="paste">Paste<span class="shortcut">⌘V</span></div>
+            <div class="menu-item" data-action="copy"><span class="menu-icon">⧉</span><span class="menu-text">Copy</span><span class="shortcut">⌘C</span></div>
+            <div class="menu-item" data-action="paste"><span class="menu-icon">📋</span><span class="menu-text">Paste</span><span class="shortcut">⌘V</span></div>
+            <div class="menu-item" data-action="paste-selection"><span class="menu-icon">📄</span><span class="menu-text">Paste Selection</span><span class="shortcut">⌘⇧V</span></div>
+            <div class="menu-item" data-action="select-all"><span class="menu-icon">▣</span><span class="menu-text">Select All</span><span class="shortcut">⌘A</span></div>
           </div>
         </div>
         <div class="menu">
           <span class="menu-label">View</span>
           <div class="menu-dropdown">
-            <div class="menu-item" data-action="zoom-in">Increase Font<span class="shortcut">⌘=</span></div>
-            <div class="menu-item" data-action="zoom-out">Decrease Font<span class="shortcut">⌘-</span></div>
-            <div class="menu-item" data-action="zoom-reset">Reset Font<span class="shortcut">⌘0</span></div>
+            <div class="menu-item" data-action="zoom-in"><span class="menu-icon">A+</span><span class="menu-text">Increase Font</span><span class="shortcut">⌘=</span></div>
+            <div class="menu-item" data-action="zoom-out"><span class="menu-icon">A−</span><span class="menu-text">Decrease Font</span><span class="shortcut">⌘-</span></div>
+            <div class="menu-item" data-action="zoom-reset"><span class="menu-icon">A</span><span class="menu-text">Reset Font</span><span class="shortcut">⌘0</span></div>
           </div>
         </div>
       </div>

@@ -486,11 +486,11 @@ class Panel {
         return;
       }
       // Let global shortcuts bubble up (handled by window listener)
-      if (e.metaKey && !e.shiftKey && (e.key === '/' || e.key === '.')) {
+      if (e.metaKey && !e.shiftKey && (e.key === '/' || e.key === '.' || e.key === 'a')) {
         return;  // Don't send to terminal, let window handler process
       }
-      if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.')) {
-        return;  // Close all tabs - let window handler process
+      if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.' || e.key === 'v')) {
+        return;  // Close all tabs / paste selection - let window handler process
       }
       if (e.metaKey && e.key >= '1' && e.key <= '9') {
         return;  // Tab switching - let window handler process
@@ -730,6 +730,32 @@ class App {
         e.preventDefault();
         e.stopPropagation();
         this.closeAllPanels();
+        return;
+      }
+      // ⌘A for select all
+      if (e.metaKey && !e.shiftKey && e.key === 'a') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          this.sendViewAction(this.activePanel.serverId, 'select_all');
+        }
+        return;
+      }
+      // ⌘⇧V for paste selection (same as paste for web)
+      if (e.metaKey && e.shiftKey && e.key === 'v') {
+        e.preventDefault();
+        e.stopPropagation();
+        navigator.clipboard.readText().then(text => {
+          if (this.activePanel && this.activePanel.ws) {
+            const encoder = new TextEncoder();
+            const textBytes = encoder.encode(text);
+            const buf = new ArrayBuffer(1 + textBytes.length);
+            const view = new Uint8Array(buf);
+            view[0] = 0x05; // TEXT_INPUT
+            view.set(textBytes, 1);
+            this.activePanel.ws.send(buf);
+          }
+        });
         return;
       }
     }, true);  // true = capture phase
@@ -1186,6 +1212,25 @@ function setupMenus() {
               app.activePanel.ws.send(buf);
             }
           });
+          break;
+        case 'paste-selection':
+          // Paste from selection (same as paste for web)
+          navigator.clipboard.readText().then(text => {
+            if (app.activePanel && app.activePanel.ws) {
+              const encoder = new TextEncoder();
+              const textBytes = encoder.encode(text);
+              const buf = new ArrayBuffer(1 + textBytes.length);
+              const view = new Uint8Array(buf);
+              view[0] = 0x05; // TEXT_INPUT
+              view.set(textBytes, 1);
+              app.activePanel.ws.send(buf);
+            }
+          });
+          break;
+        case 'select-all':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'select_all');
+          }
           break;
         case 'zoom-in':
           if (app.activePanel?.serverId !== null) {
