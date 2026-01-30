@@ -2389,6 +2389,9 @@ class App {
       { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration' },
       { title: 'Toggle Inspector', action: 'inspector:toggle', description: 'Toggle terminal inspector' },
 
+      // Title
+      { title: 'Change Title...', action: '_change_title', description: 'Change the terminal title' },
+
       // Fun
       { title: 'Ghostty', action: 'text:👻', description: 'Add a little ghost to your terminal' },
     ];
@@ -2507,6 +2510,7 @@ class App {
         case '_split_down': this.splitActivePanel('down'); break;
         case '_split_left': this.splitActivePanel('left'); break;
         case '_split_up': this.splitActivePanel('up'); break;
+        case '_change_title': this.promptChangeTitle(); break;
       }
       return;
     }
@@ -2525,6 +2529,28 @@ class App {
     // Refocus terminal
     if (this.activePanel && this.activePanel.canvas) {
       this.activePanel.canvas.focus();
+    }
+  }
+
+  promptChangeTitle() {
+    // Get current title
+    const tab = this.tabs.get(this.activeTab);
+    const currentTitle = tab?.title || '';
+
+    const newTitle = prompt('Enter new title:', currentTitle);
+    if (newTitle !== null && this.activePanel?.serverId !== null) {
+      // Send to server to change title
+      this.sendViewAction(this.activePanel.serverId, `set_title:${newTitle}`);
+      // Update local tab title immediately
+      if (tab) {
+        tab.title = newTitle;
+        const tabEl = this.tabsEl.querySelector(`[data-id="${this.activeTab}"] .title`);
+        if (tabEl) tabEl.textContent = newTitle || '👻';
+        // Update document title
+        document.title = newTitle || '👻';
+        const appTitle = document.getElementById('app-title');
+        if (appTitle) appTitle.textContent = newTitle || '👻';
+      }
     }
   }
 }
@@ -2716,6 +2742,9 @@ function setupMenus() {
           break;
         case 'command-palette':
           app.showCommandPalette();
+          break;
+        case 'change-title':
+          app.promptChangeTitle();
           break;
       }
 
