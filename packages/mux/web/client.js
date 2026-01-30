@@ -636,6 +636,275 @@ class Panel {
     this.disconnect();
     this.element.remove();
   }
+
+  // Reparent panel to a new container
+  reparent(newContainer) {
+    this.container = newContainer;
+    newContainer.appendChild(this.element);
+  }
+}
+
+// ============================================================================
+// SplitContainer - manages split panes within a tab
+// ============================================================================
+
+class SplitContainer {
+  constructor(parent = null) {
+    this.parent = parent;           // Parent SplitContainer (null for root)
+    this.direction = null;          // 'horizontal' | 'vertical' | null (leaf)
+    this.first = null;              // First child SplitContainer
+    this.second = null;             // Second child SplitContainer
+    this.panel = null;              // Panel (only for leaf nodes)
+    this.ratio = 0.5;               // Split ratio (0.0 - 1.0)
+    this.element = null;            // DOM element
+    this.paneElement = null;        // Pane wrapper element (for leaves)
+    this.divider = null;            // Divider element (for splits)
+    this.isDragging = false;
+  }
+
+  // Create a leaf node with a panel
+  static createLeaf(panel, parent = null) {
+    const container = new SplitContainer(parent);
+    container.panel = panel;
+    container.element = document.createElement('div');
+    container.element.className = 'split-pane';
+    container.element.style.flex = '1';
+    panel.reparent(container.element);
+    return container;
+  }
+
+  // Split this container in a direction
+  // splitDirection: 'right', 'down', 'left', 'up'
+  split(splitDirection, newPanel) {
+    if (this.direction !== null) {
+      // Already split - delegate to the focused child
+      console.error('Cannot split a non-leaf container directly');
+      return null;
+    }
+
+    // Determine layout direction and order
+    const isHorizontal = splitDirection === 'left' || splitDirection === 'right';
+    const newPanelFirst = splitDirection === 'left' || splitDirection === 'up';
+
+    // Convert leaf to split node
+    const oldPanel = this.panel;
+    this.panel = null;
+    this.direction = isHorizontal ? 'horizontal' : 'vertical';
+
+    if (newPanelFirst) {
+      // New panel goes first (left/up)
+      this.first = SplitContainer.createLeaf(newPanel, this);
+      this.second = SplitContainer.createLeaf(oldPanel, this);
+    } else {
+      // Old panel stays first (right/down)
+      this.first = SplitContainer.createLeaf(oldPanel, this);
+      this.second = SplitContainer.createLeaf(newPanel, this);
+    }
+
+    // Rebuild DOM
+    this.rebuildDOM();
+
+    return newPanelFirst ? this.first : this.second;
+  }
+
+  rebuildDOM() {
+    // Clear element
+    const parent = this.element.parentElement;
+    const oldElement = this.element;
+
+    // Create new container element
+    this.element = document.createElement('div');
+    this.element.className = `split-container ${this.direction}`;
+
+    // Build first pane
+    this.element.appendChild(this.first.element);
+
+    // Create divider
+    this.divider = document.createElement('div');
+    this.divider.className = 'split-divider';
+    this.setupDividerDrag();
+    this.element.appendChild(this.divider);
+
+    // Build second pane
+    this.element.appendChild(this.second.element);
+
+    // Apply ratio
+    this.applyRatio();
+
+    // Replace old element
+    if (parent) {
+      parent.replaceChild(this.element, oldElement);
+    }
+  }
+
+  setupDividerDrag() {
+    let startPos = 0;
+    let startRatio = 0;
+    let containerSize = 0;
+
+    const onMouseDown = (e) => {
+      e.preventDefault();
+      this.isDragging = true;
+      this.divider.classList.add('dragging');
+
+      const rect = this.element.getBoundingClientRect();
+      if (this.direction === 'horizontal') {
+        startPos = e.clientX;
+        containerSize = rect.width;
+      } else {
+        startPos = e.clientY;
+        containerSize = rect.height;
+      }
+      startRatio = this.ratio;
+
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+    };
+
+    const onMouseMove = (e) => {
+      if (!this.isDragging) return;
+
+      let delta;
+      if (this.direction === 'horizontal') {
+        delta = e.clientX - startPos;
+      } else {
+        delta = e.clientY - startPos;
+      }
+
+      // Calculate new ratio (account for divider size)
+      const dividerSize = this.direction === 'horizontal' ? 4 : 4;
+      const availableSize = containerSize - dividerSize;
+      const deltaRatio = delta / availableSize;
+
+      this.ratio = Math.max(0.1, Math.min(0.9, startRatio + deltaRatio));
+      this.applyRatio();
+    };
+
+    const onMouseUp = () => {
+      this.isDragging = false;
+      this.divider.classList.remove('dragging');
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+    };
+
+    this.divider.addEventListener('mousedown', onMouseDown);
+  }
+
+  applyRatio() {
+    if (!this.first || !this.second) return;
+
+    const firstPercent = (this.ratio * 100).toFixed(2);
+    const secondPercent = ((1 - this.ratio) * 100).toFixed(2);
+
+    this.first.element.style.flex = `0 0 calc(${firstPercent}% - 2px)`;
+    this.second.element.style.flex = `0 0 calc(${secondPercent}% - 2px)`;
+  }
+
+  // Find the container holding a specific panel
+  findContainer(panel) {
+    if (this.panel === panel) return this;
+    if (this.first) {
+      const found = this.first.findContainer(panel);
+      if (found) return found;
+    }
+    if (this.second) {
+      const found = this.second.findContainer(panel);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  // Get all panels in this container tree
+  getAllPanels() {
+    const panels = [];
+    if (this.panel) {
+      panels.push(this.panel);
+    }
+    if (this.first) {
+      panels.push(...this.first.getAllPanels());
+    }
+    if (this.second) {
+      panels.push(...this.second.getAllPanels());
+    }
+    return panels;
+  }
+
+  // Remove a panel and collapse the split
+  removePanel(panel) {
+    if (this.panel === panel) {
+      // This is a leaf - parent needs to handle removal
+      return true;
+    }
+
+    if (this.first && this.first.panel === panel) {
+      // First child is the panel to remove - promote second
+      this.promoteChild(this.second);
+      return true;
+    }
+
+    if (this.second && this.second.panel === panel) {
+      // Second child is the panel to remove - promote first
+      this.promoteChild(this.first);
+      return true;
+    }
+
+    // Recurse into children
+    if (this.first && this.first.removePanel(panel)) return true;
+    if (this.second && this.second.removePanel(panel)) return true;
+
+    return false;
+  }
+
+  promoteChild(child) {
+    // Replace this split with the remaining child
+    if (child.direction !== null) {
+      // Child is also a split - adopt its structure
+      this.direction = child.direction;
+      this.first = child.first;
+      this.second = child.second;
+      this.ratio = child.ratio;
+      this.panel = null;
+      if (this.first) this.first.parent = this;
+      if (this.second) this.second.parent = this;
+      this.rebuildDOM();
+    } else {
+      // Child is a leaf - become a leaf
+      this.direction = null;
+      this.first = null;
+      this.second = null;
+      this.panel = child.panel;
+      this.divider = null;
+
+      // Rebuild as leaf
+      const parent = this.element.parentElement;
+      const oldElement = this.element;
+
+      this.element = document.createElement('div');
+      this.element.className = 'split-pane';
+      this.element.style.flex = '1';
+      this.panel.reparent(this.element);
+
+      if (parent) {
+        parent.replaceChild(this.element, oldElement);
+      }
+    }
+  }
+
+  // Destroy all panels in this container
+  destroy() {
+    if (this.panel) {
+      this.panel.destroy();
+    }
+    if (this.first) {
+      this.first.destroy();
+    }
+    if (this.second) {
+      this.second.destroy();
+    }
+    if (this.element && this.element.parentElement) {
+      this.element.remove();
+    }
+  }
 }
 
 // ============================================================================
@@ -650,16 +919,19 @@ class Panel {
 class App {
   constructor() {
     this.controlWs = null;
-    this.panels = new Map();
+    this.panels = new Map();        // panelId -> Panel
+    this.tabs = new Map();          // tabId -> { root: SplitContainer, element: DOM, title: string }
     this.activePanel = null;
+    this.activeTab = null;          // Current tab ID
     this.nextLocalId = 1;
-    
+    this.nextTabId = 1;
+
     this.tabsEl = document.getElementById('tabs');
     this.panelsEl = document.getElementById('panels');
     this.statusEl = document.getElementById('status');
-    
+
     document.getElementById('new-tab').addEventListener('click', () => {
-      this.createPanel();
+      this.createTab();
     });
 
     // Global keyboard shortcuts (use capture phase to run before canvas handler)
@@ -671,8 +943,8 @@ class App {
         const index = parseInt(e.key) - 1;
         const tabs = Array.from(this.tabsEl.children);
         if (index < tabs.length) {
-          const id = parseInt(tabs[index].dataset.id);
-          this.switchToPanel(id);
+          const tabId = parseInt(tabs[index].dataset.id);
+          this.switchToTab(tabId);
         }
         return;
       }
@@ -680,23 +952,21 @@ class App {
       if (e.metaKey && e.key === '/') {
         e.preventDefault();
         e.stopPropagation();
-        this.createPanel();
+        this.createTab();
         return;
       }
-      // ⌘. to close tab
+      // ⌘. to close tab/split
       if (e.metaKey && !e.shiftKey && e.key === '.') {
         e.preventDefault();
         e.stopPropagation();
-        if (this.activePanel) {
-          this.removePanel(this.activePanel.id);
-        }
+        this.closeActivePanel();
         return;
       }
       // ⌘⇧. to close all tabs
       if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.')) {
         e.preventDefault();
         e.stopPropagation();
-        this.closeAllPanels();
+        this.closeAllTabs();
         return;
       }
       // ⌘A for select all
@@ -758,13 +1028,27 @@ class App {
       if (e.metaKey && (e.key === 'd' || e.key === 'D')) {
         e.preventDefault();
         e.stopPropagation();
-        if (this.activePanel?.serverId !== null) {
+        if (this.activePanel) {
           if (e.shiftKey) {
-            this.sendViewAction(this.activePanel.serverId, 'new_split:down');
+            this.splitActivePanel('down');
           } else {
-            this.sendViewAction(this.activePanel.serverId, 'new_split:right');
+            this.splitActivePanel('right');
           }
         }
+        return;
+      }
+      // ⌘⌥Arrow to navigate between splits
+      if (e.metaKey && e.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.navigateSplit(e.key.replace('Arrow', '').toLowerCase());
+        return;
+      }
+      // ⌘] and ⌘[ to cycle through splits
+      if (e.metaKey && (e.key === ']' || e.key === '[')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.cycleSplit(e.key === ']' ? 1 : -1);
         return;
       }
       // Forward all other keys to active panel
@@ -825,15 +1109,15 @@ class App {
         // Initial panel list from server
         console.log('Panel list received:', msg.panels);
         if (msg.panels && msg.panels.length > 0) {
-          // Connect to existing panels
+          // Connect to existing panels - each in its own tab for now
           console.log('Connecting to', msg.panels.length, 'existing panels');
           for (const p of msg.panels) {
-            this.connectToPanel(p.id);
+            this.createTabWithServerId(p.id);
           }
         } else {
           // No panels on server - create one
           console.log('No panels on server, creating new one');
-          this.createPanel();
+          this.createTab();
         }
         break;
 
@@ -880,77 +1164,295 @@ class App {
     }
   }
   
-  createPanel() {
-    // Create new panel on server
+  // Create a new panel (used internally)
+  createPanel(container, serverId = null) {
     const localId = this.nextLocalId++;
-    const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
-    const onViewAction = (serverId, action) => this.sendViewAction(serverId, action);
-    const panel = new Panel(localId, this.panelsEl, null, onResize, onViewAction);  // null = create new
+    const onResize = (sid, w, h) => this.sendResizePanel(sid, w, h);
+    const onViewAction = (sid, action) => this.sendViewAction(sid, action);
+    const panel = new Panel(localId, container, serverId, onResize, onViewAction);
     panel.connect();
     this.panels.set(localId, panel);
-    this.addTab(localId, `Terminal`);
-    this.switchToPanel(localId);
+
+    // Add click handler to focus this panel
+    panel.element.addEventListener('mousedown', () => {
+      this.setActivePanel(panel);
+    });
+
+    return panel;
   }
 
-  connectToPanel(serverId) {
-    // Check if already connected to this server panel
+  // Create a new tab with a single panel
+  createTab() {
+    const tabId = this.nextTabId++;
+
+    // Create tab content container
+    const tabContent = document.createElement('div');
+    tabContent.className = 'tab-content';
+    tabContent.dataset.tabId = tabId;
+    this.panelsEl.appendChild(tabContent);
+
+    // Create panel in the tab content
+    const panel = this.createPanel(tabContent, null);
+
+    // Create root split container with the panel
+    const root = SplitContainer.createLeaf(panel, null);
+    tabContent.appendChild(root.element);
+
+    // Store tab info
+    this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+
+    // Add tab to tab bar
+    this.addTabUI(tabId, 'Terminal');
+
+    // Switch to new tab
+    this.switchToTab(tabId);
+
+    return tabId;
+  }
+
+  // Create a tab connected to an existing server panel
+  createTabWithServerId(serverId) {
+    // Check if already connected
     for (const [, panel] of this.panels) {
       if (panel.serverId === serverId) return;
     }
 
-    const localId = this.nextLocalId++;
-    const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
-    const onViewAction = (serverId, action) => this.sendViewAction(serverId, action);
-    const panel = new Panel(localId, this.panelsEl, serverId, onResize, onViewAction);  // serverId = connect to existing
-    panel.connect();
-    this.panels.set(localId, panel);
-    this.addTab(localId, `Terminal`);
+    const tabId = this.nextTabId++;
 
-    if (!this.activePanel) {
-      this.switchToPanel(localId);
+    // Create tab content container
+    const tabContent = document.createElement('div');
+    tabContent.className = 'tab-content';
+    tabContent.dataset.tabId = tabId;
+    this.panelsEl.appendChild(tabContent);
+
+    // Create panel connected to server
+    const panel = this.createPanel(tabContent, serverId);
+
+    // Create root split container
+    const root = SplitContainer.createLeaf(panel, null);
+    tabContent.appendChild(root.element);
+
+    // Store tab info
+    this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+
+    // Add tab to tab bar
+    this.addTabUI(tabId, 'Terminal');
+
+    // Switch to tab if no active tab
+    if (!this.activeTab) {
+      this.switchToTab(tabId);
+    }
+
+    return tabId;
+  }
+
+  // Split the active panel
+  splitActivePanel(direction) {
+    if (!this.activePanel || this.activeTab === null) return;
+
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab) return;
+
+    // Find the container holding the active panel
+    const container = tab.root.findContainer(this.activePanel);
+    if (!container) return;
+
+    // Create new panel for the split
+    const newPanel = this.createPanel(document.createElement('div'), null);
+
+    // Perform the split
+    const newContainer = container.split(direction, newPanel);
+    if (newContainer) {
+      // Focus the new panel
+      this.setActivePanel(newPanel);
     }
   }
-  
-  removePanel(id) {
-    const panel = this.panels.get(id);
-    if (!panel) return;
 
-    // If this is the last panel, create a new one first
-    if (this.panels.size === 1) {
-      this.createPanel();
-    }
+  // Close the active panel (or tab if last panel in tab)
+  closeActivePanel() {
+    if (!this.activePanel || this.activeTab === null) return;
 
-    // Tell server to destroy the panel (if we know the server ID)
-    if (panel.serverId !== null) {
-      this.sendClosePanel(panel.serverId);
-    }
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab) return;
 
-    panel.destroy();
-    this.panels.delete(id);
-    this.removeTab(id);
+    // Get all panels in the tab
+    const tabPanels = tab.root.getAllPanels();
 
-    if (this.activePanel === panel) {
-      this.activePanel = null;
-      // Switch to another panel
-      const remaining = this.panels.keys().next();
-      if (!remaining.done) {
-        this.switchToPanel(remaining.value);
+    if (tabPanels.length === 1) {
+      // Last panel in tab - close the whole tab
+      this.closeTab(this.activeTab);
+    } else {
+      // Multiple panels - just close this one
+      const panelToClose = this.activePanel;
+      const panelId = panelToClose.id;
+
+      // Find another panel to focus
+      const otherPanel = tabPanels.find(p => p !== panelToClose);
+
+      // Remove from split container
+      tab.root.removePanel(panelToClose);
+
+      // Tell server to close
+      if (panelToClose.serverId !== null) {
+        this.sendClosePanel(panelToClose.serverId);
+      }
+
+      // Destroy panel
+      panelToClose.destroy();
+      this.panels.delete(panelId);
+
+      // Focus other panel
+      if (otherPanel) {
+        this.setActivePanel(otherPanel);
       }
     }
   }
 
-  closeAllPanels() {
-    // Get all existing panel IDs
-    const ids = Array.from(this.panels.keys());
-    if (ids.length === 0) return;
+  // Close a tab
+  closeTab(tabId) {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return;
 
-    // Create a new tab first
-    this.createPanel();
-
-    // Close all the old panels one by one
-    for (const id of ids) {
-      this.removePanel(id);
+    // If last tab, create new one first
+    if (this.tabs.size === 1) {
+      this.createTab();
     }
+
+    // Get all panels in tab
+    const tabPanels = tab.root.getAllPanels();
+
+    // Close all panels
+    for (const panel of tabPanels) {
+      if (panel.serverId !== null) {
+        this.sendClosePanel(panel.serverId);
+      }
+      this.panels.delete(panel.id);
+    }
+
+    // Destroy the split container (will destroy panels)
+    tab.root.destroy();
+    tab.element.remove();
+    this.tabs.delete(tabId);
+    this.removeTabUI(tabId);
+
+    // Switch to another tab if this was active
+    if (this.activeTab === tabId) {
+      this.activeTab = null;
+      this.activePanel = null;
+      const remaining = this.tabs.keys().next();
+      if (!remaining.done) {
+        this.switchToTab(remaining.value);
+      }
+    }
+  }
+
+  // Close all tabs
+  closeAllTabs() {
+    const tabIds = Array.from(this.tabs.keys());
+    if (tabIds.length === 0) return;
+
+    // Create new tab first
+    this.createTab();
+
+    // Close old tabs
+    for (const tabId of tabIds) {
+      this.closeTab(tabId);
+    }
+  }
+
+  // Set active panel (for focus tracking)
+  setActivePanel(panel) {
+    if (this.activePanel === panel) return;
+
+    // Update active panel
+    this.activePanel = panel;
+
+    // Focus the panel's canvas
+    if (panel && panel.canvas) {
+      panel.canvas.focus();
+    }
+
+    // Update title
+    this.updateTitleForPanel(panel);
+  }
+
+  // Navigate to an adjacent split pane
+  navigateSplit(direction) {
+    if (!this.activePanel || this.activeTab === null) return;
+
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab) return;
+
+    const panels = tab.root.getAllPanels();
+    if (panels.length <= 1) return;
+
+    // Get bounding rects for all panels
+    const activeRect = this.activePanel.element.getBoundingClientRect();
+    const activeCenterX = activeRect.left + activeRect.width / 2;
+    const activeCenterY = activeRect.top + activeRect.height / 2;
+
+    let bestPanel = null;
+    let bestDistance = Infinity;
+
+    for (const panel of panels) {
+      if (panel === this.activePanel) continue;
+
+      const rect = panel.element.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+
+      // Check if panel is in the right direction
+      let isInDirection = false;
+      let distance = 0;
+
+      switch (direction) {
+        case 'left':
+          isInDirection = centerX < activeCenterX;
+          distance = activeCenterX - centerX + Math.abs(centerY - activeCenterY) * 0.1;
+          break;
+        case 'right':
+          isInDirection = centerX > activeCenterX;
+          distance = centerX - activeCenterX + Math.abs(centerY - activeCenterY) * 0.1;
+          break;
+        case 'up':
+          isInDirection = centerY < activeCenterY;
+          distance = activeCenterY - centerY + Math.abs(centerX - activeCenterX) * 0.1;
+          break;
+        case 'down':
+          isInDirection = centerY > activeCenterY;
+          distance = centerY - activeCenterY + Math.abs(centerX - activeCenterX) * 0.1;
+          break;
+      }
+
+      if (isInDirection && distance < bestDistance) {
+        bestDistance = distance;
+        bestPanel = panel;
+      }
+    }
+
+    if (bestPanel) {
+      this.setActivePanel(bestPanel);
+    }
+  }
+
+  // Cycle through split panes
+  cycleSplit(delta) {
+    if (!this.activePanel || this.activeTab === null) return;
+
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab) return;
+
+    const panels = tab.root.getAllPanels();
+    if (panels.length <= 1) return;
+
+    const currentIndex = panels.indexOf(this.activePanel);
+    if (currentIndex === -1) return;
+
+    let newIndex = currentIndex + delta;
+    if (newIndex < 0) newIndex = panels.length - 1;
+    if (newIndex >= panels.length) newIndex = 0;
+
+    this.setActivePanel(panels[newIndex]);
   }
 
   sendClosePanel(serverId) {
@@ -974,32 +1476,66 @@ class App {
     console.log(`Sent view_action for server panel ${serverId}: ${action}`);
   }
 
-  switchToPanel(id) {
-    // Hide current
-    if (this.activePanel) {
-      this.activePanel.hide();
+  // Switch to a tab
+  switchToTab(tabId) {
+    // Hide current tab
+    if (this.activeTab !== null) {
+      const oldTab = this.tabs.get(this.activeTab);
+      if (oldTab) {
+        oldTab.element.classList.remove('active');
+        // Pause all panels in old tab
+        for (const panel of oldTab.root.getAllPanels()) {
+          panel.hide();
+        }
+      }
     }
 
-    // Show new
-    const panel = this.panels.get(id);
-    if (panel) {
-      panel.show();
-      this.activePanel = panel;
-      this.updateTabActive(id);
+    // Show new tab
+    const tab = this.tabs.get(tabId);
+    if (tab) {
+      tab.element.classList.add('active');
+      this.activeTab = tabId;
+      this.updateTabUIActive(tabId);
 
-      // Update document title and app title
-      const tab = this.tabsEl.querySelector(`[data-id="${id}"] .title`);
-      const title = tab ? tab.textContent : 'Terminal';
-      document.title = title + ' - termweb';
-      const appTitle = document.getElementById('app-title');
-      if (appTitle) appTitle.textContent = title;
+      // Resume all panels in new tab
+      const tabPanels = tab.root.getAllPanels();
+      for (const panel of tabPanels) {
+        panel.show();
+      }
+
+      // Set active panel to first panel if none set
+      if (!this.activePanel || !tabPanels.includes(this.activePanel)) {
+        this.activePanel = tabPanels[0] || null;
+      }
+
+      // Update title
+      if (this.activePanel) {
+        this.updateTitleForPanel(this.activePanel);
+      }
     }
   }
-  
-  addTab(id, title) {
+
+  // Update title bar for a panel
+  updateTitleForPanel(panel) {
+    // Find which tab this panel belongs to
+    for (const [tabId, tab] of this.tabs) {
+      if (tab.root.findContainer(panel)) {
+        const tabEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .title`);
+        const title = tabEl ? tabEl.textContent : 'Terminal';
+        document.title = title + ' - termweb';
+        const appTitle = document.getElementById('app-title');
+        if (appTitle) appTitle.textContent = title;
+        this.updateIndicatorForPanel(panel, title);
+        break;
+      }
+    }
+  }
+
+  // Add tab UI element
+  addTabUI(tabId, title) {
     const tab = document.createElement('div');
     tab.className = 'tab';
-    tab.dataset.id = id;
+    tab.dataset.id = tabId;
 
     // Get tab index for hotkey (1-9)
     const tabIndex = this.tabsEl.children.length + 1;
@@ -1009,20 +1545,21 @@ class App {
 
     tab.addEventListener('click', (e) => {
       if (!e.target.classList.contains('close')) {
-        this.switchToPanel(id);
+        this.switchToTab(tabId);
       }
     });
 
     tab.querySelector('.close').addEventListener('click', (e) => {
       e.stopPropagation();
-      this.removePanel(id);
+      this.closeTab(tabId);
     });
 
     this.tabsEl.appendChild(tab);
   }
-  
-  removeTab(id) {
-    const tab = this.tabsEl.querySelector(`[data-id="${id}"]`);
+
+  // Remove tab UI element
+  removeTabUI(tabId) {
+    const tab = this.tabsEl.querySelector(`[data-id="${tabId}"]`);
     if (tab) tab.remove();
     this.updateHotkeyHints();
   }
@@ -1036,40 +1573,72 @@ class App {
       }
     });
   }
-  
-  updateTabActive(id) {
+
+  updateTabUIActive(tabId) {
     for (const tab of this.tabsEl.children) {
-      tab.classList.toggle('active', tab.dataset.id == id);
+      tab.classList.toggle('active', tab.dataset.id == tabId);
     }
   }
-  
-  updatePanelTitle(id, title) {
-    const tab = this.tabsEl.querySelector(`[data-id="${id}"] .title`);
-    if (tab) tab.textContent = title;
+
+  // Find which tab a panel belongs to
+  findTabForPanel(panel) {
+    for (const [tabId, tab] of this.tabs) {
+      if (tab.root.findContainer(panel)) {
+        return tabId;
+      }
+    }
+    return null;
+  }
+
+  updatePanelTitle(serverId, title) {
+    // Find panel by server ID
+    let targetPanel = null;
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === serverId) {
+        targetPanel = panel;
+        break;
+      }
+    }
+    if (!targetPanel) return;
+
+    // Find which tab this panel belongs to and update tab title
+    const tabId = this.findTabForPanel(targetPanel);
+    if (tabId !== null) {
+      const tabEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .title`);
+      if (tabEl) tabEl.textContent = title;
+
+      // Update tab data
+      const tab = this.tabs.get(tabId);
+      if (tab) tab.title = title;
+    }
 
     // Update document title and app title if this is the active panel
-    const panel = this.panels.get(id);
-    if (panel && panel === this.activePanel) {
+    if (targetPanel === this.activePanel) {
       document.title = title + ' - termweb';
       const appTitle = document.getElementById('app-title');
       if (appTitle) appTitle.textContent = title;
-      // Update indicator based on whether title looks like a running command
-      // If title is different from pwd basename, a command is likely running
-      this.updateIndicatorForPanel(panel, title);
+      this.updateIndicatorForPanel(targetPanel, title);
     }
   }
 
-  updatePanelPwd(id, pwd) {
-    // Store pwd on the panel
-    const panel = this.panels.get(id);
-    if (!panel) return;
-    panel.pwd = pwd;
+  updatePanelPwd(serverId, pwd) {
+    // Find panel by server ID
+    let targetPanel = null;
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === serverId) {
+        targetPanel = panel;
+        break;
+      }
+    }
+    if (!targetPanel) return;
+
+    targetPanel.pwd = pwd;
 
     // If this is the active panel, update the indicator
-    if (panel === this.activePanel) {
+    if (targetPanel === this.activePanel) {
       const appTitle = document.getElementById('app-title');
       const currentTitle = appTitle ? appTitle.textContent : '';
-      this.updateIndicatorForPanel(panel, currentTitle);
+      this.updateIndicatorForPanel(targetPanel, currentTitle);
     }
   }
 
@@ -1105,21 +1674,35 @@ class App {
     if (el) el.innerHTML = indicator;
   }
 
-  handlePanelBell(id) {
-    // Flash the tab if not active
-    const tab = this.tabsEl.querySelector(`[data-id="${id}"]`);
-    if (tab && !tab.classList.contains('active')) {
-      tab.classList.add('bell');
-      setTimeout(() => tab.classList.remove('bell'), 500);
+  handlePanelBell(serverId) {
+    // Find panel by server ID
+    let targetPanel = null;
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === serverId) {
+        targetPanel = panel;
+        break;
+      }
     }
-    // Show bell indicator in title bar
-    const panel = this.panels.get(id);
-    if (panel && panel === this.activePanel) {
+    if (!targetPanel) return;
+
+    // Find which tab this panel belongs to
+    const tabId = this.findTabForPanel(targetPanel);
+    if (tabId !== null) {
+      // Flash the tab if not active
+      const tabEl = this.tabsEl.querySelector(`[data-id="${tabId}"]`);
+      if (tabEl && !tabEl.classList.contains('active')) {
+        tabEl.classList.add('bell');
+        setTimeout(() => tabEl.classList.remove('bell'), 500);
+      }
+    }
+
+    // Show bell indicator in title bar if this is the active panel
+    if (targetPanel === this.activePanel) {
       this.updateTitleIndicator('🔔');
       // Reset to normal indicator after 2 seconds
       setTimeout(() => {
         const appTitle = document.getElementById('app-title');
-        this.updateIndicatorForPanel(panel, appTitle ? appTitle.textContent : '');
+        this.updateIndicatorForPanel(targetPanel, appTitle ? appTitle.textContent : '');
       }, 2000);
     }
   }
@@ -1234,32 +1817,32 @@ function setupMenus() {
 
       switch (action) {
         case 'new-tab':
-          app.createPanel();
+          app.createTab();
           break;
         case 'close-tab':
-          if (app.activePanel) app.removePanel(app.activePanel.id);
+          app.closeActivePanel();
           break;
         case 'close-all-tabs':
-          app.closeAllPanels();
+          app.closeAllTabs();
           break;
         case 'split-right':
-          if (app.activePanel?.serverId !== null) {
-            app.sendViewAction(app.activePanel.serverId, 'new_split:right');
+          if (app.activePanel) {
+            app.splitActivePanel('right');
           }
           break;
         case 'split-down':
-          if (app.activePanel?.serverId !== null) {
-            app.sendViewAction(app.activePanel.serverId, 'new_split:down');
+          if (app.activePanel) {
+            app.splitActivePanel('down');
           }
           break;
         case 'split-left':
-          if (app.activePanel?.serverId !== null) {
-            app.sendViewAction(app.activePanel.serverId, 'new_split:left');
+          if (app.activePanel) {
+            app.splitActivePanel('left');
           }
           break;
         case 'split-up':
-          if (app.activePanel?.serverId !== null) {
-            app.sendViewAction(app.activePanel.serverId, 'new_split:up');
+          if (app.activePanel) {
+            app.splitActivePanel('up');
           }
           break;
         case 'copy':
