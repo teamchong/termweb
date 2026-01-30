@@ -208,7 +208,7 @@ pub const Layout = struct {
         tab.* = .{
             .id = self.next_tab_id,
             .root = root,
-            .title = try self.allocator.dupe(u8, "Terminal"),
+            .title = &.{}, // Empty - will show ghost emoji until terminal sets title
         };
         self.next_tab_id += 1;
 

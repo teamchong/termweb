@@ -1219,10 +1219,10 @@ class App {
     tabContent.appendChild(root.element);
 
     // Store tab info
-    this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+    this.tabs.set(tabId, { root, element: tabContent, title: '' });
 
     // Add tab to tab bar
-    this.addTabUI(tabId, 'Terminal');
+    this.addTabUI(tabId, '');
 
     // Switch to new tab
     this.switchToTab(tabId);
@@ -1253,10 +1253,10 @@ class App {
     tabContent.appendChild(root.element);
 
     // Store tab info
-    this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+    this.tabs.set(tabId, { root, element: tabContent, title: '' });
 
     // Add tab to tab bar
-    this.addTabUI(tabId, 'Terminal');
+    this.addTabUI(tabId, '');
 
     // Switch to tab if no active tab
     if (!this.activeTab) {
@@ -1291,10 +1291,10 @@ class App {
     tabContent.appendChild(root.element);
 
     // Store tab info
-    this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+    this.tabs.set(tabId, { root, element: tabContent, title: '' });
 
     // Add tab to tab bar
-    this.addTabUI(tabId, 'Terminal');
+    this.addTabUI(tabId, '');
 
     // Switch to new tab
     this.switchToTab(tabId);
@@ -1360,10 +1360,10 @@ class App {
       tabContent.appendChild(root.element);
 
       // Store tab info (include server tab ID for mapping)
-      this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal', serverTabId: serverTab.id });
+      this.tabs.set(tabId, { root, element: tabContent, title: '', serverTabId: serverTab.id });
 
-      // Add tab to tab bar
-      this.addTabUI(tabId, 'Terminal');
+      // Add tab to tab bar (empty title shows ghost emoji)
+      this.addTabUI(tabId, '');
     }
 
     // Switch to active tab using server's activeTabId
@@ -1835,10 +1835,13 @@ class App {
     for (const [tabId, tab] of this.tabs) {
       if (tab.root.findContainer(panel)) {
         const tabEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .title`);
-        const title = tabEl ? tabEl.textContent : 'Terminal';
-        document.title = title + ' - termweb';
+        let title = tabEl ? tabEl.textContent : '';
+        // Ghost emoji means no title set yet
+        if (title === '👻') title = '';
+        const displayTitle = title || 'termweb';
+        document.title = displayTitle + ' - termweb';
         const appTitle = document.getElementById('app-title');
-        if (appTitle) appTitle.textContent = title;
+        if (appTitle) appTitle.textContent = displayTitle;
         this.updateIndicatorForPanel(panel, title);
         break;
       }
@@ -1855,7 +1858,9 @@ class App {
     const tabIndex = this.tabsEl.children.length + 1;
     const hotkeyHint = tabIndex <= 9 ? `⌘${tabIndex}` : '';
 
-    tab.innerHTML = `<span class="close">×</span><span class="title">${title}</span><span class="hotkey">${hotkeyHint}</span>`;
+    // Show ghost emoji if title is empty
+    const displayTitle = title || '👻';
+    tab.innerHTML = `<span class="close">×</span><span class="title">${displayTitle}</span><span class="hotkey">${hotkeyHint}</span>`;
 
     tab.addEventListener('click', (e) => {
       if (!e.target.classList.contains('close')) {
