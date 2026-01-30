@@ -2105,26 +2105,8 @@ class App {
     // Determine if a command is running:
     // - If title contains path characters or looks like a path, we're at prompt
     // - Otherwise, a command is probably running
-    let indicator = '';
-
-    if (panel.pwd) {
-      // Check if we're at prompt (title matches directory) or running a command
-      // If title is a path-like string, we're at prompt - just show folder
-      const titleLooksLikePrompt = title.includes('/') ||
-                                    title.startsWith('~') ||
-                                    title === '';
-      if (!titleLooksLikePrompt && title.length > 0) {
-        // Title looks like a running command - show folder + heavy asterisk
-        indicator = '📁 ✱';
-      } else {
-        // At prompt - just show folder, no dot or asterisk
-        indicator = '📁';
-      }
-    } else {
-      // No pwd yet - indicator is empty (ghost emoji shown in app title)
-      indicator = '';
-    }
-
+    const isAtPrompt = this.isAtPrompt(panel, title);
+    const indicator = isAtPrompt ? '•' : '✱';
     this.updateTitleIndicator(indicator);
   }
 
