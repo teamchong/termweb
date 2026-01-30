@@ -1109,11 +1109,9 @@ class App {
         // Initial panel list from server
         console.log('Panel list received:', msg.panels);
         if (msg.panels && msg.panels.length > 0) {
-          // Connect to existing panels - each in its own tab for now
+          // Connect to existing panels - put them all in one tab with splits
           console.log('Connecting to', msg.panels.length, 'existing panels');
-          for (const p of msg.panels) {
-            this.createTabWithServerId(p.id);
-          }
+          this.reconnectPanelsAsSplits(msg.panels);
         } else {
           // No panels on server - create one
           console.log('No panels on server, creating new one');
@@ -1245,6 +1243,61 @@ class App {
     }
 
     return tabId;
+  }
+
+  // Reconnect to multiple server panels as splits in a single tab
+  reconnectPanelsAsSplits(serverPanels) {
+    if (serverPanels.length === 0) return;
+
+    // Check if already connected to any of these panels
+    for (const p of serverPanels) {
+      for (const [, panel] of this.panels) {
+        if (panel.serverId === p.id) return; // Already connected
+      }
+    }
+
+    const tabId = this.nextTabId++;
+
+    // Create tab content container
+    const tabContent = document.createElement('div');
+    tabContent.className = 'tab-content';
+    tabContent.dataset.tabId = tabId;
+    this.panelsEl.appendChild(tabContent);
+
+    // Create first panel
+    const firstPanel = this.createPanel(tabContent, serverPanels[0].id);
+    const root = SplitContainer.createLeaf(firstPanel, null);
+    tabContent.appendChild(root.element);
+
+    // Store tab info
+    this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+
+    // Add tab to tab bar
+    this.addTabUI(tabId, 'Terminal');
+
+    // Switch to new tab
+    this.switchToTab(tabId);
+
+    // Add remaining panels as splits
+    for (let i = 1; i < serverPanels.length; i++) {
+      const serverId = serverPanels[i].id;
+      const tab = this.tabs.get(tabId);
+      if (!tab) break;
+
+      // Find the current active panel's container
+      const container = tab.root.findContainer(this.activePanel);
+      if (!container) break;
+
+      // Create new panel connected to server
+      const newPanel = this.createPanel(document.createElement('div'), serverId);
+
+      // Alternate between right and down splits for a grid-like layout
+      const direction = (i % 2 === 1) ? 'right' : 'down';
+      container.split(direction, newPanel);
+
+      // Focus the new panel
+      this.setActivePanel(newPanel);
+    }
   }
 
   // Split the active panel
