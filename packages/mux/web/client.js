@@ -1838,10 +1838,15 @@ class App {
         let title = tabEl ? tabEl.textContent : '';
         // Ghost emoji means no title set yet
         if (title === '👻') title = '';
-        const displayTitle = title || 'termweb';
-        document.title = displayTitle + ' - termweb';
+
         const appTitle = document.getElementById('app-title');
-        if (appTitle) appTitle.textContent = displayTitle;
+        if (title) {
+          document.title = title;
+          if (appTitle) appTitle.textContent = title;
+        } else {
+          document.title = '👻';
+          if (appTitle) appTitle.textContent = '👻';
+        }
         this.updateIndicatorForPanel(panel, title);
         break;
       }
@@ -1933,7 +1938,7 @@ class App {
 
     // Update document title and app title if this is the active panel
     if (targetPanel === this.activePanel) {
-      document.title = title + ' - termweb';
+      document.title = title;
       const appTitle = document.getElementById('app-title');
       if (appTitle) appTitle.textContent = title;
       this.updateIndicatorForPanel(targetPanel, title);
@@ -1981,8 +1986,8 @@ class App {
         indicator = '📁';
       }
     } else {
-      // No pwd yet - show small ghost emoji as default
-      indicator = '<span style="font-size:10px">👻</span>';
+      // No pwd yet - indicator is empty (ghost emoji shown in app title)
+      indicator = '';
     }
 
     this.updateTitleIndicator(indicator);
