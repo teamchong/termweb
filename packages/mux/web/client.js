@@ -1336,9 +1336,13 @@ class App {
     this.activeTab = null;
     this.activePanel = null;
 
+    // Map server tab ID to client tab ID
+    const serverToClientTabId = new Map();
+
     // Restore each tab from server layout
     for (const serverTab of layout.tabs) {
       const tabId = this.nextTabId++;
+      serverToClientTabId.set(serverTab.id, tabId);
 
       // Create tab content container
       const tabContent = document.createElement('div');
@@ -1355,19 +1359,19 @@ class App {
 
       tabContent.appendChild(root.element);
 
-      // Store tab info
-      this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal' });
+      // Store tab info (include server tab ID for mapping)
+      this.tabs.set(tabId, { root, element: tabContent, title: 'Terminal', serverTabId: serverTab.id });
 
       // Add tab to tab bar
       this.addTabUI(tabId, 'Terminal');
     }
 
-    // Switch to active tab (or first tab)
-    const activeTabId = layout.activeTabId;
+    // Switch to active tab using server's activeTabId
     let targetTabId = null;
-
-    // Find matching tab (server tab IDs may not match client IDs)
-    if (this.tabs.size > 0) {
+    if (layout.activeTabId && serverToClientTabId.has(layout.activeTabId)) {
+      targetTabId = serverToClientTabId.get(layout.activeTabId);
+    } else if (this.tabs.size > 0) {
+      // Fallback to first tab
       targetTabId = this.tabs.keys().next().value;
     }
 
@@ -1602,8 +1606,20 @@ class App {
       panel.canvas.focus();
     }
 
+    // Notify server of focus change (for remembering active tab)
+    if (panel && panel.serverId !== null) {
+      this.sendFocusPanel(panel.serverId);
+    }
+
     // Update title
     this.updateTitleForPanel(panel);
+  }
+
+  // Send focus_panel to server to track active tab
+  sendFocusPanel(serverId) {
+    if (!this.controlWs || this.controlWs.readyState !== WebSocket.OPEN) return;
+    const msg = JSON.stringify({ type: 'focus_panel', panel_id: serverId });
+    this.controlWs.send(msg);
   }
 
   // Navigate to an adjacent split pane

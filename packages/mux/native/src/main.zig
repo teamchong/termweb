@@ -1496,6 +1496,15 @@ const Server = struct {
                 .scale = scale,
             }) catch {};
             self.mutex.unlock();
+        } else if (std.mem.indexOf(u8, data, "\"focus_panel\"")) |_| {
+            // Client focused a panel - update active tab
+            // {"type":"focus_panel","panel_id":1}
+            const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
+            self.mutex.lock();
+            if (self.layout.findTabByPanel(panel_id)) |tab| {
+                self.layout.active_tab_id = tab.id;
+            }
+            self.mutex.unlock();
         } else if (std.mem.indexOf(u8, data, "\"view_action\"")) |_| {
             const id = self.parseJsonInt(data, "panel_id") orelse return;
             const action = self.parseJsonString(data, "action") orelse return;
