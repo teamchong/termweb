@@ -478,65 +478,11 @@ class Panel {
   }
   
   setupInputHandlers() {
-    // Focus handling
+    // Focus handling (kept for mouse events)
     this.canvas.tabIndex = 1;
 
-    // Keyboard - intercept all keys including Cmd+/-/= for ghostty font scaling
-    this.canvas.addEventListener('keydown', (e) => {
-      // Handle font size shortcuts via control channel
-      if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
-        e.preventDefault();
-        if (this.serverId !== null && this.onViewAction) {
-          if (e.key === '=') this.onViewAction(this.serverId, 'increase_font_size:1');
-          else if (e.key === '-') this.onViewAction(this.serverId, 'decrease_font_size:1');
-          else if (e.key === '0') this.onViewAction(this.serverId, 'reset_font_size');
-        }
-        return;
-      }
+    // Keyboard and paste are now handled at document level in App class
 
-      // Local shortcuts handled by window capture handler - don't interfere
-      if (e.metaKey && !e.shiftKey && (e.key === '/' || e.key === '.' || e.key === 'a')) {
-        return;
-      }
-      if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.' || e.key === 'v' || e.key === 'V')) {
-        return;
-      }
-      if (e.metaKey && e.key >= '1' && e.key <= '9') {
-        return;
-      }
-      // ⌘C for copy - send to ghostty
-      if (e.metaKey && !e.shiftKey && (e.key === 'c' || e.key === 'C')) {
-        e.preventDefault();
-        e.stopPropagation();
-        if (this.serverId !== null && this.onViewAction) {
-          this.onViewAction(this.serverId, 'copy_to_clipboard');
-        }
-        return;
-      }
-      // ⌘V for paste - handle via paste event
-      if (e.metaKey && (e.key === 'v' || e.key === 'V')) {
-        return;
-      }
-
-      e.preventDefault();
-      this.sendKeyInput(e, 1); // press
-    });
-
-    this.canvas.addEventListener('keyup', (e) => {
-      if (e.metaKey) return;
-      e.preventDefault();
-      this.sendKeyInput(e, 0); // release
-    });
-
-    // Handle paste event
-    this.canvas.addEventListener('paste', (e) => {
-      e.preventDefault();
-      const text = e.clipboardData.getData('text');
-      if (text) {
-        this.sendTextInput(text);
-      }
-    });
-    
     // Mouse
     this.canvas.addEventListener('mousedown', (e) => {
       this.canvas.focus();
@@ -815,7 +761,7 @@ class App {
       }
     }, true);  // true = capture phase
 
-    // Also capture keyup at window level
+    // Also capture keyup at document level
     document.addEventListener('keyup', (e) => {
       if (e.metaKey) return;
       if (this.activePanel) {
@@ -823,6 +769,15 @@ class App {
         this.activePanel.sendKeyInput(e, 0); // release
       }
     }, true);
+
+    // Handle paste at document level
+    document.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = e.clipboardData.getData('text');
+      if (text && this.activePanel) {
+        this.activePanel.sendTextInput(text);
+      }
+    });
   }
   
   connect(host = 'localhost') {
