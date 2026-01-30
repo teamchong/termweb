@@ -44,6 +44,7 @@ class Panel {
     this.lastReportedWidth = 0;
     this.lastReportedHeight = 0;
     this.resizeTimeout = null;
+    this.pwd = null;                 // Current working directory
 
     // WebGPU state
     this.device = null;
@@ -774,6 +775,10 @@ class App {
         this.updatePanelTitle(msg.panel_id, msg.title);
         break;
 
+      case 'panel_pwd':
+        this.updatePanelPwd(msg.panel_id, msg.pwd);
+        break;
+
       case 'panel_bell':
         this.handlePanelBell(msg.panel_id);
         break;
@@ -865,13 +870,20 @@ class App {
     if (this.activePanel) {
       this.activePanel.hide();
     }
-    
+
     // Show new
     const panel = this.panels.get(id);
     if (panel) {
       panel.show();
       this.activePanel = panel;
       this.updateTabActive(id);
+
+      // Update document title and app title
+      const tab = this.tabsEl.querySelector(`[data-id="${id}"] .title`);
+      const title = tab ? tab.textContent : 'Terminal';
+      document.title = title + ' - termweb';
+      const appTitle = document.getElementById('app-title');
+      if (appTitle) appTitle.textContent = title;
     }
   }
   
@@ -925,6 +937,63 @@ class App {
   updatePanelTitle(id, title) {
     const tab = this.tabsEl.querySelector(`[data-id="${id}"] .title`);
     if (tab) tab.textContent = title;
+
+    // Update document title and app title if this is the active panel
+    const panel = this.panels.get(id);
+    if (panel && panel === this.activePanel) {
+      document.title = title + ' - termweb';
+      const appTitle = document.getElementById('app-title');
+      if (appTitle) appTitle.textContent = title;
+      // Update indicator based on whether title looks like a running command
+      // If title is different from pwd basename, a command is likely running
+      this.updateIndicatorForPanel(panel, title);
+    }
+  }
+
+  updatePanelPwd(id, pwd) {
+    // Store pwd on the panel
+    const panel = this.panels.get(id);
+    if (!panel) return;
+    panel.pwd = pwd;
+
+    // If this is the active panel, update the indicator
+    if (panel === this.activePanel) {
+      const appTitle = document.getElementById('app-title');
+      const currentTitle = appTitle ? appTitle.textContent : '';
+      this.updateIndicatorForPanel(panel, currentTitle);
+    }
+  }
+
+  updateIndicatorForPanel(panel, title) {
+    // Determine if a command is running:
+    // - If title contains path characters or looks like a path, we're at prompt
+    // - Otherwise, a command is probably running
+    let indicator = '';
+
+    if (panel.pwd) {
+      // Check if we're at prompt (title matches directory) or running a command
+      // If title is a path-like string, we're at prompt - just show folder
+      const titleLooksLikePrompt = title.includes('/') ||
+                                    title.startsWith('~') ||
+                                    title === '';
+      if (!titleLooksLikePrompt && title.length > 0) {
+        // Title looks like a running command - show folder + asterisk
+        indicator = '📁 *';
+      } else {
+        // At prompt - just show folder, no dot or asterisk
+        indicator = '📁';
+      }
+    } else {
+      // No pwd yet - show small ghost emoji as default
+      indicator = '<span style="font-size:10px">👻</span>';
+    }
+
+    this.updateTitleIndicator(indicator);
+  }
+
+  updateTitleIndicator(indicator) {
+    const el = document.getElementById('title-indicator');
+    if (el) el.innerHTML = indicator;
   }
 
   handlePanelBell(id) {
@@ -933,6 +1002,16 @@ class App {
     if (tab && !tab.classList.contains('active')) {
       tab.classList.add('bell');
       setTimeout(() => tab.classList.remove('bell'), 500);
+    }
+    // Show bell indicator in title bar
+    const panel = this.panels.get(id);
+    if (panel && panel === this.activePanel) {
+      this.updateTitleIndicator('🔔');
+      // Reset to normal indicator after 2 seconds
+      setTimeout(() => {
+        const appTitle = document.getElementById('app-title');
+        this.updateIndicatorForPanel(panel, appTitle ? appTitle.textContent : '');
+      }, 2000);
     }
   }
 }
@@ -1034,6 +1113,91 @@ function applyColors(colors) {
   root.style.setProperty('--accent', fg);
 }
 
+function setupMenus() {
+  const isMobile = () => window.innerWidth < 600;
+
+  // Menu item actions
+  document.querySelectorAll('.menu-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const action = item.dataset.action;
+      const app = window.app;
+      if (!app) return;
+
+      switch (action) {
+        case 'new-tab':
+          app.createPanel();
+          break;
+        case 'close-tab':
+          if (app.activePanel) app.removePanel(app.activePanel.id);
+          break;
+        case 'copy':
+          document.execCommand('copy');
+          break;
+        case 'paste':
+          navigator.clipboard.readText().then(text => {
+            // Send paste to active panel
+            if (app.activePanel && app.activePanel.ws) {
+              const encoder = new TextEncoder();
+              const textBytes = encoder.encode(text);
+              const buf = new ArrayBuffer(1 + textBytes.length);
+              const view = new Uint8Array(buf);
+              view[0] = 0x05; // TEXT_INPUT
+              view.set(textBytes, 1);
+              app.activePanel.ws.send(buf);
+            }
+          });
+          break;
+        case 'zoom-in':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'increase_font_size:1');
+          }
+          break;
+        case 'zoom-out':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'decrease_font_size:1');
+          }
+          break;
+        case 'zoom-reset':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'reset_font_size');
+          }
+          break;
+      }
+
+      // Close menu after action
+      document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+    });
+  });
+
+  // Mobile: click to toggle menu
+  document.querySelectorAll('.menu-label').forEach(label => {
+    label.addEventListener('click', (e) => {
+      if (!isMobile()) return;
+      e.stopPropagation();
+      const menu = label.parentElement;
+      const wasOpen = menu.classList.contains('open');
+      // Close all menus
+      document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+      // Toggle this one
+      if (!wasOpen) menu.classList.add('open');
+    });
+  });
+
+  // Close menus when clicking outside
+  document.addEventListener('click', () => {
+    document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+  });
+
+  // Hamburger menu toggle
+  const hamburger = document.getElementById('hamburger');
+  if (hamburger) {
+    hamburger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      document.getElementById('menubar').classList.toggle('open');
+    });
+  }
+}
+
 async function init() {
   // Fetch config to get WebSocket ports and colors
   try {
@@ -1051,6 +1215,8 @@ async function init() {
     console.error('Failed to fetch config:', e);
     return;
   }
+
+  setupMenus();
 
   // No external dependencies - uses native DecompressionStream
   window.app = new App();

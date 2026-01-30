@@ -93,6 +93,7 @@ pub const ControlMsgType = enum {
     panel_created,   // New panel created
     panel_closed,    // Panel was closed
     panel_title,     // Panel title changed
+    panel_pwd,       // Panel working directory changed
     panel_bell,      // Bell notification
     layout_update,   // Split layout changed
 
@@ -1058,6 +1059,18 @@ const Server = struct {
         }
     }
 
+    fn broadcastPanelPwd(self: *Server, panel_id: u32, pwd: []const u8) void {
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"panel_pwd\",\"panel_id\":{},\"pwd\":\"{s}\"}}", .{ panel_id, pwd }) catch return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.control_connections.items) |conn| {
+            conn.sendText(msg) catch {};
+        }
+    }
+
     // Run HTTP server
     fn runHttpServer(self: *Server) void {
         self.http_server.run() catch |err| {
@@ -1485,6 +1498,29 @@ fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.gh
                 self.mutex.unlock();
             }
         },
+        c.GHOSTTY_ACTION_PWD => {
+            // Get pwd from action
+            const pwd_ptr = action.action.pwd.pwd;
+            if (pwd_ptr == null) return false;
+
+            const pwd = std.mem.span(pwd_ptr);
+
+            // Find which panel this surface belongs to
+            if (target.tag == c.GHOSTTY_TARGET_SURFACE) {
+                const surface = target.target.surface;
+                self.mutex.lock();
+                var panel_it = self.panels.valueIterator();
+                while (panel_it.next()) |panel_ptr| {
+                    const panel = panel_ptr.*;
+                    if (panel.surface == surface) {
+                        self.mutex.unlock();
+                        self.broadcastPanelPwd(panel.id, pwd);
+                        return true;
+                    }
+                }
+                self.mutex.unlock();
+            }
+        },
         else => {},
     }
     return false;
@@ -1547,6 +1583,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 
     return args;
 }
+
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
