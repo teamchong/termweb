@@ -754,6 +754,19 @@ class App {
         }
         return;
       }
+      // ⌘D for split right, ⌘⇧D for split down
+      if (e.metaKey && (e.key === 'd' || e.key === 'D')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          if (e.shiftKey) {
+            this.sendViewAction(this.activePanel.serverId, 'new_split:down');
+          } else {
+            this.sendViewAction(this.activePanel.serverId, 'new_split:right');
+          }
+        }
+        return;
+      }
       // Forward all other keys to active panel
       if (this.activePanel) {
         e.preventDefault();
@@ -1228,6 +1241,26 @@ function setupMenus() {
           break;
         case 'close-all-tabs':
           app.closeAllPanels();
+          break;
+        case 'split-right':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'new_split:right');
+          }
+          break;
+        case 'split-down':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'new_split:down');
+          }
+          break;
+        case 'split-left':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'new_split:left');
+          }
+          break;
+        case 'split-up':
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'new_split:up');
+          }
           break;
         case 'copy':
           if (app.activePanel?.serverId !== null) {

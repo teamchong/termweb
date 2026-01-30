@@ -193,6 +193,11 @@
     .menu-item:hover {
       background: var(--tab-hover);
     }
+    .menu-separator {
+      height: 1px;
+      background: rgba(128,128,128,0.3);
+      margin: 4px 8px;
+    }
     .menu-item .shortcut {
       color: var(--text-dim);
       margin-left: auto;
@@ -342,6 +347,12 @@
           <span class="menu-label">File</span>
           <div class="menu-dropdown">
             <div class="menu-item" data-action="new-tab"><span class="menu-icon">⊞</span><span class="menu-text">New Tab</span><span class="shortcut">⌘/</span></div>
+            <div class="menu-separator"></div>
+            <div class="menu-item" data-action="split-right"><span class="menu-icon">⬚▐</span><span class="menu-text">Split Right</span><span class="shortcut">⌘D</span></div>
+            <div class="menu-item" data-action="split-down"><span class="menu-icon">⬚▄</span><span class="menu-text">Split Down</span><span class="shortcut">⌘<span class="shift">⇧</span>D</span></div>
+            <div class="menu-item" data-action="split-left"><span class="menu-icon">▌⬚</span><span class="menu-text">Split Left</span></div>
+            <div class="menu-item" data-action="split-up"><span class="menu-icon">▀⬚</span><span class="menu-text">Split Up</span></div>
+            <div class="menu-separator"></div>
             <div class="menu-item" data-action="close-tab"><span class="menu-icon">✕</span><span class="menu-text">Close Tab</span><span class="shortcut">⌘.</span></div>
             <div class="menu-item" data-action="close-all-tabs"><span class="menu-icon">⊠</span><span class="menu-text">Close All Tabs</span><span class="shortcut">⌘<span class="shift">⇧</span>.</span></div>
           </div>
