@@ -621,20 +621,21 @@
       top: 0;
       left: 0;
       width: 100%;
-      height: 50vh;
+      height: 400px;
       background: var(--bg);
       border-radius: 0 0 12px 12px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      box-shadow: none;
       z-index: 1500;
       overflow: hidden;
       display: flex;
       flex-direction: column;
       transform: translateY(-100%);
-      transition: transform 0.25s ease-out;
+      transition: transform 0.2s ease-out, box-shadow 0.2s ease-out;
       pointer-events: none;
     }
     #quick-terminal.visible {
       transform: translateY(0);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
       pointer-events: auto;
     }
     #quick-terminal .quick-terminal-content {
