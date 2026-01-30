@@ -201,6 +201,11 @@
       letter-spacing: 1px;
       line-height: 1;
     }
+    .menu-item .shortcut .shift {
+      position: relative;
+      top: -1px;
+      font-weight: bold;
+    }
     #toolbar {
       background: var(--toolbar-bg);
       display: flex;
@@ -338,7 +343,7 @@
           <div class="menu-dropdown">
             <div class="menu-item" data-action="new-tab"><span class="menu-icon">⊞</span><span class="menu-text">New Tab</span><span class="shortcut">⌘/</span></div>
             <div class="menu-item" data-action="close-tab"><span class="menu-icon">✕</span><span class="menu-text">Close Tab</span><span class="shortcut">⌘.</span></div>
-            <div class="menu-item" data-action="close-all-tabs"><span class="menu-icon">⊠</span><span class="menu-text">Close All Tabs</span><span class="shortcut">⌘⇧.</span></div>
+            <div class="menu-item" data-action="close-all-tabs"><span class="menu-icon">⊠</span><span class="menu-text">Close All Tabs</span><span class="shortcut">⌘<span class="shift">⇧</span>.</span></div>
           </div>
         </div>
         <div class="menu">
@@ -346,7 +351,7 @@
           <div class="menu-dropdown">
             <div class="menu-item" data-action="copy"><span class="menu-icon">⧉</span><span class="menu-text">Copy</span><span class="shortcut">⌘C</span></div>
             <div class="menu-item" data-action="paste"><span class="menu-icon">📋</span><span class="menu-text">Paste</span><span class="shortcut">⌘V</span></div>
-            <div class="menu-item" data-action="paste-selection"><span class="menu-icon">📄</span><span class="menu-text">Paste Selection</span><span class="shortcut">⌘⇧V</span></div>
+            <div class="menu-item" data-action="paste-selection"><span class="menu-icon">📄</span><span class="menu-text">Paste Selection</span><span class="shortcut">⌘<span class="shift">⇧</span>V</span></div>
             <div class="menu-item" data-action="select-all"><span class="menu-icon">▣</span><span class="menu-text">Select All</span><span class="shortcut">⌘A</span></div>
           </div>
         </div>
