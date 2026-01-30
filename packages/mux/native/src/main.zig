@@ -47,11 +47,12 @@ pub const ClientMsg = enum(u8) {
 };
 
 // Key input message format (from browser)
-// [msg_type:u8][key_code:u32][action:u8][mods:u8]
+// [msg_type:u8][key_code:u32][action:u8][mods:u8][text_len:u8][text:...]
 const KeyInputMsg = extern struct {
     key_code: u32,    // ghostty_input_key_e
     action: u8,       // 0=release, 1=press, 2=repeat
     mods: u8,         // modifier flags: shift=1, ctrl=2, alt=4, super=8
+    text_len: u8,     // length of following text (0 for special keys)
 };
 
 // Mouse button message format
@@ -221,7 +222,11 @@ const Compressor = struct {
 // ============================================================================
 
 const InputEvent = union(enum) {
-    key: c.ghostty_input_key_s,
+    key: struct {
+        input: c.ghostty_input_key_s,
+        text_buf: [8]u8, // Buffer to store key text (null-terminated)
+        text_len: u8,
+    },
     text: struct { data: [256]u8, len: usize },
     mouse_pos: struct { x: f64, y: f64, mods: c.ghostty_input_mods_e },
     mouse_button: struct { state: c.ghostty_input_mouse_state_e, button: c.ghostty_input_mouse_button_e, mods: c.ghostty_input_mods_e },
@@ -446,10 +451,14 @@ const Panel = struct {
         self.input_queue.clearRetainingCapacity();
         self.mutex.unlock();
 
-        for (events_buf[0..events_count]) |event| {
-            switch (event) {
-                .key => |key_input| {
-                    _ = c.ghostty_surface_key(self.surface, key_input);
+        for (events_buf[0..events_count]) |*event| {
+            switch (event.*) {
+                .key => |*key_event| {
+                    // Set text pointer to our stored buffer
+                    if (key_event.text_len > 0) {
+                        key_event.input.text = @ptrCast(&key_event.text_buf);
+                    }
+                    _ = c.ghostty_surface_key(self.surface, key_event.input);
                 },
                 .text => |text| {
                     c.ghostty_surface_text(self.surface, &text.data, text.len);
@@ -501,30 +510,184 @@ const Panel = struct {
         return @intCast(mods);
     }
 
+    // Map JS e.code to macOS virtual keycode (ghostty expects macOS keycodes, not its own enum)
+    fn mapKeyCode(code: []const u8) u32 {
+        // Use comptime string map for efficient lookup - values are macOS virtual keycodes
+        const map = std.StaticStringMap(u32).initComptime(.{
+            // Writing System Keys
+            .{ "Backquote", 0x32 },
+            .{ "Backslash", 0x2a },
+            .{ "BracketLeft", 0x21 },
+            .{ "BracketRight", 0x1e },
+            .{ "Comma", 0x2b },
+            .{ "Digit0", 0x1d },
+            .{ "Digit1", 0x12 },
+            .{ "Digit2", 0x13 },
+            .{ "Digit3", 0x14 },
+            .{ "Digit4", 0x15 },
+            .{ "Digit5", 0x17 },
+            .{ "Digit6", 0x16 },
+            .{ "Digit7", 0x1a },
+            .{ "Digit8", 0x1c },
+            .{ "Digit9", 0x19 },
+            .{ "Equal", 0x18 },
+            .{ "IntlBackslash", 0x0a },
+            .{ "KeyA", 0x00 },
+            .{ "KeyB", 0x0b },
+            .{ "KeyC", 0x08 },
+            .{ "KeyD", 0x02 },
+            .{ "KeyE", 0x0e },
+            .{ "KeyF", 0x03 },
+            .{ "KeyG", 0x05 },
+            .{ "KeyH", 0x04 },
+            .{ "KeyI", 0x22 },
+            .{ "KeyJ", 0x26 },
+            .{ "KeyK", 0x28 },
+            .{ "KeyL", 0x25 },
+            .{ "KeyM", 0x2e },
+            .{ "KeyN", 0x2d },
+            .{ "KeyO", 0x1f },
+            .{ "KeyP", 0x23 },
+            .{ "KeyQ", 0x0c },
+            .{ "KeyR", 0x0f },
+            .{ "KeyS", 0x01 },
+            .{ "KeyT", 0x11 },
+            .{ "KeyU", 0x20 },
+            .{ "KeyV", 0x09 },
+            .{ "KeyW", 0x0d },
+            .{ "KeyX", 0x07 },
+            .{ "KeyY", 0x10 },
+            .{ "KeyZ", 0x06 },
+            .{ "Minus", 0x1b },
+            .{ "Period", 0x2f },
+            .{ "Quote", 0x27 },
+            .{ "Semicolon", 0x29 },
+            .{ "Slash", 0x2c },
+            // Modifier Keys
+            .{ "AltLeft", 0x3a },
+            .{ "AltRight", 0x3d },
+            .{ "ControlLeft", 0x3b },
+            .{ "ControlRight", 0x3e },
+            .{ "MetaLeft", 0x37 },
+            .{ "MetaRight", 0x36 },
+            .{ "ShiftLeft", 0x38 },
+            .{ "ShiftRight", 0x3c },
+            // Functional Keys
+            .{ "Backspace", 0x33 },
+            .{ "CapsLock", 0x39 },
+            .{ "ContextMenu", 0x6e },
+            .{ "Enter", 0x24 },
+            .{ "Space", 0x31 },
+            .{ "Tab", 0x30 },
+            // Control Pad
+            .{ "Delete", 0x75 },
+            .{ "End", 0x77 },
+            .{ "Home", 0x73 },
+            .{ "Insert", 0x72 },
+            .{ "PageDown", 0x79 },
+            .{ "PageUp", 0x74 },
+            // Arrow Keys
+            .{ "ArrowDown", 0x7d },
+            .{ "ArrowLeft", 0x7b },
+            .{ "ArrowRight", 0x7c },
+            .{ "ArrowUp", 0x7e },
+            // Numpad
+            .{ "NumLock", 0x47 },
+            .{ "Numpad0", 0x52 },
+            .{ "Numpad1", 0x53 },
+            .{ "Numpad2", 0x54 },
+            .{ "Numpad3", 0x55 },
+            .{ "Numpad4", 0x56 },
+            .{ "Numpad5", 0x57 },
+            .{ "Numpad6", 0x58 },
+            .{ "Numpad7", 0x59 },
+            .{ "Numpad8", 0x5b },
+            .{ "Numpad9", 0x5c },
+            .{ "NumpadAdd", 0x45 },
+            .{ "NumpadDecimal", 0x41 },
+            .{ "NumpadDivide", 0x4b },
+            .{ "NumpadEnter", 0x4c },
+            .{ "NumpadEqual", 0x51 },
+            .{ "NumpadMultiply", 0x43 },
+            .{ "NumpadSubtract", 0x4e },
+            // Function Keys
+            .{ "Escape", 0x35 },
+            .{ "F1", 0x7a },
+            .{ "F2", 0x78 },
+            .{ "F3", 0x63 },
+            .{ "F4", 0x76 },
+            .{ "F5", 0x60 },
+            .{ "F6", 0x61 },
+            .{ "F7", 0x62 },
+            .{ "F8", 0x64 },
+            .{ "F9", 0x65 },
+            .{ "F10", 0x6d },
+            .{ "F11", 0x67 },
+            .{ "F12", 0x6f },
+            // Media/Browser Keys
+            .{ "PrintScreen", 0x69 },
+            .{ "ScrollLock", 0x6b },
+            .{ "Pause", 0x71 },
+        });
+        return map.get(code) orelse 0xFFFF; // Invalid keycode
+    }
+
     // Handle keyboard input from client (queues event for main thread)
+    // Format: [action:u8][mods:u8][code_len:u8][code:...][text_len:u8][text:...]
     fn handleKeyInput(self: *Panel, data: []const u8) void {
-        if (data.len < @sizeOf(KeyInputMsg)) return;
+        if (data.len < 4) return;
 
-        const msg: *const KeyInputMsg = @ptrCast(@alignCast(data.ptr));
+        const action = data[0];
+        const mods = data[1];
+        const code_len = data[2];
 
-        const key_input = c.ghostty_input_key_s{
-            .action = switch (msg.action) {
-                0 => c.GHOSTTY_ACTION_RELEASE,
-                1 => c.GHOSTTY_ACTION_PRESS,
-                2 => c.GHOSTTY_ACTION_REPEAT,
-                else => c.GHOSTTY_ACTION_PRESS,
+        if (data.len < 4 + code_len) return;
+        const code = data[3 .. 3 + code_len];
+
+        const text_offset = 3 + code_len;
+        if (data.len <= text_offset) return;
+        const text_len: u8 = @min(data[text_offset], 7);
+
+        const text_start = text_offset + 1;
+
+        // Map JS code to macOS keycode
+        const keycode = mapKeyCode(code);
+
+        // Compute unshifted codepoint
+        var unshifted: u32 = 0;
+        if (text_len == 1 and data.len > text_start) {
+            const ch = data[text_start];
+            unshifted = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+        }
+
+        var event: InputEvent = .{ .key = .{
+            .input = c.ghostty_input_key_s{
+                .action = switch (action) {
+                    0 => c.GHOSTTY_ACTION_RELEASE,
+                    1 => c.GHOSTTY_ACTION_PRESS,
+                    2 => c.GHOSTTY_ACTION_REPEAT,
+                    else => c.GHOSTTY_ACTION_PRESS,
+                },
+                .keycode = keycode,
+                .mods = convertMods(mods),
+                .consumed_mods = 0,
+                .text = null,
+                .unshifted_codepoint = unshifted,
+                .composing = false,
             },
-            .keycode = msg.key_code,
-            .mods = convertMods(msg.mods),
-            .consumed_mods = 0,
-            .text = null,
-            .unshifted_codepoint = 0,
-            .composing = false,
-        };
+            .text_buf = undefined,
+            .text_len = text_len,
+        } };
+
+        // Copy text to buffer
+        if (text_len > 0 and data.len >= text_start + text_len) {
+            @memcpy(event.key.text_buf[0..text_len], data[text_start .. text_start + text_len]);
+            event.key.text_buf[text_len] = 0;
+        }
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.input_queue.append(self.allocator, .{ .key = key_input }) catch {};
+        self.input_queue.append(self.allocator, event) catch {};
     }
 
     // Handle text input (for IME, paste, etc.) - queues event for main thread

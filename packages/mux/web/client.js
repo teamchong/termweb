@@ -506,29 +506,13 @@ class Panel {
       }
 
       e.preventDefault();
-
-      // Check if it's a special key that needs KEY_INPUT
-      const keyCode = keyCodeMap[e.code];
-      if (keyCode) {
-        this.sendKeyInput(e, 1); // press
-      } else if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
-        // Printable character - send as text
-        this.sendTextInput(e.key);
-      } else if (e.ctrlKey && e.key.length === 1) {
-        // Ctrl+key combination - send as key input if mapped
-        this.sendKeyInput(e, 1);
-      }
+      this.sendKeyInput(e, 1); // press
     });
 
     this.canvas.addEventListener('keyup', (e) => {
-      // Skip shortcuts on keyup
       if (e.metaKey) return;
-
-      const keyCode = keyCodeMap[e.code];
-      if (keyCode) {
-        e.preventDefault();
-        this.sendKeyInput(e, 0); // release
-      }
+      e.preventDefault();
+      this.sendKeyInput(e, 0); // release
     });
 
     // Handle paste event
@@ -585,15 +569,22 @@ class Panel {
   sendKeyInput(e, action) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const keyCode = keyCodeMap[e.code] || 0;
-    if (keyCode === 0) return;
+    // Send raw key code and key text to server
+    // Format: [msg_type:u8][action:u8][mods:u8][code_len:u8][code:...][text_len:u8][text:...]
+    const codeBytes = new TextEncoder().encode(e.code);
+    const text = (e.key.length === 1) ? e.key : '';
+    const textBytes = new TextEncoder().encode(text);
 
-    const buf = new ArrayBuffer(7);
-    const view = new DataView(buf);
-    view.setUint8(0, ClientMsg.KEY_INPUT);
-    view.setUint32(1, keyCode, true);
-    view.setUint8(5, action);
-    view.setUint8(6, this.getModifiers(e));
+    // 5 bytes header: msg_type + action + mods + code_len + text_len
+    const buf = new ArrayBuffer(5 + codeBytes.length + textBytes.length);
+    const view = new Uint8Array(buf);
+    view[0] = ClientMsg.KEY_INPUT;
+    view[1] = action;
+    view[2] = this.getModifiers(e);
+    view[3] = codeBytes.length;
+    view.set(codeBytes, 4);
+    view[4 + codeBytes.length] = textBytes.length;
+    view.set(textBytes, 5 + codeBytes.length);
     this.ws.send(buf);
   }
 
@@ -692,32 +683,6 @@ class Panel {
 // Key code mapping (JavaScript code -> ghostty key code)
 // ============================================================================
 
-const keyCodeMap = {
-  'KeyA': 4, 'KeyB': 5, 'KeyC': 6, 'KeyD': 7, 'KeyE': 8, 'KeyF': 9,
-  'KeyG': 10, 'KeyH': 11, 'KeyI': 12, 'KeyJ': 13, 'KeyK': 14, 'KeyL': 15,
-  'KeyM': 16, 'KeyN': 17, 'KeyO': 18, 'KeyP': 19, 'KeyQ': 20, 'KeyR': 21,
-  'KeyS': 22, 'KeyT': 23, 'KeyU': 24, 'KeyV': 25, 'KeyW': 26, 'KeyX': 27,
-  'KeyY': 28, 'KeyZ': 29,
-  'Digit1': 30, 'Digit2': 31, 'Digit3': 32, 'Digit4': 33, 'Digit5': 34,
-  'Digit6': 35, 'Digit7': 36, 'Digit8': 37, 'Digit9': 38, 'Digit0': 39,
-  'Enter': 40, 'Escape': 41, 'Backspace': 42, 'Tab': 43, 'Space': 44,
-  'Minus': 45, 'Equal': 46, 'BracketLeft': 47, 'BracketRight': 48,
-  'Backslash': 49, 'Semicolon': 51, 'Quote': 52, 'Backquote': 53,
-  'Comma': 54, 'Period': 55, 'Slash': 56, 'CapsLock': 57,
-  'F1': 58, 'F2': 59, 'F3': 60, 'F4': 61, 'F5': 62, 'F6': 63,
-  'F7': 64, 'F8': 65, 'F9': 66, 'F10': 67, 'F11': 68, 'F12': 69,
-  'PrintScreen': 70, 'ScrollLock': 71, 'Pause': 72,
-  'Insert': 73, 'Home': 74, 'PageUp': 75, 'Delete': 76, 'End': 77, 'PageDown': 78,
-  'ArrowRight': 79, 'ArrowLeft': 80, 'ArrowDown': 81, 'ArrowUp': 82,
-  'NumLock': 83,
-  'NumpadDivide': 84, 'NumpadMultiply': 85, 'NumpadSubtract': 86,
-  'NumpadAdd': 87, 'NumpadEnter': 88,
-  'Numpad1': 89, 'Numpad2': 90, 'Numpad3': 91, 'Numpad4': 92, 'Numpad5': 93,
-  'Numpad6': 94, 'Numpad7': 95, 'Numpad8': 96, 'Numpad9': 97, 'Numpad0': 98,
-  'NumpadDecimal': 99,
-  'ControlLeft': 224, 'ShiftLeft': 225, 'AltLeft': 226, 'MetaLeft': 227,
-  'ControlRight': 228, 'ShiftRight': 229, 'AltRight': 230, 'MetaRight': 231,
-};
 
 // ============================================================================
 // App - manages control connection and panels
