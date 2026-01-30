@@ -484,6 +484,13 @@ class Panel {
         }
         return;
       }
+      // Cmd+Shift+P for command palette
+      if (e.metaKey && e.shiftKey && e.code === 'KeyP') {
+        if (this.serverId !== null && this.onFontAction) {
+          this.onFontAction(this.serverId, 'toggle_command_palette');
+        }
+        return;
+      }
       this.sendKeyInput(e, 1); // press
     });
 
