@@ -1183,12 +1183,16 @@ class App {
   // Create a new tab with a single panel
   createTab() {
     const tabId = this.nextTabId++;
+    console.log(`createTab: creating tab ${tabId}, total tabs before: ${this.tabs.size}`);
 
     // Create tab content container
     const tabContent = document.createElement('div');
     tabContent.className = 'tab-content';
     tabContent.dataset.tabId = tabId;
-    this.panelsEl.appendChild(tabContent);
+    // Ensure we're appending to the correct element
+    const panelsEl = document.getElementById('panels');
+    panelsEl.appendChild(tabContent);
+    console.log(`createTab: appended tabContent to #panels, children count: ${panelsEl.children.length}`);
 
     // Create panel in the tab content
     const panel = this.createPanel(tabContent, null);
@@ -1597,9 +1601,12 @@ class App {
 
   // Switch to a tab
   switchToTab(tabId) {
+    console.log(`switchToTab: switching to tab ${tabId}, total tabs: ${this.tabs.size}`);
+
     // Hide ALL tabs first (ensures clean state)
     for (const [tid, t] of this.tabs) {
       t.element.classList.remove('active');
+      console.log(`switchToTab: removed active from tab ${tid}`);
       if (tid !== tabId) {
         // Pause panels in non-active tabs
         for (const panel of t.root.getAllPanels()) {
@@ -1612,6 +1619,7 @@ class App {
     const tab = this.tabs.get(tabId);
     if (tab) {
       tab.element.classList.add('active');
+      console.log(`switchToTab: added active to tab ${tabId}`);
       this.activeTab = tabId;
       this.updateTabUIActive(tabId);
 
