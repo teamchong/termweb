@@ -631,8 +631,8 @@ class App {
         e.preventDefault();
         this.createPanel();
       }
-      // ⌘W to close tab
-      if (e.metaKey && e.key === 'w') {
+      // ⌘. to close tab
+      if (e.metaKey && e.key === '.') {
         e.preventDefault();
         if (this.activePanel) {
           this.removePanel(this.activePanel.id);
@@ -700,6 +700,7 @@ class App {
   }
   
   createPanel() {
+    this.hideWelcome();
     // Create panel locally and connect
     const panel = new Panel(this.nextLocalId++, this.panelsEl);
     panel.connect();
@@ -724,19 +725,47 @@ class App {
   removePanel(id) {
     const panel = this.panels.get(id);
     if (!panel) return;
-    
+
     panel.destroy();
     this.panels.delete(id);
     this.removeTab(id);
-    
+
     if (this.activePanel === panel) {
       this.activePanel = null;
       // Switch to another panel if available
       const remaining = this.panels.keys().next();
       if (!remaining.done) {
         this.switchToPanel(remaining.value);
+      } else {
+        // Last tab closed - show welcome screen
+        this.showWelcome();
       }
     }
+  }
+
+  showWelcome() {
+    this.hideWelcome();
+    const welcome = document.createElement('div');
+    welcome.id = 'welcome';
+    welcome.innerHTML = `
+      <h1>termweb-mux</h1>
+      <div class="shortcuts">
+        <div class="shortcut"><span class="key">⌘/</span> New Tab</div>
+        <div class="shortcut"><span class="key">⌘.</span> Close Tab</div>
+        <div class="shortcut"><span class="key">⌘1-9</span> Switch Tab</div>
+      </div>
+      <button id="welcome-new">+ New Terminal</button>
+    `;
+    this.panelsEl.appendChild(welcome);
+    document.getElementById('welcome-new').addEventListener('click', () => {
+      this.hideWelcome();
+      this.createPanel();
+    });
+  }
+
+  hideWelcome() {
+    const welcome = document.getElementById('welcome');
+    if (welcome) welcome.remove();
   }
   
   switchToPanel(id) {
