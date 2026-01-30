@@ -101,7 +101,7 @@
       cursor: pointer;
       color: var(--text);
     }
-    @media (max-width: 600px) {
+    @media (max-width: 768px) {
       .menu:hover .menu-dropdown {
         display: none;
       }
@@ -407,10 +407,10 @@
       left: 0;
       width: 100%;
       height: 100%;
-      background: rgba(0,0,0,0.85);
+      background: color-mix(in srgb, var(--bg) 90%, black);
       z-index: 1000;
       overflow: auto;
-      padding: 40px;
+      padding: 32px;
     }
     #tab-overview.visible {
       display: block;
@@ -418,10 +418,9 @@
     #tab-overview-grid {
       display: flex;
       flex-wrap: wrap;
-      gap: 24px;
-      max-width: 1600px;
-      margin: 0 auto;
-      justify-content: center;
+      gap: 20px;
+      align-items: flex-start;
+      justify-content: flex-start;
     }
     .tab-preview {
       background: var(--bg);
@@ -480,8 +479,8 @@
       object-position: top left;
     }
     .tab-preview-title {
-      padding: 10px 12px;
-      font-size: 13px;
+      padding: 0 6px;
+      font-size: 11px;
       color: var(--text);
       background: var(--toolbar-bg);
       display: flex;
@@ -489,9 +488,14 @@
       justify-content: space-between;
       border-radius: 12px 12px 0 0;
     }
+    .tab-preview-spacer {
+      width: 16px;
+      flex-shrink: 0;
+    }
     .tab-preview-title-text {
       display: flex;
       align-items: center;
+      justify-content: center;
       gap: 6px;
       min-width: 0;
       flex: 1;
@@ -506,25 +510,37 @@
       white-space: nowrap;
     }
     .tab-preview-close {
-      width: 24px;
-      height: 24px;
+      width: 16px;
+      height: 16px;
       display: flex;
       align-items: center;
       justify-content: center;
       border-radius: 50%;
+      font-size: 10px;
       color: var(--text-dim);
       cursor: pointer;
-      transition: background 0.1s;
+      transition: opacity 0.15s, background 0.1s;
+      opacity: 0;
+    }
+    .tab-preview:hover .tab-preview-close {
+      opacity: 1;
     }
     .tab-preview-close:hover {
       background: var(--close-hover);
       color: var(--text);
     }
+    @media (max-width: 768px) {
+      .tab-preview-close {
+        opacity: 1;
+      }
+      .tab .close {
+        opacity: 1;
+      }
+    }
     #tab-overview-title {
-      text-align: center;
-      font-size: 24px;
+      font-size: 16px;
       color: var(--text);
-      margin-bottom: 32px;
+      margin-bottom: 12px;
     }
   </style>
 </head>

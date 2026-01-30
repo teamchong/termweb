@@ -2136,10 +2136,11 @@ class App {
       }
     }
 
-    // Get panels container dimensions for scaling
+    // Get panels container dimensions for scaling - match aspect ratio of actual panels
     const panelsRect = this.panelsEl.getBoundingClientRect();
-    const previewWidth = 400;
-    const previewHeight = 250;
+    const aspectRatio = panelsRect.width / panelsRect.height;
+    const previewHeight = 200;
+    const previewWidth = Math.round(previewHeight * aspectRatio);
     const scale = Math.min(previewWidth / panelsRect.width, previewHeight / panelsRect.height);
     const scaledWidth = panelsRect.width * scale;
     const scaledHeight = panelsRect.height * scale;
@@ -2205,6 +2206,10 @@ class App {
       titleText.appendChild(indicator);
       titleText.appendChild(titleLabel);
 
+      // Spacer on left to balance close button on right (for centering title)
+      const spacer = document.createElement('span');
+      spacer.className = 'tab-preview-spacer';
+
       const closeBtn = document.createElement('span');
       closeBtn.className = 'tab-preview-close';
       closeBtn.textContent = '✕';
@@ -2221,8 +2226,9 @@ class App {
         }
       });
 
-      titleBar.appendChild(titleText);
       titleBar.appendChild(closeBtn);
+      titleBar.appendChild(titleText);
+      titleBar.appendChild(spacer);
 
       // Title on top, content below
       preview.appendChild(titleBar);
