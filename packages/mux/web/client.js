@@ -44,7 +44,6 @@ class Panel {
     this.lastReportedWidth = 0;
     this.lastReportedHeight = 0;
     this.resizeTimeout = null;
-    this.skipNextResize = false;     // Skip resize event after show()
     this.pwd = null;                 // Current working directory
 
     // WebGPU state
@@ -70,12 +69,6 @@ class Panel {
 
   setupResizeObserver() {
     this.resizeObserver = new ResizeObserver(() => {
-      // Skip resize events triggered by show() - the panel already has correct size
-      if (this.skipNextResize) {
-        this.skipNextResize = false;
-        return;
-      }
-
       // Debounce resize to avoid flooding server during drag
       if (this.resizeTimeout) {
         clearTimeout(this.resizeTimeout);
@@ -279,10 +272,16 @@ class Panel {
 
   sendCreatePanel() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const rect = this.canvas.getBoundingClientRect();
+    // Use container size since panel might be hidden (display: none)
+    const rect = this.container.getBoundingClientRect();
     const width = Math.floor(rect.width) || 800;
     const height = Math.floor(rect.height) || 600;
     const scale = window.devicePixelRatio || 1;
+
+    // Track what size we're creating with to avoid duplicate resize
+    this.lastReportedWidth = width;
+    this.lastReportedHeight = height;
+
     const buf = new ArrayBuffer(9);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.CREATE_PANEL);
@@ -667,8 +666,6 @@ class Panel {
   }
   
   show() {
-    // Skip the resize event that fires when panel becomes visible
-    this.skipNextResize = true;
     this.element.classList.add('active');
     this.canvas.focus();
     this.resume();

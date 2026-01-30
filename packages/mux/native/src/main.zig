@@ -263,14 +263,17 @@ const Panel = struct {
         const panel = try allocator.create(Panel);
         errdefer allocator.destroy(panel);
 
+        // Create window at point dimensions (CSS pixels from browser)
+        // The layer's contentsScale handles retina rendering
         const window_view = createHiddenWindow(width, height) orelse return error.WindowCreationFailed;
 
-        // Make view layer-backed for Metal rendering
-        makeViewLayerBacked(window_view.view);
+        // Make view layer-backed for Metal rendering and set contentsScale for retina
+        makeViewLayerBacked(window_view.view, scale);
 
         var surface_config = c.ghostty_surface_config_new();
         surface_config.platform_tag = c.GHOSTTY_PLATFORM_MACOS;
         surface_config.platform.macos.nsview = @ptrCast(window_view.view);
+        // Use actual scale factor - ghostty will render at retina resolution
         surface_config.scale_factor = scale;
         // Use default shell (null = user's shell from /etc/passwd)
         surface_config.command = null;
@@ -283,8 +286,10 @@ const Panel = struct {
         // Focus the surface so it accepts input
         c.ghostty_surface_set_focus(surface, true);
 
+        // Set size in points - ghostty multiplies by scale_factor internally
         c.ghostty_surface_set_size(surface, width, height);
 
+        // Frame buffer is at pixel dimensions (width * scale, height * scale)
         const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
         const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * scale);
 
@@ -297,8 +302,8 @@ const Panel = struct {
             .compressor = try Compressor.init(),
             .sequence = 0,
             .last_keyframe = 0,
-            .width = width,
-            .height = height,
+            .width = width,       // Store point dimensions
+            .height = height,     // Store point dimensions
             .scale = scale,
             .streaming = std.atomic.Value(bool).init(false), // Start paused until connected
             .force_keyframe = true,
@@ -332,18 +337,19 @@ const Panel = struct {
     }
 
     // Internal resize - called from main thread only (via processInputQueue)
+    // width/height are in CSS pixels (points)
     fn resizeInternal(self: *Panel, width: u32, height: u32) !void {
         self.width = width;
         self.height = height;
 
-        // Resize the NSWindow and NSView
+        // Resize the NSWindow and NSView at point dimensions
         resizeWindow(self.window, width, height);
 
-        // Tell ghostty about the new size
+        // Tell ghostty about the new size in points - it multiplies by scale_factor internally
         c.ghostty_surface_set_size(self.surface, width, height);
 
         // Don't resize frame_buffer here - let captureFromIOSurface do it
-        // when the IOSurface actually updates to the new size
+        // when the IOSurface actually updates to the new size (at pixel dimensions)
         self.force_keyframe = true;
     }
 
@@ -1324,9 +1330,12 @@ const Server = struct {
     fn runRenderLoop(self: *Server) void {
         const target_fps: u64 = 30;
         const frame_time_ns: u64 = std.time.ns_per_s / target_fps;
+        const input_interval_ns: u64 = 8 * std.time.ns_per_ms; // Process input every 8ms
+
+        var last_frame: i128 = 0;
 
         while (self.running.load(.acquire)) {
-            const start = std.time.nanoTimestamp();
+            const now = std.time.nanoTimestamp();
 
             // Process pending panel creations/destructions/resizes (NSWindow/ghostty must be on main thread)
             self.processPendingPanels();
@@ -1336,40 +1345,44 @@ const Server = struct {
             // Tick ghostty
             self.tick();
 
-            // Process input and render all streaming panels
+            // Process input for all panels (more responsive than frame rate)
             self.mutex.lock();
             var panel_it = self.panels.valueIterator();
             while (panel_it.next()) |panel_ptr| {
                 const panel = panel_ptr.*;
-                // Process input queue for all panels (not just streaming ones)
                 panel.processInputQueue();
-                if (!panel.streaming.load(.acquire)) continue;
                 panel.tick();
             }
             self.mutex.unlock();
 
-            // Small delay for Metal render
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            // Only capture and send frames at target fps
+            const since_last_frame: u64 = @intCast(now - last_frame);
+            if (since_last_frame >= frame_time_ns) {
+                last_frame = now;
 
-            // Capture and send frames
-            self.mutex.lock();
-            panel_it = self.panels.valueIterator();
-            while (panel_it.next()) |panel_ptr| {
-                const panel = panel_ptr.*;
-                if (!panel.streaming.load(.acquire)) continue;
+                // Small delay for Metal render
+                std.Thread.sleep(1 * std.time.ns_per_ms);
 
-                if (panel.getIOSurface()) |iosurface| {
-                    panel.captureFromIOSurface(iosurface) catch continue;
-                    const result = panel.prepareFrame() catch continue;
-                    panel.sendFrame(result.data) catch {};
+                // Capture and send frames
+                self.mutex.lock();
+                panel_it = self.panels.valueIterator();
+                while (panel_it.next()) |panel_ptr| {
+                    const panel = panel_ptr.*;
+                    if (!panel.streaming.load(.acquire)) continue;
+
+                    if (panel.getIOSurface()) |iosurface| {
+                        panel.captureFromIOSurface(iosurface) catch continue;
+                        const result = panel.prepareFrame() catch continue;
+                        panel.sendFrame(result.data) catch {};
+                    }
                 }
+                self.mutex.unlock();
             }
-            self.mutex.unlock();
 
-            // Frame rate limiting
-            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - start);
-            if (elapsed < frame_time_ns) {
-                std.Thread.sleep(frame_time_ns - elapsed);
+            // Sleep until next input processing interval
+            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - now);
+            if (elapsed < input_interval_ns) {
+                std.Thread.sleep(input_interval_ns - elapsed);
             }
         }
     }
@@ -1430,14 +1443,26 @@ const WindowView = struct {
 };
 
 const MsgSendBoolFn = *const fn (objc.id, objc.SEL, bool) callconv(.c) void;
+const MsgSendCGFloatFn = *const fn (objc.id, objc.SEL, f64) callconv(.c) void;
 
 fn msgSendBool() MsgSendBoolFn {
     return @ptrCast(&objc.objc_msgSend);
 }
 
-fn makeViewLayerBacked(view: objc.id) void {
+fn msgSendCGFloat() MsgSendCGFloatFn {
+    return @ptrCast(&objc.objc_msgSend);
+}
+
+fn makeViewLayerBacked(view: objc.id, scale: f64) void {
     // [view setWantsLayer:YES]
     msgSendBool()(view, sel("setWantsLayer:"), true);
+
+    // Get the layer and set its contentsScale for retina rendering
+    const layer = msgSendId()(view, sel("layer"));
+    if (layer != null) {
+        // [layer setContentsScale:scale]
+        msgSendCGFloat()(layer, sel("setContentsScale:"), scale);
+    }
 }
 
 fn createHiddenWindow(width: u32, height: u32) ?WindowView {
