@@ -1983,10 +1983,8 @@ class App {
     const tabIndex = this.tabsEl.children.length + 1;
     const hotkeyHint = tabIndex <= 9 ? `⌘${tabIndex}` : '';
 
-    // Show ghost emoji if title is empty, • indicator for idle (no title yet means idle)
     const displayTitle = title || '👻';
-    const indicator = title ? '*' : '•';  // * when has title (command running), • when idle
-    tab.innerHTML = `<span class="close">×</span><span class="title-wrapper"><span class="indicator">${indicator}</span><span class="title">${displayTitle}</span></span><span class="hotkey">${hotkeyHint}</span>`;
+    tab.innerHTML = `<span class="close">×</span><span class="title-wrapper"><span class="indicator">•</span><span class="title">${displayTitle}</span></span><span class="hotkey">${hotkeyHint}</span>`;
 
     tab.addEventListener('click', (e) => {
       if (!e.target.classList.contains('close')) {
@@ -2052,11 +2050,11 @@ class App {
       const tabEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .title`);
       if (tabEl) tabEl.textContent = title;
 
-      // Update tab indicator (• for at prompt, * for command running)
+      // Update tab indicator (• for at prompt, ✱ for command running)
       const indicatorEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .indicator`);
       if (indicatorEl) {
         const isAtPrompt = this.isAtPrompt(targetPanel, title);
-        indicatorEl.textContent = isAtPrompt ? '•' : '*';
+        indicatorEl.textContent = isAtPrompt ? '•' : '✱';
       }
 
       // Update tab data
@@ -2116,8 +2114,8 @@ class App {
                                     title.startsWith('~') ||
                                     title === '';
       if (!titleLooksLikePrompt && title.length > 0) {
-        // Title looks like a running command - show folder + asterisk
-        indicator = '📁 *';
+        // Title looks like a running command - show folder + heavy asterisk
+        indicator = '📁 ✱';
       } else {
         // At prompt - just show folder, no dot or asterisk
         indicator = '📁';
@@ -2249,7 +2247,7 @@ class App {
       // Check if command is running by comparing title to pwd
       const isAtPrompt = firstPanel && firstPanel.pwd && tab.title &&
         (tab.title.includes(firstPanel.pwd) || tab.title.endsWith(firstPanel.pwd.split('/').pop()));
-      indicator.textContent = isAtPrompt ? '•' : '*';
+      indicator.textContent = isAtPrompt ? '•' : '✱';
 
       const titleLabel = document.createElement('span');
       titleLabel.className = 'tab-preview-title-label';
