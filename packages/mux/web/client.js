@@ -485,6 +485,16 @@ class Panel {
         }
         return;
       }
+      // Let global shortcuts bubble up (handled by window listener)
+      if (e.metaKey && !e.shiftKey && (e.key === '/' || e.key === '.')) {
+        return;  // Don't send to terminal, let window handler process
+      }
+      if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.')) {
+        return;  // Close all tabs - let window handler process
+      }
+      if (e.metaKey && e.key >= '1' && e.key <= '9') {
+        return;  // Tab switching - let window handler process
+      }
       // NOTE: Command palette and inspector open as separate floating windows
       // that are outside our IOSurface capture - they won't render in the browser
       this.sendKeyInput(e, 1); // press
@@ -685,31 +695,44 @@ class App {
       this.createPanel();
     });
 
-    // Global keyboard shortcuts
+    // Global keyboard shortcuts (use capture phase to run before canvas handler)
     window.addEventListener('keydown', (e) => {
       // ⌘1-9 to switch tabs
       if (e.metaKey && e.key >= '1' && e.key <= '9') {
         e.preventDefault();
+        e.stopPropagation();
         const index = parseInt(e.key) - 1;
         const tabs = Array.from(this.tabsEl.children);
         if (index < tabs.length) {
           const id = parseInt(tabs[index].dataset.id);
           this.switchToPanel(id);
         }
+        return;
       }
       // ⌘/ for new tab
       if (e.metaKey && e.key === '/') {
         e.preventDefault();
+        e.stopPropagation();
         this.createPanel();
+        return;
       }
       // ⌘. to close tab
-      if (e.metaKey && e.key === '.') {
+      if (e.metaKey && !e.shiftKey && e.key === '.') {
         e.preventDefault();
+        e.stopPropagation();
         if (this.activePanel) {
           this.removePanel(this.activePanel.id);
         }
+        return;
       }
-    });
+      // ⌘⇧. to close all tabs
+      if (e.metaKey && e.shiftKey && (e.key === '>' || e.key === '.')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeAllPanels();
+        return;
+      }
+    }, true);  // true = capture phase
   }
   
   connect(host = 'localhost') {
@@ -841,6 +864,20 @@ class App {
       if (!remaining.done) {
         this.switchToPanel(remaining.value);
       }
+    }
+  }
+
+  closeAllPanels() {
+    // Get all existing panel IDs
+    const ids = Array.from(this.panels.keys());
+    if (ids.length === 0) return;
+
+    // Create a new tab first
+    this.createPanel();
+
+    // Close all the old panels one by one
+    for (const id of ids) {
+      this.removePanel(id);
     }
   }
 
@@ -1129,6 +1166,9 @@ function setupMenus() {
           break;
         case 'close-tab':
           if (app.activePanel) app.removePanel(app.activePanel.id);
+          break;
+        case 'close-all-tabs':
+          app.closeAllPanels();
           break;
         case 'copy':
           document.execCommand('copy');
