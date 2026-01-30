@@ -120,6 +120,10 @@ const FrameBuffer = struct {
     width: u32,
     height: u32,
     allocator: std.mem.Allocator,
+    // Background color for alpha blending (RGB)
+    bg_r: u8,
+    bg_g: u8,
+    bg_b: u8,
 
     fn init(allocator: std.mem.Allocator, width: u32, height: u32) !FrameBuffer {
         const rgba_size = width * height * 4;
@@ -135,6 +139,9 @@ const FrameBuffer = struct {
             .width = width,
             .height = height,
             .allocator = allocator,
+            .bg_r = 0x28,  // Default background (from ghostty config)
+            .bg_g = 0x2c,
+            .bg_b = 0x34,
         };
     }
 
@@ -152,17 +159,89 @@ const FrameBuffer = struct {
         self.* = try FrameBuffer.init(self.allocator, width, height);
     }
 
-    // Convert BGRA to RGB (drop alpha, swap B/R)
+    // Convert BGRA to RGB with alpha blending
     fn convertBgraToRgb(self: *FrameBuffer) void {
         const pixel_count = self.width * self.height;
+        const bgra = self.rgba_current;
+        const rgb = self.rgb_current;
+        const bg_r = self.bg_r;
+        const bg_g = self.bg_g;
+        const bg_b = self.bg_b;
+
+        // Process 8 pixels at a time for SIMD
+        const Vec8 = @Vector(8, u16);
+        const vec_bg_r: Vec8 = @splat(@as(u16, bg_r));
+        const vec_bg_g: Vec8 = @splat(@as(u16, bg_g));
+        const vec_bg_b: Vec8 = @splat(@as(u16, bg_b));
+        const vec_255: Vec8 = @splat(@as(u16, 255));
+
         var i: usize = 0;
+        while (i + 8 <= pixel_count) : (i += 8) {
+            // Check if all 8 pixels are fully opaque (fast path)
+            var all_opaque = true;
+            inline for (0..8) |j| {
+                if (bgra[(i + j) * 4 + 3] != 255) {
+                    all_opaque = false;
+                    break;
+                }
+            }
+
+            if (all_opaque) {
+                // Fast path: no alpha blending needed
+                inline for (0..8) |j| {
+                    const src = (i + j) * 4;
+                    const dst = (i + j) * 3;
+                    rgb[dst + 0] = bgra[src + 2]; // R
+                    rgb[dst + 1] = bgra[src + 1]; // G
+                    rgb[dst + 2] = bgra[src + 0]; // B
+                }
+            } else {
+                // Slow path: alpha blend with SIMD
+                var r: Vec8 = undefined;
+                var g: Vec8 = undefined;
+                var b: Vec8 = undefined;
+                var a: Vec8 = undefined;
+
+                inline for (0..8) |j| {
+                    const src = (i + j) * 4;
+                    b[j] = bgra[src + 0];
+                    g[j] = bgra[src + 1];
+                    r[j] = bgra[src + 2];
+                    a[j] = bgra[src + 3];
+                }
+
+                // Alpha blend: result = (fg * a + bg * (255 - a)) / 255
+                const inv_a = vec_255 - a;
+                const blended_r = (r * a + vec_bg_r * inv_a) / vec_255;
+                const blended_g = (g * a + vec_bg_g * inv_a) / vec_255;
+                const blended_b = (b * a + vec_bg_b * inv_a) / vec_255;
+
+                inline for (0..8) |j| {
+                    const dst = (i + j) * 3;
+                    rgb[dst + 0] = @truncate(blended_r[j]);
+                    rgb[dst + 1] = @truncate(blended_g[j]);
+                    rgb[dst + 2] = @truncate(blended_b[j]);
+                }
+            }
+        }
+
+        // Handle remaining pixels
         while (i < pixel_count) : (i += 1) {
             const src = i * 4;
             const dst = i * 3;
-            // BGRA -> RGB
-            self.rgb_current[dst + 0] = self.rgba_current[src + 2]; // R
-            self.rgb_current[dst + 1] = self.rgba_current[src + 1]; // G
-            self.rgb_current[dst + 2] = self.rgba_current[src + 0]; // B
+            const a = bgra[src + 3];
+
+            if (a == 255) {
+                rgb[dst + 0] = bgra[src + 2];
+                rgb[dst + 1] = bgra[src + 1];
+                rgb[dst + 2] = bgra[src + 0];
+            } else {
+                const inv_a = 255 - @as(u16, a);
+                const aa = @as(u16, a);
+                rgb[dst + 0] = @truncate((@as(u16, bgra[src + 2]) * aa + @as(u16, bg_r) * inv_a) / 255);
+                rgb[dst + 1] = @truncate((@as(u16, bgra[src + 1]) * aa + @as(u16, bg_g) * inv_a) / 255);
+                rgb[dst + 2] = @truncate((@as(u16, bgra[src + 0]) * aa + @as(u16, bg_b) * inv_a) / 255);
+            }
         }
     }
 
