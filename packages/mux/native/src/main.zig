@@ -329,11 +329,15 @@ const Panel = struct {
     fn resizeInternal(self: *Panel, width: u32, height: u32) !void {
         self.width = width;
         self.height = height;
+
+        // Resize the NSWindow and NSView
+        resizeWindow(self.window, width, height);
+
+        // Tell ghostty about the new size
         c.ghostty_surface_set_size(self.surface, width, height);
 
-        const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * self.scale);
-        const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * self.scale);
-        try self.frame_buffer.resize(pixel_width, pixel_height);
+        // Don't resize frame_buffer here - let captureFromIOSurface do it
+        // when the IOSurface actually updates to the new size
         self.force_keyframe = true;
     }
 
@@ -1229,8 +1233,8 @@ const Server = struct {
                         continue;
                     };
 
-                    if (panel.sequence % 100 == 1) {
-                        std.debug.print("[DEBUG] Frame {}: {} bytes, keyframe={}\n", .{ panel.sequence, result.data.len, result.is_keyframe });
+                    if (panel.sequence % 100 == 1 or panel.force_keyframe) {
+                        std.debug.print("[DEBUG] Frame {}: {}x{}, {} bytes, keyframe={}\n", .{ panel.sequence, panel.frame_buffer.width, panel.frame_buffer.height, result.data.len, result.is_keyframe });
                     }
 
                     panel.sendFrame(result.data) catch |err| {
@@ -1335,6 +1339,22 @@ fn createHiddenWindow(width: u32, height: u32) ?WindowView {
     const view = msgSendId()(initialized, sel("contentView")) orelse return null;
 
     return .{ .window = initialized, .view = view };
+}
+
+fn resizeWindow(window: objc.id, width: u32, height: u32) void {
+    if (window == null) return;
+
+    const rect = NSRect{
+        .x = 0.0,
+        .y = 0.0,
+        .w = @floatFromInt(width),
+        .h = @floatFromInt(height),
+    };
+
+    // [window setFrame:display:]
+    const MsgSendSetFrame = *const fn (objc.id, objc.SEL, NSRect, bool) callconv(.c) void;
+    const setFrame: MsgSendSetFrame = @ptrCast(&objc.objc_msgSend);
+    setFrame(window, sel("setFrame:display:"), rect, true);
 }
 
 var debug_frame_count: u32 = 0;

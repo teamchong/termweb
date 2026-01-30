@@ -86,7 +86,7 @@ class Panel {
             this.onResize(this.serverId, width, height);
           }
         }
-      }, 100);
+      }, 16);  // ~60fps for responsive resize
     });
     this.resizeObserver.observe(this.element);
   }
