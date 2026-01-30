@@ -632,8 +632,39 @@ class Panel {
   destroy() {
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
+      this.resizeObserver = null;
+    }
+    if (this.resizeTimeout) {
+      clearTimeout(this.resizeTimeout);
+      this.resizeTimeout = null;
     }
     this.disconnect();
+
+    // Clean up WebGPU resources
+    if (this.prevBuffer) {
+      this.prevBuffer.destroy();
+      this.prevBuffer = null;
+    }
+    if (this.diffBuffer) {
+      this.diffBuffer.destroy();
+      this.diffBuffer = null;
+    }
+    if (this.texture) {
+      this.texture.destroy();
+      this.texture = null;
+    }
+    // Bind groups, pipelines, sampler are automatically garbage collected
+    // but clear references to help GC
+    this.xorBindGroup = null;
+    this.convertBindGroup = null;
+    this.renderBindGroup = null;
+    this.pipeline = null;
+    this.xorPipeline = null;
+    this.rgbToRgbaPipeline = null;
+    this.sampler = null;
+    this.context = null;
+    this.device = null;
+
     this.element.remove();
   }
 
@@ -838,13 +869,19 @@ class SplitContainer {
 
     if (this.first && this.first.panel === panel) {
       // First child is the panel to remove - promote second
+      const toRemove = this.first;
       this.promoteChild(this.second);
+      // Clean up the removed container's element
+      if (toRemove.element) toRemove.element.remove();
       return true;
     }
 
     if (this.second && this.second.panel === panel) {
       // Second child is the panel to remove - promote first
+      const toRemove = this.second;
       this.promoteChild(this.first);
+      // Clean up the removed container's element
+      if (toRemove.element) toRemove.element.remove();
       return true;
     }
 
@@ -856,6 +893,12 @@ class SplitContainer {
   }
 
   promoteChild(child) {
+    // Clean up old divider
+    if (this.divider) {
+      this.divider.remove();
+      this.divider = null;
+    }
+
     // Replace this split with the remaining child
     if (child.direction !== null) {
       // Child is also a split - adopt its structure
@@ -863,6 +906,7 @@ class SplitContainer {
       this.first = child.first;
       this.second = child.second;
       this.ratio = child.ratio;
+      this.divider = child.divider;
       this.panel = null;
       if (this.first) this.first.parent = this;
       if (this.second) this.second.parent = this;
@@ -873,7 +917,6 @@ class SplitContainer {
       this.first = null;
       this.second = null;
       this.panel = child.panel;
-      this.divider = null;
 
       // Rebuild as leaf
       const parent = this.element.parentElement;
