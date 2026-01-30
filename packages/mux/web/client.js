@@ -74,18 +74,20 @@ class Panel {
         clearTimeout(this.resizeTimeout);
       }
       this.resizeTimeout = setTimeout(() => {
-        const rect = this.element.getBoundingClientRect();
+        // Use container size for consistency with sendCreatePanel
+        const rect = this.container.getBoundingClientRect();
         const width = Math.floor(rect.width);
         const height = Math.floor(rect.height);
 
-        // Only send if size actually changed
-        if (width !== this.lastReportedWidth || height !== this.lastReportedHeight) {
-          this.lastReportedWidth = width;
-          this.lastReportedHeight = height;
+        // Skip if panel is hidden (0x0) or size unchanged
+        if (width === 0 || height === 0) return;
+        if (width === this.lastReportedWidth && height === this.lastReportedHeight) return;
 
-          if (this.serverId !== null && this.onResize) {
-            this.onResize(this.serverId, width, height);
-          }
+        this.lastReportedWidth = width;
+        this.lastReportedHeight = height;
+
+        if (this.serverId !== null && this.onResize) {
+          this.onResize(this.serverId, width, height);
         }
       }, 16);  // ~60fps for responsive resize
     });

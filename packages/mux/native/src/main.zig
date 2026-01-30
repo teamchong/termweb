@@ -339,6 +339,9 @@ const Panel = struct {
     // Internal resize - called from main thread only (via processInputQueue)
     // width/height are in CSS pixels (points)
     fn resizeInternal(self: *Panel, width: u32, height: u32) !void {
+        // Skip if size hasn't changed to avoid unnecessary terminal reflow
+        if (self.width == width and self.height == height) return;
+
         self.width = width;
         self.height = height;
 
