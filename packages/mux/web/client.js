@@ -2102,11 +2102,10 @@ class App {
   }
 
   updateIndicatorForPanel(panel, title) {
-    // Determine if a command is running:
-    // - If title contains path characters or looks like a path, we're at prompt
-    // - Otherwise, a command is probably running
+    // Format: folder + indicator (• at prompt, ✱ running)
     const isAtPrompt = this.isAtPrompt(panel, title);
-    const indicator = isAtPrompt ? '•' : '✱';
+    const stateIndicator = isAtPrompt ? '•' : '✱';
+    const indicator = panel.pwd ? `📁 ${stateIndicator}` : stateIndicator;
     this.updateTitleIndicator(indicator);
   }
 
