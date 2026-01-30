@@ -1221,6 +1221,30 @@ const Server = struct {
         }
     }
 
+    fn broadcastClipboard(self: *Server, text: []const u8) void {
+        // Base64 encode the text to avoid JSON escaping issues
+        const base64 = std.base64.standard;
+        const encoded_len = base64.Encoder.calcSize(text.len);
+
+        // Allocate buffer for JSON message
+        const msg_buf = self.allocator.alloc(u8, encoded_len + 32) catch return;
+        defer self.allocator.free(msg_buf);
+
+        const encoded_buf = self.allocator.alloc(u8, encoded_len) catch return;
+        defer self.allocator.free(encoded_buf);
+
+        const encoded = base64.Encoder.encode(encoded_buf, text);
+
+        const msg = std.fmt.bufPrint(msg_buf, "{{\"type\":\"clipboard\",\"data\":\"{s}\"}}", .{encoded}) catch return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.control_connections.items) |conn| {
+            conn.sendText(msg) catch {};
+        }
+    }
+
     // Run HTTP server
     fn runHttpServer(self: *Server) void {
         self.http_server.run() catch |err| {
@@ -1653,9 +1677,6 @@ fn writeClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_
     _ = protected;
 
     const self = Server.global_server orelse return;
-
-    // Only handle selection clipboard writes
-    if (clipboard != c.GHOSTTY_CLIPBOARD_SELECTION) return;
     if (count == 0 or content == null) return;
 
     // Get the text/plain content
@@ -1667,16 +1688,19 @@ fn writeClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_
             if (std.mem.eql(u8, mime, "text/plain")) {
                 const data = std.mem.span(item.data);
 
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                if (clipboard == c.GHOSTTY_CLIPBOARD_SELECTION) {
+                    // Store selection clipboard locally
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
 
-                // Free old selection
-                if (self.selection_clipboard) |old| {
-                    self.allocator.free(old);
+                    if (self.selection_clipboard) |old| {
+                        self.allocator.free(old);
+                    }
+                    self.selection_clipboard = self.allocator.dupe(u8, data) catch null;
+                } else if (clipboard == c.GHOSTTY_CLIPBOARD_STANDARD) {
+                    // Send standard clipboard to all connected clients
+                    self.broadcastClipboard(data);
                 }
-
-                // Store new selection
-                self.selection_clipboard = self.allocator.dupe(u8, data) catch null;
                 return;
             }
         }

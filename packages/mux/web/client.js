@@ -504,8 +504,13 @@ class Panel {
       if (e.metaKey && e.key >= '1' && e.key <= '9') {
         return;
       }
-      // ⌘C for copy - let browser handle
-      if (e.metaKey && (e.key === 'c' || e.key === 'C')) {
+      // ⌘C for copy - send to ghostty
+      if (e.metaKey && !e.shiftKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.serverId !== null && this.onViewAction) {
+          this.onViewAction(this.serverId, 'copy_to_clipboard');
+        }
         return;
       }
       // ⌘V for paste - handle via paste event
@@ -855,6 +860,20 @@ class App {
 
       case 'panel_bell':
         this.handlePanelBell(msg.panel_id);
+        break;
+
+      case 'clipboard':
+        // Clipboard data from server (base64 encoded)
+        try {
+          const text = atob(msg.data);
+          navigator.clipboard.writeText(text).then(() => {
+            console.log('Clipboard updated from terminal');
+          }).catch(err => {
+            console.error('Failed to write clipboard:', err);
+          });
+        } catch (e) {
+          console.error('Failed to decode clipboard data:', e);
+        }
         break;
     }
   }
@@ -1222,7 +1241,9 @@ function setupMenus() {
           app.closeAllPanels();
           break;
         case 'copy':
-          document.execCommand('copy');
+          if (app.activePanel?.serverId !== null) {
+            app.sendViewAction(app.activePanel.serverId, 'copy_to_clipboard');
+          }
           break;
         case 'paste':
           navigator.clipboard.readText().then(text => {
