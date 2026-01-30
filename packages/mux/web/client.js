@@ -1133,7 +1133,8 @@ class App {
         break;
         
       case 'panel_closed':
-        this.removePanel(msg.panel_id);
+        // Server closed a panel - find and remove it
+        this.handleServerPanelClosed(msg.panel_id);
         break;
         
       case 'panel_title':
@@ -1453,6 +1454,71 @@ class App {
     if (newIndex >= panels.length) newIndex = 0;
 
     this.setActivePanel(panels[newIndex]);
+  }
+
+  // Handle server notifying us that a panel was closed
+  handleServerPanelClosed(serverId) {
+    // Find the panel with this server ID
+    let targetPanel = null;
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === serverId) {
+        targetPanel = panel;
+        break;
+      }
+    }
+    if (!targetPanel) return;
+
+    // Find which tab this panel belongs to
+    const tabId = this.findTabForPanel(targetPanel);
+    if (tabId === null) return;
+
+    const tab = this.tabs.get(tabId);
+    if (!tab) return;
+
+    // Get all panels in the tab
+    const tabPanels = tab.root.getAllPanels();
+
+    if (tabPanels.length === 1) {
+      // Last panel in tab - close the whole tab
+      // But first create a new tab if this is the last tab
+      if (this.tabs.size === 1) {
+        this.createTab();
+      }
+
+      tab.root.destroy();
+      tab.element.remove();
+      this.tabs.delete(tabId);
+      this.removeTabUI(tabId);
+      this.panels.delete(targetPanel.id);
+
+      if (this.activeTab === tabId) {
+        this.activeTab = null;
+        this.activePanel = null;
+        const remaining = this.tabs.keys().next();
+        if (!remaining.done) {
+          this.switchToTab(remaining.value);
+        }
+      }
+    } else {
+      // Multiple panels - just close this one
+      const panelId = targetPanel.id;
+
+      // Find another panel to focus if this was active
+      const wasActive = targetPanel === this.activePanel;
+      const otherPanel = tabPanels.find(p => p !== targetPanel);
+
+      // Remove from split container
+      tab.root.removePanel(targetPanel);
+
+      // Destroy panel
+      targetPanel.destroy();
+      this.panels.delete(panelId);
+
+      // Focus other panel if needed
+      if (wasActive && otherPanel) {
+        this.setActivePanel(otherPanel);
+      }
+    }
   }
 
   sendClosePanel(serverId) {
