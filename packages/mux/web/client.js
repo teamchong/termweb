@@ -1799,6 +1799,21 @@ class App {
     }
     if (!targetPanel) return;
 
+    // Check if this is the quick terminal panel
+    if (targetPanel === this.quickTerminalPanel) {
+      const container = document.getElementById('quick-terminal');
+      if (container) container.classList.remove('visible');
+      targetPanel.destroy();
+      this.panels.delete(targetPanel.id);
+      this.quickTerminalPanel = null;
+      // Restore previous active panel
+      if (this.previousActivePanel) {
+        this.setActivePanel(this.previousActivePanel);
+        this.previousActivePanel = null;
+      }
+      return;
+    }
+
     // Find which tab this panel belongs to
     const tabId = this.findTabForPanel(targetPanel);
     if (tabId === null) return;
