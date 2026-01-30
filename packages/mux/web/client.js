@@ -30,12 +30,12 @@ const FrameType = {
 // ============================================================================
 
 class Panel {
-  constructor(id, container, serverId = null, onResize = null, onFontAction = null) {
+  constructor(id, container, serverId = null, onResize = null, onViewAction = null) {
     this.id = id;                    // Local client ID
     this.serverId = serverId;        // Server panel ID (null = create new)
     this.container = container;
     this.onResize = onResize;        // Callback for resize events
-    this.onFontAction = onFontAction; // Callback for font size actions
+    this.onViewAction = onViewAction; // Callback for ghostty view actions
     this.ws = null;
     this.canvas = document.createElement('canvas');
     this.width = 0;
@@ -477,27 +477,15 @@ class Panel {
       e.preventDefault();
       // Handle font size shortcuts via control channel
       if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
-        if (this.serverId !== null && this.onFontAction) {
-          if (e.key === '=') this.onFontAction(this.serverId, 'increase_font_size:1');
-          else if (e.key === '-') this.onFontAction(this.serverId, 'decrease_font_size:1');
-          else if (e.key === '0') this.onFontAction(this.serverId, 'reset_font_size');
+        if (this.serverId !== null && this.onViewAction) {
+          if (e.key === '=') this.onViewAction(this.serverId, 'increase_font_size:1');
+          else if (e.key === '-') this.onViewAction(this.serverId, 'decrease_font_size:1');
+          else if (e.key === '0') this.onViewAction(this.serverId, 'reset_font_size');
         }
         return;
       }
-      // Cmd+Shift+P for command palette
-      if (e.metaKey && e.shiftKey && e.code === 'KeyP') {
-        if (this.serverId !== null && this.onFontAction) {
-          this.onFontAction(this.serverId, 'toggle_command_palette');
-        }
-        return;
-      }
-      // Alt+Cmd+I for terminal inspector
-      if (e.metaKey && e.altKey && e.code === 'KeyI') {
-        if (this.serverId !== null && this.onFontAction) {
-          this.onFontAction(this.serverId, 'inspector:toggle');
-        }
-        return;
-      }
+      // NOTE: Command palette and inspector open as separate floating windows
+      // that are outside our IOSurface capture - they won't render in the browser
       this.sendKeyInput(e, 1); // press
     });
 
@@ -796,8 +784,8 @@ class App {
     // Create new panel on server
     const localId = this.nextLocalId++;
     const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
-    const onFontAction = (serverId, action) => this.sendFontAction(serverId, action);
-    const panel = new Panel(localId, this.panelsEl, null, onResize, onFontAction);  // null = create new
+    const onViewAction = (serverId, action) => this.sendViewAction(serverId, action);
+    const panel = new Panel(localId, this.panelsEl, null, onResize, onViewAction);  // null = create new
     panel.connect();
     this.panels.set(localId, panel);
     this.addTab(localId, `Terminal`);
@@ -812,8 +800,8 @@ class App {
 
     const localId = this.nextLocalId++;
     const onResize = (serverId, w, h) => this.sendResizePanel(serverId, w, h);
-    const onFontAction = (serverId, action) => this.sendFontAction(serverId, action);
-    const panel = new Panel(localId, this.panelsEl, serverId, onResize, onFontAction);  // serverId = connect to existing
+    const onViewAction = (serverId, action) => this.sendViewAction(serverId, action);
+    const panel = new Panel(localId, this.panelsEl, serverId, onResize, onViewAction);  // serverId = connect to existing
     panel.connect();
     this.panels.set(localId, panel);
     this.addTab(localId, `Terminal`);
@@ -865,11 +853,11 @@ class App {
     console.log(`Sent resize_panel for server panel ${serverId}: ${width}x${height}`);
   }
 
-  sendFontAction(serverId, action) {
+  sendViewAction(serverId, action) {
     if (!this.controlWs || this.controlWs.readyState !== WebSocket.OPEN) return;
-    const msg = JSON.stringify({ type: 'font_action', panel_id: serverId, action });
+    const msg = JSON.stringify({ type: 'view_action', panel_id: serverId, action });
     this.controlWs.send(msg);
-    console.log(`Sent font_action for server panel ${serverId}: ${action}`);
+    console.log(`Sent view_action for server panel ${serverId}: ${action}`);
   }
 
   switchToPanel(id) {

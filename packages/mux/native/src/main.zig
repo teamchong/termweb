@@ -923,17 +923,19 @@ const Server = struct {
             self.mutex.lock();
             self.pending_resizes.append(self.allocator, .{ .id = id, .width = width, .height = height }) catch {};
             self.mutex.unlock();
-        } else if (std.mem.indexOf(u8, data, "\"font_action\"")) |_| {
-            // Execute font action on panel
+        } else if (std.mem.indexOf(u8, data, "\"view_action\"")) |_| {
+            // Execute view action on panel
             const id = self.parseJsonInt(data, "panel_id") orelse return;
             const action = self.parseJsonString(data, "action") orelse return;
-            std.debug.print("Font action on panel {}: {s}\n", .{ id, action });
+            std.debug.print("View action on panel {}: {s} (len={})\n", .{ id, action, action.len });
             self.mutex.lock();
             if (self.panels.get(id)) |panel| {
                 self.mutex.unlock();
-                _ = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
+                const result = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
+                std.debug.print("View action result: {}\n", .{result});
             } else {
                 self.mutex.unlock();
+                std.debug.print("Panel {} not found\n", .{id});
             }
         }
     }
