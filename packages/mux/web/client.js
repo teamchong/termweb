@@ -2568,25 +2568,24 @@ class App {
     if (container.classList.contains('visible')) {
       // Hide quick terminal (keep panel alive for persistence)
       container.classList.remove('visible');
-      // Refocus main terminal
-      if (this.activePanel && this.activePanel.canvas) {
-        this.activePanel.canvas.focus();
+      // Restore previous active panel
+      if (this.previousActivePanel) {
+        this.setActivePanel(this.previousActivePanel);
+        this.previousActivePanel = null;
       }
     } else {
       // Show quick terminal
       container.classList.add('visible');
+      // Save current active panel to restore later
+      this.previousActivePanel = this.activePanel;
       // Create panel only if not already created
       if (!this.quickTerminalPanel) {
         const content = container.querySelector('.quick-terminal-content');
         content.innerHTML = '';
         this.quickTerminalPanel = this.createPanel(content, null);
       }
-      // Focus after animation starts
-      setTimeout(() => {
-        if (this.quickTerminalPanel?.canvas) {
-          this.quickTerminalPanel.canvas.focus();
-        }
-      }, 50);
+      // Set quick terminal as active panel
+      this.setActivePanel(this.quickTerminalPanel);
     }
   }
 }
