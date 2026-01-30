@@ -608,6 +608,8 @@ const Panel = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     input_queue: std.ArrayList(InputEvent),
+    title: []const u8,  // Last known title
+    pwd: []const u8,    // Last known working directory
 
     const KEYFRAME_INTERVAL_MS = 2000;
 
@@ -665,6 +667,8 @@ const Panel = struct {
             .allocator = allocator,
             .mutex = .{},
             .input_queue = .{},
+            .title = &.{},
+            .pwd = &.{},
         };
 
         return panel;
@@ -675,6 +679,8 @@ const Panel = struct {
         self.frame_buffer.deinit();
         self.compressor.deinit();
         self.input_queue.deinit(self.allocator);
+        if (self.title.len > 0) self.allocator.free(self.title);
+        if (self.pwd.len > 0) self.allocator.free(self.pwd);
         self.allocator.destroy(self);
     }
 
@@ -1595,10 +1601,13 @@ const Server = struct {
         while (it.next()) |entry| {
             if (!first) writer.writeAll(",") catch return;
             first = false;
-            writer.print("{{\"id\":{},\"width\":{},\"height\":{}}}", .{
-                entry.value_ptr.*.id,
-                entry.value_ptr.*.width,
-                entry.value_ptr.*.height,
+            const panel = entry.value_ptr.*;
+            writer.print("{{\"id\":{},\"width\":{},\"height\":{},\"title\":\"{s}\",\"pwd\":\"{s}\"}}", .{
+                panel.id,
+                panel.width,
+                panel.height,
+                panel.title,
+                panel.pwd,
             }) catch return;
         }
 
@@ -1638,6 +1647,12 @@ const Server = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Store title in panel for reconnects
+        if (self.panels.get(panel_id)) |panel| {
+            if (panel.title.len > 0) self.allocator.free(panel.title);
+            panel.title = self.allocator.dupe(u8, title) catch &.{};
+        }
+
         for (self.control_connections.items) |conn| {
             conn.sendText(msg) catch {};
         }
@@ -1661,6 +1676,12 @@ const Server = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Store pwd in panel for reconnects
+        if (self.panels.get(panel_id)) |panel| {
+            if (panel.pwd.len > 0) self.allocator.free(panel.pwd);
+            panel.pwd = self.allocator.dupe(u8, pwd) catch &.{};
+        }
 
         for (self.control_connections.items) |conn| {
             conn.sendText(msg) catch {};
