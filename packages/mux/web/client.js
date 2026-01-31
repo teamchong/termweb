@@ -2339,7 +2339,19 @@ class App {
 
     targetPanel.pwd = pwd;
 
-    // If this is the active panel, update the indicator
+    // Update tab indicator to match (both tab and title should show same state)
+    const tabId = this.findTabIdForPanel(targetPanel);
+    if (tabId !== null) {
+      const tab = this.tabs.get(tabId);
+      const currentTitle = tab?.title || '';
+      const indicatorEl = this.tabsEl.querySelector(`[data-id="${tabId}"] .indicator`);
+      if (indicatorEl) {
+        const isAtPrompt = this.isAtPrompt(targetPanel, currentTitle);
+        indicatorEl.textContent = isAtPrompt ? '•' : '✱';
+      }
+    }
+
+    // If this is the active panel, update the title indicator
     if (targetPanel === this.activePanel) {
       const appTitle = document.getElementById('app-title');
       const currentTitle = appTitle ? appTitle.textContent : '';
@@ -2347,17 +2359,27 @@ class App {
     }
   }
 
+  findTabIdForPanel(panel) {
+    for (const [tabId, tab] of this.tabs) {
+      const panels = tab.root.getAllPanels();
+      if (panels.includes(panel)) return tabId;
+    }
+    return null;
+  }
+
   updateIndicatorForPanel(panel, title) {
     // Format: folder + indicator (• at prompt, ✱ running)
     const isAtPrompt = this.isAtPrompt(panel, title);
     const stateIndicator = isAtPrompt ? '•' : '✱';
-    const indicator = panel.pwd ? `📁 ${stateIndicator}` : stateIndicator;
-    this.updateTitleIndicator(indicator);
+    const indicator = panel.pwd ? '📁' : '';
+    this.updateTitleIndicator(indicator, stateIndicator);
   }
 
-  updateTitleIndicator(indicator) {
+  updateTitleIndicator(indicator, stateIndicator) {
     const el = document.getElementById('title-indicator');
     if (el) el.innerHTML = indicator;
+    const elState = document.getElementById('title-state-indicator');
+    if (elState) elState.innerHTML = stateIndicator;
   }
 
   handlePanelBell(serverId) {
