@@ -1253,7 +1253,7 @@ class App {
 
     this.tabsEl = document.getElementById('tabs');
     this.panelsEl = document.getElementById('panels');
-    this.statusEl = document.getElementById('status');
+    this.statusDot = document.getElementById('status-dot');
 
     document.getElementById('new-tab').addEventListener('click', () => {
       this.createTab();
@@ -1446,12 +1446,23 @@ class App {
       }
     });
   }
-  
+
+  setStatus(state, message) {
+    if (!this.statusDot) return;
+    this.statusDot.className = '';
+    if (state === 'connected') {
+      this.statusDot.classList.add('connected');
+    } else if (state === 'error') {
+      this.statusDot.classList.add('error');
+    }
+    this.statusDot.title = message;
+  }
+
   connect(host = 'localhost') {
     this.controlWs = new WebSocket(`ws://${host}:${CONTROL_PORT}`);
     
     this.controlWs.onopen = () => {
-      this.statusEl.textContent = 'Connected';
+      this.setStatus('connected', 'Connected');
       console.log('Control channel connected');
       // Wait for panel_list to decide whether to create or connect
     };
@@ -1470,12 +1481,12 @@ class App {
     };
     
     this.controlWs.onclose = () => {
-      this.statusEl.textContent = 'Disconnected';
+      this.setStatus('disconnected', 'Disconnected');
       console.log('Control channel disconnected');
     };
     
     this.controlWs.onerror = (err) => {
-      this.statusEl.textContent = 'Connection error';
+      this.setStatus('error', 'Connection error');
       console.error('Control error:', err);
     };
   }
