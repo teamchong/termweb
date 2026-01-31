@@ -1395,11 +1395,15 @@ const Server = struct {
     }
 
     fn onControlMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        _ = is_binary;
         const self = global_server orelse return;
 
-        // Parse JSON control message
-        self.handleControlMessage(conn, data);
+        if (is_binary and data.len > 0) {
+            // Binary message - file transfer
+            self.handleBinaryControlMessage(conn, data);
+        } else {
+            // Text message - JSON control message
+            self.handleControlMessage(conn, data);
+        }
     }
 
     fn onControlDisconnect(conn: *ws.Connection) void {
@@ -1699,10 +1703,37 @@ const Server = struct {
         }
     }
 
-    fn handleFileUpload(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
-        const filename = self.parseJsonString(data, "filename") orelse return;
-        const base64_data = self.parseJsonString(data, "data") orelse return;
+    // Binary control message handler for file transfer
+    // 0x10 = file_upload: [panel_id:u32][name_len:u16][name][compressed_data]
+    // 0x11 = file_download: [panel_id:u32][path_len:u16][path]
+    fn handleBinaryControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 1) return;
+
+        const msg_type = data[0];
+        switch (msg_type) {
+            0x10 => self.handleBinaryFileUpload(conn, data[1..]),
+            0x11 => self.handleBinaryFileDownload(conn, data[1..]),
+            else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
+        }
+    }
+
+    // Binary file upload: [panel_id:u32][name_len:u16][name][compressed_data]
+    fn handleBinaryFileUpload(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 6) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const panel_id = std.mem.readInt(u32, data[0..4], .little);
+        const name_len = std.mem.readInt(u16, data[4..6], .little);
+
+        if (data.len < 6 + name_len) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const filename = data[6 .. 6 + name_len];
+        const compressed_data = data[6 + name_len ..];
 
         // Get panel's cwd
         self.mutex.lock();
@@ -1710,83 +1741,108 @@ const Server = struct {
         self.mutex.unlock();
 
         if (panel == null) {
-            self.sendFileError(conn, filename, "Panel not found");
+            self.sendBinaryFileError(conn, "Panel not found");
             return;
         }
 
-        // Get current working directory from panel
         const cwd = panel.?.pwd;
         if (cwd.len == 0) {
-            self.sendFileError(conn, filename, "Cannot determine working directory");
+            self.sendBinaryFileError(conn, "No working directory");
             return;
         }
 
-        // Build full path: cwd/filename
+        // Build full path
         var path_buf: [4096]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cwd, filename }) catch {
-            self.sendFileError(conn, filename, "Path too long");
+            self.sendBinaryFileError(conn, "Path too long");
             return;
         };
 
-        // Decode base64
-        const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(base64_data) catch {
-            self.sendFileError(conn, filename, "Invalid base64 data");
+        // Decompress with libdeflate
+        const decompressor = c.libdeflate_alloc_decompressor() orelse {
+            self.sendBinaryFileError(conn, "Decompressor init failed");
             return;
         };
-        const decoded = self.allocator.alloc(u8, decoded_size) catch {
-            self.sendFileError(conn, filename, "Out of memory");
-            return;
-        };
-        defer self.allocator.free(decoded);
+        defer c.libdeflate_free_decompressor(decompressor);
 
-        _ = std.base64.standard.Decoder.decode(decoded, base64_data) catch {
-            self.sendFileError(conn, filename, "Base64 decode failed");
+        // Allocate buffer for decompressed data (estimate 10x compression ratio max)
+        const max_decompressed = @min(compressed_data.len * 10, 100 * 1024 * 1024);
+        const decompressed = self.allocator.alloc(u8, max_decompressed) catch {
+            self.sendBinaryFileError(conn, "Out of memory");
             return;
         };
+        defer self.allocator.free(decompressed);
+
+        var actual_size: usize = 0;
+        const result = c.libdeflate_zlib_decompress(
+            decompressor,
+            compressed_data.ptr,
+            compressed_data.len,
+            decompressed.ptr,
+            decompressed.len,
+            &actual_size,
+        );
+
+        if (result != 0) {
+            self.sendBinaryFileError(conn, "Decompression failed");
+            return;
+        }
 
         // Write file
         const file = std.fs.createFileAbsolute(full_path, .{}) catch {
-            self.sendFileError(conn, filename, "Cannot create file");
+            self.sendBinaryFileError(conn, "Cannot create file");
             return;
         };
         defer file.close();
 
-        file.writeAll(decoded) catch {
-            self.sendFileError(conn, filename, "Write failed");
+        file.writeAll(decompressed[0..actual_size]) catch {
+            self.sendBinaryFileError(conn, "Write failed");
             return;
         };
 
-        // Send success response
+        // Send success (use simple JSON for success since it's small)
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"file_upload_result\",\"filename\":\"{s}\",\"success\":true}}", .{filename}) catch return;
         conn.sendText(msg) catch {};
-        std.log.info("File uploaded: {s}", .{full_path});
+        std.log.info("File uploaded: {s} ({d} bytes compressed -> {d} bytes)", .{ full_path, compressed_data.len, actual_size });
     }
 
-    fn handleFileDownload(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
-        var path = self.parseJsonString(data, "path") orelse return;
+    // Binary file download: [panel_id:u32][path_len:u16][path]
+    // Response: [0x12][name_len:u16][name][compressed_data]
+    // Error: [0x13][error_len:u16][error]
+    fn handleBinaryFileDownload(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 6) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const panel_id = std.mem.readInt(u32, data[0..4], .little);
+        const path_len = std.mem.readInt(u16, data[4..6], .little);
+
+        if (data.len < 6 + path_len) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        var path = data[6 .. 6 + path_len];
 
         // Get panel for cwd resolution
         self.mutex.lock();
         const panel = self.panels.get(panel_id);
         self.mutex.unlock();
 
-        // Expand ~ to cwd if path starts with ~/
+        // Expand ~ or relative paths
         var resolved_path_buf: [4096]u8 = undefined;
         var resolved_path: []const u8 = path;
 
         if (path.len > 0 and path[0] == '~') {
-            // Get home directory
             const home = std.posix.getenv("HOME") orelse "/tmp";
             if (path.len > 1 and path[1] == '/') {
-                // ~/foo -> $HOME/foo
                 resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
             } else {
                 resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
             }
         } else if (path.len > 0 and path[0] != '/') {
-            // Relative path - prepend cwd
             if (panel) |p| {
                 if (p.pwd.len > 0) {
                     resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
@@ -1794,68 +1850,110 @@ const Server = struct {
             }
         }
 
-        // Extract filename from path
         const filename = std.fs.path.basename(resolved_path);
 
         // Read file
         const file = std.fs.openFileAbsolute(resolved_path, .{}) catch {
-            self.sendFileError(conn, filename, "Cannot open file");
+            self.sendBinaryFileError(conn, "Cannot open file");
             return;
         };
         defer file.close();
 
         const stat = file.stat() catch {
-            self.sendFileError(conn, filename, "Cannot stat file");
+            self.sendBinaryFileError(conn, "Cannot stat file");
             return;
         };
 
-        if (stat.size > 100 * 1024 * 1024) { // 100MB limit
-            self.sendFileError(conn, filename, "File too large (max 100MB)");
+        if (stat.size > 100 * 1024 * 1024) {
+            self.sendBinaryFileError(conn, "File too large (max 100MB)");
             return;
         }
 
         const file_data = file.readToEndAlloc(self.allocator, 100 * 1024 * 1024) catch {
-            self.sendFileError(conn, filename, "Read failed");
+            self.sendBinaryFileError(conn, "Read failed");
             return;
         };
         defer self.allocator.free(file_data);
 
-        // Encode to base64
-        const base64_size = std.base64.standard.Encoder.calcSize(file_data.len);
-        const base64_data = self.allocator.alloc(u8, base64_size) catch {
-            self.sendFileError(conn, filename, "Out of memory");
+        // Compress with libdeflate
+        const compressor = c.libdeflate_alloc_compressor(6) orelse {
+            self.sendBinaryFileError(conn, "Compressor init failed");
             return;
         };
-        defer self.allocator.free(base64_data);
+        defer c.libdeflate_free_compressor(compressor);
 
-        _ = std.base64.standard.Encoder.encode(base64_data, file_data);
+        const max_compressed = c.libdeflate_zlib_compress_bound(compressor, file_data.len);
+        const compressed = self.allocator.alloc(u8, max_compressed) catch {
+            self.sendBinaryFileError(conn, "Out of memory");
+            return;
+        };
+        defer self.allocator.free(compressed);
 
-        // Build and send response
-        // {"type":"file_data","filename":"...","data":"base64..."}
-        const msg_size = 50 + filename.len + base64_data.len;
-        const msg = self.allocator.alloc(u8, msg_size) catch {
-            self.sendFileError(conn, filename, "Out of memory");
+        const compressed_size = c.libdeflate_zlib_compress(
+            compressor,
+            file_data.ptr,
+            file_data.len,
+            compressed.ptr,
+            compressed.len,
+        );
+
+        if (compressed_size == 0) {
+            self.sendBinaryFileError(conn, "Compression failed");
+            return;
+        }
+
+        // Build binary response: [0x12][name_len:u16][name][compressed_data]
+        const msg_len = 1 + 2 + filename.len + compressed_size;
+        const msg = self.allocator.alloc(u8, msg_len) catch {
+            self.sendBinaryFileError(conn, "Out of memory");
             return;
         };
         defer self.allocator.free(msg);
 
-        const msg_len = std.fmt.bufPrint(msg, "{{\"type\":\"file_data\",\"filename\":\"{s}\",\"data\":\"{s}\"}}", .{ filename, base64_data }) catch {
-            self.sendFileError(conn, filename, "Format error");
-            return;
-        };
+        msg[0] = 0x12; // file_data type
+        std.mem.writeInt(u16, msg[1..3], @intCast(filename.len), .little);
+        @memcpy(msg[3 .. 3 + filename.len], filename);
+        @memcpy(msg[3 + filename.len ..][0..compressed_size], compressed[0..compressed_size]);
 
-        conn.sendText(msg_len) catch {
+        conn.sendBinary(msg) catch {
             std.log.err("Failed to send file data", .{});
             return;
         };
-        std.log.info("File downloaded: {s} ({d} bytes)", .{ resolved_path, file_data.len });
+        std.log.info("File downloaded: {s} ({d} -> {d} bytes)", .{ resolved_path, file_data.len, compressed_size });
     }
 
-    fn sendFileError(self: *Server, conn: *ws.Connection, filename: []const u8, err: []const u8) void {
+    fn sendBinaryFileError(self: *Server, conn: *ws.Connection, err: []const u8) void {
         _ = self;
-        var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"file_data\",\"filename\":\"{s}\",\"error\":\"{s}\"}}", .{ filename, err }) catch return;
-        conn.sendText(msg) catch {};
+        // Error format: [0x13][error_len:u16][error]
+        var buf: [256]u8 = undefined;
+        buf[0] = 0x13;
+        std.mem.writeInt(u16, buf[1..3], @intCast(err.len), .little);
+        @memcpy(buf[3..][0..err.len], err);
+        conn.sendBinary(buf[0 .. 3 + err.len]) catch {};
+    }
+
+    // Keep old JSON handlers for backwards compatibility (will be removed later)
+    fn handleFileUpload(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        _ = self;
+        _ = conn;
+        _ = data;
+        // Deprecated - use binary upload (0x10)
+    }
+
+    fn handleFileDownload(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        _ = self;
+        _ = conn;
+        _ = data;
+        // Deprecated - use binary download (0x11)
+    }
+
+    fn sendFileError(_: *Server, conn: *ws.Connection, _: []const u8, err: []const u8) void {
+        // Error format: [0x13][error_len:u16][error]
+        var buf: [256]u8 = undefined;
+        buf[0] = 0x13;
+        std.mem.writeInt(u16, buf[1..3], @intCast(err.len), .little);
+        @memcpy(buf[3..][0..err.len], err);
+        conn.sendBinary(buf[0 .. 3 + err.len]) catch {};
     }
 
     fn broadcastInspectorUpdates(self: *Server) void {
