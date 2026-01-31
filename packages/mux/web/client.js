@@ -1441,6 +1441,14 @@ class App {
 
     // Handle paste at document level
     document.addEventListener('paste', (e) => {
+      // Skip if dialog is open (let user paste in input fields)
+      const commandPalette = document.getElementById('command-palette');
+      const downloadDialog = document.getElementById('download-dialog');
+      if ((commandPalette && commandPalette.classList.contains('visible')) ||
+          (downloadDialog && downloadDialog.classList.contains('visible'))) {
+        return; // Let default paste behavior work
+      }
+
       e.preventDefault();
       const text = e.clipboardData.getData('text');
       if (text && this.activePanel) {
