@@ -312,7 +312,7 @@
       flex-shrink: 0;
       margin-left: 6px;
     }
-    #new-tab {
+    #show-all-tabs, #new-tab {
       width: 26px;
       height: 26px;
       display: flex;
@@ -328,7 +328,7 @@
       flex-shrink: 0;
       margin-left: 2px;
     }
-    #new-tab:hover {
+    #show-all-tabs:hover, #new-tab:hover {
       background: var(--tab-hover);
     }
     #panels {
@@ -1070,6 +1070,7 @@
   <div id="toolbar">
     <div id="tabbar">
       <div id="tabs"></div>
+      <button id="show-all-tabs" title="Show All Tabs (⌘⇧\)">⊞</button>
       <button id="new-tab" title="New Tab (⌘/)">+</button>
     </div>
   </div>

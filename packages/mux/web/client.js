@@ -1237,6 +1237,10 @@ class App {
       this.createTab();
     });
 
+    document.getElementById('show-all-tabs').addEventListener('click', () => {
+      this.showTabOverview();
+    });
+
     // Global keyboard shortcuts (use capture phase to run before canvas handler)
     document.addEventListener('keydown', (e) => {
       // Skip if command palette is open (let user type)
