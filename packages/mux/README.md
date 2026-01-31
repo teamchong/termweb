@@ -5,7 +5,7 @@ A high-performance terminal multiplexer for the web, powered by [Ghostty](https:
 ## Features
 
 - **Native Terminal Rendering**: Uses libghostty (Ghostty's core) compiled to WASM for pixel-perfect terminal emulation
-- **GPU Acceleration**: WebGL2-based rendering with proper font atlas and ligature support
+- **GPU Acceleration**: WebGPU-based rendering with proper font atlas and ligature support
 - **Tab Management**: Multiple tabs with LRU (last recently used) switching on close
 - **Split Panes**: Horizontal/vertical splits with draggable dividers
 - **Mouse Support**: Full mouse tracking (hover, click, scroll, drag)
@@ -26,7 +26,7 @@ A high-performance terminal multiplexer for the web, powered by [Ghostty](https:
 │  ┌────┴────────────────────────────────┐                    │
 │  │ Panel (canvas + WebSocket)          │                    │
 │  │  ┌────────────────────────────────┐ │                    │
-│  │  │     WebGL2 Terminal Canvas     │ │                    │
+│  │  │     WebGPU Terminal Canvas     │ │                    │
 │  │  │   (rendered by libghostty)     │ │                    │
 │  │  └────────────────────────────────┘ │                    │
 │  │  [Inspector: dimensions, cell info] │ ← Alt+Cmd+I        │
@@ -71,7 +71,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/termweb
 ```
 
-Then open `http://localhost:7681` in a WebGL2-capable browser.
+Then open `http://localhost:7681` in a WebGPU-capable browser (Chrome 113+, Edge 113+, or Firefox Nightly).
 
 ## Keyboard Shortcuts
 
@@ -118,7 +118,7 @@ Each panel has a dedicated binary WebSocket for terminal I/O:
 - Mouse events (binary: x, y, modifiers, button)
 
 **Server → Client:**
-- Frame data (WebGL texture updates)
+- Frame data (GPU texture updates)
 - Cursor position
 - Title/pwd updates
 - Size changes
