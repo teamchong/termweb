@@ -1294,8 +1294,8 @@ const Server = struct {
         const control_ws = try ws.Server.init(allocator, "0.0.0.0", control_port);
         control_ws.setCallbacks(onControlConnect, onControlMessage, onControlDisconnect);
 
-        // Create panel WebSocket server (for pixel streams)
-        const panel_ws = try ws.Server.init(allocator, "0.0.0.0", panel_port);
+        // Create panel WebSocket server (for pixel streams - no deflate, video is pre-compressed)
+        const panel_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
         panel_ws.setCallbacks(onPanelConnect, onPanelMessage, onPanelDisconnect);
 
         server.* = .{
@@ -1422,8 +1422,14 @@ const Server = struct {
         const self = global_server orelse return;
 
         if (is_binary and data.len > 0) {
-            // Binary message - file transfer
-            self.handleBinaryControlMessage(conn, data);
+            const msg_type = data[0];
+            if (msg_type >= 0x80 and msg_type <= 0x8F) {
+                // Binary control message (client -> server)
+                self.handleBinaryControlMessageFromClient(conn, data);
+            } else {
+                // Binary file transfer message
+                self.handleBinaryControlMessage(conn, data);
+            }
         } else {
             // Text message - JSON control message
             self.handleControlMessage(conn, data);
@@ -1678,96 +1684,80 @@ const Server = struct {
         _ = conn;
 
         const msg_type = data[0];
-        switch (msg_type) {
-            @intFromEnum(BinaryCtrlMsg.close_panel) => {
-                // [type:u8][panel_id:u32] = 5 bytes
-                if (data.len < 5) return;
-                const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                self.mutex.lock();
-                self.pending_destroys.append(self.allocator, .{ .id = panel_id }) catch {};
-                self.mutex.unlock();
-            },
-            @intFromEnum(BinaryCtrlMsg.resize_panel) => {
-                // [type:u8][panel_id:u32][width:u16][height:u16] = 9 bytes
-                if (data.len < 9) return;
-                const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                const width = std.mem.readInt(u16, data[5..7], .little);
-                const height = std.mem.readInt(u16, data[7..9], .little);
-                self.mutex.lock();
-                self.pending_resizes.append(self.allocator, .{ .id = panel_id, .width = width, .height = height }) catch {};
-                self.mutex.unlock();
-            },
-            @intFromEnum(BinaryCtrlMsg.focus_panel) => {
-                // [type:u8][panel_id:u32] = 5 bytes
-                if (data.len < 5) return;
-                const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                self.mutex.lock();
-                if (self.layout.findTabByPanel(panel_id)) |tab| {
-                    self.layout.active_tab_id = tab.id;
-                }
-                self.mutex.unlock();
-            },
-            @intFromEnum(BinaryCtrlMsg.split_panel) => {
-                // [type:u8][panel_id:u32][direction:u8][width:u16][height:u16][scale_x100:u16] = 12 bytes
-                if (data.len < 12) return;
-                const parent_id = std.mem.readInt(u32, data[1..5], .little);
-                const dir_byte = data[5];
-                const width = std.mem.readInt(u16, data[6..8], .little);
-                const height = std.mem.readInt(u16, data[8..10], .little);
-                const scale_x100 = std.mem.readInt(u16, data[10..12], .little);
-                const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
-                const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
+        if (msg_type == 0x81) { // close_panel
+            if (data.len < 5) return;
+            const panel_id = std.mem.readInt(u32, data[1..5], .little);
+            self.mutex.lock();
+            self.pending_destroys.append(self.allocator, .{ .id = panel_id }) catch {};
+            self.mutex.unlock();
+        } else if (msg_type == 0x82) { // resize_panel
+            if (data.len < 9) return;
+            const panel_id = std.mem.readInt(u32, data[1..5], .little);
+            const width = std.mem.readInt(u16, data[5..7], .little);
+            const height = std.mem.readInt(u16, data[7..9], .little);
+            self.mutex.lock();
+            self.pending_resizes.append(self.allocator, .{ .id = panel_id, .width = width, .height = height }) catch {};
+            self.mutex.unlock();
+        } else if (msg_type == 0x83) { // focus_panel
+            if (data.len < 5) return;
+            const panel_id = std.mem.readInt(u32, data[1..5], .little);
+            self.mutex.lock();
+            if (self.layout.findTabByPanel(panel_id)) |tab| {
+                self.layout.active_tab_id = tab.id;
+            }
+            self.mutex.unlock();
+        } else if (msg_type == 0x84) { // split_panel
+            if (data.len < 12) return;
+            const parent_id = std.mem.readInt(u32, data[1..5], .little);
+            const dir_byte = data[5];
+            const width = std.mem.readInt(u16, data[6..8], .little);
+            const height = std.mem.readInt(u16, data[8..10], .little);
+            const scale_x100 = std.mem.readInt(u16, data[10..12], .little);
+            const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
+            const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
 
-                self.mutex.lock();
-                self.pending_splits.append(self.allocator, .{
-                    .parent_panel_id = parent_id,
-                    .direction = direction,
-                    .width = width,
-                    .height = height,
-                    .scale = scale,
-                }) catch {};
+            self.mutex.lock();
+            self.pending_splits.append(self.allocator, .{
+                .parent_panel_id = parent_id,
+                .direction = direction,
+                .width = width,
+                .height = height,
+                .scale = scale,
+            }) catch {};
+            self.mutex.unlock();
+        } else if (msg_type == 0x85) { // inspector_subscribe
+            if (data.len < 6) return;
+            const panel_id = std.mem.readInt(u32, data[1..5], .little);
+            const tab_len = data[5];
+            if (data.len < 6 + tab_len) return;
+            const tab = data[6..][0..tab_len];
+            self.subscribeInspectorBinary(panel_id, tab);
+        } else if (msg_type == 0x86) { // inspector_unsubscribe
+            if (data.len < 5) return;
+            const panel_id = std.mem.readInt(u32, data[1..5], .little);
+            self.unsubscribeInspectorBinary(panel_id);
+        } else if (msg_type == 0x87) { // inspector_tab
+            if (data.len < 6) return;
+            const panel_id = std.mem.readInt(u32, data[1..5], .little);
+            const tab_len = data[5];
+            if (data.len < 6 + tab_len) return;
+            const tab = data[6..][0..tab_len];
+            self.setInspectorTabBinary(panel_id, tab);
+        } else if (msg_type == 0x88) { // view_action
+            if (data.len < 6) return;
+            const panel_id = std.mem.readInt(u32, data[1..5], .little);
+            const action_len = data[5];
+            if (data.len < 6 + action_len) return;
+            const action = data[6..][0..action_len];
+            self.mutex.lock();
+            if (self.panels.get(panel_id)) |panel| {
                 self.mutex.unlock();
-            },
-            @intFromEnum(BinaryCtrlMsg.inspector_subscribe) => {
-                // [type:u8][panel_id:u32][tab_len:u8][tab...] = 6 + tab_len bytes
-                if (data.len < 6) return;
-                const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                const tab_len = data[5];
-                if (data.len < 6 + tab_len) return;
-                const tab = data[6..][0..tab_len];
-                self.subscribeInspectorBinary(panel_id, tab);
-            },
-            @intFromEnum(BinaryCtrlMsg.inspector_unsubscribe) => {
-                // [type:u8][panel_id:u32] = 5 bytes
-                if (data.len < 5) return;
-                const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                self.unsubscribeInspectorBinary(panel_id);
-            },
-            @intFromEnum(BinaryCtrlMsg.inspector_tab) => {
-                // [type:u8][panel_id:u32][tab_len:u8][tab...] = 6 + tab_len bytes
-                if (data.len < 6) return;
-                const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                const tab_len = data[5];
-                if (data.len < 6 + tab_len) return;
-                const tab = data[6..][0..tab_len];
-                self.setInspectorTabBinary(panel_id, tab);
-            },
-            @intFromEnum(BinaryCtrlMsg.view_action) => {
-                // [type:u8][panel_id:u32][action_len:u8][action...] = 6 + action_len bytes
-                if (data.len < 6) return;
-                const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                const action_len = data[5];
-                if (data.len < 6 + action_len) return;
-                const action = data[6..][0..action_len];
-                self.mutex.lock();
-                if (self.panels.get(panel_id)) |panel| {
-                    self.mutex.unlock();
-                    _ = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
-                } else {
-                    self.mutex.unlock();
-                }
-            },
-            else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
+                _ = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
+            } else {
+                self.mutex.unlock();
+            }
+        } else {
+            std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type});
         }
     }
 
@@ -1859,16 +1849,21 @@ const Server = struct {
         }
     }
 
-    // Binary control message handler for file transfer
-    // 0x10 = file_upload: [panel_id:u32][name_len:u16][name][compressed_data]
-    // 0x11 = file_download: [panel_id:u32][path_len:u16][path]
+    // Binary control message handler
+    // 0x10 = file_upload, 0x11 = file_download (file transfer)
+    // 0x81-0x88 = client control messages (close, resize, focus, split, etc.)
     fn handleBinaryControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len < 1) return;
 
         const msg_type = data[0];
         switch (msg_type) {
+            // File transfer
             0x10 => self.handleBinaryFileUpload(conn, data[1..]),
             0x11 => self.handleBinaryFileDownload(conn, data[1..]),
+            // Client control messages
+            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88 => {
+                self.handleBinaryControlMessageFromClient(conn, data);
+            },
             else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
         }
     }
@@ -1951,6 +1946,36 @@ const Server = struct {
             };
             self.sendBinaryFileError(conn, err_msg);
             return;
+        }
+
+        // Create parent directories if needed (for folder uploads)
+        if (std.mem.lastIndexOfScalar(u8, full_path, '/')) |last_slash| {
+            const dir_path = full_path[0..last_slash];
+            std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+                error.PathAlreadyExists => {}, // Directory exists, that's fine
+                else => {
+                    // Try recursive mkdir
+                    var i: usize = 0;
+                    while (i < dir_path.len) {
+                        if (std.mem.indexOfScalarPos(u8, dir_path, i + 1, '/')) |next_slash| {
+                            std.fs.makeDirAbsolute(dir_path[0..next_slash]) catch |e| switch (e) {
+                                error.PathAlreadyExists => {},
+                                else => {},
+                            };
+                            i = next_slash;
+                        } else {
+                            std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
+                                error.PathAlreadyExists => {},
+                                else => {
+                                    self.sendBinaryFileError(conn, "Cannot create directory");
+                                    return;
+                                },
+                            };
+                            break;
+                        }
+                    }
+                },
+            };
         }
 
         // Write file

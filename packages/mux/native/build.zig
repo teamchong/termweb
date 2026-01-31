@@ -43,6 +43,14 @@ pub fn build(b: *std.Build) !void {
     });
     server.root_module.addImport("websocket", websocket_mod);
 
+    // Add SIMD mask module from termweb
+    const simd_mask_mod = b.createModule(.{
+        .root_source_file = b.path("../../../src/simd/mask.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server.root_module.addImport("simd_mask", simd_mask_mod);
+
     // Add libdeflate for compression and decompression
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/deflate_compress.c"), .flags = &.{"-O2"} });
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/deflate_decompress.c"), .flags = &.{"-O2"} });

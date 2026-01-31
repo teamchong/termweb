@@ -3,6 +3,12 @@ const net = std.net;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
+const c = @cImport({
+    @cInclude("libdeflate.h");
+});
+
+const simd_mask = @import("simd_mask");
+
 // ============================================================================
 // WebSocket Protocol
 // ============================================================================
@@ -32,6 +38,10 @@ pub const Connection = struct {
     allocator: Allocator,
     is_open: bool,
     user_data: ?*anyopaque,
+    // permessage-deflate fields
+    deflate_enabled: bool = false,
+    compressor: ?*c.libdeflate_compressor = null,
+    decompressor: ?*c.libdeflate_decompressor = null,
 
     pub fn init(stream: net.Stream, allocator: Allocator) Connection {
         return .{
@@ -39,16 +49,31 @@ pub const Connection = struct {
             .allocator = allocator,
             .is_open = true,
             .user_data = null,
+            .deflate_enabled = false,
+            .compressor = null,
+            .decompressor = null,
         };
     }
 
     pub fn deinit(self: *Connection) void {
+        // Free deflate resources
+        if (self.compressor) |comp| c.libdeflate_free_compressor(comp);
+        if (self.decompressor) |decomp| c.libdeflate_free_decompressor(decomp);
         self.stream.close();
         self.is_open = false;
     }
 
     // Perform WebSocket handshake (server side)
+    // Set enable_deflate=false for connections that carry pre-compressed data (like video frames)
     pub fn acceptHandshake(self: *Connection) !void {
+        return self.acceptHandshakeWithOptions(true);
+    }
+
+    pub fn acceptHandshakeNoDeflate(self: *Connection) !void {
+        return self.acceptHandshakeWithOptions(false);
+    }
+
+    fn acceptHandshakeWithOptions(self: *Connection, enable_deflate: bool) !void {
         var buf: [4096]u8 = undefined;
         const n = try self.stream.read(&buf);
         if (n == 0) return error.ConnectionClosed;
@@ -72,6 +97,9 @@ pub const Connection = struct {
         var accept_key: [28]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&accept_key, &hash);
 
+        // Check for permessage-deflate extension (only if enabled for this connection)
+        const has_deflate = enable_deflate and std.mem.indexOf(u8, request, "permessage-deflate") != null;
+
         // Send handshake response
         const response = "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -79,6 +107,15 @@ pub const Connection = struct {
             "Sec-WebSocket-Accept: ";
         _ = try self.stream.write(response);
         _ = try self.stream.write(&accept_key);
+
+        // Enable permessage-deflate if client supports it
+        if (has_deflate) {
+            _ = try self.stream.write("\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover");
+            self.deflate_enabled = true;
+            self.compressor = c.libdeflate_alloc_compressor(6);
+            self.decompressor = c.libdeflate_alloc_decompressor();
+        }
+
         _ = try self.stream.write("\r\n\r\n");
     }
 
@@ -89,6 +126,7 @@ pub const Connection = struct {
         if (header_read < 2) return null;
 
         const fin = (header[0] & 0x80) != 0;
+        const rsv1 = (header[0] & 0x40) != 0; // Compression flag per RFC 7692
         const opcode: Opcode = @enumFromInt(@as(u4, @truncate(header[0] & 0x0F)));
         const masked = (header[1] & 0x80) != 0;
         var payload_len: u64 = header[1] & 0x7F;
@@ -112,7 +150,7 @@ pub const Connection = struct {
 
         // Read payload
         if (payload_len > 16 * 1024 * 1024) return error.PayloadTooLarge;
-        const payload = try self.allocator.alloc(u8, @intCast(payload_len));
+        var payload = try self.allocator.alloc(u8, @intCast(payload_len));
         errdefer self.allocator.free(payload);
 
         var total_read: usize = 0;
@@ -122,10 +160,63 @@ pub const Connection = struct {
             total_read += read;
         }
 
-        // Unmask if needed
+        // Unmask if needed (SIMD-accelerated)
         if (masked) {
-            for (payload, 0..) |*byte, i| {
-                byte.* ^= mask[i % 4];
+            simd_mask.xorMask(payload, mask);
+        }
+
+        // Decompress if RSV1 is set and deflate is enabled (per RFC 7692)
+        if (rsv1 and self.deflate_enabled) {
+            if (self.decompressor) |decomp| {
+                // Per RFC 7692, sender removed trailing 0x00 0x00 0xFF 0xFF from deflate output.
+                // We add it back, then append a final empty stored block with BFINAL=1.
+                // libdeflate requires BFINAL=1 to know the stream is complete.
+                const input = try self.allocator.alloc(u8, payload.len + 4 + 5);
+                defer self.allocator.free(input);
+                @memcpy(input[0..payload.len], payload);
+                // Complete original empty stored block (BFINAL=0)
+                input[payload.len..][0..4].* = .{ 0x00, 0x00, 0xFF, 0xFF };
+                // Add final empty stored block (BFINAL=1)
+                input[payload.len + 4 ..][0..5].* = .{ 0x01, 0x00, 0x00, 0xFF, 0xFF };
+
+                // Allocate decompression buffer (start with 10x, retry with larger if needed)
+                var decompress_buf = try self.allocator.alloc(u8, payload.len * 10 + 4096);
+
+                var actual_size: usize = 0;
+                var result = c.libdeflate_deflate_decompress(
+                    decomp,
+                    input.ptr,
+                    input.len,
+                    decompress_buf.ptr,
+                    decompress_buf.len,
+                    &actual_size,
+                );
+
+                // If buffer too small, try with larger buffer
+                if (result == c.LIBDEFLATE_INSUFFICIENT_SPACE) {
+                    self.allocator.free(decompress_buf);
+                    decompress_buf = try self.allocator.alloc(u8, payload.len * 100 + 65536);
+                    result = c.libdeflate_deflate_decompress(
+                        decomp,
+                        input.ptr,
+                        input.len,
+                        decompress_buf.ptr,
+                        decompress_buf.len,
+                        &actual_size,
+                    );
+                }
+
+                if (result != c.LIBDEFLATE_SUCCESS) {
+                    self.allocator.free(decompress_buf);
+                    return error.DecompressionFailed;
+                }
+
+                // Replace payload with decompressed data
+                self.allocator.free(payload);
+                const final_payload = try self.allocator.alloc(u8, actual_size);
+                @memcpy(final_payload, decompress_buf[0..actual_size]);
+                self.allocator.free(decompress_buf);
+                payload = final_payload;
             }
         }
 
@@ -137,12 +228,14 @@ pub const Connection = struct {
     }
 
     // Write a WebSocket frame
+    // Note: Server-side compression disabled because libdeflate produces complete
+    // deflate streams with BFINAL=1, not Z_SYNC_FLUSH format that browsers expect.
+    // Client->server decompression still works.
     pub fn writeFrame(self: *Connection, opcode: Opcode, payload: []const u8) !void {
-        // Frame header
         var header: [10]u8 = undefined;
         var header_len: usize = 2;
 
-        header[0] = 0x80 | @as(u8, @intFromEnum(opcode)); // FIN + opcode
+        header[0] = 0x80 | @as(u8, @intFromEnum(opcode)); // FIN + opcode, no compression
 
         if (payload.len < 126) {
             header[1] = @intCast(payload.len);
@@ -190,11 +283,20 @@ pub const Server = struct {
     listener: net.Server,
     allocator: Allocator,
     running: std.atomic.Value(bool),
+    enable_deflate: bool,
     on_connect: ?*const fn (*Connection) void,
     on_message: ?*const fn (*Connection, []u8, bool) void, // conn, data, is_binary
     on_disconnect: ?*const fn (*Connection) void,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16) !*Server {
+        return initWithOptions(allocator, address, port, true);
+    }
+
+    pub fn initNoDeflate(allocator: Allocator, address: []const u8, port: u16) !*Server {
+        return initWithOptions(allocator, address, port, false);
+    }
+
+    fn initWithOptions(allocator: Allocator, address: []const u8, port: u16, enable_deflate: bool) !*Server {
         const server = try allocator.create(Server);
         errdefer allocator.destroy(server);
 
@@ -203,6 +305,7 @@ pub const Server = struct {
             .listener = try addr.listen(.{ .reuse_address = true }),
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
+            .enable_deflate = enable_deflate,
             .on_connect = null,
             .on_message = null,
             .on_disconnect = null,
@@ -239,8 +342,8 @@ pub const Server = struct {
         const conn = try self.allocator.create(Connection);
         conn.* = Connection.init(stream.stream, self.allocator);
 
-        // Perform handshake
-        try conn.acceptHandshake();
+        // Perform handshake (with or without deflate based on server config)
+        try conn.acceptHandshakeWithOptions(self.enable_deflate);
 
         if (self.on_connect) |cb| cb(conn);
 

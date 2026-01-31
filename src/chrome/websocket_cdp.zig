@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const simd = @import("../simd/dispatch.zig");
+const simd_mask = @import("../simd/mask.zig");
 const FramePool = @import("../simd/frame_pool.zig").FramePool;
 const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
 
@@ -819,11 +820,10 @@ pub const WebSocketCdpClient = struct {
         @memcpy(frame_buf[frame_len..][0..4], &mask);
         frame_len += 4;
 
-        // Write masked payload
-        for (payload, 0..) |byte, i| {
-            frame_buf[frame_len] = byte ^ mask[i % 4];
-            frame_len += 1;
-        }
+        // Copy payload then mask with SIMD
+        @memcpy(frame_buf[frame_len..][0..payload.len], payload);
+        simd_mask.xorMask(frame_buf[frame_len..][0..payload.len], mask);
+        frame_len += payload.len;
 
         // Send frame
         _ = try self.stream.writeAll(frame_buf[0..frame_len]);
