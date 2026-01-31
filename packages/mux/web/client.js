@@ -1265,9 +1265,11 @@ class App {
 
     // Global keyboard shortcuts (use capture phase to run before canvas handler)
     document.addEventListener('keydown', (e) => {
-      // Skip if command palette is open (let user type)
+      // Skip if dialog is open (let user type)
       const commandPalette = document.getElementById('command-palette');
-      if (commandPalette && commandPalette.classList.contains('visible')) {
+      const downloadDialog = document.getElementById('download-dialog');
+      if ((commandPalette && commandPalette.classList.contains('visible')) ||
+          (downloadDialog && downloadDialog.classList.contains('visible'))) {
         return;
       }
 
