@@ -2946,10 +2946,10 @@ class App {
     reader.onload = () => {
       const fileData = new Uint8Array(reader.result);
 
-      // Compress with pako (zlib)
+      // Compress with pako (raw deflate, not zlib)
       let compressed;
       try {
-        compressed = pako.deflate(fileData);
+        compressed = pako.deflateRaw(fileData);
       } catch (e) {
         console.error('Compression failed:', e);
         compressed = fileData; // Fallback to uncompressed
@@ -3082,10 +3082,10 @@ class App {
     const filename = new TextDecoder().decode(bytes.slice(offset, offset + nameLen)); offset += nameLen;
     const compressedData = bytes.slice(offset);
 
-    // Decompress with pako
+    // Decompress with pako (raw deflate, not zlib)
     let fileData;
     try {
-      fileData = pako.inflate(compressedData);
+      fileData = pako.inflateRaw(compressedData);
     } catch (e) {
       console.error('Decompression failed:', e);
       fileData = compressedData; // Fallback

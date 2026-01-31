@@ -1774,7 +1774,7 @@ const Server = struct {
         defer self.allocator.free(decompressed);
 
         var actual_size: usize = 0;
-        const result = c.libdeflate_zlib_decompress(
+        const result = c.libdeflate_deflate_decompress(
             decompressor,
             compressed_data.ptr,
             compressed_data.len,
@@ -1784,6 +1784,7 @@ const Server = struct {
         );
 
         if (result != 0) {
+            std.log.err("Decompression failed with result: {d}", .{result});
             self.sendBinaryFileError(conn, "Decompression failed");
             return;
         }
@@ -1882,14 +1883,14 @@ const Server = struct {
         };
         defer c.libdeflate_free_compressor(compressor);
 
-        const max_compressed = c.libdeflate_zlib_compress_bound(compressor, file_data.len);
+        const max_compressed = c.libdeflate_deflate_compress_bound(compressor, file_data.len);
         const compressed = self.allocator.alloc(u8, max_compressed) catch {
             self.sendBinaryFileError(conn, "Out of memory");
             return;
         };
         defer self.allocator.free(compressed);
 
-        const compressed_size = c.libdeflate_zlib_compress(
+        const compressed_size = c.libdeflate_deflate_compress(
             compressor,
             file_data.ptr,
             file_data.len,
