@@ -43,9 +43,11 @@ pub fn build(b: *std.Build) !void {
     });
     server.root_module.addImport("websocket", websocket_mod);
 
-    // Add libdeflate for compression
+    // Add libdeflate for compression and decompression
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/deflate_compress.c"), .flags = &.{"-O2"} });
+    server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/deflate_decompress.c"), .flags = &.{"-O2"} });
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/zlib_compress.c"), .flags = &.{"-O2"} });
+    server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/zlib_decompress.c"), .flags = &.{"-O2"} });
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/adler32.c"), .flags = &.{"-O2"} });
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/utils.c"), .flags = &.{"-O2"} });
     if (target.result.cpu.arch == .aarch64) {
