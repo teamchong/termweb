@@ -110,6 +110,8 @@ pub const LaunchOptions = struct {
     /// Copies bookmarks, history, cookies, etc.
     /// Set to "Default" by default, use empty string "" to skip cloning
     clone_profile: ?[]const u8 = null, // Default: fresh profile (no cloning)
+    /// Enable extensions when using a cloned profile
+    enable_extensions: bool = false,
     /// Print debug messages (default: true for CLI, false for SDK)
     verbose: bool = true,
 };
@@ -161,9 +163,8 @@ pub fn listProfiles(allocator: std.mem.Allocator) ![][]const u8 {
     return try profiles.toOwnedSlice(allocator);
 }
 
-/// Clone a Chrome profile to a temporary directory (minimal for fast startup)
-/// Copies only essential session data: Cookies, Local Storage, IndexedDB
-/// Skips: Extensions, History, Bookmarks, etc. (not needed for session auth)
+/// Clone a Chrome profile to a temporary directory
+/// Copies session data: Cookies, Local Storage, IndexedDB, Extensions
 /// Uses COW (copy-on-write) cloning on macOS APFS for instant copies
 fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir: []const u8, verbose: bool) !void {
     const user_data_dir = try getChromeUserDataDir(allocator);
@@ -213,11 +214,14 @@ fn cloneProfile(allocator: std.mem.Allocator, profile_name: []const u8, dest_dir
         copied += 1;
     }
 
-    // Copy directories for web app data (Local Storage, IndexedDB)
+    // Copy directories for web app data (Local Storage, IndexedDB, Extensions)
     const dirs_to_copy = [_][]const u8{
         "Local Storage", // localStorage API data
         "IndexedDB", // IndexedDB data
         "File System", // OPFS data
+        "Extensions", // Chrome extensions
+        "Extension State", // Extension state data
+        "Local Extension Settings", // Extension settings
     };
 
     for (dirs_to_copy) |dir_name| {
@@ -240,6 +244,9 @@ fn tryFastClone(allocator: std.mem.Allocator, source: []const u8, dest: []const 
         "Local Storage",
         "IndexedDB",
         "File System",
+        "Extensions",
+        "Extension State",
+        "Local Extension Settings",
     };
 
     var cloned: u32 = 0;
@@ -424,9 +431,11 @@ pub fn launchChromePipe(
         try args_list.append(allocator, "--no-zygote");
     }
 
-    // Disable extensions - we use CDP polyfills instead (fs, clipboard, resize)
-    try args_list.append(allocator, "--disable-extensions");
-    try args_list.append(allocator, "--disable-component-extensions-with-background-pages");
+    // Disable extensions unless using a cloned profile with extensions enabled
+    if (!options.enable_extensions) {
+        try args_list.append(allocator, "--disable-extensions");
+        try args_list.append(allocator, "--disable-component-extensions-with-background-pages");
+    }
     try args_list.append(allocator, "--disable-background-networking");
 
     if (options.disable_gpu) {

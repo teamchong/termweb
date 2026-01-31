@@ -251,13 +251,14 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Determine profile cloning behavior:
     // Default: fresh profile (no cloning) - avoids Google session logout issues
-    // --profile X: clone profile X for logged-in sessions
+    // --profile X: clone profile X for logged-in sessions (with extensions enabled)
     const launch_opts = launcher.LaunchOptions{
         .viewport_width = viewport_width,
         .viewport_height = viewport_height,
         .browser_path = browser_path,
         .disable_gpu = disable_gpu,
         .clone_profile = clone_profile,
+        .enable_extensions = clone_profile != null,
     };
 
     var chrome_instance = launcher.launchChromePipe(allocator, launch_opts) catch |err| {
