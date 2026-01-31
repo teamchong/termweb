@@ -747,8 +747,30 @@ class Panel {
     
     // Prevent context menu
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // Drag & drop file upload
+    this.canvas.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      this.canvas.style.opacity = '0.7';
+    });
+
+    this.canvas.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      this.canvas.style.opacity = '1';
+    });
+
+    this.canvas.addEventListener('drop', (e) => {
+      e.preventDefault();
+      this.canvas.style.opacity = '1';
+      if (e.dataTransfer.files.length > 0) {
+        for (const file of e.dataTransfer.files) {
+          window.app?.uploadFile(file);
+        }
+      }
+    });
   }
-  
+
   getModifiers(e) {
     let mods = 0;
     if (e.shiftKey) mods |= 0x01;
@@ -1296,6 +1318,20 @@ class App {
         this.showCommandPalette();
         return;
       }
+      // ⌘U for upload
+      if (e.metaKey && !e.shiftKey && (e.key === 'u' || e.key === 'U')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.showUploadDialog();
+        return;
+      }
+      // ⌘⇧S for download
+      if (e.metaKey && e.shiftKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.showDownloadDialog();
+        return;
+      }
       // ⌘A for select all
       if (e.metaKey && !e.shiftKey && e.key === 'a') {
         e.preventDefault();
@@ -1509,6 +1545,21 @@ class App {
           });
         } catch (e) {
           console.error('Failed to decode clipboard data:', e);
+        }
+        break;
+
+      case 'file_data':
+        // File download from server
+        this.handleFileData(msg);
+        break;
+
+      case 'file_upload_result':
+        // Upload result from server
+        if (msg.error) {
+          console.error(`Upload failed: ${msg.error}`);
+          alert(`Upload failed: ${msg.error}`);
+        } else {
+          console.log(`Upload complete: ${msg.filename}`);
         }
         break;
     }
@@ -2860,6 +2911,140 @@ class App {
     }
   }
 
+  // File transfer: Upload
+  showUploadDialog() {
+    const input = document.getElementById('file-upload-input');
+    if (!input) return;
+
+    input.onchange = () => {
+      if (input.files.length === 0) return;
+      for (const file of input.files) {
+        this.uploadFile(file);
+      }
+      input.value = ''; // Reset for next use
+    };
+    input.click();
+  }
+
+  uploadFile(file) {
+    if (!this.activePanel?.serverId) {
+      console.error('No active panel for upload');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const data = reader.result;
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(data)));
+
+      const msg = {
+        type: 'file_upload',
+        panel_id: this.activePanel.serverId,
+        filename: file.name,
+        size: file.size,
+        data: base64
+      };
+
+      if (this.controlWs && this.controlWs.readyState === WebSocket.OPEN) {
+        this.controlWs.send(JSON.stringify(msg));
+        console.log(`Uploading ${file.name} (${file.size} bytes)`);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // File transfer: Download
+  showDownloadDialog() {
+    const overlay = document.getElementById('download-dialog');
+    const input = document.getElementById('download-path-input');
+    if (!overlay || !input) return;
+
+    overlay.classList.add('visible');
+    input.value = '';
+    input.focus();
+
+    const confirmBtn = overlay.querySelector('.dialog-btn.confirm');
+    const cancelBtn = overlay.querySelector('.dialog-btn.cancel');
+
+    const cleanup = () => {
+      overlay.classList.remove('visible');
+      input.onkeydown = null;
+      confirmBtn.onclick = null;
+      cancelBtn.onclick = null;
+      if (this.activePanel?.canvas) {
+        this.activePanel.canvas.focus();
+      }
+    };
+
+    const doDownload = () => {
+      const path = input.value.trim();
+      if (path) {
+        this.requestDownload(path);
+      }
+      cleanup();
+    };
+
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        doDownload();
+      } else if (e.key === 'Escape') {
+        cleanup();
+      }
+    };
+
+    confirmBtn.onclick = doDownload;
+    cancelBtn.onclick = cleanup;
+    overlay.onclick = (e) => {
+      if (e.target === overlay) cleanup();
+    };
+  }
+
+  requestDownload(path) {
+    if (!this.activePanel?.serverId) {
+      console.error('No active panel for download');
+      return;
+    }
+
+    const msg = {
+      type: 'file_download',
+      panel_id: this.activePanel.serverId,
+      path: path
+    };
+
+    if (this.controlWs && this.controlWs.readyState === WebSocket.OPEN) {
+      this.controlWs.send(JSON.stringify(msg));
+      console.log(`Requesting download: ${path}`);
+    }
+  }
+
+  handleFileData(msg) {
+    // Server sends: { type: 'file_data', filename, data: base64, error? }
+    if (msg.error) {
+      alert(`Download failed: ${msg.error}`);
+      return;
+    }
+
+    // Decode base64 and trigger browser download
+    const binaryString = atob(msg.data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    const blob = new Blob([bytes]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = msg.filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    console.log(`Downloaded: ${msg.filename}`);
+  }
+
   promptChangeTitle() {
     // Get current title
     const tab = this.tabs.get(this.activeTab);
@@ -3046,6 +3231,12 @@ function setupMenus() {
           break;
         case 'close-all-tabs':
           app.closeAllTabs();
+          break;
+        case 'upload':
+          app.showUploadDialog();
+          break;
+        case 'download':
+          app.showDownloadDialog();
           break;
         case 'split-right':
           if (app.activePanel) {

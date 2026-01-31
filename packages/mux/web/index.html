@@ -575,6 +575,76 @@
       color: var(--text);
       margin-bottom: 12px;
     }
+    /* Dialog overlay (download, etc.) */
+    .dialog-overlay {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.5);
+      z-index: 2000;
+      align-items: flex-start;
+      justify-content: center;
+      padding-top: 20vh;
+    }
+    .dialog-overlay.visible {
+      display: flex;
+    }
+    .dialog-box {
+      background: var(--toolbar-bg);
+      border: 1px solid rgba(128,128,128,0.3);
+      border-radius: 8px;
+      padding: 16px;
+      min-width: 350px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    .dialog-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: var(--text);
+    }
+    .dialog-box input[type="text"] {
+      width: 100%;
+      padding: 8px 12px;
+      background: var(--bg);
+      border: 1px solid rgba(128,128,128,0.3);
+      border-radius: 4px;
+      color: var(--text);
+      font-size: 13px;
+      font-family: inherit;
+      box-sizing: border-box;
+    }
+    .dialog-box input[type="text"]:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .dialog-buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 16px;
+    }
+    .dialog-btn {
+      padding: 6px 16px;
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .dialog-btn.cancel {
+      background: rgba(128,128,128,0.2);
+      color: var(--text);
+    }
+    .dialog-btn.confirm {
+      background: var(--accent);
+      color: white;
+    }
+    .dialog-btn:hover {
+      filter: brightness(1.1);
+    }
     /* Command Palette */
     #command-palette {
       display: none;
@@ -1028,6 +1098,9 @@
           <div class="menu-dropdown">
             <div class="menu-item" data-action="new-tab"><span class="menu-icon">⊞</span><span class="menu-text">New Tab</span><span class="shortcut">⌘/</span></div>
             <div class="menu-separator"></div>
+            <div class="menu-item" data-action="upload"><span class="menu-icon">⬆</span><span class="menu-text">Upload...</span><span class="shortcut">⌘U</span></div>
+            <div class="menu-item" data-action="download"><span class="menu-icon">⬇</span><span class="menu-text">Download...</span><span class="shortcut">⌘<span class="shift">⇧</span>S</span></div>
+            <div class="menu-separator"></div>
             <div class="menu-item" data-action="split-right"><span class="menu-icon">⬚▐</span><span class="menu-text">Split Right</span><span class="shortcut">⌘D</span></div>
             <div class="menu-item" data-action="split-down"><span class="menu-icon">⬚▄</span><span class="menu-text">Split Down</span><span class="shortcut">⌘<span class="shift">⇧</span>D</span></div>
             <div class="menu-item" data-action="split-left"><span class="menu-icon">▌⬚</span><span class="menu-text">Split Left</span></div>
@@ -1088,6 +1161,21 @@
   </div>
   <div id="quick-terminal">
     <div class="quick-terminal-content"></div>
+  </div>
+
+  <!-- Hidden file input for upload -->
+  <input type="file" id="file-upload-input" style="display: none" multiple />
+
+  <!-- Download path dialog -->
+  <div id="download-dialog" class="dialog-overlay">
+    <div class="dialog-box">
+      <div class="dialog-title">Download File</div>
+      <input type="text" id="download-path-input" placeholder="Enter remote path (e.g., ~/file.txt)" autocomplete="off" />
+      <div class="dialog-buttons">
+        <button class="dialog-btn cancel">Cancel</button>
+        <button class="dialog-btn confirm">Download</button>
+      </div>
+    </div>
   </div>
 
   <script src="client.js"></script>

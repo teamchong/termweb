@@ -1636,6 +1636,10 @@ const Server = struct {
             const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
             const tab = self.parseJsonString(data, "tab") orelse return;
             self.setInspectorTab(conn, panel_id, tab);
+        } else if (std.mem.indexOf(u8, data, "\"file_upload\"")) |_| {
+            self.handleFileUpload(conn, data);
+        } else if (std.mem.indexOf(u8, data, "\"file_download\"")) |_| {
+            self.handleFileDownload(conn, data);
         }
     }
 
@@ -1693,6 +1697,165 @@ const Server = struct {
                 return;
             }
         }
+    }
+
+    fn handleFileUpload(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
+        const filename = self.parseJsonString(data, "filename") orelse return;
+        const base64_data = self.parseJsonString(data, "data") orelse return;
+
+        // Get panel's cwd
+        self.mutex.lock();
+        const panel = self.panels.get(panel_id);
+        self.mutex.unlock();
+
+        if (panel == null) {
+            self.sendFileError(conn, filename, "Panel not found");
+            return;
+        }
+
+        // Get current working directory from panel
+        const cwd = panel.?.pwd;
+        if (cwd.len == 0) {
+            self.sendFileError(conn, filename, "Cannot determine working directory");
+            return;
+        }
+
+        // Build full path: cwd/filename
+        var path_buf: [4096]u8 = undefined;
+        const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cwd, filename }) catch {
+            self.sendFileError(conn, filename, "Path too long");
+            return;
+        };
+
+        // Decode base64
+        const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(base64_data) catch {
+            self.sendFileError(conn, filename, "Invalid base64 data");
+            return;
+        };
+        const decoded = self.allocator.alloc(u8, decoded_size) catch {
+            self.sendFileError(conn, filename, "Out of memory");
+            return;
+        };
+        defer self.allocator.free(decoded);
+
+        _ = std.base64.standard.Decoder.decode(decoded, base64_data) catch {
+            self.sendFileError(conn, filename, "Base64 decode failed");
+            return;
+        };
+
+        // Write file
+        const file = std.fs.createFileAbsolute(full_path, .{}) catch {
+            self.sendFileError(conn, filename, "Cannot create file");
+            return;
+        };
+        defer file.close();
+
+        file.writeAll(decoded) catch {
+            self.sendFileError(conn, filename, "Write failed");
+            return;
+        };
+
+        // Send success response
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"file_upload_result\",\"filename\":\"{s}\",\"success\":true}}", .{filename}) catch return;
+        conn.sendText(msg) catch {};
+        std.log.info("File uploaded: {s}", .{full_path});
+    }
+
+    fn handleFileDownload(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
+        var path = self.parseJsonString(data, "path") orelse return;
+
+        // Get panel for cwd resolution
+        self.mutex.lock();
+        const panel = self.panels.get(panel_id);
+        self.mutex.unlock();
+
+        // Expand ~ to cwd if path starts with ~/
+        var resolved_path_buf: [4096]u8 = undefined;
+        var resolved_path: []const u8 = path;
+
+        if (path.len > 0 and path[0] == '~') {
+            // Get home directory
+            const home = std.posix.getenv("HOME") orelse "/tmp";
+            if (path.len > 1 and path[1] == '/') {
+                // ~/foo -> $HOME/foo
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
+            } else {
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
+            }
+        } else if (path.len > 0 and path[0] != '/') {
+            // Relative path - prepend cwd
+            if (panel) |p| {
+                if (p.pwd.len > 0) {
+                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
+                }
+            }
+        }
+
+        // Extract filename from path
+        const filename = std.fs.path.basename(resolved_path);
+
+        // Read file
+        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch {
+            self.sendFileError(conn, filename, "Cannot open file");
+            return;
+        };
+        defer file.close();
+
+        const stat = file.stat() catch {
+            self.sendFileError(conn, filename, "Cannot stat file");
+            return;
+        };
+
+        if (stat.size > 100 * 1024 * 1024) { // 100MB limit
+            self.sendFileError(conn, filename, "File too large (max 100MB)");
+            return;
+        }
+
+        const file_data = file.readToEndAlloc(self.allocator, 100 * 1024 * 1024) catch {
+            self.sendFileError(conn, filename, "Read failed");
+            return;
+        };
+        defer self.allocator.free(file_data);
+
+        // Encode to base64
+        const base64_size = std.base64.standard.Encoder.calcSize(file_data.len);
+        const base64_data = self.allocator.alloc(u8, base64_size) catch {
+            self.sendFileError(conn, filename, "Out of memory");
+            return;
+        };
+        defer self.allocator.free(base64_data);
+
+        _ = std.base64.standard.Encoder.encode(base64_data, file_data);
+
+        // Build and send response
+        // {"type":"file_data","filename":"...","data":"base64..."}
+        const msg_size = 50 + filename.len + base64_data.len;
+        const msg = self.allocator.alloc(u8, msg_size) catch {
+            self.sendFileError(conn, filename, "Out of memory");
+            return;
+        };
+        defer self.allocator.free(msg);
+
+        const msg_len = std.fmt.bufPrint(msg, "{{\"type\":\"file_data\",\"filename\":\"{s}\",\"data\":\"{s}\"}}", .{ filename, base64_data }) catch {
+            self.sendFileError(conn, filename, "Format error");
+            return;
+        };
+
+        conn.sendText(msg_len) catch {
+            std.log.err("Failed to send file data", .{});
+            return;
+        };
+        std.log.info("File downloaded: {s} ({d} bytes)", .{ resolved_path, file_data.len });
+    }
+
+    fn sendFileError(self: *Server, conn: *ws.Connection, filename: []const u8, err: []const u8) void {
+        _ = self;
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"file_data\",\"filename\":\"{s}\",\"error\":\"{s}\"}}", .{ filename, err }) catch return;
+        conn.sendText(msg) catch {};
     }
 
     fn broadcastInspectorUpdates(self: *Server) void {
