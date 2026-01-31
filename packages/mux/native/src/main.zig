@@ -84,10 +84,34 @@ const MouseScrollMsg = packed struct {
 };
 
 // ============================================================================
-// Control Channel Protocol (JSON over text WebSocket frames)
+// Control Channel Protocol (Binary + JSON fallback)
 // ============================================================================
 
-// Control message types (text/JSON)
+// Binary control message types (wire protocol)
+pub const BinaryCtrlMsg = enum(u8) {
+    // Server → Client (0x01-0x0F)
+    panel_list = 0x01,
+    panel_created = 0x02,
+    panel_closed = 0x03,
+    panel_title = 0x04,
+    panel_pwd = 0x05,
+    panel_bell = 0x06,
+    layout_update = 0x07,
+    clipboard = 0x08,
+    inspector_state = 0x09,
+
+    // Client → Server (0x80-0x8F)
+    close_panel = 0x81,
+    resize_panel = 0x82,
+    focus_panel = 0x83,
+    split_panel = 0x84,
+    inspector_subscribe = 0x85,
+    inspector_unsubscribe = 0x86,
+    inspector_tab = 0x87,
+    view_action = 0x88,
+};
+
+// Control message types (text/JSON - legacy)
 pub const ControlMsgType = enum {
     // Server → Client
     panel_list,      // List of all panels
@@ -1551,31 +1575,33 @@ const Server = struct {
         _ = self;
         const size = c.ghostty_surface_size(panel.surface);
 
-        // Only send data we can actually get from ghostty C API
-        // Currently only ghostty_surface_size() is available
-        var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf,
-            \\{{"type":"inspector_state","panel_id":{},
-            \\"size":{{"cols":{},"rows":{},"screen_width":{},"screen_height":{},"cell_width":{},"cell_height":{}}}}}
-        , .{
-            panel.id,
-            size.columns,
-            size.rows,
-            size.width_px,
-            size.height_px,
-            size.cell_width_px,
-            size.cell_height_px,
-        }) catch return;
+        // Binary: [type:u8][panel_id:u32][cols:u16][rows:u16][sw:u16][sh:u16][cw:u8][ch:u8] = 15 bytes
+        var buf: [15]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state);
+        std.mem.writeInt(u32, buf[1..5], panel.id, .little);
+        std.mem.writeInt(u16, buf[5..7], @intCast(size.columns), .little);
+        std.mem.writeInt(u16, buf[7..9], @intCast(size.rows), .little);
+        std.mem.writeInt(u16, buf[9..11], @intCast(size.width_px), .little);
+        std.mem.writeInt(u16, buf[11..13], @intCast(size.height_px), .little);
+        buf[13] = @intCast(size.cell_width_px);
+        buf[14] = @intCast(size.cell_height_px);
 
-        conn.sendText(msg) catch {};
+        conn.sendBinary(&buf) catch {};
     }
 
     // ========== Control message handling ==========
 
     fn handleControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        // Simple JSON parsing (look for "type" field)
-        // In production, use proper JSON parser
+        if (data.len == 0) return;
 
+        // Binary message detection: first byte >= 0x80 indicates client->server binary message
+        // JSON always starts with '{' (0x7B) or other printable ASCII
+        if (data[0] >= 0x80) {
+            self.handleBinaryControlMessageFromClient(conn, data);
+            return;
+        }
+
+        // JSON fallback - Simple JSON parsing (look for "type" field)
         if (std.mem.indexOf(u8, data, "\"create_panel\"")) |_| {
             // Panels are auto-created when panel WS connects
         } else if (std.mem.indexOf(u8, data, "\"close_panel\"")) |_| {
@@ -1644,6 +1670,136 @@ const Server = struct {
             self.handleFileUpload(conn, data);
         } else if (std.mem.indexOf(u8, data, "\"file_download\"")) |_| {
             self.handleFileDownload(conn, data);
+        }
+    }
+
+    fn handleBinaryControlMessageFromClient(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 1) return;
+        _ = conn;
+
+        const msg_type = data[0];
+        switch (msg_type) {
+            @intFromEnum(BinaryCtrlMsg.close_panel) => {
+                // [type:u8][panel_id:u32] = 5 bytes
+                if (data.len < 5) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                self.mutex.lock();
+                self.pending_destroys.append(self.allocator, .{ .id = panel_id }) catch {};
+                self.mutex.unlock();
+            },
+            @intFromEnum(BinaryCtrlMsg.resize_panel) => {
+                // [type:u8][panel_id:u32][width:u16][height:u16] = 9 bytes
+                if (data.len < 9) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                const width = std.mem.readInt(u16, data[5..7], .little);
+                const height = std.mem.readInt(u16, data[7..9], .little);
+                self.mutex.lock();
+                self.pending_resizes.append(self.allocator, .{ .id = panel_id, .width = width, .height = height }) catch {};
+                self.mutex.unlock();
+            },
+            @intFromEnum(BinaryCtrlMsg.focus_panel) => {
+                // [type:u8][panel_id:u32] = 5 bytes
+                if (data.len < 5) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                self.mutex.lock();
+                if (self.layout.findTabByPanel(panel_id)) |tab| {
+                    self.layout.active_tab_id = tab.id;
+                }
+                self.mutex.unlock();
+            },
+            @intFromEnum(BinaryCtrlMsg.split_panel) => {
+                // [type:u8][panel_id:u32][direction:u8][width:u16][height:u16][scale_x100:u16] = 12 bytes
+                if (data.len < 12) return;
+                const parent_id = std.mem.readInt(u32, data[1..5], .little);
+                const dir_byte = data[5];
+                const width = std.mem.readInt(u16, data[6..8], .little);
+                const height = std.mem.readInt(u16, data[8..10], .little);
+                const scale_x100 = std.mem.readInt(u16, data[10..12], .little);
+                const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
+                const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
+
+                self.mutex.lock();
+                self.pending_splits.append(self.allocator, .{
+                    .parent_panel_id = parent_id,
+                    .direction = direction,
+                    .width = width,
+                    .height = height,
+                    .scale = scale,
+                }) catch {};
+                self.mutex.unlock();
+            },
+            @intFromEnum(BinaryCtrlMsg.inspector_subscribe) => {
+                // [type:u8][panel_id:u32][tab_len:u8][tab...] = 6 + tab_len bytes
+                if (data.len < 6) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                const tab_len = data[5];
+                if (data.len < 6 + tab_len) return;
+                const tab = data[6..][0..tab_len];
+                self.subscribeInspectorBinary(panel_id, tab);
+            },
+            @intFromEnum(BinaryCtrlMsg.inspector_unsubscribe) => {
+                // [type:u8][panel_id:u32] = 5 bytes
+                if (data.len < 5) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                self.unsubscribeInspectorBinary(panel_id);
+            },
+            @intFromEnum(BinaryCtrlMsg.inspector_tab) => {
+                // [type:u8][panel_id:u32][tab_len:u8][tab...] = 6 + tab_len bytes
+                if (data.len < 6) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                const tab_len = data[5];
+                if (data.len < 6 + tab_len) return;
+                const tab = data[6..][0..tab_len];
+                self.setInspectorTabBinary(panel_id, tab);
+            },
+            @intFromEnum(BinaryCtrlMsg.view_action) => {
+                // [type:u8][panel_id:u32][action_len:u8][action...] = 6 + action_len bytes
+                if (data.len < 6) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                const action_len = data[5];
+                if (data.len < 6 + action_len) return;
+                const action = data[6..][0..action_len];
+                self.mutex.lock();
+                if (self.panels.get(panel_id)) |panel| {
+                    self.mutex.unlock();
+                    _ = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
+                } else {
+                    self.mutex.unlock();
+                }
+            },
+            else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
+        }
+    }
+
+    fn subscribeInspectorBinary(self: *Server, panel_id: u32, tab: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.panels.get(panel_id)) |panel| {
+            panel.inspector_subscribed = true;
+            const len = @min(tab.len, panel.inspector_tab.len);
+            @memcpy(panel.inspector_tab[0..len], tab[0..len]);
+            panel.inspector_tab_len = @intCast(len);
+        }
+    }
+
+    fn unsubscribeInspectorBinary(self: *Server, panel_id: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.panels.get(panel_id)) |panel| {
+            panel.inspector_subscribed = false;
+        }
+    }
+
+    fn setInspectorTabBinary(self: *Server, panel_id: u32, tab: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.panels.get(panel_id)) |panel| {
+            const len = @min(tab.len, panel.inspector_tab.len);
+            @memcpy(panel.inspector_tab[0..len], tab[0..len]);
+            panel.inspector_tab_len = @intCast(len);
         }
     }
 
@@ -1765,9 +1921,10 @@ const Server = struct {
         };
         defer c.libdeflate_free_decompressor(decompressor);
 
-        // Allocate buffer for decompressed data (estimate 10x compression ratio max)
-        const max_decompressed = @min(compressed_data.len * 10, 100 * 1024 * 1024);
-        const decompressed = self.allocator.alloc(u8, max_decompressed) catch {
+        // Allocate buffer for decompressed data (use 100x ratio for text files)
+        const max_decompressed = @max(compressed_data.len * 100, 1024 * 1024);
+        const capped = @min(max_decompressed, 100 * 1024 * 1024);
+        const decompressed = self.allocator.alloc(u8, capped) catch {
             self.sendBinaryFileError(conn, "Out of memory");
             return;
         };
@@ -1783,9 +1940,16 @@ const Server = struct {
             &actual_size,
         );
 
+        // 0=SUCCESS, 1=BAD_DATA, 2=SHORT_OUTPUT, 3=INSUFFICIENT_SPACE
         if (result != 0) {
-            std.log.err("Decompression failed with result: {d}", .{result});
-            self.sendBinaryFileError(conn, "Decompression failed");
+            std.log.err("Upload decompression failed: result={d}, compressed_size={d}", .{ result, compressed_data.len });
+            const err_msg = switch (result) {
+                1 => "Upload failed: corrupted data",
+                2 => "Upload failed: incomplete data",
+                3 => "Upload failed: file too large",
+                else => "Upload failed: decompression error",
+            };
+            self.sendBinaryFileError(conn, err_msg);
             return;
         }
 
@@ -2043,74 +2207,107 @@ const Server = struct {
         const layout_json = self.layout.toJson(self.allocator) catch return;
         defer self.allocator.free(layout_json);
 
-        // Build JSON panel list with layout
-        var buf: [8192]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buf);
-        const writer = stream.writer();
-
-        writer.writeAll("{\"type\":\"panel_list\",\"panels\":[") catch return;
-
-        var first = true;
+        // Binary: [type:u8][count:u8][panel_id:u32, title_len:u8, title...]*[layout_len:u16][layout_json]
+        // Calculate total size
+        const panel_count = self.panels.count();
+        var total_panel_data_size: usize = 0;
         var it = self.panels.iterator();
         while (it.next()) |entry| {
-            if (!first) writer.writeAll(",") catch return;
-            first = false;
             const panel = entry.value_ptr.*;
-            writer.print("{{\"id\":{},\"width\":{},\"height\":{}}}", .{
-                panel.id,
-                panel.width,
-                panel.height,
-            }) catch return;
+            // panel_id:u32 + title_len:u8 + title
+            total_panel_data_size += 4 + 1 + @min(panel.title.len, 255);
         }
 
-        writer.print("],\"layout\":{s}}}", .{layout_json}) catch return;
+        const layout_len: u16 = @min(@as(u16, @intCast(@min(layout_json.len, 65535))), 65535);
+        const msg_size = 1 + 1 + total_panel_data_size + 2 + layout_len;
+        const msg_buf = self.allocator.alloc(u8, msg_size) catch return;
+        defer self.allocator.free(msg_buf);
 
-        conn.sendText(stream.getWritten()) catch {};
+        msg_buf[0] = @intFromEnum(BinaryCtrlMsg.panel_list);
+        msg_buf[1] = @intCast(@min(panel_count, 255));
 
-        // Send title/pwd for each panel so client can update UI
+        var offset: usize = 2;
         var it2 = self.panels.iterator();
         while (it2.next()) |entry| {
             const panel = entry.value_ptr.*;
+            std.mem.writeInt(u32, msg_buf[offset..][0..4], panel.id, .little);
+            offset += 4;
+            const title_len: u8 = @intCast(@min(panel.title.len, 255));
+            msg_buf[offset] = title_len;
+            offset += 1;
+            @memcpy(msg_buf[offset..][0..title_len], panel.title[0..title_len]);
+            offset += title_len;
+        }
+
+        std.mem.writeInt(u16, msg_buf[offset..][0..2], layout_len, .little);
+        offset += 2;
+        @memcpy(msg_buf[offset..][0..layout_len], layout_json[0..layout_len]);
+
+        conn.sendBinary(msg_buf) catch {};
+
+        // Send title/pwd for each panel so client can update UI
+        var it3 = self.panels.iterator();
+        while (it3.next()) |entry| {
+            const panel = entry.value_ptr.*;
             if (panel.title.len > 0) {
-                var title_buf: [512]u8 = undefined;
-                const title_msg = std.fmt.bufPrint(&title_buf, "{{\"type\":\"panel_title\",\"panel_id\":{},\"title\":\"{s}\"}}", .{ panel.id, panel.title }) catch continue;
-                conn.sendText(title_msg) catch {};
+                // Binary: [type:u8][panel_id:u32][title_len:u8][title...]
+                const title_len: u8 = @intCast(@min(panel.title.len, 255));
+                var title_buf: [262]u8 = undefined;
+                title_buf[0] = @intFromEnum(BinaryCtrlMsg.panel_title);
+                std.mem.writeInt(u32, title_buf[1..5], panel.id, .little);
+                title_buf[5] = title_len;
+                @memcpy(title_buf[6..][0..title_len], panel.title[0..title_len]);
+                conn.sendBinary(title_buf[0 .. 6 + title_len]) catch {};
             }
             if (panel.pwd.len > 0) {
-                var pwd_buf: [1024]u8 = undefined;
-                const pwd_msg = std.fmt.bufPrint(&pwd_buf, "{{\"type\":\"panel_pwd\",\"panel_id\":{},\"pwd\":\"{s}\"}}", .{ panel.id, panel.pwd }) catch continue;
-                conn.sendText(pwd_msg) catch {};
+                // Binary: [type:u8][panel_id:u32][pwd_len:u16][pwd...]
+                const pwd_len: u16 = @intCast(@min(panel.pwd.len, 1024));
+                var pwd_buf: [1031]u8 = undefined;
+                pwd_buf[0] = @intFromEnum(BinaryCtrlMsg.panel_pwd);
+                std.mem.writeInt(u32, pwd_buf[1..5], panel.id, .little);
+                std.mem.writeInt(u16, pwd_buf[5..7], pwd_len, .little);
+                @memcpy(pwd_buf[7..][0..pwd_len], panel.pwd[0..pwd_len]);
+                conn.sendBinary(pwd_buf[0 .. 7 + pwd_len]) catch {};
             }
         }
     }
 
     fn broadcastPanelCreated(self: *Server, panel_id: u32) void {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"panel_created\",\"panel_id\":{}}}", .{panel_id}) catch return;
+        // Binary: [type:u8][panel_id:u32] = 5 bytes
+        var buf: [5]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_created);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
 
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (self.control_connections.items) |conn| {
-            conn.sendText(msg) catch {};
+            conn.sendBinary(&buf) catch {};
         }
     }
 
     fn broadcastPanelClosed(self: *Server, panel_id: u32) void {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"panel_closed\",\"panel_id\":{}}}", .{panel_id}) catch return;
+        // Binary: [type:u8][panel_id:u32] = 5 bytes
+        var buf: [5]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_closed);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
 
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (self.control_connections.items) |conn| {
-            conn.sendText(msg) catch {};
+            conn.sendBinary(&buf) catch {};
         }
     }
 
     fn broadcastPanelTitle(self: *Server, panel_id: u32, title: []const u8) void {
-        var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"panel_title\",\"panel_id\":{},\"title\":\"{s}\"}}", .{ panel_id, title }) catch return;
+        // Binary: [type:u8][panel_id:u32][title_len:u8][title...] = 6 + title.len bytes
+        const title_len: u8 = @min(@as(u8, @intCast(@min(title.len, 255))), 255);
+        var buf: [262]u8 = undefined; // 1 + 4 + 1 + 256
+        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_title);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        buf[5] = title_len;
+        @memcpy(buf[6..][0..title_len], title[0..title_len]);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2122,25 +2319,32 @@ const Server = struct {
         }
 
         for (self.control_connections.items) |conn| {
-            conn.sendText(msg) catch {};
+            conn.sendBinary(buf[0 .. 6 + title_len]) catch {};
         }
     }
 
     fn broadcastPanelBell(self: *Server, panel_id: u32) void {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"panel_bell\",\"panel_id\":{}}}", .{panel_id}) catch return;
+        // Binary: [type:u8][panel_id:u32] = 5 bytes
+        var buf: [5]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_bell);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
 
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (self.control_connections.items) |conn| {
-            conn.sendText(msg) catch {};
+            conn.sendBinary(&buf) catch {};
         }
     }
 
     fn broadcastPanelPwd(self: *Server, panel_id: u32, pwd: []const u8) void {
-        var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"panel_pwd\",\"panel_id\":{},\"pwd\":\"{s}\"}}", .{ panel_id, pwd }) catch return;
+        // Binary: [type:u8][panel_id:u32][pwd_len:u16][pwd...] = 7 + pwd.len bytes
+        const pwd_len: u16 = @min(@as(u16, @intCast(@min(pwd.len, 1024))), 1024);
+        var buf: [1031]u8 = undefined; // 1 + 4 + 2 + 1024
+        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_pwd);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        std.mem.writeInt(u16, buf[5..7], pwd_len, .little);
+        @memcpy(buf[7..][0..pwd_len], pwd[0..pwd_len]);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2152,7 +2356,7 @@ const Server = struct {
         }
 
         for (self.control_connections.items) |conn| {
-            conn.sendText(msg) catch {};
+            conn.sendBinary(buf[0 .. 7 + pwd_len]) catch {};
         }
     }
 
@@ -2164,66 +2368,64 @@ const Server = struct {
         };
         defer self.allocator.free(layout_json);
 
-        // Build message
-        var buf: [8192]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"layout_update\",\"layout\":{s}}}", .{layout_json}) catch {
+        // Binary: [type:u8][layout_len:u16][layout_json...] = 3 + layout.len bytes
+        const layout_len: u16 = @min(@as(u16, @intCast(@min(layout_json.len, 65535))), 65535);
+        const msg_buf = self.allocator.alloc(u8, 3 + layout_len) catch {
             self.mutex.unlock();
             return;
         };
+        defer self.allocator.free(msg_buf);
+
+        msg_buf[0] = @intFromEnum(BinaryCtrlMsg.layout_update);
+        std.mem.writeInt(u16, msg_buf[1..3], layout_len, .little);
+        @memcpy(msg_buf[3..][0..layout_len], layout_json[0..layout_len]);
 
         for (self.control_connections.items) |conn| {
-            conn.sendText(msg) catch {};
+            conn.sendBinary(msg_buf) catch {};
         }
         self.mutex.unlock();
     }
 
     fn broadcastClipboard(self: *Server, text: []const u8) void {
-        // Base64 encode the text to avoid JSON escaping issues
-        const base64 = std.base64.standard;
-        const encoded_len = base64.Encoder.calcSize(text.len);
-
-        // Allocate buffer for JSON message
-        const msg_buf = self.allocator.alloc(u8, encoded_len + 32) catch return;
+        // Binary: [type:u8][data_len:u32][data...] = 5 + text.len bytes (raw UTF-8, no base64)
+        const data_len: u32 = @intCast(@min(text.len, 16 * 1024 * 1024)); // Max 16MB
+        const msg_buf = self.allocator.alloc(u8, 5 + data_len) catch return;
         defer self.allocator.free(msg_buf);
 
-        const encoded_buf = self.allocator.alloc(u8, encoded_len) catch return;
-        defer self.allocator.free(encoded_buf);
-
-        const encoded = base64.Encoder.encode(encoded_buf, text);
-
-        const msg = std.fmt.bufPrint(msg_buf, "{{\"type\":\"clipboard\",\"data\":\"{s}\"}}", .{encoded}) catch return;
+        msg_buf[0] = @intFromEnum(BinaryCtrlMsg.clipboard);
+        std.mem.writeInt(u32, msg_buf[1..5], data_len, .little);
+        @memcpy(msg_buf[5..][0..data_len], text[0..data_len]);
 
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (self.control_connections.items) |conn| {
-            conn.sendText(msg) catch {};
+            conn.sendBinary(msg_buf) catch {};
         }
     }
 
     fn sendInspectorStateUnlocked(self: *Server, conn: *ws.Connection, panel_id: u32, tab: []const u8) void {
         _ = tab; // Tab parameter for future use when more data is available
+        _ = self;
         // Note: mutex must already be held by caller
-        const panel = self.panels.get(panel_id) orelse return;
-        const size = c.ghostty_surface_size(panel.surface);
+        // Binary: [type:u8][panel_id:u32][cols:u16][rows:u16][sw:u16][sh:u16][cw:u8][ch:u8] = 15 bytes
+        // TODO: Re-enable when ghostty surface is available
+        _ = conn;
+        _ = panel_id;
+        // const panel = self.panels.get(panel_id) orelse return;
+        // const size = c.ghostty_surface_size(panel.surface);
 
-        // Only send data we can actually get from ghostty C API
-        // Currently only ghostty_surface_size() is available
-        var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf,
-            \\{{"type":"inspector_state","panel_id":{},
-            \\"size":{{"cols":{},"rows":{},"screen_width":{},"screen_height":{},"cell_width":{},"cell_height":{}}}}}
-        , .{
-            panel_id,
-            size.columns,
-            size.rows,
-            size.width_px,
-            size.height_px,
-            size.cell_width_px,
-            size.cell_height_px,
-        }) catch return;
+        // var buf: [15]u8 = undefined;
+        // buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state);
+        // std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        // std.mem.writeInt(u16, buf[5..7], @intCast(size.columns), .little);
+        // std.mem.writeInt(u16, buf[7..9], @intCast(size.rows), .little);
+        // std.mem.writeInt(u16, buf[9..11], @intCast(size.width_px), .little);
+        // std.mem.writeInt(u16, buf[11..13], @intCast(size.height_px), .little);
+        // buf[13] = @intCast(size.cell_width_px);
+        // buf[14] = @intCast(size.cell_height_px);
 
-        conn.sendText(msg) catch {};
+        // conn.sendBinary(&buf) catch {};
     }
 
     // Run HTTP server
