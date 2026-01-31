@@ -44,15 +44,25 @@
     #title-left {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 2px;
     }
     #title-indicator {
       color: var(--text-dim);
-      font-size: 20px;
-      margin: 0 4px;
+      font-size: 12px;
+      margin: 0 0 0 4px;
       line-height: 1;
     }
     #title-indicator:empty {
+      display: none;
+    }
+    #title-state-indicator {
+      color: var(--text-dim);
+      font-weight: 100;
+      font-family: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+      margin: 0 4px;
+      line-height: 1;
+    }
+    #title-state-indicator:empty {
       display: none;
     }
     #app-title {
@@ -278,11 +288,13 @@
       align-items: center;
       justify-content: center;
       min-width: 0;
-      gap: 6px;
+      gap: 4px;
     }
     .tab .indicator {
-      font-size: 20px;
+      font-size: 14px;
+      font-weight: 100;
       color: var(--text-dim);
+      font-family: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
       flex-shrink: 0;
       line-height: 1;
     }
@@ -1006,6 +1018,7 @@
   <div id="titlebar">
     <div id="title-left">
       <span id="title-indicator"></span>
+      <span id="title-state-indicator"></span>
       <span id="app-title">termweb</span>
     </div>
     <div id="title-right">

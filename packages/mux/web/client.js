@@ -1222,6 +1222,7 @@ class App {
     this.controlWs = null;
     this.panels = new Map();        // panelId -> Panel
     this.tabs = new Map();          // tabId -> { root: SplitContainer, element: DOM, title: string }
+    this.tabHistory = [];           // Tab activation history (most recent at end) for LRU switching
     this.activePanel = null;
     this.activeTab = null;          // Current tab ID
     this.nextLocalId = 1;
@@ -1905,10 +1906,24 @@ class App {
     this.tabs.delete(tabId);
     this.removeTabUI(tabId);
 
-    // Switch to another tab if this was active
+    // Remove from tab history
+    const historyIdx = this.tabHistory.indexOf(tabId);
+    if (historyIdx !== -1) {
+      this.tabHistory.splice(historyIdx, 1);
+    }
+
+    // Switch to last recently used tab if this was active
     if (this.activeTab === tabId) {
       this.activeTab = null;
       this.activePanel = null;
+      // Find most recently used tab that still exists
+      for (let i = this.tabHistory.length - 1; i >= 0; i--) {
+        if (this.tabs.has(this.tabHistory[i])) {
+          this.switchToTab(this.tabHistory[i]);
+          return;
+        }
+      }
+      // Fallback: switch to any remaining tab
       const remaining = this.tabs.keys().next();
       if (!remaining.done) {
         this.switchToTab(remaining.value);
@@ -2101,9 +2116,23 @@ class App {
       this.removeTabUI(tabId);
       this.panels.delete(targetPanel.id);
 
+      // Remove from tab history
+      const historyIdx = this.tabHistory.indexOf(tabId);
+      if (historyIdx !== -1) {
+        this.tabHistory.splice(historyIdx, 1);
+      }
+
       if (this.activeTab === tabId) {
         this.activeTab = null;
         this.activePanel = null;
+        // Find most recently used tab that still exists
+        for (let i = this.tabHistory.length - 1; i >= 0; i--) {
+          if (this.tabs.has(this.tabHistory[i])) {
+            this.switchToTab(this.tabHistory[i]);
+            return;
+          }
+        }
+        // Fallback: switch to any remaining tab
         const remaining = this.tabs.keys().next();
         if (!remaining.done) {
           this.switchToTab(remaining.value);
@@ -2155,6 +2184,13 @@ class App {
   // Switch to a tab
   switchToTab(tabId) {
     console.log(`switchToTab: switching to tab ${tabId}, total tabs: ${this.tabs.size}`);
+
+    // Update tab history (LRU: move to end)
+    const historyIdx = this.tabHistory.indexOf(tabId);
+    if (historyIdx !== -1) {
+      this.tabHistory.splice(historyIdx, 1);
+    }
+    this.tabHistory.push(tabId);
 
     // Hide ALL tabs first (ensures clean state)
     for (const [tid, t] of this.tabs) {

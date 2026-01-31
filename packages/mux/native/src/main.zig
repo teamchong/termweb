@@ -2136,14 +2136,25 @@ const Server = struct {
             self.tick();
 
             // Process input for all panels (more responsive than frame rate)
+            // Collect panels first, then release mutex before calling ghostty
+            // (ghostty callbacks may need the mutex)
+            var panels_buf: [64]*Panel = undefined;
+            var panels_count: usize = 0;
             self.mutex.lock();
             var panel_it = self.panels.valueIterator();
             while (panel_it.next()) |panel_ptr| {
-                const panel = panel_ptr.*;
+                if (panels_count < panels_buf.len) {
+                    panels_buf[panels_count] = panel_ptr.*;
+                    panels_count += 1;
+                }
+            }
+            self.mutex.unlock();
+
+            // Now process input without holding the mutex
+            for (panels_buf[0..panels_count]) |panel| {
                 panel.processInputQueue();
                 panel.tick();
             }
-            self.mutex.unlock();
 
             // Only capture and send frames at target fps
             const since_last_frame: u64 = @intCast(now - last_frame);

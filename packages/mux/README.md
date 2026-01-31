@@ -1,143 +1,141 @@
 # termweb-mux
 
-Terminal multiplexer with VT compression, OPFS persistence, and libghostty-vt rendering.
+A high-performance terminal multiplexer for the web, powered by [Ghostty](https://ghostty.org)'s libghostty rendering engine compiled to WebAssembly.
 
 ## Features
 
-- **Multiplexing**: Multiple terminal sessions over single WebSocket
-- **Compression**: VT sequences compressed with zlib (minimal bandwidth)
-- **Persistence**: OPFS storage for scrollback history in browser
-- **Modern Terminal**: Will use libghostty-vt for proper VT100 emulation
+- **Native Terminal Rendering**: Uses libghostty (Ghostty's core) compiled to WASM for pixel-perfect terminal emulation
+- **GPU Acceleration**: WebGL2-based rendering with proper font atlas and ligature support
+- **Tab Management**: Multiple tabs with LRU (last recently used) switching on close
+- **Split Panes**: Horizontal/vertical splits with draggable dividers
+- **Mouse Support**: Full mouse tracking (hover, click, scroll, drag)
+- **Keyboard Shortcuts**: macOS-native shortcuts (Cmd+T, Cmd+W, Cmd+1-9, etc.)
+- **Per-Panel Inspector**: Alt+Cmd+I to inspect terminal state (dimensions, cell info)
+- **Shell Integration**: pwd tracking, running command indicators in tabs/titlebar
+- **Binary Protocol**: Efficient binary WebSocket protocol for terminal I/O
 
-## Usage
+## Architecture
 
-### Server
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Browser (client.js)                     │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐                      │
+│  │  Tab 1  │  │  Tab 2  │  │  Tab 3  │  ← Tab bar           │
+│  └────┬────┘  └─────────┘  └─────────┘                      │
+│       │                                                      │
+│  ┌────┴────────────────────────────────┐                    │
+│  │ Panel (canvas + WebSocket)          │                    │
+│  │  ┌────────────────────────────────┐ │                    │
+│  │  │     WebGL2 Terminal Canvas     │ │                    │
+│  │  │   (rendered by libghostty)     │ │                    │
+│  │  └────────────────────────────────┘ │                    │
+│  │  [Inspector: dimensions, cell info] │ ← Alt+Cmd+I        │
+│  └─────────────────────────────────────┘                    │
+└─────────────────────────────────────────────────────────────┘
+                           │
+                    WebSocket (binary)
+                           │
+┌─────────────────────────────────────────────────────────────┐
+│                    Server (main.zig)                         │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                 libghostty (C API)                   │    │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐              │    │
+│  │  │ Surface │  │ Surface │  │ Surface │  ← Terminals │    │
+│  │  └────┬────┘  └─────────┘  └─────────┘              │    │
+│  │       │                                              │    │
+│  │       ↓                                              │    │
+│  │  ┌─────────┐                                         │    │
+│  │  │   PTY   │  ← /bin/zsh or $SHELL                  │    │
+│  │  └─────────┘                                         │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Building
+
+Requires Zig 0.14.0+ and a C compiler for libghostty:
 
 ```bash
-npx termweb-mux
-# or
-npm install -g termweb-mux
-termweb-mux
+cd packages/mux
+zig build
 ```
 
-Or programmatically:
+Release build:
+```bash
+zig build -Doptimize=ReleaseFast
+```
+
+## Running
+
+```bash
+./zig-out/bin/termweb
+```
+
+Then open `http://localhost:7681` in a WebGL2-capable browser.
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| Cmd+T | New tab |
+| Cmd+W | Close tab/panel |
+| Cmd+1-9 | Switch to tab N |
+| Cmd+Shift+] | Next tab |
+| Cmd+Shift+[ | Previous tab |
+| Cmd+D | Split horizontally |
+| Cmd+Shift+D | Split vertically |
+| Cmd+Option+Arrow | Move focus between splits |
+| Alt+Cmd+I | Toggle inspector |
+| Cmd+K | Clear terminal |
+| Cmd+, | Open command palette |
+
+## Protocol
+
+### Control WebSocket (JSON)
+
+Used for session management:
 
 ```javascript
-const { createServer } = require('termweb-mux');
+// Create panel
+{ type: 'create_panel' }
 
-const server = createServer({ port: 7682, compression: true });
+// Close panel
+{ type: 'close_panel', panel_id: 1 }
+
+// Resize panel
+{ type: 'resize_panel', panel_id: 1, width: 800, height: 600 }
+
+// Focus panel
+{ type: 'focus_panel', panel_id: 1 }
 ```
 
-### Client (Browser)
+### Panel WebSocket (Binary)
 
-```html
-<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
-<script src="dist/client.bundle.js"></script>
-<script>
-const client = new MuxClient('ws://localhost:7682');
+Each panel has a dedicated binary WebSocket for terminal I/O:
 
-client.onConnect = () => console.log('Connected');
-client.onDisconnect = () => console.log('Disconnected');
-client.onError = (err) => console.error(err);
+**Client → Server:**
+- Keyboard input (raw bytes)
+- Mouse events (binary: x, y, modifiers, button)
 
-await client.connect();
+**Server → Client:**
+- Frame data (WebGL texture updates)
+- Cursor position
+- Title/pwd updates
+- Size changes
 
-// Create a terminal session
-const sessionId = await client.createSession({
-  onData: (data) => {
-    // Render VT sequences (use xterm.js or libghostty-vt)
-    terminal.write(data);
-  },
-  onExit: (code) => {
-    console.log('Session exited:', code);
-  }
-}, { cols: 120, rows: 40 });
+## Inspector
 
-// Send input
-client.write(sessionId, 'ls -la\n');
+Press Alt+Cmd+I to toggle the per-panel inspector. Currently shows:
 
-// Resize terminal
-client.resize(sessionId, 120, 40);
+- **Surface Info**: Grid dimensions, cell size, screen size
+- **Terminal IO**: (placeholder for VT sequence logging)
 
-// List sessions
-const sessions = await client.listSessions();
+The inspector uses WebSocket push updates (no polling).
 
-// Kill session
-client.kill(sessionId);
-</script>
-```
+## Dependencies
 
-## Protocol (JSON over WebSocket)
-
-### Client -> Server
-
-```javascript
-// Create session
-{ type: 'create', cols: 80, rows: 24, shell: '/bin/bash' }
-
-// Send input
-{ type: 'input', sessionId: 1, data: 'ls -la\n' }
-
-// Resize
-{ type: 'resize', sessionId: 1, cols: 120, rows: 40 }
-
-// Kill session
-{ type: 'kill', sessionId: 1 }
-
-// List sessions
-{ type: 'list' }
-
-// Attach to existing session
-{ type: 'attach', sessionId: 1 }
-
-// Get scrollback
-{ type: 'scrollback', sessionId: 1 }
-```
-
-### Server -> Client
-
-```javascript
-// Connected
-{ type: 'connected', clientId: 'abc123' }
-
-// Session created
-{ type: 'created', sessionId: 1 }
-
-// Terminal output (compressed)
-{ type: 'data', sessionId: 1, data: '<base64 zlib>', compressed: true }
-
-// Terminal output (uncompressed)
-{ type: 'data', sessionId: 1, data: 'raw vt data' }
-
-// Session exited
-{ type: 'exit', sessionId: 1, code: 0 }
-
-// Session list
-{ type: 'sessions', sessions: [{ id: 1, cols: 80, rows: 24 }] }
-
-// Error
-{ type: 'error', error: 'message' }
-```
-
-## OPFS Persistence
-
-The browser client automatically saves scrollback to OPFS (Origin Private File System):
-
-```javascript
-// Load persisted scrollback
-const scrollback = await client.loadFromOPFS(sessionId);
-
-// Clear persisted data
-await client.clearOPFS(sessionId);
-```
-
-## Roadmap
-
-- [ ] Integrate libghostty-vt WASM for proper VT emulation
-- [ ] File transfer support via OPFS
-- [ ] Session reconnection after disconnect
-- [ ] Shared sessions (collaboration)
-- [ ] Binary protocol option for lower overhead
+- [Ghostty](https://github.com/ghostty-org/ghostty) - Terminal emulation core (vendored)
+- Zig 0.14.0+ - Build system and native code
 
 ## License
 
