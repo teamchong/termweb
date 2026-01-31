@@ -759,12 +759,12 @@ class Panel {
   }
   
   getCanvasCoords(e) {
+    // Return coordinates in points (CSS pixels), not device pixels
+    // Ghostty expects point coordinates matching the surface size
     const rect = this.canvas.getBoundingClientRect();
-    const scaleX = this.canvas.width / rect.width;
-    const scaleY = this.canvas.height / rect.height;
     return {
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top) * scaleY
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
     };
   }
   
@@ -819,7 +819,7 @@ class Panel {
   
   sendMouseMove(e) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    
+
     const coords = this.getCanvasCoords(e);
     const buf = new ArrayBuffer(18);
     const view = new DataView(buf);

@@ -57,7 +57,7 @@ const KeyInputMsg = extern struct {
 
 // Mouse button message format
 // [msg_type:u8][x:f64][y:f64][button:u8][state:u8][mods:u8]
-const MouseButtonMsg = extern struct {
+const MouseButtonMsg = packed struct {
     x: f64,
     y: f64,
     button: u8,       // 0=left, 1=right, 2=middle
@@ -67,7 +67,7 @@ const MouseButtonMsg = extern struct {
 
 // Mouse move message format
 // [msg_type:u8][x:f64][y:f64][mods:u8]
-const MouseMoveMsg = extern struct {
+const MouseMoveMsg = packed struct {
     x: f64,
     y: f64,
     mods: u8,
@@ -75,7 +75,7 @@ const MouseMoveMsg = extern struct {
 
 // Mouse scroll message format
 // [msg_type:u8][x:f64][y:f64][dx:f64][dy:f64][mods:u8]
-const MouseScrollMsg = extern struct {
+const MouseScrollMsg = packed struct {
     x: f64,
     y: f64,
     scroll_x: f64,
@@ -1078,54 +1078,65 @@ const Panel = struct {
     }
 
     // Handle mouse button input from client - queues events for main thread
+    // Format: [x:f64][y:f64][button:u8][state:u8][mods:u8] = 19 bytes
     fn handleMouseButton(self: *Panel, data: []const u8) void {
-        if (data.len < @sizeOf(MouseButtonMsg)) return;
+        if (data.len < 19) return;
 
-        const msg: *const MouseButtonMsg = @ptrCast(@alignCast(data.ptr));
+        const x: f64 = @bitCast(std.mem.readInt(u64, data[0..8], .little));
+        const y: f64 = @bitCast(std.mem.readInt(u64, data[8..16], .little));
+        const button_byte = data[16];
+        const state_byte = data[17];
+        const mods = convertMods(data[18]);
 
-        const state: c.ghostty_input_mouse_state_e = if (msg.state == 1)
+        const state: c.ghostty_input_mouse_state_e = if (state_byte == 1)
             c.GHOSTTY_MOUSE_PRESS
         else
             c.GHOSTTY_MOUSE_RELEASE;
 
-        const button: c.ghostty_input_mouse_button_e = switch (msg.button) {
+        const button: c.ghostty_input_mouse_button_e = switch (button_byte) {
             0 => c.GHOSTTY_MOUSE_LEFT,
             1 => c.GHOSTTY_MOUSE_RIGHT,
             2 => c.GHOSTTY_MOUSE_MIDDLE,
             else => c.GHOSTTY_MOUSE_LEFT,
         };
 
-        const mods = convertMods(msg.mods);
-
         self.mutex.lock();
         defer self.mutex.unlock();
         // Queue position update first, then button event
-        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = msg.x, .y = msg.y, .mods = mods } }) catch {};
+        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = x, .y = y, .mods = mods } }) catch {};
         self.input_queue.append(self.allocator, .{ .mouse_button = .{ .state = state, .button = button, .mods = mods } }) catch {};
     }
 
     // Handle mouse move - queues event for main thread
+    // Format: [x:f64][y:f64][mods:u8] = 17 bytes
     fn handleMouseMove(self: *Panel, data: []const u8) void {
-        if (data.len < @sizeOf(MouseMoveMsg)) return;
+        if (data.len < 17) return;
 
-        const msg: *const MouseMoveMsg = @ptrCast(@alignCast(data.ptr));
+        const x: f64 = @bitCast(std.mem.readInt(u64, data[0..8], .little));
+        const y: f64 = @bitCast(std.mem.readInt(u64, data[8..16], .little));
+        const mods = convertMods(data[16]);
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = msg.x, .y = msg.y, .mods = convertMods(msg.mods) } }) catch {};
+        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = x, .y = y, .mods = mods } }) catch {};
     }
 
     // Handle mouse scroll - queues events for main thread
+    // Format: [x:f64][y:f64][dx:f64][dy:f64][mods:u8] = 33 bytes
     fn handleMouseScroll(self: *Panel, data: []const u8) void {
-        if (data.len < @sizeOf(MouseScrollMsg)) return;
+        if (data.len < 33) return;
 
-        const msg: *const MouseScrollMsg = @ptrCast(@alignCast(data.ptr));
+        const x: f64 = @bitCast(std.mem.readInt(u64, data[0..8], .little));
+        const y: f64 = @bitCast(std.mem.readInt(u64, data[8..16], .little));
+        const dx: f64 = @bitCast(std.mem.readInt(u64, data[16..24], .little));
+        const dy: f64 = @bitCast(std.mem.readInt(u64, data[24..32], .little));
+        const mods = convertMods(data[32]);
 
         self.mutex.lock();
         defer self.mutex.unlock();
         // Queue position update first, then scroll event
-        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = msg.x, .y = msg.y, .mods = convertMods(msg.mods) } }) catch {};
-        self.input_queue.append(self.allocator, .{ .mouse_scroll = .{ .x = msg.x, .y = msg.y, .dx = msg.scroll_x, .dy = msg.scroll_y } }) catch {};
+        self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = x, .y = y, .mods = mods } }) catch {};
+        self.input_queue.append(self.allocator, .{ .mouse_scroll = .{ .x = x, .y = y, .dx = dx, .dy = dy } }) catch {};
     }
 
     // Handle client message
