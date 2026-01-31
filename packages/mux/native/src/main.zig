@@ -610,6 +610,9 @@ const Panel = struct {
     input_queue: std.ArrayList(InputEvent),
     title: []const u8,  // Last known title
     pwd: []const u8,    // Last known working directory
+    inspector_subscribed: bool,
+    inspector_tab: [16]u8,
+    inspector_tab_len: u8,
 
     const KEYFRAME_INTERVAL_MS = 2000;
 
@@ -669,6 +672,9 @@ const Panel = struct {
             .input_queue = .{},
             .title = &.{},
             .pwd = &.{},
+            .inspector_subscribed = false,
+            .inspector_tab = undefined,
+            .inspector_tab_len = 0,
         };
 
         return panel;
@@ -1205,6 +1211,14 @@ const Server = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     selection_clipboard: ?[]u8,  // Selection clipboard buffer
+    inspector_subscriptions: std.ArrayList(InspectorSubscription),
+
+    const InspectorSubscription = struct {
+        conn: *ws.Connection,
+        panel_id: u32,
+        tab: [16]u8 = undefined,
+        tab_len: u8 = 0,
+    };
 
     var global_server: ?*Server = null;
 
@@ -1268,6 +1282,7 @@ const Server = struct {
             .allocator = allocator,
             .mutex = .{},
             .selection_clipboard = null,
+            .inspector_subscriptions = .{},
         };
 
         global_server = server;
@@ -1386,6 +1401,16 @@ const Server = struct {
                 break;
             }
         }
+
+        // Remove any inspector subscriptions for this connection
+        var i: usize = 0;
+        while (i < self.inspector_subscriptions.items.len) {
+            if (self.inspector_subscriptions.items[i].conn == conn) {
+                _ = self.inspector_subscriptions.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
         self.mutex.unlock();
     }
 
@@ -1396,8 +1421,16 @@ const Server = struct {
     }
 
     fn onPanelMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        _ = is_binary;
         const self = global_server orelse return;
+
+        // Handle JSON text messages (inspector commands)
+        if (!is_binary and data.len > 0 and data[0] == '{') {
+            if (conn.user_data) |ud| {
+                const panel: *Panel = @ptrCast(@alignCast(ud));
+                self.handlePanelInspectorMessage(panel, conn, data);
+            }
+            return;
+        }
 
         if (conn.user_data) |ud| {
             // Already connected to a panel - forward message
@@ -1460,10 +1493,71 @@ const Server = struct {
         self.mutex.unlock();
     }
 
+    fn handlePanelInspectorMessage(self: *Server, panel: *Panel, conn: *ws.Connection, data: []const u8) void {
+        if (std.mem.indexOf(u8, data, "\"inspector_subscribe\"")) |_| {
+            // Subscribe to inspector updates
+            panel.inspector_subscribed = true;
+
+            // Parse tab from message
+            if (self.parseJsonString(data, "tab")) |tab| {
+                const len = @min(tab.len, panel.inspector_tab.len);
+                @memcpy(panel.inspector_tab[0..len], tab[0..len]);
+                panel.inspector_tab_len = @intCast(len);
+            } else {
+                // Default to "screen" tab
+                const default_tab = "screen";
+                @memcpy(panel.inspector_tab[0..default_tab.len], default_tab);
+                panel.inspector_tab_len = default_tab.len;
+            }
+
+            // Send initial state
+            self.mutex.lock();
+            self.sendInspectorStateToPanel(panel, conn);
+            self.mutex.unlock();
+        } else if (std.mem.indexOf(u8, data, "\"inspector_unsubscribe\"")) |_| {
+            panel.inspector_subscribed = false;
+        } else if (std.mem.indexOf(u8, data, "\"inspector_tab\"")) |_| {
+            // Tab change
+            if (self.parseJsonString(data, "tab")) |tab| {
+                const len = @min(tab.len, panel.inspector_tab.len);
+                @memcpy(panel.inspector_tab[0..len], tab[0..len]);
+                panel.inspector_tab_len = @intCast(len);
+
+                // Send state for new tab immediately
+                self.mutex.lock();
+                self.sendInspectorStateToPanel(panel, conn);
+                self.mutex.unlock();
+            }
+        }
+    }
+
+    fn sendInspectorStateToPanel(self: *Server, panel: *Panel, conn: *ws.Connection) void {
+        // Note: mutex must already be held by caller
+        _ = self;
+        const size = c.ghostty_surface_size(panel.surface);
+
+        // Only send data we can actually get from ghostty C API
+        // Currently only ghostty_surface_size() is available
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf,
+            \\{{"type":"inspector_state","panel_id":{},
+            \\"size":{{"cols":{},"rows":{},"screen_width":{},"screen_height":{},"cell_width":{},"cell_height":{}}}}}
+        , .{
+            panel.id,
+            size.columns,
+            size.rows,
+            size.width_px,
+            size.height_px,
+            size.cell_width_px,
+            size.cell_height_px,
+        }) catch return;
+
+        conn.sendText(msg) catch {};
+    }
+
     // ========== Control message handling ==========
 
     fn handleControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        _ = conn; // Control connection not used directly here
         // Simple JSON parsing (look for "type" field)
         // In production, use proper JSON parser
 
@@ -1520,6 +1614,93 @@ const Server = struct {
                 _ = c.ghostty_surface_binding_action(panel.surface, action.ptr, action.len);
             } else {
                 self.mutex.unlock();
+            }
+        } else if (std.mem.indexOf(u8, data, "\"inspector_subscribe\"")) |_| {
+            const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
+            self.subscribeInspector(conn, panel_id, data);
+        } else if (std.mem.indexOf(u8, data, "\"inspector_unsubscribe\"")) |_| {
+            const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
+            self.unsubscribeInspector(conn, panel_id);
+        } else if (std.mem.indexOf(u8, data, "\"inspector_tab\"")) |_| {
+            const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
+            const tab = self.parseJsonString(data, "tab") orelse return;
+            self.setInspectorTab(conn, panel_id, tab);
+        }
+    }
+
+    fn subscribeInspector(self: *Server, conn: *ws.Connection, panel_id: u32, data: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check if already subscribed
+        for (self.inspector_subscriptions.items) |sub| {
+            if (sub.conn == conn and sub.panel_id == panel_id) return;
+        }
+
+        var sub = InspectorSubscription{ .conn = conn, .panel_id = panel_id };
+
+        // Parse tab from data
+        if (self.parseJsonString(data, "tab")) |tab| {
+            const len = @min(tab.len, sub.tab.len);
+            @memcpy(sub.tab[0..len], tab[0..len]);
+            sub.tab_len = @intCast(len);
+        }
+
+        self.inspector_subscriptions.append(self.allocator, sub) catch return;
+
+        // Send initial state immediately
+        self.sendInspectorStateUnlocked(conn, panel_id, sub.tab[0..sub.tab_len]);
+    }
+
+    fn unsubscribeInspector(self: *Server, conn: *ws.Connection, panel_id: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.inspector_subscriptions.items.len) {
+            const sub = self.inspector_subscriptions.items[i];
+            if (sub.conn == conn and sub.panel_id == panel_id) {
+                _ = self.inspector_subscriptions.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn setInspectorTab(self: *Server, conn: *ws.Connection, panel_id: u32, tab: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.inspector_subscriptions.items) |*sub| {
+            if (sub.conn == conn and sub.panel_id == panel_id) {
+                const len = @min(tab.len, sub.tab.len);
+                @memcpy(sub.tab[0..len], tab[0..len]);
+                sub.tab_len = @intCast(len);
+
+                // Send state for new tab immediately
+                self.sendInspectorStateUnlocked(conn, panel_id, tab);
+                return;
+            }
+        }
+    }
+
+    fn broadcastInspectorUpdates(self: *Server) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Send to control connection subscriptions (legacy)
+        for (self.inspector_subscriptions.items) |sub| {
+            self.sendInspectorStateUnlocked(sub.conn, sub.panel_id, sub.tab[0..sub.tab_len]);
+        }
+
+        // Send to panel-based inspector subscriptions
+        var it = self.panels.iterator();
+        while (it.next()) |entry| {
+            const panel = entry.value_ptr.*;
+            if (panel.inspector_subscribed) {
+                if (panel.connection) |conn| {
+                    self.sendInspectorStateToPanel(panel, conn);
+                }
             }
         }
     }
@@ -1747,6 +1928,31 @@ const Server = struct {
         }
     }
 
+    fn sendInspectorStateUnlocked(self: *Server, conn: *ws.Connection, panel_id: u32, tab: []const u8) void {
+        _ = tab; // Tab parameter for future use when more data is available
+        // Note: mutex must already be held by caller
+        const panel = self.panels.get(panel_id) orelse return;
+        const size = c.ghostty_surface_size(panel.surface);
+
+        // Only send data we can actually get from ghostty C API
+        // Currently only ghostty_surface_size() is available
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf,
+            \\{{"type":"inspector_state","panel_id":{},
+            \\"size":{{"cols":{},"rows":{},"screen_width":{},"screen_height":{},"cell_width":{},"cell_height":{}}}}}
+        , .{
+            panel_id,
+            size.columns,
+            size.rows,
+            size.width_px,
+            size.height_px,
+            size.cell_width_px,
+            size.cell_height_px,
+        }) catch return;
+
+        conn.sendText(msg) catch {};
+    }
+
     // Run HTTP server
     fn runHttpServer(self: *Server) void {
         self.http_server.run() catch |err| {
@@ -1858,6 +2064,15 @@ const Server = struct {
             if (self.panels.get(req.id)) |panel| {
                 self.mutex.unlock();
                 panel.resizeInternal(req.width, req.height) catch {};
+
+                // Send inspector update if subscribed
+                if (panel.inspector_subscribed) {
+                    if (panel.connection) |conn| {
+                        self.mutex.lock();
+                        self.sendInspectorStateToPanel(panel, conn);
+                        self.mutex.unlock();
+                    }
+                }
             } else {
                 self.mutex.unlock();
             }
@@ -1942,6 +2157,7 @@ const Server = struct {
                 }
                 self.mutex.unlock();
             }
+
 
             // Sleep until next input processing interval
             const elapsed: u64 = @intCast(std.time.nanoTimestamp() - now);

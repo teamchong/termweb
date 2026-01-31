@@ -57,14 +57,241 @@ class Panel {
     this.texture = null;
     this.sampler = null;
 
+    // Inspector state (per-panel)
+    this.inspectorVisible = false;
+    this.inspectorHeight = 200;
+    this.inspectorActiveTab = 'screen';
+    this.inspectorState = null;
+
     this.element = document.createElement('div');
     this.element.className = 'panel';
     this.element.appendChild(this.canvas);
+    this.createInspectorElement();
     container.appendChild(this.element);
 
     this.setupInputHandlers();
     this.initGPU();
     this.setupResizeObserver();
+  }
+
+  createInspectorElement() {
+    this.inspectorEl = document.createElement('div');
+    this.inspectorEl.className = 'panel-inspector';
+    this.inspectorEl.innerHTML = `
+      <div class="inspector-resize"></div>
+      <div class="inspector-content">
+        <div class="inspector-left">
+          <div class="inspector-left-header">
+            <div class="inspector-dock-wrapper">
+              <span class="inspector-dock-icon"></span>
+              <div class="inspector-dock-menu">
+                <div class="inspector-dock-menu-item" data-action="hide-header">Hide Tab Bar</div>
+              </div>
+            </div>
+            <div class="inspector-tabs">
+              <button class="inspector-tab active" data-tab="screen">Screen</button>
+            </div>
+          </div>
+          <div class="inspector-collapsed-toggle" data-panel="left"></div>
+          <div class="inspector-main"></div>
+        </div>
+        <div class="inspector-right">
+          <div class="inspector-right-header">
+            <div class="inspector-dock-wrapper">
+              <span class="inspector-dock-icon"></span>
+              <div class="inspector-dock-menu">
+                <div class="inspector-dock-menu-item" data-action="hide-header">Hide Tab Bar</div>
+              </div>
+            </div>
+            <span class="inspector-right-title">Surface Info</span>
+          </div>
+          <div class="inspector-collapsed-toggle" data-panel="right"></div>
+          <div class="inspector-sidebar"></div>
+        </div>
+      </div>
+    `;
+    this.element.appendChild(this.inspectorEl);
+    this.setupInspectorHandlers();
+  }
+
+  setupInspectorHandlers() {
+    // Tab switching
+    const tabs = this.inspectorEl.querySelectorAll('.inspector-tab');
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        this.inspectorActiveTab = tab.dataset.tab;
+        this.sendInspectorTab(tab.dataset.tab);
+        this.renderInspectorView();
+      });
+    });
+
+    // Resize handle
+    const handle = this.inspectorEl.querySelector('.inspector-resize');
+    let startY, startHeight;
+    const onMouseMove = (e) => {
+      const delta = startY - e.clientY;
+      const newHeight = Math.min(Math.max(startHeight + delta, 100), this.element.clientHeight * 0.6);
+      this.inspectorHeight = newHeight;
+      this.inspectorEl.style.height = newHeight + 'px';
+    };
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      // Trigger resize after drag ends
+      this.triggerResize();
+    };
+    handle.addEventListener('mousedown', (e) => {
+      startY = e.clientY;
+      startHeight = this.inspectorHeight;
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+    });
+
+    // Dock icon dropdown
+    const dockIcons = this.inspectorEl.querySelectorAll('.inspector-dock-icon');
+    dockIcons.forEach(icon => {
+      icon.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const menu = icon.parentElement.querySelector('.inspector-dock-menu');
+        // Close other menus
+        this.inspectorEl.querySelectorAll('.inspector-dock-menu.visible').forEach(m => {
+          if (m !== menu) m.classList.remove('visible');
+        });
+        menu.classList.toggle('visible');
+      });
+    });
+
+    // Hide menu when clicking elsewhere
+    document.addEventListener('click', () => {
+      this.inspectorEl.querySelectorAll('.inspector-dock-menu.visible').forEach(m => {
+        m.classList.remove('visible');
+      });
+    });
+
+    // Menu item click - hide header
+    const menuItems = this.inspectorEl.querySelectorAll('.inspector-dock-menu-item');
+    menuItems.forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const panel = item.closest('.inspector-left, .inspector-right');
+        if (panel && item.dataset.action === 'hide-header') {
+          panel.classList.add('header-hidden');
+        }
+        // Close menu
+        item.closest('.inspector-dock-menu').classList.remove('visible');
+      });
+    });
+
+    // Collapsed toggle - show header again
+    const toggles = this.inspectorEl.querySelectorAll('.inspector-collapsed-toggle');
+    toggles.forEach(toggle => {
+      toggle.addEventListener('click', () => {
+        const panel = toggle.closest('.inspector-left, .inspector-right');
+        if (panel) {
+          panel.classList.remove('header-hidden');
+        }
+      });
+    });
+  }
+
+  toggleInspector() {
+    this.inspectorVisible ? this.hideInspector() : this.showInspector();
+  }
+
+  showInspector() {
+    this.inspectorVisible = true;
+    this.inspectorEl.classList.add('visible');
+    this.inspectorEl.style.height = this.inspectorHeight + 'px';
+    this.sendInspectorSubscribe();
+    // Trigger resize so terminal reflows
+    this.triggerResize();
+  }
+
+  hideInspector() {
+    this.inspectorVisible = false;
+    this.inspectorEl.classList.remove('visible');
+    this.sendInspectorUnsubscribe();
+    // Trigger resize so terminal reclaims space
+    this.triggerResize();
+  }
+
+  triggerResize() {
+    // Force recalculate size after layout change
+    requestAnimationFrame(() => {
+      const rect = this.canvas.getBoundingClientRect();
+      const width = Math.floor(rect.width);
+      const height = Math.floor(rect.height);
+      if (width > 0 && height > 0 && this.serverId !== null && this.onResize) {
+        this.lastReportedWidth = width;
+        this.lastReportedHeight = height;
+        this.onResize(this.serverId, width, height);
+      }
+    });
+  }
+
+  sendInspectorSubscribe() {
+    if (!this.ws) return;
+    this.ws.send(JSON.stringify({ type: 'inspector_subscribe', tab: this.inspectorActiveTab }));
+  }
+
+  sendInspectorUnsubscribe() {
+    if (!this.ws) return;
+    this.ws.send(JSON.stringify({ type: 'inspector_unsubscribe' }));
+  }
+
+  sendInspectorTab(tab) {
+    if (!this.ws) return;
+    this.ws.send(JSON.stringify({ type: 'inspector_tab', tab: tab }));
+  }
+
+  handleInspectorState(state) {
+    this.inspectorState = state;
+    this.renderInspectorSidebar();
+    this.renderInspectorView();
+  }
+
+  renderInspectorSidebar() {
+    const sidebarEl = this.inspectorEl.querySelector('.inspector-sidebar');
+    if (!sidebarEl || !this.inspectorState) return;
+
+    const size = this.inspectorState.size || {};
+
+    if (!sidebarEl.dataset.initialized) {
+      sidebarEl.dataset.initialized = 'true';
+      sidebarEl.innerHTML = `
+        <div class="inspector-simple-section">
+          <span class="inspector-simple-title">Dimensions</span>
+          <hr>
+        </div>
+        <div class="inspector-row"><span class="inspector-label">Screen Size</span><span class="inspector-value" data-field="screen-size"></span></div>
+        <div class="inspector-row"><span class="inspector-label">Grid Size</span><span class="inspector-value" data-field="grid-size"></span></div>
+        <div class="inspector-row"><span class="inspector-label">Cell Size</span><span class="inspector-value" data-field="cell-size"></span></div>
+      `;
+    }
+
+    const f = (field) => sidebarEl.querySelector(`[data-field="${field}"]`);
+    f('screen-size').textContent = `${size.screen_width ?? 0}px x ${size.screen_height ?? 0}px`;
+    f('grid-size').textContent = `${size.cols ?? 0}c x ${size.rows ?? 0}r`;
+    f('cell-size').textContent = `${size.cell_width ?? 0}px x ${size.cell_height ?? 0}px`;
+  }
+
+  renderInspectorView() {
+    const mainEl = this.inspectorEl.querySelector('.inspector-main');
+    if (!mainEl) return;
+
+    const size = this.inspectorState?.size || {};
+
+    mainEl.innerHTML = `
+      <div class="inspector-simple-section">
+        <span class="inspector-simple-title">Terminal Size</span>
+        <hr>
+      </div>
+      <div class="inspector-row"><span class="inspector-label">Grid</span><span class="inspector-value">${size.cols ?? 0} columns × ${size.rows ?? 0} rows</span></div>
+      <div class="inspector-row"><span class="inspector-label">Screen</span><span class="inspector-value">${size.screen_width ?? 0} × ${size.screen_height ?? 0} px</span></div>
+      <div class="inspector-row"><span class="inspector-label">Cell</span><span class="inspector-value">${size.cell_width ?? 0} × ${size.cell_height ?? 0} px</span></div>
+    `;
   }
 
   setupResizeObserver() {
@@ -249,7 +476,19 @@ class Panel {
     };
 
     this.ws.onmessage = (event) => {
-      this.handleFrame(event.data);
+      // Check if it's a text message (JSON for inspector) or binary (frame data)
+      if (typeof event.data === 'string') {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'inspector_state') {
+            this.handleInspectorState(msg);
+          }
+        } catch (e) {
+          console.error('Failed to parse JSON message:', e);
+        }
+      } else {
+        this.handleFrame(event.data);
+      }
     };
 
     this.ws.onclose = () => {
@@ -1118,6 +1357,13 @@ class App {
             this.splitActivePanel('right');
           }
         }
+        return;
+      }
+      // ⌘⌥I to toggle inspector
+      if (e.metaKey && e.altKey && e.code === 'KeyI') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleInspector();
         return;
       }
       // ⌘⌥Arrow to navigate between splits
@@ -2406,7 +2652,7 @@ class App {
 
       // Config
       { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration' },
-      { title: 'Toggle Inspector', action: 'inspector:toggle', description: 'Toggle terminal inspector' },
+      { title: 'Toggle Inspector', action: '_toggle_inspector', description: 'Toggle terminal inspector', shortcut: '⌥⌘I' },
 
       // Title
       { title: 'Change Title...', action: '_change_title', description: 'Change the terminal title' },
@@ -2530,6 +2776,7 @@ class App {
         case '_split_left': this.splitActivePanel('left'); break;
         case '_split_up': this.splitActivePanel('up'); break;
         case '_change_title': this.promptChangeTitle(); break;
+        case '_toggle_inspector': this.toggleInspector(); break;
       }
       return;
     }
@@ -2571,6 +2818,25 @@ class App {
         if (appTitle) appTitle.textContent = newTitle || '👻';
       }
     }
+  }
+
+  // ============================================================================
+  // Terminal Inspector (per-panel)
+  // ============================================================================
+
+  toggleInspector() {
+    // Each panel has its own inspector - toggle the active panel's inspector
+    if (this.activePanel) {
+      this.activePanel.toggleInspector();
+    }
+  }
+
+  formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
   }
 
   toggleQuickTerminal() {
@@ -2795,6 +3061,9 @@ function setupMenus() {
           break;
         case 'quick-terminal':
           app.toggleQuickTerminal();
+          break;
+        case 'toggle-inspector':
+          app.toggleInspector();
           break;
       }
 
