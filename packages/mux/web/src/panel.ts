@@ -473,17 +473,17 @@ export class Panel {
   private handleMouseMove(e: MouseEvent): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
+    // Use CSS pixels (points), not device pixels - Ghostty expects point coordinates
     const rect = this.canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (window.devicePixelRatio || 1);
-    const y = (e.clientY - rect.top) * (window.devicePixelRatio || 1);
-    const mods = this.getModifiers(e);
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
-    const buf = new ArrayBuffer(10);
+    const buf = new ArrayBuffer(18);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.MOUSE_MOVE);
-    view.setFloat32(1, x, true);
-    view.setFloat32(5, y, true);
-    view.setUint8(9, mods);
+    view.setFloat64(1, x, true);
+    view.setFloat64(9, y, true);
+    view.setUint8(17, this.getModifiers(e));
     this.ws.send(buf);
   }
 
@@ -491,18 +491,17 @@ export class Panel {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     const rect = this.canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (window.devicePixelRatio || 1);
-    const y = (e.clientY - rect.top) * (window.devicePixelRatio || 1);
-    const mods = this.getModifiers(e);
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
-    const buf = new ArrayBuffer(12);
+    const buf = new ArrayBuffer(20);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.MOUSE_INPUT);
-    view.setFloat32(1, x, true);
-    view.setFloat32(5, y, true);
-    view.setUint8(9, e.button);
-    view.setUint8(10, pressed ? 1 : 0);
-    view.setUint8(11, mods);
+    view.setFloat64(1, x, true);
+    view.setFloat64(9, y, true);
+    view.setUint8(17, e.button);
+    view.setUint8(18, pressed ? 1 : 0);
+    view.setUint8(19, this.getModifiers(e));
     this.ws.send(buf);
   }
 
@@ -511,8 +510,8 @@ export class Panel {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     const rect = this.canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (window.devicePixelRatio || 1);
-    const y = (e.clientY - rect.top) * (window.devicePixelRatio || 1);
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
     let dx = e.deltaX;
     let dy = e.deltaY;
@@ -524,14 +523,14 @@ export class Panel {
       dy *= this.canvas.clientHeight;
     }
 
-    const buf = new ArrayBuffer(18);
+    const buf = new ArrayBuffer(34);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.MOUSE_SCROLL);
-    view.setFloat32(1, x, true);
-    view.setFloat32(5, y, true);
-    view.setFloat32(9, dx, true);
-    view.setFloat32(13, dy, true);
-    view.setUint8(17, this.getModifiers(e));
+    view.setFloat64(1, x, true);
+    view.setFloat64(9, y, true);
+    view.setFloat64(17, dx, true);
+    view.setFloat64(25, dy, true);
+    view.setUint8(33, this.getModifiers(e));
     this.ws.send(buf);
   }
 
