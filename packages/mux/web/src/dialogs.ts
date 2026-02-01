@@ -241,11 +241,18 @@ export class UploadDialog {
   }
 }
 
+export interface DownloadOptions {
+  path: string;
+  excludes: string[];
+  deleteExtra: boolean;
+  preview: boolean;
+}
+
 export class DownloadDialog {
   private overlay: HTMLElement | null = null;
-  private onDownload?: (path: string) => void;
+  private onDownload?: (options: DownloadOptions) => void;
 
-  constructor(onDownload: (path: string) => void) {
+  constructor(onDownload: (options: DownloadOptions) => void) {
     this.onDownload = onDownload;
   }
 
@@ -254,6 +261,9 @@ export class DownloadDialog {
     if (!this.overlay) return;
 
     const input = this.overlay.querySelector('.download-input') as HTMLInputElement;
+    const excludeInput = this.overlay.querySelector('.download-exclude') as HTMLInputElement;
+    const deleteCheckbox = this.overlay.querySelector('.download-delete') as HTMLInputElement;
+    const previewCheckbox = this.overlay.querySelector('.download-preview') as HTMLInputElement;
     const downloadBtn = this.overlay.querySelector('.dialog-btn.primary');
 
     if (input) {
@@ -262,7 +272,7 @@ export class DownloadDialog {
       input.onkeydown = (e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
-          this.download(input.value);
+          this.download();
         } else if (e.key === 'Escape') {
           e.preventDefault();
           this.hide();
@@ -270,9 +280,7 @@ export class DownloadDialog {
       };
     }
 
-    downloadBtn?.addEventListener('click', () => {
-      if (input) this.download(input.value);
-    });
+    downloadBtn?.addEventListener('click', () => this.download());
 
     this.overlay.classList.add('visible');
 
@@ -293,11 +301,31 @@ export class DownloadDialog {
     this.overlay?.classList.remove('visible');
   }
 
-  private download(path: string): void {
-    if (path.trim()) {
-      this.hide();
-      this.onDownload?.(path.trim());
-    }
+  private download(): void {
+    if (!this.overlay) return;
+
+    const input = this.overlay.querySelector('.download-input') as HTMLInputElement;
+    const excludeInput = this.overlay.querySelector('.download-exclude') as HTMLInputElement;
+    const deleteCheckbox = this.overlay.querySelector('.download-delete') as HTMLInputElement;
+    const previewCheckbox = this.overlay.querySelector('.download-preview') as HTMLInputElement;
+
+    const path = input?.value.trim();
+    if (!path) return;
+
+    const excludes = excludeInput?.value
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => s.length > 0) || [];
+
+    const options: DownloadOptions = {
+      path,
+      excludes,
+      deleteExtra: deleteCheckbox?.checked || false,
+      preview: previewCheckbox?.checked || false,
+    };
+
+    this.hide();
+    this.onDownload?.(options);
   }
 }
 

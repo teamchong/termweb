@@ -6,7 +6,7 @@
 import { Panel } from './panel';
 import { SplitContainer } from './split-container';
 import { FileTransferHandler } from './file-transfer';
-import { CommandPalette, UploadDialog, DownloadDialog, AccessControlDialog } from './dialogs';
+import { CommandPalette, UploadDialog, DownloadDialog, AccessControlDialog, type DownloadOptions } from './dialogs';
 import type { AppConfig, TabInfo, LayoutData, LayoutNode } from './types';
 import { generateId, applyColors, formatBytes, isLightColor, shadowColor } from './utils';
 import { BinaryCtrlMsg } from './protocol';
@@ -73,7 +73,7 @@ class App {
 
     this.commandPalette = new CommandPalette((action) => this.executeCommand(action));
     this.uploadDialog = new UploadDialog((file) => this.uploadFile(file));
-    this.downloadDialog = new DownloadDialog((path) => this.requestDownload(path));
+    this.downloadDialog = new DownloadDialog((options) => this.requestDownload(options));
     this.accessControlDialog = new AccessControlDialog();
 
     this.setupAccessControlCallbacks();
@@ -1596,11 +1596,14 @@ class App {
   // File Transfer
   // ============================================================================
 
-  requestDownload(path: string, isFolder = false): void {
+  requestDownload(options: DownloadOptions): void {
     if (!this.activePanel?.serverId) {
       console.error('No active panel for download');
       return;
     }
+
+    let { path, excludes, deleteExtra, preview } = options;
+    let isFolder = false;
 
     if (path.endsWith('/')) {
       isFolder = true;
@@ -1610,7 +1613,13 @@ class App {
     const panelId = this.activePanel.serverId;
     const pathBytes = new TextEncoder().encode(path);
 
-    const msgLen = 1 + 4 + 2 + pathBytes.length;
+    // Encode exclude patterns
+    const excludeBytes = excludes.map(e => new TextEncoder().encode(e));
+    const excludeTotalLen = excludeBytes.reduce((sum, b) => sum + 1 + b.length, 0);
+
+    // Message format: type(1) + panelId(4) + flags(1) + excludeCount(1) + pathLen(2) + path + excludes
+    const flags = (deleteExtra ? 0x01 : 0) | (preview ? 0x02 : 0);
+    const msgLen = 1 + 4 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
     const msg = new ArrayBuffer(msgLen);
     const view = new DataView(msg);
     const bytes = new Uint8Array(msg);
@@ -1618,11 +1627,22 @@ class App {
     let offset = 0;
     view.setUint8(offset, isFolder ? 0x14 : 0x11); offset += 1;
     view.setUint32(offset, panelId, true); offset += 4;
+    view.setUint8(offset, flags); offset += 1;
+    view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
-    bytes.set(pathBytes, offset);
+    bytes.set(pathBytes, offset); offset += pathBytes.length;
+
+    for (const eb of excludeBytes) {
+      view.setUint8(offset, eb.length); offset += 1;
+      bytes.set(eb, offset); offset += eb.length;
+    }
 
     this.controlWs?.send(msg);
-    console.log(`Requesting ${isFolder ? 'folder' : 'file'} download: ${path}`);
+    console.log(`Requesting ${isFolder ? 'folder' : 'file'} download: ${path}`, { preview, deleteExtra, excludes });
+
+    if (preview) {
+      console.log('Preview mode - will show dry-run results');
+    }
   }
 
   private uploadFile(file: File): void {
