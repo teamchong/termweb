@@ -1,8 +1,8 @@
 /**
- * Panel - Terminal panel with H.264 video via MSE + jMuxer
+ * Panel - Terminal panel with H.264 video via WebCodecs
+ * Lower latency than jMuxer/MSE by decoding directly to canvas
  */
 
-import JMuxer from 'jmuxer';
 import { ClientMsg } from './protocol';
 
 export interface PanelCallbacks {
@@ -14,17 +14,21 @@ export class Panel {
   readonly id: string;
   serverId: number | null;
   container: HTMLElement;
-  readonly video: HTMLVideoElement;
+  readonly canvas: HTMLCanvasElement;
   readonly element: HTMLElement;
-  pwd: string = ''; // Current working directory
+  pwd: string = '';
 
   private ws: WebSocket | null = null;
   private callbacks: PanelCallbacks;
   private destroyed = false;
   private paused = false;
 
-  // jMuxer for H.264 → fMP4 → MSE
-  private jmuxer: JMuxer | null = null;
+  // WebCodecs decoder
+  private decoder: VideoDecoder | null = null;
+  private decoderConfigured = false;
+  private pendingFrames: Uint8Array[] = []; // Buffer frames until decoder ready
+  private frameCount = 0;
+  private ctx: CanvasRenderingContext2D | null = null;
 
   private lastReportedWidth = 0;
   private lastReportedHeight = 0;
@@ -32,17 +36,21 @@ export class Panel {
   resizeObserver: ResizeObserver | null = null;
 
   // Adaptive bitrate - buffer monitoring
-  private bufferMonitorInterval: ReturnType<typeof setInterval> | null = null;
   private lastBufferReport = 0;
-  private frameTimestamps: number[] = []; // For FPS calculation
+  private frameTimestamps: number[] = [];
+  private pendingDecode = 0; // Frames waiting to be decoded
+
+  // Debug stats overlay (enable with #debug=1 in URL)
+  private static debugEnabled = window.location.hash.includes('debug=1');
+  private statsOverlay: HTMLElement | null = null;
+  private renderedFrames = 0;
+  private lastStatsUpdate = 0;
+  private displayedFps = 0;
+  private decodeLatencies: number[] = [];
+  private lastDecodeStart = 0;
 
   // Inspector elements
   private inspectorVisible = false;
-
-  // Alias for backwards compatibility - returns video element for getBoundingClientRect
-  get canvas(): HTMLVideoElement {
-    return this.video;
-  }
 
   constructor(
     id: string,
@@ -55,12 +63,12 @@ export class Panel {
     this.container = container;
     this.callbacks = callbacks;
 
-    // Create panel element
+    // Create panel element with canvas
     this.element = document.createElement('div');
     this.element.className = 'panel';
     this.element.innerHTML = `
       <div class="panel-content">
-        <video class="panel-video" autoplay muted playsinline></video>
+        <canvas class="panel-canvas"></canvas>
       </div>
       <div class="panel-inspector" style="display: none;">
         <div class="inspector-header">
@@ -74,100 +82,119 @@ export class Panel {
     `;
     container.appendChild(this.element);
 
-    this.video = this.element.querySelector('.panel-video') as HTMLVideoElement;
+    this.canvas = this.element.querySelector('.panel-canvas') as HTMLCanvasElement;
+    this.ctx = this.canvas.getContext('2d');
 
-    // Setup event handlers
     this.setupEventHandlers();
     this.setupResizeObserver();
-    this.initJMuxer();
+    this.initDecoder();
+    this.setupStatsOverlay();
   }
 
-  private initJMuxer(): void {
-    this.jmuxer = new JMuxer({
-      node: this.video,
-      mode: 'video',
-      flushingTime: 0, // Immediate flush for low latency
-      fps: 30,
-      debug: false,
-      onReady: () => {
-        console.log('jMuxer ready');
-        this.startBufferMonitor();
-      },
-      onError: (e: Error) => {
-        console.error('jMuxer error:', e);
-      },
+  private initDecoder(): void {
+    this.decoder = new VideoDecoder({
+      output: (frame) => this.onFrame(frame),
+      error: (e) => console.error('Decoder error:', e),
     });
   }
 
-  private startBufferMonitor(): void {
-    // Monitor buffer health every 500ms
-    this.bufferMonitorInterval = setInterval(() => {
-      this.checkBufferHealth();
-    }, 500);
+  private setupStatsOverlay(): void {
+    if (!Panel.debugEnabled) return;
+
+    this.statsOverlay = document.createElement('div');
+    this.statsOverlay.className = 'panel-stats-overlay';
+    this.statsOverlay.style.cssText = `
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(0, 0, 0, 0.8);
+      color: #0f0;
+      font-family: monospace;
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 4px;
+      z-index: 1000;
+      pointer-events: none;
+      line-height: 1.4;
+    `;
+    this.element.appendChild(this.statsOverlay);
   }
 
-  private checkBufferHealth(): void {
-    if (!this.video || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  private updateStatsOverlay(): void {
+    if (!this.statsOverlay) return;
 
     const now = performance.now();
 
-    // Calculate buffer length (how much video is buffered ahead)
-    let bufferLength = 0;
-    if (this.video.buffered.length > 0) {
-      const currentTime = this.video.currentTime;
-      for (let i = 0; i < this.video.buffered.length; i++) {
-        if (this.video.buffered.start(i) <= currentTime && this.video.buffered.end(i) > currentTime) {
-          bufferLength = this.video.buffered.end(i) - currentTime;
-          break;
-        }
-      }
+    // Update displayed FPS every 500ms
+    if (now - this.lastStatsUpdate > 500) {
+      this.displayedFps = this.renderedFrames * 2; // 2x because 500ms interval
+      this.renderedFrames = 0;
+      this.lastStatsUpdate = now;
     }
 
-    // Calculate received FPS from frame timestamps
+    // Calculate average decode latency
+    const avgLatency = this.decodeLatencies.length > 0
+      ? (this.decodeLatencies.reduce((a, b) => a + b, 0) / this.decodeLatencies.length).toFixed(1)
+      : '0.0';
+
+    // Keep only recent latencies
+    if (this.decodeLatencies.length > 30) {
+      this.decodeLatencies.shift();
+    }
+
+    // Calculate received FPS
     const oneSecondAgo = now - 1000;
-    this.frameTimestamps = this.frameTimestamps.filter(t => t > oneSecondAgo);
-    const receivedFps = this.frameTimestamps.length;
+    const receivedFps = this.frameTimestamps.filter(t => t > oneSecondAgo).length;
 
-    // Buffer health: 0-100 (0 = starving, 100 = too much buffered)
-    // Target: ~100ms buffer (3 frames at 30fps)
-    // < 50ms = starving (need lower bitrate/fps)
-    // > 300ms = too much buffer (can increase quality)
-    const targetBuffer = 0.1; // 100ms
-    const bufferHealth = Math.min(100, Math.max(0, (bufferLength / targetBuffer) * 50));
+    // Buffer health
+    const health = Math.max(0, 100 - this.pendingDecode * 20);
 
-    // Only report if enough time has passed or significant change
-    if (now - this.lastBufferReport > 1000) {
-      this.sendBufferStats(bufferHealth, receivedFps, bufferLength);
-      this.lastBufferReport = now;
-    }
+    this.statsOverlay.innerHTML = `
+      FPS: <span style="color: ${this.displayedFps >= 25 ? '#0f0' : this.displayedFps >= 15 ? '#ff0' : '#f00'}">${this.displayedFps}</span> render / ${receivedFps} recv<br>
+      Queue: <span style="color: ${this.pendingDecode <= 1 ? '#0f0' : this.pendingDecode <= 3 ? '#ff0' : '#f00'}">${this.pendingDecode}</span> frames<br>
+      Decode: ${avgLatency}ms<br>
+      Health: <span style="color: ${health >= 80 ? '#0f0' : health >= 40 ? '#ff0' : '#f00'}">${health}%</span>
+    `;
   }
 
-  private sendBufferStats(health: number, fps: number, bufferMs: number): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  private onFrame(frame: VideoFrame): void {
+    this.pendingDecode--;
 
-    // Format: [msg_type:u8][health:u8][fps:u8][buffer_ms:u16]
-    const buf = new ArrayBuffer(5);
-    const view = new DataView(buf);
-    view.setUint8(0, ClientMsg.BUFFER_STATS);
-    view.setUint8(1, Math.round(health));
-    view.setUint8(2, Math.round(fps));
-    view.setUint16(3, Math.round(bufferMs * 1000), true); // Convert to ms
-    this.ws.send(buf);
+    // Track decode latency
+    if (this.lastDecodeStart > 0) {
+      this.decodeLatencies.push(performance.now() - this.lastDecodeStart);
+    }
+
+    if (this.destroyed || !this.ctx) {
+      frame.close();
+      return;
+    }
+
+    // Resize canvas to match frame if needed
+    if (this.canvas.width !== frame.displayWidth || this.canvas.height !== frame.displayHeight) {
+      this.canvas.width = frame.displayWidth;
+      this.canvas.height = frame.displayHeight;
+    }
+
+    // Draw frame to canvas
+    this.ctx.drawImage(frame, 0, 0);
+    frame.close();
+
+    // Update stats
+    this.renderedFrames++;
+    this.updateStatsOverlay();
   }
 
   private setupEventHandlers(): void {
-    // Keyboard is handled at document level in App class, not here
-    // This avoids double input issues
+    // Mouse events on canvas
+    this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
+    this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
+    this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+    this.canvas.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
+    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-    // Mouse events
-    this.video.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-    this.video.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-    this.video.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-    this.video.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
-    this.video.addEventListener('contextmenu', (e) => e.preventDefault());
-
-    // Focus handling - video needs tabIndex for focus
-    this.video.tabIndex = 1;
+    // Focus handling
+    this.canvas.tabIndex = 1;
 
     // Inspector close button
     const closeBtn = this.element.querySelector('.inspector-close');
@@ -198,7 +225,6 @@ export class Panel {
     this.resizeObserver.observe(this.element);
   }
 
-  // WebSocket connection
   connect(host: string, port: number): void {
     if (this.ws) {
       this.ws.close();
@@ -209,7 +235,6 @@ export class Panel {
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
-      // If we have a serverId, reconnect to existing panel; otherwise create new
       if (this.serverId !== null) {
         this.sendConnectPanel(this.serverId);
       } else {
@@ -262,34 +287,164 @@ export class Panel {
     this.ws.send(buf);
   }
 
-  // Frame handling - receives raw H.264 NAL units with Annex B start codes
-  private handleFrame(data: ArrayBuffer): void {
-    if (this.destroyed || !this.jmuxer) return;
+  // Parse NAL units from Annex B format (00 00 00 01 start codes)
+  private parseNalUnits(data: Uint8Array): Uint8Array[] {
+    const units: Uint8Array[] = [];
+    let start = 0;
 
-    // Track frame timestamp for FPS calculation
-    this.frameTimestamps.push(performance.now());
+    for (let i = 0; i < data.length - 3; i++) {
+      // Look for start code 00 00 00 01
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+        if (i > start) {
+          units.push(data.slice(start, i));
+        }
+        start = i + 4; // Skip start code
+        i += 3;
+      }
+    }
 
-    const nalData = new Uint8Array(data);
+    // Last NAL unit
+    if (start < data.length) {
+      units.push(data.slice(start));
+    }
 
-    // Feed H.264 NAL units to jMuxer
-    // jMuxer handles Annex B format (00 00 00 01 start codes)
-    this.jmuxer.feed({
-      video: nalData,
-    });
+    return units;
   }
 
-  // Input handling - called from App class at document level
+  // Extract codec string from SPS NAL unit
+  private getCodecFromSps(sps: Uint8Array): string {
+    // SPS structure: [NAL header][profile_idc][constraint_flags][level_idc]...
+    // Format: avc1.PPCCLL (PP=profile, CC=constraints, LL=level)
+    if (sps.length < 4) return 'avc1.42E01F'; // Default baseline 3.1
+
+    const profile = sps[1];     // Skip NAL header byte
+    const constraints = sps[2];
+    const level = sps[3];
+
+    return `avc1.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
+  }
+
+  private handleFrame(data: ArrayBuffer): void {
+    if (this.destroyed || !this.decoder) return;
+
+    this.frameTimestamps.push(performance.now());
+    const nalData = new Uint8Array(data);
+    const nalUnits = this.parseNalUnits(nalData);
+
+    let isKeyframe = false;
+    let sps: Uint8Array | null = null;
+    let pps: Uint8Array | null = null;
+
+    // Check NAL unit types
+    for (const nal of nalUnits) {
+      if (nal.length === 0) continue;
+      const nalType = nal[0] & 0x1f;
+
+      if (nalType === 7) { // SPS
+        sps = nal;
+      } else if (nalType === 8) { // PPS
+        pps = nal;
+      } else if (nalType === 5) { // IDR (keyframe)
+        isKeyframe = true;
+      }
+    }
+
+    // Configure decoder on first keyframe with SPS
+    if (sps && !this.decoderConfigured) {
+      const codec = this.getCodecFromSps(sps);
+
+      try {
+        this.decoder.configure({
+          codec: codec,
+          optimizeForLatency: true,
+        });
+        this.decoderConfigured = true;
+        console.log('Decoder configured:', codec);
+
+        // Process any pending frames
+        for (const pending of this.pendingFrames) {
+          this.decodeFrame(pending, false);
+        }
+        this.pendingFrames = [];
+      } catch (e) {
+        console.error('Failed to configure decoder:', e);
+        return;
+      }
+    }
+
+    // If not configured yet, buffer the frame
+    if (!this.decoderConfigured) {
+      this.pendingFrames.push(nalData);
+      return;
+    }
+
+    this.decodeFrame(nalData, isKeyframe);
+    this.checkBufferHealth();
+  }
+
+  private decodeFrame(data: Uint8Array, isKeyframe: boolean): void {
+    if (!this.decoder || this.decoder.state !== 'configured') return;
+
+    const timestamp = this.frameCount * (1000000 / 30); // microseconds at 30fps
+    this.frameCount++;
+    this.pendingDecode++;
+    this.lastDecodeStart = performance.now();
+
+    try {
+      const chunk = new EncodedVideoChunk({
+        type: isKeyframe ? 'key' : 'delta',
+        timestamp: timestamp,
+        data: data,
+      });
+      this.decoder.decode(chunk);
+    } catch (e) {
+      console.error('Decode error:', e);
+      this.pendingDecode--;
+    }
+  }
+
+  private checkBufferHealth(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const now = performance.now();
+
+    // Calculate received FPS
+    const oneSecondAgo = now - 1000;
+    this.frameTimestamps = this.frameTimestamps.filter(t => t > oneSecondAgo);
+    const receivedFps = this.frameTimestamps.length;
+
+    // Buffer health based on pending decode queue
+    // 0 pending = healthy (100), many pending = unhealthy (0)
+    const health = Math.max(0, 100 - this.pendingDecode * 20);
+
+    // Report every second
+    if (now - this.lastBufferReport > 1000) {
+      this.sendBufferStats(health, receivedFps);
+      this.lastBufferReport = now;
+    }
+  }
+
+  private sendBufferStats(health: number, fps: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const buf = new ArrayBuffer(5);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.BUFFER_STATS);
+    view.setUint8(1, Math.round(health));
+    view.setUint8(2, Math.round(fps));
+    view.setUint16(3, this.pendingDecode * 33, true); // Approx ms of buffer
+    this.ws.send(buf);
+  }
+
+  // Input handling
   sendKeyInput(e: KeyboardEvent, action: number): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // Send raw key code and key text to server
-    // Format: [msg_type:u8][action:u8][mods:u8][code_len:u8][code:...][text_len:u8][text:...]
     const encoder = new TextEncoder();
     const codeBytes = encoder.encode(e.code);
     const text = (e.key.length === 1) ? e.key : '';
     const textBytes = encoder.encode(text);
 
-    // 5 bytes header: msg_type + action + mods + code_len + text_len
     const buf = new ArrayBuffer(5 + codeBytes.length + textBytes.length);
     const view = new Uint8Array(buf);
     view[0] = ClientMsg.KEY_INPUT;
@@ -314,7 +469,7 @@ export class Panel {
   private handleMouseMove(e: MouseEvent): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const rect = this.video.getBoundingClientRect();
+    const rect = this.canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) * (window.devicePixelRatio || 1);
     const y = (e.clientY - rect.top) * (window.devicePixelRatio || 1);
     const mods = this.getModifiers(e);
@@ -331,7 +486,7 @@ export class Panel {
   private sendMouseButton(e: MouseEvent, pressed: boolean): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const rect = this.video.getBoundingClientRect();
+    const rect = this.canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) * (window.devicePixelRatio || 1);
     const y = (e.clientY - rect.top) * (window.devicePixelRatio || 1);
     const mods = this.getModifiers(e);
@@ -351,19 +506,18 @@ export class Panel {
     e.preventDefault();
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const rect = this.video.getBoundingClientRect();
+    const rect = this.canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) * (window.devicePixelRatio || 1);
     const y = (e.clientY - rect.top) * (window.devicePixelRatio || 1);
 
-    // Normalize scroll delta
     let dx = e.deltaX;
     let dy = e.deltaY;
     if (e.deltaMode === 1) {
       dx *= 20;
       dy *= 20;
     } else if (e.deltaMode === 2) {
-      dx *= this.video.clientWidth;
-      dy *= this.video.clientHeight;
+      dx *= this.canvas.clientWidth;
+      dy *= this.canvas.clientHeight;
     }
 
     const buf = new ArrayBuffer(18);
@@ -411,7 +565,6 @@ export class Panel {
     }
   }
 
-  // Pause streaming (when tab is not visible)
   hide(): void {
     if (this.paused) return;
     this.paused = true;
@@ -423,7 +576,6 @@ export class Panel {
     }
   }
 
-  // Resume streaming (when tab becomes visible)
   show(): void {
     if (!this.paused) return;
     this.paused = false;
@@ -435,9 +587,7 @@ export class Panel {
     }
   }
 
-  // Handle inspector state from server
   handleInspectorState(state: unknown): void {
-    // Update inspector content if visible
     if (!this.inspectorVisible) return;
 
     const content = this.element.querySelector('.inspector-content');
@@ -446,11 +596,9 @@ export class Panel {
     }
   }
 
-  // Send text input (for paste operations)
   sendTextInput(text: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // Format: [msg_type:u8][text:...]
     const encoder = new TextEncoder();
     const textBytes = encoder.encode(text);
     const buf = new ArrayBuffer(1 + textBytes.length);
@@ -462,11 +610,6 @@ export class Panel {
 
   destroy(): void {
     this.destroyed = true;
-
-    if (this.bufferMonitorInterval) {
-      clearInterval(this.bufferMonitorInterval);
-      this.bufferMonitorInterval = null;
-    }
 
     if (this.resizeTimeout) {
       clearTimeout(this.resizeTimeout);
@@ -483,9 +626,14 @@ export class Panel {
       this.ws = null;
     }
 
-    if (this.jmuxer) {
-      this.jmuxer.destroy();
-      this.jmuxer = null;
+    if (this.decoder) {
+      this.decoder.close();
+      this.decoder = null;
+    }
+
+    if (this.statsOverlay) {
+      this.statsOverlay.remove();
+      this.statsOverlay = null;
     }
 
     if (this.element.parentElement) {
