@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "bun build src/index.ts --outfile=client.js --minify",
-    "build:dev": "bun build src/index.ts --outfile=client.js",
-    "dev": "bun build src/index.ts --outfile=client.js --watch",
+    "build": "bun build src/index.ts --outfile=client.js --minify --format=iife",
+    "build:dev": "bun build src/index.ts --outfile=client.js --format=iife",
+    "dev": "bun build src/index.ts --outfile=client.js --watch --format=iife",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
