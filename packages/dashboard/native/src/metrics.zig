@@ -29,10 +29,15 @@ extern fn napi_create_function(env: napi_env, utf8name: ?[*:0]const u8, length: 
 // C imports for system APIs
 // ============================================================================
 
+// Platform detection
+const is_linux = builtin.os.tag == .linux;
+const is_darwin = builtin.os.tag == .macos;
+
 const c = @cImport({
     @cInclude("sys/statvfs.h");
     @cInclude("dirent.h");
     @cInclude("unistd.h");
+    @cInclude("fcntl.h");
     if (builtin.os.tag == .macos) {
         @cInclude("mach/mach.h");
         @cInclude("mach/mach_host.h");
@@ -47,8 +52,13 @@ const c = @cImport({
         @cInclude("libproc.h");
         @cInclude("net/if.h");
         @cInclude("ifaddrs.h");
+        @cInclude("dispatch/dispatch.h");
     }
 });
+
+// Linux io_uring for async batched I/O
+const linux = if (is_linux) std.os.linux else void;
+const IoUring = if (is_linux) linux.IoUring else void;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
@@ -318,15 +328,191 @@ fn getProcessStats(allocator: std.mem.Allocator, max_procs: usize) ![]ProcStats 
     return if (builtin.os.tag == .linux) getLinuxProcs(allocator, max_procs) else if (builtin.os.tag == .macos) getMacProcs(allocator, max_procs) else error.UnsupportedOs;
 }
 
+// io_uring batched reads for Linux /proc files
+// Significantly faster than sequential reads for 500+ processes
+const BATCH_SIZE = 128; // FDs to open at once (respects ulimit)
+const STAT_BUF_SIZE = 512;
+const STATM_BUF_SIZE = 128;
+
 fn getLinuxProcs(allocator: std.mem.Allocator, max_procs: usize) ![]ProcStats {
+    if (!is_linux) return error.UnsupportedOs;
+
     var procs: std.ArrayListUnmanaged(ProcStats) = .{};
     errdefer procs.deinit(allocator);
+
+    // Phase 1: Collect all PIDs (fast directory iteration)
+    var pids: std.ArrayListUnmanaged(i32) = .{};
+    defer pids.deinit(allocator);
+
     var proc_dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return try procs.toOwnedSlice(allocator);
     defer proc_dir.close();
     var iter = proc_dir.iterate();
     while (iter.next() catch null) |entry| {
         if (entry.kind != .directory) continue;
         const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        try pids.append(allocator, pid);
+    }
+
+    if (pids.items.len == 0) return try procs.toOwnedSlice(allocator);
+
+    // Phase 2: Initialize io_uring for batched reads
+    var ring = IoUring.init(256, 0) catch {
+        // Fallback to sequential reads if io_uring unavailable
+        return getLinuxProcsSequential(allocator, pids.items, max_procs);
+    };
+    defer ring.deinit();
+
+    // Phase 3: Process PIDs in batches
+    var batch_start: usize = 0;
+    while (batch_start < pids.items.len) {
+        const batch_end = @min(batch_start + BATCH_SIZE, pids.items.len);
+        const batch_pids = pids.items[batch_start..batch_end];
+        const batch_count = batch_pids.len;
+
+        // Allocate buffers for this batch
+        const stat_buffers = try allocator.alloc([STAT_BUF_SIZE]u8, batch_count);
+        defer allocator.free(stat_buffers);
+        const statm_buffers = try allocator.alloc([STATM_BUF_SIZE]u8, batch_count);
+        defer allocator.free(statm_buffers);
+        const stat_fds = try allocator.alloc(std.posix.fd_t, batch_count);
+        defer allocator.free(stat_fds);
+        const statm_fds = try allocator.alloc(std.posix.fd_t, batch_count);
+        defer allocator.free(statm_fds);
+        const stat_lens = try allocator.alloc(usize, batch_count);
+        defer allocator.free(stat_lens);
+        const statm_lens = try allocator.alloc(usize, batch_count);
+        defer allocator.free(statm_lens);
+
+        // Open all files for this batch
+        var valid_count: usize = 0;
+        const valid_indices = try allocator.alloc(usize, batch_count);
+        defer allocator.free(valid_indices);
+
+        for (batch_pids, 0..) |pid, i| {
+            var stat_path: [64]u8 = undefined;
+            var statm_path: [64]u8 = undefined;
+            const stat_path_slice = std.fmt.bufPrint(&stat_path, "/proc/{d}/stat\x00", .{pid}) catch continue;
+            const statm_path_slice = std.fmt.bufPrint(&statm_path, "/proc/{d}/statm\x00", .{pid}) catch continue;
+
+            const stat_fd = std.posix.open(@ptrCast(stat_path_slice.ptr), .{ .ACCMODE = .RDONLY }, 0) catch continue;
+            const statm_fd = std.posix.open(@ptrCast(statm_path_slice.ptr), .{ .ACCMODE = .RDONLY }, 0) catch {
+                std.posix.close(stat_fd);
+                continue;
+            };
+
+            stat_fds[valid_count] = stat_fd;
+            statm_fds[valid_count] = statm_fd;
+            valid_indices[valid_count] = i;
+            valid_count += 1;
+        }
+
+        if (valid_count == 0) {
+            batch_start = batch_end;
+            continue;
+        }
+
+        // Submit all reads to io_uring (stat files)
+        for (0..valid_count) |i| {
+            var iovecs = [_]std.posix.iovec{.{
+                .base = &stat_buffers[valid_indices[i]],
+                .len = STAT_BUF_SIZE,
+            }};
+            _ = ring.read(@intCast(i), stat_fds[i], .{ .buffer = &iovecs }, 0) catch continue;
+        }
+        _ = ring.submit() catch 0;
+
+        // Wait for stat reads
+        var completed: usize = 0;
+        while (completed < valid_count) {
+            var cqes: [32]linux.io_uring_cqe = undefined;
+            const n = ring.copy_cqes(&cqes, 1) catch break;
+            for (cqes[0..n]) |cqe| {
+                const idx: usize = @intCast(cqe.user_data);
+                stat_lens[idx] = if (cqe.res > 0) @intCast(cqe.res) else 0;
+                completed += 1;
+            }
+        }
+
+        // Submit statm reads
+        for (0..valid_count) |i| {
+            var iovecs = [_]std.posix.iovec{.{
+                .base = &statm_buffers[valid_indices[i]],
+                .len = STATM_BUF_SIZE,
+            }};
+            _ = ring.read(@intCast(i), statm_fds[i], .{ .buffer = &iovecs }, 0) catch continue;
+        }
+        _ = ring.submit() catch 0;
+
+        // Wait for statm reads
+        completed = 0;
+        while (completed < valid_count) {
+            var cqes: [32]linux.io_uring_cqe = undefined;
+            const n = ring.copy_cqes(&cqes, 1) catch break;
+            for (cqes[0..n]) |cqe| {
+                const idx: usize = @intCast(cqe.user_data);
+                statm_lens[idx] = if (cqe.res > 0) @intCast(cqe.res) else 0;
+                completed += 1;
+            }
+        }
+
+        // Close all FDs
+        for (0..valid_count) |i| {
+            std.posix.close(stat_fds[i]);
+            std.posix.close(statm_fds[i]);
+        }
+
+        // Parse results
+        for (0..valid_count) |i| {
+            const orig_idx = valid_indices[i];
+            const pid = batch_pids[orig_idx];
+            const stat_len = stat_lens[i];
+            const statm_len = statm_lens[i];
+
+            if (stat_len == 0 or statm_len == 0) continue;
+
+            const stat_data = stat_buffers[orig_idx][0..stat_len];
+            const statm_data = statm_buffers[orig_idx][0..statm_len];
+
+            // Parse stat
+            const name_start = std.mem.indexOf(u8, stat_data, "(") orelse continue;
+            const name_end = std.mem.lastIndexOf(u8, stat_data, ")") orelse continue;
+            if (name_end <= name_start + 1) continue;
+            const name = stat_data[name_start + 1 .. name_end];
+            if (name_end + 2 >= stat_data.len) continue;
+            const after_name = stat_data[name_end + 2 ..];
+            var parts = std.mem.tokenizeScalar(u8, after_name, ' ');
+            const state_str = parts.next() orelse continue;
+            const state = if (state_str.len > 0) state_str[0] else 'S';
+            for (0..10) |_| _ = parts.next();
+            const utime = std.fmt.parseInt(u64, parts.next() orelse "0", 10) catch 0;
+            const stime = std.fmt.parseInt(u64, parts.next() orelse "0", 10) catch 0;
+
+            // Parse statm
+            var statm_parts = std.mem.tokenizeScalar(u8, statm_data, ' ');
+            _ = statm_parts.next();
+            const rss_pages = std.fmt.parseInt(u64, statm_parts.next() orelse "0", 10) catch 0;
+
+            var proc = ProcStats{ .pid = pid, .name = undefined, .name_len = 0, .cpu_time = utime + stime, .mem_rss = rss_pages * 4096, .state = state };
+            const nl = @min(name.len, proc.name.len - 1);
+            @memcpy(proc.name[0..nl], name[0..nl]);
+            proc.name[nl] = 0;
+            proc.name_len = nl;
+            try procs.append(allocator, proc);
+        }
+
+        batch_start = batch_end;
+    }
+
+    if (procs.items.len > max_procs) procs.shrinkRetainingCapacity(max_procs);
+    return try procs.toOwnedSlice(allocator);
+}
+
+// Fallback sequential reader for systems without io_uring
+fn getLinuxProcsSequential(allocator: std.mem.Allocator, pids: []const i32, max_procs: usize) ![]ProcStats {
+    var procs: std.ArrayListUnmanaged(ProcStats) = .{};
+    errdefer procs.deinit(allocator);
+
+    for (pids) |pid| {
         var path_buf: [64]u8 = undefined;
         const stat_path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch continue;
         var stat_file = std.fs.openFileAbsolute(stat_path, .{}) catch continue;
@@ -361,7 +547,7 @@ fn getLinuxProcs(allocator: std.mem.Allocator, max_procs: usize) ![]ProcStats {
         proc.name_len = nl;
         try procs.append(allocator, proc);
     }
-    // Don't sort by cumulative time - JS will sort by current CPU% after delta calculation
+
     if (procs.items.len > max_procs) procs.shrinkRetainingCapacity(max_procs);
     return try procs.toOwnedSlice(allocator);
 }
@@ -388,42 +574,97 @@ fn machTimeToNanos(mach_time: u64) u64 {
     return mach_time * mach_timebase_numer / mach_timebase_denom;
 }
 
+// Context for dispatch_apply parallel proc_pidinfo calls
+const DispatchProcContext = extern struct {
+    pids: [*]c.pid_t,
+    results: [*]ProcStats,
+    valid: [*]bool,
+    num_pids: usize,
+};
+
+// Worker function called by dispatch_apply for each PID
+fn dispatchProcWorker(context: ?*anyopaque, idx: usize) callconv(.c) void {
+    const ctx: *DispatchProcContext = @ptrCast(@alignCast(context));
+    if (idx >= ctx.num_pids) return;
+
+    const pid = ctx.pids[idx];
+    if (pid <= 0) {
+        ctx.valid[idx] = false;
+        return;
+    }
+
+    var pinfo: c.struct_proc_taskallinfo = undefined;
+    const size = c.proc_pidinfo(pid, c.PROC_PIDTASKALLINFO, 0, &pinfo, @sizeOf(@TypeOf(pinfo)));
+    if (size <= 0) {
+        ctx.valid[idx] = false;
+        return;
+    }
+
+    // Convert Mach time to nanoseconds
+    const cpu_time_mach = pinfo.ptinfo.pti_total_user + pinfo.ptinfo.pti_total_system;
+    var proc = &ctx.results[idx];
+    proc.pid = pid;
+    proc.cpu_time = machTimeToNanos(cpu_time_mach);
+    proc.mem_rss = pinfo.ptinfo.pti_resident_size;
+    proc.state = switch (pinfo.pbsd.pbi_status) {
+        2 => 'R',
+        1, 3 => 'S',
+        4 => 'T',
+        5 => 'Z',
+        else => 'S',
+    };
+
+    const name_slice = std.mem.sliceTo(&pinfo.pbsd.pbi_name, 0);
+    const nl = @min(name_slice.len, proc.name.len - 1);
+    @memcpy(proc.name[0..nl], name_slice[0..nl]);
+    proc.name[nl] = 0;
+    proc.name_len = nl;
+    ctx.valid[idx] = true;
+}
+
 fn getMacProcs(allocator: std.mem.Allocator, max_procs: usize) ![]ProcStats {
-    var procs: std.ArrayListUnmanaged(ProcStats) = .{};
-    errdefer procs.deinit(allocator);
+    if (!is_darwin) return error.UnsupportedOs;
+
+    // Get all PIDs
     var pids: [2048]c.pid_t = undefined;
     const pid_count = c.proc_listallpids(&pids, @sizeOf(@TypeOf(pids)));
-    if (pid_count <= 0) return try procs.toOwnedSlice(allocator);
+    if (pid_count <= 0) return allocator.alloc(ProcStats, 0);
     const num_pids: usize = @intCast(@divFloor(pid_count, @sizeOf(c.pid_t)));
-    for (pids[0..num_pids]) |pid| {
-        if (pid <= 0) continue;
-        var pinfo: c.struct_proc_taskallinfo = undefined;
-        const size = c.proc_pidinfo(pid, c.PROC_PIDTASKALLINFO, 0, &pinfo, @sizeOf(@TypeOf(pinfo)));
-        if (size <= 0) continue;
-        // Convert Mach time to nanoseconds for accurate CPU percentage calculation
-        const cpu_time_mach = pinfo.ptinfo.pti_total_user + pinfo.ptinfo.pti_total_system;
-        var proc = ProcStats{
-            .pid = pid,
-            .name = undefined,
-            .name_len = 0,
-            .cpu_time = machTimeToNanos(cpu_time_mach),
-            .mem_rss = pinfo.ptinfo.pti_resident_size,
-            .state = switch (pinfo.pbsd.pbi_status) {
-                2 => 'R',
-                1, 3 => 'S',
-                4 => 'T',
-                5 => 'Z',
-                else => 'S',
-            },
-        };
-        const name_slice = std.mem.sliceTo(&pinfo.pbsd.pbi_name, 0);
-        const nl = @min(name_slice.len, proc.name.len - 1);
-        @memcpy(proc.name[0..nl], name_slice[0..nl]);
-        proc.name[nl] = 0;
-        proc.name_len = nl;
-        try procs.append(allocator, proc);
+
+    // Allocate results array (each thread writes to its own index - no contention)
+    const results = try allocator.alloc(ProcStats, num_pids);
+    errdefer allocator.free(results);
+    const valid = try allocator.alloc(bool, num_pids);
+    defer allocator.free(valid);
+    @memset(valid, false);
+
+    // Initialize Mach timebase before parallel execution
+    initMachTimebase();
+
+    // Setup context for dispatch_apply
+    var ctx = DispatchProcContext{
+        .pids = &pids,
+        .results = results.ptr,
+        .valid = valid.ptr,
+        .num_pids = num_pids,
+    };
+
+    // Use dispatch_apply for parallel proc_pidinfo calls
+    // This distributes work across all CPU cores via GCD
+    const queue = c.dispatch_get_global_queue(c.DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+    c.dispatch_apply_f(num_pids, queue, &ctx, &dispatchProcWorker);
+
+    // Collect valid results
+    var procs: std.ArrayListUnmanaged(ProcStats) = .{};
+    errdefer procs.deinit(allocator);
+    for (0..num_pids) |i| {
+        if (valid[i]) {
+            try procs.append(allocator, results[i]);
+        }
     }
-    // Don't sort by cumulative time - JS will sort by current CPU% after delta calculation
+
+    allocator.free(results);
+
     if (procs.items.len > max_procs) procs.shrinkRetainingCapacity(max_procs);
     return try procs.toOwnedSlice(allocator);
 }
