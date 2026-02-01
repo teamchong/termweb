@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) !void {
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/zlib_compress.c"), .flags = &.{"-O2"} });
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/zlib_decompress.c"), .flags = &.{"-O2"} });
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/adler32.c"), .flags = &.{"-O2"} });
+    server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/crc32.c"), .flags = &.{"-O2"} });
     server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/utils.c"), .flags = &.{"-O2"} });
     if (target.result.cpu.arch == .aarch64) {
         server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/arm/cpu_features.c"), .flags = &.{"-O2"} });

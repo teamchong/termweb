@@ -3,6 +3,7 @@ const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
 const auth = @import("auth.zig");
+const zip = @import("zip.zig");
 
 const c = @cImport({
     @cInclude("libdeflate.h");
@@ -2132,7 +2133,7 @@ const Server = struct {
     }
 
     // Binary control message handler
-    // 0x10 = file_upload, 0x11 = file_download (file transfer)
+    // 0x10 = file_upload, 0x11 = file_download, 0x14 = folder_download (zip)
     // 0x81-0x88 = client control messages (close, resize, focus, split, etc.)
     fn handleBinaryControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len < 1) return;
@@ -2142,6 +2143,7 @@ const Server = struct {
             // File transfer
             0x10 => self.handleBinaryFileUpload(conn, data[1..]),
             0x11 => self.handleBinaryFileDownload(conn, data[1..]),
+            0x14 => self.handleBinaryFolderDownload(conn, data[1..]),
             // Client control messages
             0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88 => {
                 self.handleBinaryControlMessageFromClient(conn, data);
@@ -2376,6 +2378,90 @@ const Server = struct {
         std.mem.writeInt(u16, buf[1..3], @intCast(err.len), .little);
         @memcpy(buf[3..][0..err.len], err);
         conn.sendBinary(buf[0 .. 3 + err.len]) catch {};
+    }
+
+    // Binary folder download: [panel_id:u32][path_len:u16][path]
+    // Response: [0x15][name_len:u16][name.zip][zip_data]
+    fn handleBinaryFolderDownload(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 6) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const panel_id = std.mem.readInt(u32, data[0..4], .little);
+        const path_len = std.mem.readInt(u16, data[4..6], .little);
+
+        if (data.len < 6 + path_len) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const path = data[6 .. 6 + path_len];
+
+        // Get panel for cwd resolution
+        self.mutex.lock();
+        const panel = self.panels.get(panel_id);
+        self.mutex.unlock();
+
+        // Expand ~ or relative paths
+        var resolved_path_buf: [4096]u8 = undefined;
+        var resolved_path: []const u8 = path;
+
+        if (path.len > 0 and path[0] == '~') {
+            const home = std.posix.getenv("HOME") orelse "/tmp";
+            if (path.len > 1 and path[1] == '/') {
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
+            } else {
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
+            }
+        } else if (path.len > 0 and path[0] != '/') {
+            if (panel) |p| {
+                if (p.pwd.len > 0) {
+                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
+                }
+            }
+        }
+
+        // Check if it's a directory
+        var dir = std.fs.openDirAbsolute(resolved_path, .{}) catch {
+            self.sendBinaryFileError(conn, "Cannot open directory");
+            return;
+        };
+        dir.close();
+
+        // Get folder name for zip filename
+        const folder_name = std.fs.path.basename(resolved_path);
+        var zip_name_buf: [256]u8 = undefined;
+        const zip_name = std.fmt.bufPrint(&zip_name_buf, "{s}.zip", .{folder_name}) catch {
+            self.sendBinaryFileError(conn, "Path too long");
+            return;
+        };
+
+        // Create zip
+        const zip_data = zip.zipDirectory(self.allocator, resolved_path, folder_name) catch {
+            self.sendBinaryFileError(conn, "Failed to create zip");
+            return;
+        };
+        defer self.allocator.free(zip_data);
+
+        // Build response: [0x15][name_len:u16][name.zip][zip_data]
+        const msg_len = 1 + 2 + zip_name.len + zip_data.len;
+        const msg = self.allocator.alloc(u8, msg_len) catch {
+            self.sendBinaryFileError(conn, "Out of memory");
+            return;
+        };
+        defer self.allocator.free(msg);
+
+        msg[0] = 0x15; // folder_data type (zip)
+        std.mem.writeInt(u16, msg[1..3], @intCast(zip_name.len), .little);
+        @memcpy(msg[3 .. 3 + zip_name.len], zip_name);
+        @memcpy(msg[3 + zip_name.len ..], zip_data);
+
+        conn.sendBinary(msg) catch {
+            std.log.err("Failed to send folder zip", .{});
+            return;
+        };
+        std.log.info("Folder downloaded: {s} -> {s} ({d} bytes)", .{ resolved_path, zip_name, zip_data.len });
     }
 
     // Keep old JSON handlers for backwards compatibility (will be removed later)

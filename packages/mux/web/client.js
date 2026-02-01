@@ -3241,36 +3241,50 @@ class App {
   }
 
   // File transfer: Download request (Binary)
-  // Format: [0x11][panel_id:u32][path_len:u16][path:bytes]
-  requestDownload(path) {
+  // Format: [0x11][panel_id:u32][path_len:u16][path:bytes] - single file
+  //         [0x14][panel_id:u32][path_len:u16][path:bytes] - folder as zip
+  // Auto-detects: path ending with / is folder, otherwise tries file first
+  requestDownload(path, isFolder = false) {
     if (!this.activePanel?.serverId) {
       console.error('No active panel for download');
       return;
     }
 
+    // Auto-detect folder if path ends with /
+    if (path.endsWith('/')) {
+      isFolder = true;
+      path = path.slice(0, -1); // Remove trailing slash
+    }
+
     const panelId = this.activePanel.serverId;
     const pathBytes = new TextEncoder().encode(path);
 
-    // Build binary message: [0x11][panel_id:u32][path_len:u16][path]
+    // Build binary message: [type][panel_id:u32][path_len:u16][path]
     const msgLen = 1 + 4 + 2 + pathBytes.length;
     const msg = new ArrayBuffer(msgLen);
     const view = new DataView(msg);
     const bytes = new Uint8Array(msg);
 
     let offset = 0;
-    view.setUint8(offset, 0x11); offset += 1;  // Type: file_download
+    view.setUint8(offset, isFolder ? 0x14 : 0x11); offset += 1;  // Type: folder or file
     view.setUint32(offset, panelId, true); offset += 4;  // Panel ID
     view.setUint16(offset, pathBytes.length, true); offset += 2;  // Path length
     bytes.set(pathBytes, offset);  // Path
 
     if (this.controlWs && this.controlWs.readyState === WebSocket.OPEN) {
       this.controlWs.send(msg);
-      console.log(`Requesting download: ${path}`);
+      console.log(`Requesting ${isFolder ? 'folder' : 'file'} download: ${path}`);
     }
   }
 
+  // Folder download (convenience method)
+  requestFolderDownload(path) {
+    this.requestDownload(path, true);
+  }
+
   // Handle binary file data from server
-  // Format: [0x12][name_len:u16][name:bytes][compressed_data:bytes]
+  // Format: [0x12][name_len:u16][name:bytes][file_data:bytes] - single file
+  //         [0x15][name_len:u16][name.zip:bytes][zip_data:bytes] - folder as zip
   // Or error: [0x13][error_len:u16][error:bytes]
   handleBinaryFileData(data) {
     const view = new DataView(data);
@@ -3285,20 +3299,20 @@ class App {
       return;
     }
 
-    if (msgType !== 0x12) {
+    if (msgType !== 0x12 && msgType !== 0x15) {
       console.error('Unknown file message type:', msgType);
       return;
     }
 
-    // Parse file data: [0x12][name_len:u16][name][file_data]
-    // Data comes uncompressed - WebSocket permessage-deflate handles transport compression
+    // Parse file/folder data: [type][name_len:u16][name][data]
     let offset = 1;
     const nameLen = view.getUint16(offset, true); offset += 2;
     const filename = new TextDecoder().decode(bytes.slice(offset, offset + nameLen)); offset += nameLen;
     const fileData = bytes.slice(offset);
 
     // Trigger browser download
-    const blob = new Blob([fileData]);
+    const mimeType = msgType === 0x15 ? 'application/zip' : 'application/octet-stream';
+    const blob = new Blob([fileData], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -3308,7 +3322,8 @@ class App {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 
-    console.log(`Downloaded ${filename}: ${fileData.length} bytes`);
+    const type = msgType === 0x15 ? 'folder' : 'file';
+    console.log(`Downloaded ${type} ${filename}: ${fileData.length} bytes`);
   }
 
   // ============================================================================
