@@ -230,7 +230,6 @@ pub fn handleDownloadWillBegin(viewer: anytype, payload: []const u8) !void {
 
     if (download_mod.parseDownloadWillBegin(payload)) |info| {
         viewer.log("[DOWNLOAD] guid={s} filename={s}\n", .{ info.guid, info.suggested_filename });
-        // Frame dimensions from screencast handle download bar automatically
 
         try viewer.download_manager.handleDownloadWillBegin(
             info.guid,

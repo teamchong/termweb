@@ -139,6 +139,8 @@ pub const Viewer = struct {
     last_frame_time: i128,
     last_frame_width: u32,  // Current frame width from screencast
     last_frame_height: u32, // Current frame height from screencast
+    last_device_width: u32,  // Chrome's reported device width (detects download bar)
+    last_device_height: u32, // Chrome's reported device height (detects download bar)
     baseline_frame_width: u32,  // Frame size after navigate/resize (for coord scaling)
     baseline_frame_height: u32, // Used to detect and compensate for frame changes (download bar)
 
@@ -173,6 +175,7 @@ pub const Viewer = struct {
     // Input throttling (deprecated - event bus handles mouse throttling)
     last_input_time: i128,
     last_mouse_move_time: i128,  // Separate throttle for mouse move events
+    last_click_time: i128,  // For quick screenshot after click (catches UI changes)
 
     // Frame tracking for skip detection
     last_rendered_generation: u64,
@@ -327,6 +330,8 @@ pub const Viewer = struct {
             .last_frame_time = 0,
             .last_frame_width = viewport_width,
             .last_frame_height = viewport_height,
+            .last_device_width = 0,
+            .last_device_height = 0,
             .baseline_frame_width = 0,  // Will be set from first screencast frame
             .baseline_frame_height = 0,
             .ui_state = UIState{},
@@ -358,6 +363,7 @@ pub const Viewer = struct {
             .event_bus = mouse_event_bus.MouseEventBus.initWithFps(cdp_client, allocator, isNaturalScrollEnabled(), target_fps),
             .last_input_time = 0,
             .last_mouse_move_time = 0,
+            .last_click_time = 0,
             .last_rendered_generation = 0,
             .last_content_image_id = null,
             .last_nav_state_update = 0,
@@ -612,6 +618,11 @@ pub const Viewer = struct {
         const every_nth = config.getEveryNthFrame(self.target_fps);
         self.log("[DEBUG] Starting screencast {}x{} ({}px, quality={}, fps={}, everyNth={})...\n", .{ self.viewport_width, self.viewport_height, total_pixels, adaptive_quality, self.target_fps, every_nth });
 
+        // Lock viewport size to prevent Chrome UI (download bar, etc.) from changing it
+        var metrics_buf: [256]u8 = undefined;
+        const metrics_params = std.fmt.bufPrint(&metrics_buf, "{{\"width\":{d},\"height\":{d},\"deviceScaleFactor\":1,\"mobile\":false}}", .{ self.viewport_width, self.viewport_height }) catch unreachable;
+        self.cdp_client.sendNavCommandAsync("Emulation.setDeviceMetricsOverride", metrics_params);
+
         try screenshot_api.startScreencast(self.cdp_client, self.allocator, .{
             .format = self.screencast_format,
             .quality = adaptive_quality,
@@ -734,6 +745,22 @@ pub const Viewer = struct {
                 const now_ns = std.time.nanoTimestamp();
                 if (new_frame) {
                     self.last_frame_time = now_ns;
+                }
+
+                // Quick recovery after mouse click: if no frame for 300ms after click, take screenshot
+                // This catches SPA navigation, download bar, and other UI changes
+                const click_stall = self.last_click_time > 0 and
+                    (now_ns - self.last_click_time) > 300 * std.time.ns_per_ms and
+                    (now_ns - self.last_click_time) < 500 * std.time.ns_per_ms and
+                    (self.last_frame_time < self.last_click_time);
+                if (click_stall) {
+                    self.log("[CLICK STALL] No frame 300ms after click, taking screenshot\n", .{});
+                    self.last_click_time = 0; // Reset to avoid repeated screenshots
+                    if (screenshot_api.captureScreenshot(self.cdp_client, self.allocator, .{ .format = .jpeg })) |screenshot| {
+                        defer self.allocator.free(screenshot);
+                        self.displayFrameWithDimensions(screenshot) catch {};
+                        self.last_frame_time = now_ns;
+                    } else |_| {}
                 }
 
                 // Auto-recovery: if no frame rendered for 3+ seconds AND there was recent input

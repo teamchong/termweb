@@ -128,9 +128,37 @@ pub fn tryRenderScreencast(viewer: anytype) !bool {
     var frame = screenshot_api.getLatestScreencastFrame(viewer.cdp_client) orelse return false;
     defer frame.deinit(); // Proper cleanup!
 
-    // Always use viewport dimensions for display (Chrome metadata can be wrong over SSH)
-    const frame_width = viewer.viewport_width;
-    const frame_height = viewer.viewport_height;
+    // Set baseline on first frame (expected size without download bar etc)
+    if (viewer.baseline_frame_height == 0 and frame.device_height > 0) {
+        viewer.baseline_frame_width = frame.device_width;
+        viewer.baseline_frame_height = frame.device_height;
+        viewer.log("[RENDER] Baseline set: {}x{}\n", .{ viewer.baseline_frame_width, viewer.baseline_frame_height });
+    }
+
+    // Detect Chrome viewport change (e.g. download bar appearing)
+    if (viewer.last_device_height > 0 and frame.device_height != viewer.last_device_height) {
+        viewer.log("[RENDER] Chrome viewport changed: {}x{} -> {}x{}\n", .{
+            viewer.last_device_width, viewer.last_device_height, frame.device_width, frame.device_height,
+        });
+        // Update chrome inner dimensions for coordinate mapping
+        viewer.chrome_inner_width = frame.device_width;
+        viewer.chrome_inner_height = frame.device_height;
+    }
+    viewer.last_device_width = frame.device_width;
+    viewer.last_device_height = frame.device_height;
+
+    // Calculate vertical offset if viewport shrunk (download bar took space)
+    const y_offset: u32 = if (viewer.baseline_frame_height > frame.device_height)
+        viewer.baseline_frame_height - frame.device_height
+    else
+        0;
+    if (y_offset > 0) {
+        viewer.log("[RENDER] Download bar offset: {}px\n", .{y_offset});
+    }
+
+    // Use actual frame dimensions from Chrome (respects viewport changes like download bar)
+    const frame_width = if (frame.device_width > 0) frame.device_width else viewer.viewport_width;
+    const frame_height = if (frame.device_height > 0) frame.device_height else viewer.viewport_height;
 
     // Detect frame dimension change and skip first changed frame to avoid visual glitch
     const frame_changed = viewer.last_frame_width > 0 and
