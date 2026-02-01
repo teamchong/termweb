@@ -108,7 +108,7 @@ export class Panel {
   private lastReportedWidth = 0;
   private lastReportedHeight = 0;
   private resizeTimeout: ReturnType<typeof setTimeout> | null = null;
-  private resizeObserver: ResizeObserver | null = null;
+  resizeObserver: ResizeObserver | null = null;
   private callbacks: PanelCallbacks;
 
   // WebGPU state

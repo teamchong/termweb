@@ -35,10 +35,12 @@ export interface PanelInstance {
   requestKeyframe(): void;
 }
 
+import type { SplitContainer } from './split-container';
+
 export interface TabInfo {
   id: string;
   title: string;
-  root: SplitContainerInstance;
+  root: SplitContainer;
   element: HTMLElement;
 }
 
