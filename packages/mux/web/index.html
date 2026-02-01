@@ -121,7 +121,7 @@
       position: absolute;
       right: 100%;
       left: auto;
-      bottom: -4px;
+      top: -4px;
       margin-right: 2px;
     }
     /* Non-touch devices: hover to show submenu */
@@ -137,6 +137,12 @@
     .menu-tab-list {
       max-height: 300px;
       overflow-y: auto;
+    }
+    .split-menu-item {
+      display: none;
+    }
+    .split-menu-item.visible {
+      display: flex;
     }
     #hamburger {
       display: none;
@@ -1359,10 +1365,10 @@
             <div class="menu-item" data-action="previous-tab"><span class="menu-icon">◀</span><span class="menu-text">Show Previous Tab</span><span class="shortcut">⌃<span class="shift">⇧</span>Tab</span></div>
             <div class="menu-item" data-action="next-tab"><span class="menu-icon">▶</span><span class="menu-text">Show Next Tab</span><span class="shortcut">⌃Tab</span></div>
             <div class="menu-separator"></div>
-            <div class="menu-item" data-action="zoom-split"><span class="menu-icon">⤢</span><span class="menu-text">Zoom Split</span><span class="shortcut">⌘<span class="shift">⇧</span>↵</span></div>
-            <div class="menu-item" data-action="previous-split"><span class="menu-icon">⇤</span><span class="menu-text">Select Previous Split</span><span class="shortcut">⌘[</span></div>
-            <div class="menu-item" data-action="next-split"><span class="menu-icon">⇥</span><span class="menu-text">Select Next Split</span><span class="shortcut">⌘]</span></div>
-            <div class="menu-item menu-submenu">
+            <div class="menu-item split-menu-item" data-action="zoom-split"><span class="menu-icon">⤢</span><span class="menu-text">Zoom Split</span><span class="shortcut">⌘<span class="shift">⇧</span>↵</span></div>
+            <div class="menu-item split-menu-item" data-action="previous-split"><span class="menu-icon">⇤</span><span class="menu-text">Select Previous Split</span><span class="shortcut">⌘[</span></div>
+            <div class="menu-item split-menu-item" data-action="next-split"><span class="menu-icon">⇥</span><span class="menu-text">Select Next Split</span><span class="shortcut">⌘]</span></div>
+            <div class="menu-item menu-submenu split-menu-item" id="select-split-submenu">
               <span class="menu-icon">◫</span><span class="menu-text">Select Split</span>
               <div class="menu-dropdown">
                 <div class="menu-item" data-action="select-split-above"><span class="menu-icon">↑</span><span class="menu-text">Select Split Above</span><span class="shortcut">⌘<span class="shift">⇧</span>↑</span></div>
@@ -1371,7 +1377,7 @@
                 <div class="menu-item" data-action="select-split-right"><span class="menu-icon">→</span><span class="menu-text">Select Split Right</span><span class="shortcut">⌘<span class="shift">⇧</span>→</span></div>
               </div>
             </div>
-            <div class="menu-item menu-submenu">
+            <div class="menu-item menu-submenu split-menu-item" id="resize-split-submenu">
               <span class="menu-icon">⇔</span><span class="menu-text">Resize Split</span>
               <div class="menu-dropdown">
                 <div class="menu-item" data-action="equalize-splits"><span class="menu-icon">=</span><span class="menu-text">Equalize Splits</span></div>

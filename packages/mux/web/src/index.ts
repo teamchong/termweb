@@ -1962,8 +1962,8 @@ class App {
         return;
       }
 
-      // ⌘⇧] and ⌘⇧[ to cycle through splits
-      if (e.metaKey && e.shiftKey && (e.key === ']' || e.key === '[' || e.key === '}' || e.key === '{')) {
+      // ⌘] and ⌘[ to cycle through splits
+      if (e.metaKey && (e.key === ']' || e.key === '[')) {
         e.preventDefault();
         e.stopPropagation();
         this.cycleSplit(e.key === ']' ? 1 : -1);
@@ -2148,6 +2148,35 @@ class App {
       });
     });
 
+    // Adjust submenu position to stay on screen
+    const adjustSubmenuPosition = (submenu: Element) => {
+      const dropdown = submenu.querySelector('.menu-dropdown') as HTMLElement;
+      if (!dropdown) return;
+      // Reset position
+      dropdown.style.left = '';
+      dropdown.style.right = '100%';
+      dropdown.style.top = '-4px';
+      dropdown.style.bottom = '';
+      // Check bounds after a frame
+      requestAnimationFrame(() => {
+        const rect = dropdown.getBoundingClientRect();
+        // If goes off left edge, show on right side
+        if (rect.left < 0) {
+          dropdown.style.right = '';
+          dropdown.style.left = '100%';
+        }
+        // If goes off bottom edge, align to bottom
+        if (rect.bottom > window.innerHeight) {
+          dropdown.style.top = '';
+          dropdown.style.bottom = '0';
+        }
+      });
+    };
+
+    document.querySelectorAll('.menu-submenu').forEach(submenu => {
+      submenu.addEventListener('mouseenter', () => adjustSubmenuPosition(submenu));
+    });
+
     // Close menus when clicking outside
     document.addEventListener('click', () => {
       document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
@@ -2313,9 +2342,20 @@ class App {
       });
     });
 
-    // Populate window tab list on menu hover
+    // Populate window tab list and update split menu visibility on menu hover
     const windowMenu = document.querySelector('.menu-label + .menu-dropdown #window-tab-list')?.closest('.menu');
-    windowMenu?.addEventListener('mouseenter', () => this.populateWindowTabList());
+    windowMenu?.addEventListener('mouseenter', () => {
+      this.populateWindowTabList();
+      this.updateSplitMenuVisibility();
+    });
+  }
+
+  private updateSplitMenuVisibility(): void {
+    const tab = this.activeTab ? this.tabs.get(this.activeTab) : null;
+    const hasSplits = tab && tab.panels.size > 1;
+    document.querySelectorAll('.split-menu-item').forEach(item => {
+      item.classList.toggle('visible', !!hasSplits);
+    });
   }
 
   private populateWindowTabList(): void {
