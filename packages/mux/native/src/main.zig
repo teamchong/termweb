@@ -437,8 +437,8 @@ const FrameStats = struct {
 const FrameBuffer = struct {
     rgba_current: []u8,    // Raw BGRA from IOSurface
     rgba_previous: []u8,   // Previous BGRA for fast comparison
-    rgb_current: []u8,     // Converted RGB (3 bytes per pixel)
-    rgb_previous: []u8,    // Previous frame RGB
+    rgb_current: []u8,     // Converted RGB (3 bytes per pixel) - used for keyframes
+    rgb_previous: []u8,    // Previous frame RGB - updated in-place
     diff: []u8,            // XOR diff
     compressed: []u8,      // Compressed output
     width: u32,
@@ -448,18 +448,24 @@ const FrameBuffer = struct {
     bg_r: u8,
     bg_g: u8,
     bg_b: u8,
+    // Zero-copy optimization: track dirty region from last frame
+    last_dirty_start: usize,
+    last_dirty_end: usize,
 
     fn init(allocator: std.mem.Allocator, width: u32, height: u32) !FrameBuffer {
         const rgba_size = width * height * 4;
         const rgb_size = width * height * 3;
         const compressed_max = rgb_size + 1024;
 
+        const diff = try allocator.alloc(u8, rgb_size);
+        @memset(diff, 0); // Zero-initialize diff buffer
+
         return .{
             .rgba_current = try allocator.alloc(u8, rgba_size),
             .rgba_previous = try allocator.alloc(u8, rgba_size),
             .rgb_current = try allocator.alloc(u8, rgb_size),
             .rgb_previous = try allocator.alloc(u8, rgb_size),
-            .diff = try allocator.alloc(u8, rgb_size),
+            .diff = diff,
             .compressed = try allocator.alloc(u8, compressed_max),
             .width = width,
             .height = height,
@@ -467,6 +473,8 @@ const FrameBuffer = struct {
             .bg_r = 0x28,  // Default background (from ghostty config)
             .bg_g = 0x2c,
             .bg_b = 0x34,
+            .last_dirty_start = 0,
+            .last_dirty_end = rgb_size, // Force full clear on first delta
         };
     }
 
@@ -611,6 +619,107 @@ const FrameBuffer = struct {
         // Convert chunk count to approximate byte count for threshold logic
         // (each chunk represents up to VecSize changed bytes)
         return FrameStats{ .changed_bytes = changed_chunks * VecSize };
+    }
+
+    /// Zero-copy diff computation: Fuses BGRA comparison, RGB conversion, and diff
+    /// in one pass. Only writes to diff buffer and updates rgb_previous where pixels changed.
+    /// For cursor blink: writes ~200 bytes instead of 28MB.
+    fn computeDiffZeroCopy(self: *FrameBuffer) FrameStats {
+        const bgra_curr = self.rgba_current;
+        const bgra_prev = self.rgba_previous;
+        const rgb_prev = self.rgb_previous;
+        const diff_buf = self.diff;
+        const pixel_count = self.width * self.height;
+        const bg_r = self.bg_r;
+        const bg_g = self.bg_g;
+        const bg_b = self.bg_b;
+
+        // Step 1: Clear only the region we dirtied last frame (not the whole buffer)
+        if (self.last_dirty_end > self.last_dirty_start) {
+            @memset(diff_buf[self.last_dirty_start..self.last_dirty_end], 0);
+        }
+
+        var dirty_start: usize = pixel_count * 3; // Start beyond end
+        var dirty_end: usize = 0;
+        var changed_bytes: usize = 0;
+
+        // Step 2: Scan pixels, only write where changes occurred
+        var i: usize = 0;
+        while (i < pixel_count) : (i += 1) {
+            const bgra_idx = i * 4;
+            const rgb_idx = i * 3;
+
+            // Compare BGRA pixels (4 bytes) - fast read
+            const curr_b = bgra_curr[bgra_idx + 0];
+            const curr_g = bgra_curr[bgra_idx + 1];
+            const curr_r = bgra_curr[bgra_idx + 2];
+            const curr_a = bgra_curr[bgra_idx + 3];
+
+            const prev_b = bgra_prev[bgra_idx + 0];
+            const prev_g = bgra_prev[bgra_idx + 1];
+            const prev_r = bgra_prev[bgra_idx + 2];
+            const prev_a = bgra_prev[bgra_idx + 3];
+
+            // Fast path: if BGRA unchanged, skip this pixel entirely (no writes)
+            if (curr_b == prev_b and curr_g == prev_g and curr_r == prev_r and curr_a == prev_a) {
+                continue;
+            }
+
+            // Pixel changed - convert both current and previous to RGB
+            var new_r: u8 = undefined;
+            var new_g: u8 = undefined;
+            var new_b: u8 = undefined;
+            var old_r: u8 = undefined;
+            var old_g: u8 = undefined;
+            var old_b: u8 = undefined;
+
+            // Convert current BGRA to RGB with alpha blending
+            if (curr_a == 255) {
+                new_r = curr_r;
+                new_g = curr_g;
+                new_b = curr_b;
+            } else {
+                const a16 = @as(u16, curr_a);
+                const inv_a = 255 - a16;
+                new_r = @truncate(((@as(u16, curr_r) * a16) + (@as(u16, bg_r) * inv_a)) / 255);
+                new_g = @truncate(((@as(u16, curr_g) * a16) + (@as(u16, bg_g) * inv_a)) / 255);
+                new_b = @truncate(((@as(u16, curr_b) * a16) + (@as(u16, bg_b) * inv_a)) / 255);
+            }
+
+            // Convert previous BGRA to RGB with alpha blending
+            if (prev_a == 255) {
+                old_r = prev_r;
+                old_g = prev_g;
+                old_b = prev_b;
+            } else {
+                const a16 = @as(u16, prev_a);
+                const inv_a = 255 - a16;
+                old_r = @truncate(((@as(u16, prev_r) * a16) + (@as(u16, bg_r) * inv_a)) / 255);
+                old_g = @truncate(((@as(u16, prev_g) * a16) + (@as(u16, bg_g) * inv_a)) / 255);
+                old_b = @truncate(((@as(u16, prev_b) * a16) + (@as(u16, bg_b) * inv_a)) / 255);
+            }
+
+            // Compute XOR diff and write to diff buffer
+            diff_buf[rgb_idx + 0] = new_r ^ old_r;
+            diff_buf[rgb_idx + 1] = new_g ^ old_g;
+            diff_buf[rgb_idx + 2] = new_b ^ old_b;
+
+            // Update rgb_previous in-place (zero-copy trick)
+            rgb_prev[rgb_idx + 0] = new_r;
+            rgb_prev[rgb_idx + 1] = new_g;
+            rgb_prev[rgb_idx + 2] = new_b;
+
+            // Track dirty region
+            if (rgb_idx < dirty_start) dirty_start = rgb_idx;
+            if (rgb_idx + 3 > dirty_end) dirty_end = rgb_idx + 3;
+            changed_bytes += 3;
+        }
+
+        // Remember dirty region for next frame
+        self.last_dirty_start = dirty_start;
+        self.last_dirty_end = dirty_end;
+
+        return FrameStats{ .changed_bytes = changed_bytes };
     }
 
     fn swapBuffers(self: *FrameBuffer) void {
@@ -844,7 +953,7 @@ const Panel = struct {
 
         try self.frame_buffer.resize(@intCast(surf_width), @intCast(surf_height));
 
-        // Copy BGRA data row by row
+        // Copy BGRA data row by row (this is unavoidable - IOSurface requires copy)
         const dst_bytes_per_row = self.frame_buffer.width * 4;
         for (0..surf_height) |y| {
             const src_offset = y * src_bytes_per_row;
@@ -856,16 +965,14 @@ const Panel = struct {
             );
         }
 
-        // FAST CHECK: Skip expensive BGRA->RGB conversion if frame unchanged
+        // FAST CHECK: Skip if frame unchanged (read-only comparison, very fast)
         if (!self.frame_buffer.rgbaChanged()) {
-            // Swap buffers so next comparison works correctly
+            // Swap RGBA buffers so next comparison works correctly
             self.frame_buffer.swapRgbaBuffers();
             return false; // No change - skip everything
         }
 
-        // Frame changed - convert BGRA to RGB
-        self.frame_buffer.convertBgraToRgb();
-        self.frame_buffer.swapRgbaBuffers();
+        // Frame changed - DON'T convert here, let prepareFrame handle it (zero-copy)
         return true;
     }
 
@@ -880,31 +987,29 @@ const Panel = struct {
         var compressor: *const Compressor = undefined;
 
         if (need_keyframe) {
-            // Send full RGB frame - use best compression (keyframes are infrequent)
+            // Keyframe: Convert full BGRA to RGB (unavoidable for keyframes)
+            self.frame_buffer.convertBgraToRgb();
             data_to_compress = self.frame_buffer.rgb_current;
             is_keyframe = true;
             compressor = &self.compressor_best;
             self.last_keyframe = now;
             self.force_keyframe = false;
         } else {
-            // FAST CHECK: Skip entirely if buffers are identical (runs at memory-read speed)
-            if (std.mem.eql(u8, self.frame_buffer.rgb_current, self.frame_buffer.rgb_previous)) {
-                return null; // No changes - CPU usage -> 0%
-            }
+            // Delta frame: Use zero-copy diff (fused compare + convert + diff)
+            // This only writes to memory where pixels actually changed
+            const stats = self.frame_buffer.computeDiffZeroCopy();
 
-            // Send XOR diff
-            const stats = self.frame_buffer.computeDiff();
-
-            // Early exit if diff is all zeros (shouldn't happen after eql check, but safety)
+            // Early exit if no changes
             if (stats.changed_bytes == 0) {
+                // Swap RGBA buffers for next frame comparison
+                self.frame_buffer.swapRgbaBuffers();
                 return null;
             }
 
             data_to_compress = self.frame_buffer.diff;
             is_keyframe = false;
 
-            // OPTIMIZATION 2: Adaptive compression level
-            // If >15% of bytes changed, it's likely video/scrolling - use fast compression
+            // Adaptive compression: fast for video/scrolling, best for cursor/small changes
             const heavy_threshold = self.frame_buffer.diff.len / 7; // ~14%
             if (stats.changed_bytes > heavy_threshold) {
                 compressor = &self.compressor_fast;
@@ -919,7 +1024,7 @@ const Panel = struct {
             self.frame_buffer.compressed[header_size..],
         );
 
-        // Write header manually to avoid alignment issues with packed struct
+        // Write header
         const buf = self.frame_buffer.compressed;
         buf[0] = if (is_keyframe) @intFromEnum(FrameType.keyframe) else @intFromEnum(FrameType.delta);
         std.mem.writeInt(u32, buf[1..5], self.sequence, .little);
@@ -928,7 +1033,18 @@ const Panel = struct {
         std.mem.writeInt(u32, buf[9..13], @intCast(compressed_size), .little);
 
         self.sequence +%= 1;
-        self.frame_buffer.swapBuffers();
+
+        // Buffer management after frame:
+        // - Keyframe: swap RGB buffers (rgb_current becomes rgb_previous for next diff)
+        // - Delta: rgb_previous already updated in-place by computeDiffZeroCopy
+        if (is_keyframe) {
+            self.frame_buffer.swapBuffers();
+            // Reset dirty tracking: next delta must clear entire diff buffer
+            self.frame_buffer.last_dirty_start = 0;
+            self.frame_buffer.last_dirty_end = self.frame_buffer.diff.len;
+        }
+        // Always swap RGBA buffers for next frame comparison
+        self.frame_buffer.swapRgbaBuffers();
 
         return .{
             .data = self.frame_buffer.compressed[0 .. header_size + compressed_size],
