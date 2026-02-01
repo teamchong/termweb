@@ -2,7 +2,7 @@
  * Panel - Terminal panel with WebGPU rendering
  */
 
-import { ClientMsg, FrameType, KEY_MAP } from './protocol';
+import { ClientMsg, FrameType } from './protocol';
 
 // WebGPU Shaders
 const XOR_SHADER = `
@@ -131,6 +131,8 @@ export class Panel {
   private inspectorHeight = 200;
   private inspectorActiveTab = 'screen';
   private inspectorState: unknown = null;
+  private inspectorClickHandler: (() => void) | null = null;
+  private destroyed = false;
 
   constructor(
     id: string,
@@ -146,7 +148,7 @@ export class Panel {
     // Create DOM elements
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'panel-canvas';
-    this.canvas.tabIndex = 0;
+    this.canvas.tabIndex = 1;
 
     this.element = document.createElement('div');
     this.element.className = 'panel';
@@ -171,16 +173,30 @@ export class Panel {
       <div class="inspector-content">
         <div class="inspector-left">
           <div class="inspector-left-header">
+            <div class="inspector-dock-wrapper">
+              <span class="inspector-dock-icon"></span>
+              <div class="inspector-dock-menu">
+                <div class="inspector-dock-menu-item" data-action="hide-header">Hide Tab Bar</div>
+              </div>
+            </div>
             <div class="inspector-tabs">
               <button class="inspector-tab active" data-tab="screen">Screen</button>
             </div>
           </div>
+          <div class="inspector-collapsed-toggle" data-panel="left"></div>
           <div class="inspector-main"></div>
         </div>
         <div class="inspector-right">
           <div class="inspector-right-header">
+            <div class="inspector-dock-wrapper">
+              <span class="inspector-dock-icon"></span>
+              <div class="inspector-dock-menu">
+                <div class="inspector-dock-menu-item" data-action="hide-header">Hide Tab Bar</div>
+              </div>
+            </div>
             <span class="inspector-right-title">Surface Info</span>
           </div>
+          <div class="inspector-collapsed-toggle" data-panel="right"></div>
           <div class="inspector-sidebar"></div>
         </div>
       </div>
@@ -199,6 +215,50 @@ export class Panel {
         this.inspectorActiveTab = tab.dataset.tab || 'screen';
         this.sendInspectorTab(this.inspectorActiveTab);
         this.renderInspectorView();
+      });
+    });
+
+    // Dock icon dropdown
+    const dockIcons = el.querySelectorAll('.inspector-dock-icon');
+    dockIcons.forEach(icon => {
+      icon.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const menu = icon.parentElement?.querySelector('.inspector-dock-menu');
+        // Close other menus
+        el.querySelectorAll('.inspector-dock-menu.visible').forEach(m => {
+          if (m !== menu) m.classList.remove('visible');
+        });
+        menu?.classList.toggle('visible');
+      });
+    });
+
+    // Hide menu when clicking elsewhere
+    this.inspectorClickHandler = () => {
+      el.querySelectorAll('.inspector-dock-menu.visible').forEach(m => {
+        m.classList.remove('visible');
+      });
+    };
+    document.addEventListener('click', this.inspectorClickHandler);
+
+    // Menu item click - hide header
+    const menuItems = el.querySelectorAll('.inspector-dock-menu-item');
+    menuItems.forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const panel = item.closest('.inspector-left, .inspector-right');
+        if (panel && (item as HTMLElement).dataset.action === 'hide-header') {
+          panel.classList.add('header-hidden');
+        }
+        item.closest('.inspector-dock-menu')?.classList.remove('visible');
+      });
+    });
+
+    // Collapsed toggle - show header again
+    const toggles = el.querySelectorAll('.inspector-collapsed-toggle');
+    toggles.forEach(toggle => {
+      toggle.addEventListener('click', () => {
+        const panel = toggle.closest('.inspector-left, .inspector-right');
+        panel?.classList.remove('header-hidden');
       });
     });
 
@@ -279,24 +339,27 @@ export class Panel {
     const state = this.inspectorState as { size?: Record<string, number> };
     const size = state.size || {};
 
-    sidebarEl.innerHTML = `
-      <div class="inspector-simple-section">
-        <span class="inspector-simple-title">Dimensions</span>
-        <hr>
-      </div>
-      <div class="inspector-row">
-        <span class="inspector-label">Screen Size</span>
-        <span class="inspector-value">${size.screen_width ?? 0}px x ${size.screen_height ?? 0}px</span>
-      </div>
-      <div class="inspector-row">
-        <span class="inspector-label">Grid Size</span>
-        <span class="inspector-value">${size.cols ?? 0}c x ${size.rows ?? 0}r</span>
-      </div>
-      <div class="inspector-row">
-        <span class="inspector-label">Cell Size</span>
-        <span class="inspector-value">${size.cell_width ?? 0}px x ${size.cell_height ?? 0}px</span>
-      </div>
-    `;
+    // Initialize once with data-field pattern for efficient updates
+    if (!sidebarEl.dataset.initialized) {
+      sidebarEl.dataset.initialized = 'true';
+      sidebarEl.innerHTML = `
+        <div class="inspector-simple-section">
+          <span class="inspector-simple-title">Dimensions</span>
+          <hr>
+        </div>
+        <div class="inspector-row"><span class="inspector-label">Screen Size</span><span class="inspector-value" data-field="screen-size"></span></div>
+        <div class="inspector-row"><span class="inspector-label">Grid Size</span><span class="inspector-value" data-field="grid-size"></span></div>
+        <div class="inspector-row"><span class="inspector-label">Cell Size</span><span class="inspector-value" data-field="cell-size"></span></div>
+      `;
+    }
+
+    const f = (field: string) => sidebarEl.querySelector(`[data-field="${field}"]`);
+    const screenSize = f('screen-size');
+    const gridSize = f('grid-size');
+    const cellSize = f('cell-size');
+    if (screenSize) screenSize.textContent = `${size.screen_width ?? 0}px x ${size.screen_height ?? 0}px`;
+    if (gridSize) gridSize.textContent = `${size.cols ?? 0}c x ${size.rows ?? 0}r`;
+    if (cellSize) cellSize.textContent = `${size.cell_width ?? 0}px x ${size.cell_height ?? 0}px`;
   }
 
   private renderInspectorView(): void {
@@ -318,6 +381,10 @@ export class Panel {
       <div class="inspector-row">
         <span class="inspector-label">Screen</span>
         <span class="inspector-value">${size.screen_width ?? 0} × ${size.screen_height ?? 0} px</span>
+      </div>
+      <div class="inspector-row">
+        <span class="inspector-label">Cell</span>
+        <span class="inspector-value">${size.cell_width ?? 0} × ${size.cell_height ?? 0} px</span>
       </div>
     `;
   }
@@ -371,6 +438,15 @@ export class Panel {
     }
 
     this.device = await adapter.requestDevice();
+    this.device.lost.then((info) => {
+      if (this.destroyed) return;
+      console.error('WebGPU device lost:', info.message, info.reason);
+    });
+    this.device.onuncapturederror = (e) => {
+      if (this.destroyed) return;
+      console.error('WebGPU error:', e.error);
+    };
+
     this.context = this.canvas.getContext('webgpu');
     if (!this.context) {
       console.error('Could not get WebGPU context');
@@ -473,6 +549,10 @@ export class Panel {
 
   // WebSocket connection
   connect(host: string, port: number): void {
+    // Close any existing connection before reconnecting
+    if (this.ws) {
+      this.disconnect();
+    }
     this.ws = new WebSocket(`ws://${host}:${port}`);
     this.ws.binaryType = 'arraybuffer';
 
@@ -548,23 +628,58 @@ export class Panel {
 
   // Frame handling
   private async handleFrame(data: ArrayBuffer): Promise<void> {
-    if (!this.device) return;
+    if (!this.device || this.destroyed) return;
 
     const view = new DataView(data);
-
-    // Parse header (13 bytes)
     const frameType = view.getUint8(0);
+
+    // Handle partial_delta (uncompressed, different header)
+    if (frameType === FrameType.PARTIAL_DELTA) {
+      // Header: type(1) + seq(4) + width(2) + height(2) + offset(4) + length(4) = 17
+      const sequence = view.getUint32(1, true);
+      const width = view.getUint16(5, true);
+      const height = view.getUint16(7, true);
+      const offset = view.getUint32(9, true);
+      const length = view.getUint32(13, true);
+
+      // Resize if needed
+      if (width !== this.width || height !== this.height) {
+        this.width = width;
+        this.height = height;
+        this.canvas.width = width;
+        this.canvas.height = height;
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        this.context!.configure({ device: this.device, format, alphaMode: 'opaque' });
+        this.createGPUBuffers(width, height);
+      }
+
+      // Create full diff buffer with zeros, place partial data at offset
+      const expectedSize = width * height * 3;
+      const alignedSize = Math.ceil(expectedSize / 4) * 4;
+      const fullDiff = new Uint8Array(alignedSize);
+      const partialData = new Uint8Array(data, 17, length);
+      fullDiff.set(partialData, offset);
+
+      // XOR with prevBuffer
+      this.device.queue.writeBuffer(this.diffBuffer!, 0, fullDiff as Uint8Array<ArrayBuffer>);
+      const commandEncoder = this.device.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(this.xorPipeline!);
+      pass.setBindGroup(0, this.xorBindGroup!);
+      pass.dispatchWorkgroups(Math.ceil(expectedSize / 4 / 256));
+      pass.end();
+      this.device.queue.submit([commandEncoder.finish()]);
+
+      this.renderFrame();
+      this.sequence = sequence;
+      return;
+    }
+
+    // Standard header (13 bytes) for keyframe/delta
     const sequence = view.getUint32(1, true);
     const width = view.getUint16(5, true);
     const height = view.getUint16(7, true);
     const compressedSize = view.getUint32(9, true);
-
-    // Handle panel ID assignment
-    if (frameType === 0xFF) {
-      this.serverId = view.getUint32(1, true);
-      console.log(`Panel ${this.id} assigned server ID: ${this.serverId}`);
-      return;
-    }
 
     // Resize if needed
     if (width !== this.width || height !== this.height) {
@@ -654,6 +769,7 @@ export class Panel {
 
   private renderFrame(): void {
     if (!this.device || !this.context || !this.pipeline) return;
+    if (!this.convertBindGroup || !this.renderBindGroup) return;
 
     const commandEncoder = this.device.createCommandEncoder();
 
@@ -686,68 +802,52 @@ export class Panel {
 
   // Input handling
   private setupInputHandlers(): void {
-    this.canvas.addEventListener('keydown', (e) => {
-      e.preventDefault();
-      const keyCode = KEY_MAP[e.code] ?? 0;
-      const mods = this.getModifiers(e);
-      this.sendKeyInput(keyCode, 1, mods, e.key.length === 1 ? e.key : undefined);
-    });
-
-    this.canvas.addEventListener('keyup', (e) => {
-      e.preventDefault();
-      const keyCode = KEY_MAP[e.code] ?? 0;
-      const mods = this.getModifiers(e);
-      this.sendKeyInput(keyCode, 0, mods);
-    });
+    // Keyboard and paste are handled at document level in App class
 
     this.canvas.addEventListener('mousedown', (e) => {
       this.canvas.focus();
-      const rect = this.canvas.getBoundingClientRect();
-      this.sendMouseInput(
-        e.clientX - rect.left,
-        e.clientY - rect.top,
-        e.button,
-        1,
-        this.getModifiers(e)
-      );
+      this.sendMouseButton(e, 1);
     });
 
     this.canvas.addEventListener('mouseup', (e) => {
-      const rect = this.canvas.getBoundingClientRect();
-      this.sendMouseInput(
-        e.clientX - rect.left,
-        e.clientY - rect.top,
-        e.button,
-        0,
-        this.getModifiers(e)
-      );
+      this.sendMouseButton(e, 0);
     });
 
     this.canvas.addEventListener('mousemove', (e) => {
-      if (e.buttons === 0) return;
-      const rect = this.canvas.getBoundingClientRect();
-      const msg = new ArrayBuffer(8);
-      const view = new DataView(msg);
-      view.setUint8(0, ClientMsg.MOUSE_MOVE);
-      view.setUint16(1, e.clientX - rect.left, true);
-      view.setUint16(3, e.clientY - rect.top, true);
-      view.setUint8(5, e.buttons);
-      view.setUint8(6, this.getModifiers(e));
-      this.ws?.send(msg);
+      this.sendMouseMove(e);
     });
 
     this.canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
-      const msg = new ArrayBuffer(6);
-      const view = new DataView(msg);
-      view.setUint8(0, ClientMsg.MOUSE_SCROLL);
-      view.setInt16(1, Math.round(e.deltaX), true);
-      view.setInt16(3, Math.round(e.deltaY), true);
-      view.setUint8(5, this.getModifiers(e));
-      this.ws?.send(msg);
+      this.sendMouseScroll(e);
     });
 
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // Drag & drop file upload
+    this.canvas.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      this.canvas.style.opacity = '0.7';
+    });
+
+    this.canvas.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.canvas.style.opacity = '1';
+    });
+
+    this.canvas.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.canvas.style.opacity = '1';
+      if (e.dataTransfer?.files) {
+        for (const file of e.dataTransfer.files) {
+          (window as unknown as { app?: { uploadFile(f: File): void } }).app?.uploadFile(file);
+        }
+      }
+    });
   }
 
   private getModifiers(e: KeyboardEvent | MouseEvent | WheelEvent): number {
@@ -759,55 +859,114 @@ export class Panel {
     return mods;
   }
 
-  // Public input methods
-  sendKeyInput(keyCode: number, action: number, mods: number, text?: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-    const textBytes = text ? new TextEncoder().encode(text) : new Uint8Array(0);
-    const msg = new ArrayBuffer(8 + textBytes.length);
-    const view = new DataView(msg);
-
-    view.setUint8(0, ClientMsg.KEY_INPUT);
-    view.setUint32(1, keyCode, true);
-    view.setUint8(5, action);
-    view.setUint8(6, mods);
-    view.setUint8(7, textBytes.length);
-    new Uint8Array(msg).set(textBytes, 8);
-
-    this.ws.send(msg);
+  private getCanvasCoords(e: MouseEvent | WheelEvent): { x: number; y: number } {
+    const rect = this.canvas.getBoundingClientRect();
+    return {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
   }
 
-  sendMouseInput(x: number, y: number, button: number, action: number, mods: number): void {
+  // Public input methods - match original protocol exactly
+  sendKeyInput(e: KeyboardEvent, action: number): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const msg = new ArrayBuffer(8);
-    const view = new DataView(msg);
+    // Format: [msg_type:u8][action:u8][mods:u8][code_len:u8][code:...][text_len:u8][text:...]
+    const codeBytes = new TextEncoder().encode(e.code);
+    const text = (e.key.length === 1) ? e.key : '';
+    const textBytes = new TextEncoder().encode(text);
+
+    const buf = new ArrayBuffer(5 + codeBytes.length + textBytes.length);
+    const view = new Uint8Array(buf);
+    view[0] = ClientMsg.KEY_INPUT;
+    view[1] = action;
+    view[2] = this.getModifiers(e);
+    view[3] = codeBytes.length;
+    view.set(codeBytes, 4);
+    view[4 + codeBytes.length] = textBytes.length;
+    view.set(textBytes, 5 + codeBytes.length);
+    this.ws.send(buf);
+  }
+
+  sendMouseButton(e: MouseEvent, state: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const coords = this.getCanvasCoords(e);
+    const buf = new ArrayBuffer(20);
+    const view = new DataView(buf);
     view.setUint8(0, ClientMsg.MOUSE_INPUT);
-    view.setUint16(1, Math.round(x), true);
-    view.setUint16(3, Math.round(y), true);
-    view.setUint8(5, button);
-    view.setUint8(6, action);
-    view.setUint8(7, mods);
-    this.ws.send(msg);
+    view.setFloat64(1, coords.x, true);
+    view.setFloat64(9, coords.y, true);
+    view.setUint8(17, e.button);
+    view.setUint8(18, state);
+    view.setUint8(19, this.getModifiers(e));
+    this.ws.send(buf);
+  }
+
+  sendMouseMove(e: MouseEvent): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const coords = this.getCanvasCoords(e);
+    const buf = new ArrayBuffer(18);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.MOUSE_MOVE);
+    view.setFloat64(1, coords.x, true);
+    view.setFloat64(9, coords.y, true);
+    view.setUint8(17, this.getModifiers(e));
+    this.ws.send(buf);
+  }
+
+  sendMouseScroll(e: WheelEvent): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const coords = this.getCanvasCoords(e);
+    const buf = new ArrayBuffer(34);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.MOUSE_SCROLL);
+    view.setFloat64(1, coords.x, true);
+    view.setFloat64(9, coords.y, true);
+    view.setFloat64(17, e.deltaX, true);
+    view.setFloat64(25, e.deltaY, true);
+    view.setUint8(33, this.getModifiers(e));
+    this.ws.send(buf);
   }
 
   sendTextInput(text: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     const textBytes = new TextEncoder().encode(text);
-    const msg = new ArrayBuffer(3 + textBytes.length);
-    const view = new DataView(msg);
-    view.setUint8(0, ClientMsg.TEXT_INPUT);
-    view.setUint16(1, textBytes.length, true);
-    new Uint8Array(msg).set(textBytes, 3);
-    this.ws.send(msg);
+    const buf = new ArrayBuffer(1 + textBytes.length);
+    const view = new Uint8Array(buf);
+    view[0] = ClientMsg.TEXT_INPUT;
+    view.set(textBytes, 1);
+    this.ws.send(buf);
   }
 
   requestKeyframe(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const msg = new ArrayBuffer(1);
-    new DataView(msg).setUint8(0, ClientMsg.REQUEST_KEYFRAME);
-    this.ws.send(msg);
+    this.ws.send(new Uint8Array([ClientMsg.REQUEST_KEYFRAME]));
+  }
+
+  pause(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(new Uint8Array([ClientMsg.PAUSE_STREAM]));
+  }
+
+  resume(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(new Uint8Array([ClientMsg.RESUME_STREAM]));
+    this.requestKeyframe();
+  }
+
+  show(): void {
+    this.element.classList.add('active');
+    this.canvas.focus();
+    this.resume();
+  }
+
+  hide(): void {
+    this.element.classList.remove('active');
+    this.pause();
   }
 
   focus(): void {
@@ -819,6 +978,7 @@ export class Panel {
     newContainer.appendChild(this.element);
 
     // Force resize check after reparenting since container changed
+    // Use 50ms delay to wait for layout to settle
     setTimeout(() => {
       const rect = this.container.getBoundingClientRect();
       const width = Math.floor(rect.width);
@@ -831,15 +991,60 @@ export class Panel {
           this.callbacks.onResize(this.serverId, width, height);
         }
       }
-    }, 0);
+    }, 50);
   }
 
   destroy(): void {
+    // Mark as destroyed to prevent callbacks on stale panel
+    this.destroyed = true;
+
+    // Clear resize timeout
+    if (this.resizeTimeout) {
+      clearTimeout(this.resizeTimeout);
+      this.resizeTimeout = null;
+    }
+
+    // Disconnect WebSocket
     this.disconnect();
-    this.resizeObserver?.disconnect();
-    this.prevBuffer?.destroy();
-    this.diffBuffer?.destroy();
-    this.texture?.destroy();
+
+    // Disconnect resize observer
+    if (this.resizeObserver) {
+      this.resizeObserver.disconnect();
+      this.resizeObserver = null;
+    }
+
+    // Remove inspector click handler
+    if (this.inspectorClickHandler) {
+      document.removeEventListener('click', this.inspectorClickHandler);
+      this.inspectorClickHandler = null;
+    }
+
+    // Clean up WebGPU resources
+    if (this.prevBuffer) {
+      this.prevBuffer.destroy();
+      this.prevBuffer = null;
+    }
+    if (this.diffBuffer) {
+      this.diffBuffer.destroy();
+      this.diffBuffer = null;
+    }
+    if (this.texture) {
+      this.texture.destroy();
+      this.texture = null;
+    }
+
+    // Clear references for GC
+    this.xorBindGroup = null;
+    this.convertBindGroup = null;
+    this.renderBindGroup = null;
+    this.pipeline = null;
+    this.xorPipeline = null;
+    this.rgbToRgbaPipeline = null;
+    this.sampler = null;
+    this.context = null;
+    this.device = null;
+
+    // Remove element from DOM
     this.element.remove();
   }
 }

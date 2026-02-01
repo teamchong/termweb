@@ -24,6 +24,7 @@ pub const FrameType = enum(u8) {
     keyframe = 0x01,
     delta = 0x02,
     request_keyframe = 0x03,
+    partial_delta = 0x04, // Uncompressed partial diff with offset
 };
 
 pub const FrameHeader = packed struct {
@@ -621,12 +622,16 @@ const FrameBuffer = struct {
         return FrameStats{ .changed_bytes = changed_chunks * VecSize };
     }
 
-    /// Zero-copy diff computation: Fuses BGRA comparison, RGB conversion, and diff
-    /// in one pass. Only writes to diff buffer and updates rgb_previous where pixels changed.
-    /// For cursor blink: writes ~200 bytes instead of 28MB.
+    /// Fast diff computation - only scans around previous dirty region
     fn computeDiffZeroCopy(self: *FrameBuffer) FrameStats {
         const bgra_curr = self.rgba_current;
         const bgra_prev = self.rgba_previous;
+
+        // Fast check: if nothing changed, exit immediately
+        if (std.mem.eql(u8, bgra_curr, bgra_prev)) {
+            return FrameStats{ .changed_bytes = 0 };
+        }
+
         const rgb_prev = self.rgb_previous;
         const diff_buf = self.diff;
         const pixel_count = self.width * self.height;
@@ -634,22 +639,107 @@ const FrameBuffer = struct {
         const bg_g = self.bg_g;
         const bg_b = self.bg_b;
 
-        // Step 1: Clear only the region we dirtied last frame (not the whole buffer)
+        // Clear only the region we dirtied last frame
         if (self.last_dirty_end > self.last_dirty_start) {
             @memset(diff_buf[self.last_dirty_start..self.last_dirty_end], 0);
         }
 
-        var dirty_start: usize = pixel_count * 3; // Start beyond end
+        var dirty_start: usize = pixel_count * 3;
         var dirty_end: usize = 0;
         var changed_bytes: usize = 0;
 
-        // Step 2: Scan pixels, only write where changes occurred
-        var i: usize = 0;
-        while (i < pixel_count) : (i += 1) {
+        const BlockSize = 4096;
+        const pixels_per_block = BlockSize / 4;
+        const num_blocks = (pixel_count * 4) / BlockSize;
+
+        // Process ALL blocks (SIMD eql is fast for unchanged blocks)
+        var block: usize = 0;
+        while (block < num_blocks) : (block += 1) {
+            const block_start = block * BlockSize;
+            const block_end = block_start + BlockSize;
+
+            if (std.mem.eql(u8, bgra_curr[block_start..block_end], bgra_prev[block_start..block_end])) {
+                continue;
+            }
+
+            // Block changed - process its 16 pixels
+            const pixel_start = block * pixels_per_block;
+            const pixel_end = pixel_start + pixels_per_block;
+
+            for (pixel_start..pixel_end) |i| {
+                const bgra_idx = i * 4;
+                const rgb_idx = i * 3;
+
+                const curr_b = bgra_curr[bgra_idx + 0];
+                const curr_g = bgra_curr[bgra_idx + 1];
+                const curr_r = bgra_curr[bgra_idx + 2];
+                const curr_a = bgra_curr[bgra_idx + 3];
+
+                const prev_b = bgra_prev[bgra_idx + 0];
+                const prev_g = bgra_prev[bgra_idx + 1];
+                const prev_r = bgra_prev[bgra_idx + 2];
+                const prev_a = bgra_prev[bgra_idx + 3];
+
+                // Skip unchanged pixels within the block
+                if (curr_b == prev_b and curr_g == prev_g and curr_r == prev_r and curr_a == prev_a) {
+                    continue;
+                }
+
+                // Convert current BGRA to RGB
+                var new_r: u8 = undefined;
+                var new_g: u8 = undefined;
+                var new_b: u8 = undefined;
+                if (curr_a == 255) {
+                    new_r = curr_r;
+                    new_g = curr_g;
+                    new_b = curr_b;
+                } else {
+                    const a16 = @as(u16, curr_a);
+                    const inv_a = 255 - a16;
+                    new_r = @truncate(((@as(u16, curr_r) * a16) + (@as(u16, bg_r) * inv_a)) / 255);
+                    new_g = @truncate(((@as(u16, curr_g) * a16) + (@as(u16, bg_g) * inv_a)) / 255);
+                    new_b = @truncate(((@as(u16, curr_b) * a16) + (@as(u16, bg_b) * inv_a)) / 255);
+                }
+
+                // Convert previous BGRA to RGB
+                var old_r: u8 = undefined;
+                var old_g: u8 = undefined;
+                var old_b: u8 = undefined;
+                if (prev_a == 255) {
+                    old_r = prev_r;
+                    old_g = prev_g;
+                    old_b = prev_b;
+                } else {
+                    const a16 = @as(u16, prev_a);
+                    const inv_a = 255 - a16;
+                    old_r = @truncate(((@as(u16, prev_r) * a16) + (@as(u16, bg_r) * inv_a)) / 255);
+                    old_g = @truncate(((@as(u16, prev_g) * a16) + (@as(u16, bg_g) * inv_a)) / 255);
+                    old_b = @truncate(((@as(u16, prev_b) * a16) + (@as(u16, bg_b) * inv_a)) / 255);
+                }
+
+                // Compute XOR diff
+                diff_buf[rgb_idx + 0] = new_r ^ old_r;
+                diff_buf[rgb_idx + 1] = new_g ^ old_g;
+                diff_buf[rgb_idx + 2] = new_b ^ old_b;
+
+                // Update rgb_previous in-place
+                rgb_prev[rgb_idx + 0] = new_r;
+                rgb_prev[rgb_idx + 1] = new_g;
+                rgb_prev[rgb_idx + 2] = new_b;
+
+                // Track dirty region
+                if (rgb_idx < dirty_start) dirty_start = rgb_idx;
+                if (rgb_idx + 3 > dirty_end) dirty_end = rgb_idx + 3;
+                changed_bytes += 3;
+            }
+        }
+
+        // Handle remaining pixels (if frame size not divisible by 16)
+        const remaining_start = num_blocks * pixels_per_block;
+        for (remaining_start..pixel_count) |i| {
             const bgra_idx = i * 4;
             const rgb_idx = i * 3;
 
-            // Compare BGRA pixels (4 bytes) - fast read
             const curr_b = bgra_curr[bgra_idx + 0];
             const curr_g = bgra_curr[bgra_idx + 1];
             const curr_r = bgra_curr[bgra_idx + 2];
@@ -660,20 +750,13 @@ const FrameBuffer = struct {
             const prev_r = bgra_prev[bgra_idx + 2];
             const prev_a = bgra_prev[bgra_idx + 3];
 
-            // Fast path: if BGRA unchanged, skip this pixel entirely (no writes)
             if (curr_b == prev_b and curr_g == prev_g and curr_r == prev_r and curr_a == prev_a) {
                 continue;
             }
 
-            // Pixel changed - convert both current and previous to RGB
             var new_r: u8 = undefined;
             var new_g: u8 = undefined;
             var new_b: u8 = undefined;
-            var old_r: u8 = undefined;
-            var old_g: u8 = undefined;
-            var old_b: u8 = undefined;
-
-            // Convert current BGRA to RGB with alpha blending
             if (curr_a == 255) {
                 new_r = curr_r;
                 new_g = curr_g;
@@ -686,7 +769,9 @@ const FrameBuffer = struct {
                 new_b = @truncate(((@as(u16, curr_b) * a16) + (@as(u16, bg_b) * inv_a)) / 255);
             }
 
-            // Convert previous BGRA to RGB with alpha blending
+            var old_r: u8 = undefined;
+            var old_g: u8 = undefined;
+            var old_b: u8 = undefined;
             if (prev_a == 255) {
                 old_r = prev_r;
                 old_g = prev_g;
@@ -699,23 +784,19 @@ const FrameBuffer = struct {
                 old_b = @truncate(((@as(u16, prev_b) * a16) + (@as(u16, bg_b) * inv_a)) / 255);
             }
 
-            // Compute XOR diff and write to diff buffer
             diff_buf[rgb_idx + 0] = new_r ^ old_r;
             diff_buf[rgb_idx + 1] = new_g ^ old_g;
             diff_buf[rgb_idx + 2] = new_b ^ old_b;
 
-            // Update rgb_previous in-place (zero-copy trick)
             rgb_prev[rgb_idx + 0] = new_r;
             rgb_prev[rgb_idx + 1] = new_g;
             rgb_prev[rgb_idx + 2] = new_b;
 
-            // Track dirty region
             if (rgb_idx < dirty_start) dirty_start = rgb_idx;
             if (rgb_idx + 3 > dirty_end) dirty_end = rgb_idx + 3;
             changed_bytes += 3;
         }
 
-        // Remember dirty region for next frame
         self.last_dirty_start = dirty_start;
         self.last_dirty_end = dirty_end;
 
@@ -815,6 +896,7 @@ const Panel = struct {
     inspector_subscribed: bool,
     inspector_tab: [16]u8,
     inspector_tab_len: u8,
+    last_iosurface_seed: u32, // For detecting IOSurface changes without copying
 
     const KEYFRAME_INTERVAL_MS = 60000; // 60 seconds
 
@@ -878,6 +960,7 @@ const Panel = struct {
             .inspector_subscribed = false,
             .inspector_tab = undefined,
             .inspector_tab_len = 0,
+            .last_iosurface_seed = 0,
         };
 
         return panel;
@@ -941,6 +1024,13 @@ const Panel = struct {
 
     // Returns true if frame changed, false if identical to previous
     fn captureFromIOSurface(self: *Panel, iosurface: IOSurfacePtr) !bool {
+        // Check IOSurface seed - if unchanged, surface wasn't modified, skip copy entirely
+        const seed = c.IOSurfaceGetSeed(iosurface);
+        if (seed == self.last_iosurface_seed and !self.force_keyframe) {
+            return false; // Surface unchanged, skip 14MB copy
+        }
+        self.last_iosurface_seed = seed;
+
         _ = c.IOSurfaceLock(iosurface, c.kIOSurfaceLockReadOnly, null);
         defer _ = c.IOSurfaceUnlock(iosurface, c.kIOSurfaceLockReadOnly, null);
 
@@ -953,30 +1043,33 @@ const Panel = struct {
 
         try self.frame_buffer.resize(@intCast(surf_width), @intCast(surf_height));
 
-        // Copy BGRA data row by row (this is unavoidable - IOSurface requires copy)
+        // Copy BGRA data - single memcpy if strides match, row-by-row otherwise
         const dst_bytes_per_row = self.frame_buffer.width * 4;
-        for (0..surf_height) |y| {
-            const src_offset = y * src_bytes_per_row;
-            const dst_offset = y * dst_bytes_per_row;
-            const copy_len = @min(dst_bytes_per_row, src_bytes_per_row);
+        if (src_bytes_per_row == dst_bytes_per_row) {
+            // Fast path: single memcpy for the entire surface
+            const total_bytes = surf_height * dst_bytes_per_row;
             @memcpy(
-                self.frame_buffer.rgba_current[dst_offset..][0..copy_len],
-                base_addr.?[src_offset..][0..copy_len],
+                self.frame_buffer.rgba_current[0..total_bytes],
+                base_addr.?[0..total_bytes],
             );
+        } else {
+            // Slow path: row by row (different stride)
+            for (0..surf_height) |y| {
+                const src_offset = y * src_bytes_per_row;
+                const dst_offset = y * dst_bytes_per_row;
+                const copy_len = @min(dst_bytes_per_row, src_bytes_per_row);
+                @memcpy(
+                    self.frame_buffer.rgba_current[dst_offset..][0..copy_len],
+                    base_addr.?[src_offset..][0..copy_len],
+                );
+            }
         }
 
-        // FAST CHECK: Skip if frame unchanged (read-only comparison, very fast)
-        if (!self.frame_buffer.rgbaChanged()) {
-            // Swap RGBA buffers so next comparison works correctly
-            self.frame_buffer.swapRgbaBuffers();
-            return false; // No change - skip everything
-        }
-
-        // Frame changed - DON'T convert here, let prepareFrame handle it (zero-copy)
         return true;
     }
 
     fn prepareFrame(self: *Panel) !?struct { data: []u8, is_keyframe: bool } {
+        const t_start = std.time.nanoTimestamp();
         const now = std.time.milliTimestamp();
         const need_keyframe = self.force_keyframe or
             (now - self.last_keyframe >= KEYFRAME_INTERVAL_MS) or
@@ -1006,23 +1099,65 @@ const Panel = struct {
                 return null;
             }
 
+            // Check if dirty region is small enough for uncompressed partial delta
+            const dirty_start = self.frame_buffer.last_dirty_start;
+            const dirty_end = self.frame_buffer.last_dirty_end;
+            const dirty_size = dirty_end - dirty_start;
+
+            // Use partial_delta (uncompressed) for small changes (<500KB)
+            // Avoids 37ms compression overhead
+            if (dirty_size < 500_000) {
+                const t_diff_end = std.time.nanoTimestamp();
+
+                // Print timing every 30 frames
+                if (self.sequence % 30 == 0) {
+                    const diff_us = @divFloor(t_diff_end - t_start, 1000);
+                    std.debug.print("  DETAIL: diff={}us partial_delta dirty={}/{}\n", .{ diff_us, dirty_size, self.frame_buffer.diff.len });
+                }
+
+                // Header: frame_type(1) + sequence(4) + width(2) + height(2) + offset(4) + length(4) = 17 bytes
+                const header_size: usize = 17;
+                const buf = self.frame_buffer.compressed;
+                buf[0] = @intFromEnum(FrameType.partial_delta);
+                std.mem.writeInt(u32, buf[1..5], self.sequence, .little);
+                std.mem.writeInt(u16, buf[5..7], @intCast(self.frame_buffer.width), .little);
+                std.mem.writeInt(u16, buf[7..9], @intCast(self.frame_buffer.height), .little);
+                std.mem.writeInt(u32, buf[9..13], @intCast(dirty_start), .little);
+                std.mem.writeInt(u32, buf[13..17], @intCast(dirty_size), .little);
+
+                // Copy uncompressed dirty region
+                @memcpy(buf[header_size..][0..dirty_size], self.frame_buffer.diff[dirty_start..dirty_end]);
+
+                self.sequence +%= 1;
+                self.frame_buffer.swapRgbaBuffers();
+
+                return .{
+                    .data = buf[0 .. header_size + dirty_size],
+                    .is_keyframe = false,
+                };
+            }
+
             data_to_compress = self.frame_buffer.diff;
             is_keyframe = false;
-
-            // Adaptive compression: fast for video/scrolling, best for cursor/small changes
-            const heavy_threshold = self.frame_buffer.diff.len / 7; // ~14%
-            if (stats.changed_bytes > heavy_threshold) {
-                compressor = &self.compressor_fast;
-            } else {
-                compressor = &self.compressor_best;
-            }
+            compressor = &self.compressor_fast;
         }
+        const t_diff = std.time.nanoTimestamp();
 
-        const header_size: usize = 13; // frame_type(1) + sequence(4) + width(2) + height(2) + compressed_size(4)
+        const header_size: usize = 13;
         const compressed_size = try compressor.compress(
             data_to_compress,
             self.frame_buffer.compressed[header_size..],
         );
+        const t_compress = std.time.nanoTimestamp();
+
+        // Print timing every 30 frames
+        if (self.sequence % 30 == 0) {
+            const diff_us = @divFloor(t_diff - t_start, 1000);
+            const compress_us = @divFloor(t_compress - t_diff, 1000);
+            const dirty_size = self.frame_buffer.last_dirty_end - self.frame_buffer.last_dirty_start;
+            const total_size = self.frame_buffer.diff.len;
+            std.debug.print("  DETAIL: diff={}us compress={}us dirty={}/{} keyframe={}\n", .{ diff_us, compress_us, dirty_size, total_size, is_keyframe });
+        }
 
         // Write header
         const buf = self.frame_buffer.compressed;
@@ -3498,13 +3633,25 @@ const Server = struct {
                     if (!panel.streaming.load(.acquire)) continue;
 
                     if (panel.getIOSurface()) |iosurface| {
-                        // captureFromIOSurface returns false if frame unchanged (skips BGRA->RGB)
+                        // TIMING: measure each stage
+                        const t0 = std.time.nanoTimestamp();
                         const changed = panel.captureFromIOSurface(iosurface) catch continue;
+                        const t1 = std.time.nanoTimestamp();
+
                         if (!changed) continue;
 
-                        // prepareFrame returns null if nothing changed (early exit optimization)
                         if (panel.prepareFrame() catch null) |result| {
+                            const t2 = std.time.nanoTimestamp();
                             panel.sendFrame(result.data) catch {};
+                            const t3 = std.time.nanoTimestamp();
+
+                            // Print timing every 30 frames (~1 second)
+                            if (panel.sequence % 30 == 0) {
+                                const capture_us = @divFloor(t1 - t0, 1000);
+                                const prepare_us = @divFloor(t2 - t1, 1000);
+                                const send_us = @divFloor(t3 - t2, 1000);
+                                std.debug.print("TIMING: capture={}us prepare={}us send={}us\n", .{ capture_us, prepare_us, send_us });
+                            }
                         }
                     }
                 }

@@ -17,6 +17,7 @@ export const ClientMsg = {
 export const FrameType = {
   KEYFRAME: 0x01,
   DELTA: 0x02,
+  PARTIAL_DELTA: 0x04,
 } as const;
 
 // Binary control message types (client -> server)
