@@ -2148,10 +2148,13 @@ class App {
       });
     });
 
-    // Adjust submenu position to stay on screen
+    // Adjust submenu position to stay on screen (only when visible)
     const adjustSubmenuPosition = (submenu: Element) => {
       const dropdown = submenu.querySelector('.menu-dropdown') as HTMLElement;
       if (!dropdown) return;
+      // Only adjust if dropdown is visible
+      const style = window.getComputedStyle(dropdown);
+      if (style.display === 'none') return;
       // Reset position
       dropdown.style.left = '';
       dropdown.style.right = '100%';
@@ -2173,8 +2176,9 @@ class App {
       });
     };
 
+    // Use mouseover (bubbles) to catch when dropdown becomes visible
     document.querySelectorAll('.menu-submenu').forEach(submenu => {
-      submenu.addEventListener('mouseenter', () => adjustSubmenuPosition(submenu));
+      submenu.addEventListener('mouseover', () => adjustSubmenuPosition(submenu));
     });
 
     // Close menus when clicking outside

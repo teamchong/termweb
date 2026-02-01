@@ -101,8 +101,6 @@
       min-width: 160px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.3);
       z-index: 100;
-      max-height: calc(100vh - 50px);
-      overflow-y: auto;
     }
     .menu:hover .menu-dropdown,
     .menu.open .menu-dropdown {
@@ -125,8 +123,6 @@
       left: auto;
       top: -4px;
       margin-right: 2px;
-      max-height: calc(100vh - 50px);
-      overflow-y: auto;
     }
     /* Non-touch devices: hover to show submenu */
     @media (hover: hover) {
@@ -142,11 +138,23 @@
       max-height: 300px;
       overflow-y: auto;
     }
-    .menu-item.split-menu-item {
+    .split-menu-item {
       display: none;
     }
-    .menu-item.split-menu-item.visible {
+    .split-menu-item.visible {
       display: flex;
+    }
+    /* Ensure submenu dropdowns stay hidden until hover/open */
+    .split-menu-item.visible > .menu-dropdown {
+      display: none;
+    }
+    @media (hover: hover) {
+      .split-menu-item.visible:hover > .menu-dropdown {
+        display: block;
+      }
+    }
+    .split-menu-item.visible.open > .menu-dropdown {
+      display: block;
     }
     #hamburger {
       display: none;
