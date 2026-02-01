@@ -1,5 +1,6 @@
 // VideoToolbox H.264 Encoder for macOS
 // Zero-latency configuration for real-time terminal streaming
+// Optimizations: CVPixelBufferPool, direct IOSurface encoding
 
 const std = @import("std");
 
@@ -9,6 +10,7 @@ const c = @cImport({
     @cInclude("CoreMedia/CoreMedia.h");
     @cInclude("CoreVideo/CoreVideo.h");
     @cInclude("Accelerate/Accelerate.h");
+    @cInclude("IOSurface/IOSurface.h");
 });
 
 pub const EncodeResult = struct {
@@ -35,6 +37,9 @@ pub const VideoEncoder = struct {
 
     // Scale buffer for downscaling (null if no scaling needed)
     scale_buffer: ?[]u8,
+
+    // CVPixelBuffer pool for buffer reuse (reduces allocation overhead)
+    pixel_buffer_pool: c.CVPixelBufferPoolRef,
 
     // Adaptive bitrate/FPS
     current_bitrate: u32,
@@ -130,6 +135,15 @@ pub const VideoEncoder = struct {
             return error.EncoderCreationFailed;
         }
 
+        // Create CVPixelBufferPool for efficient buffer reuse
+        const pixel_buffer_pool = createPixelBufferPool(encode_width, encode_height) orelse {
+            c.VTCompressionSessionInvalidate(session);
+            c.CFRelease(session);
+            if (scale_buffer) |buf| allocator.free(buf);
+            allocator.free(output_buffer);
+            return error.PixelBufferPoolCreationFailed;
+        };
+
         encoder.* = .{
             .session = session,
             .width = encode_width,
@@ -143,6 +157,7 @@ pub const VideoEncoder = struct {
             .is_keyframe = false,
             .encode_pending = false,
             .scale_buffer = scale_buffer,
+            .pixel_buffer_pool = pixel_buffer_pool,
             .current_bitrate = 5_000_000, // Start at high quality
             .target_fps = 30,
             .quality_level = 3, // High
@@ -152,6 +167,77 @@ pub const VideoEncoder = struct {
         try encoder.configureSession();
 
         return encoder;
+    }
+
+    fn createPixelBufferPool(width: u32, height: u32) ?c.CVPixelBufferPoolRef {
+        // Pool attributes
+        var pool_keys = [_]c.CFStringRef{
+            c.kCVPixelBufferPoolMinimumBufferCountKey,
+        };
+        var min_count: c.SInt32 = 3; // Keep 3 buffers in pool
+        const min_count_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &min_count);
+        defer if (min_count_num != null) c.CFRelease(min_count_num);
+
+        var pool_values = [_]c.CFTypeRef{
+            @ptrCast(min_count_num),
+        };
+
+        const pool_attrs = c.CFDictionaryCreate(
+            null,
+            @ptrCast(&pool_keys),
+            @ptrCast(&pool_values),
+            1,
+            &c.kCFTypeDictionaryKeyCallBacks,
+            &c.kCFTypeDictionaryValueCallBacks,
+        );
+        defer if (pool_attrs != null) c.CFRelease(pool_attrs);
+
+        // Pixel buffer attributes
+        var pb_keys = [_]c.CFStringRef{
+            c.kCVPixelBufferWidthKey,
+            c.kCVPixelBufferHeightKey,
+            c.kCVPixelBufferPixelFormatTypeKey,
+            c.kCVPixelBufferIOSurfacePropertiesKey,
+        };
+
+        var w: c.SInt32 = @intCast(width);
+        var h: c.SInt32 = @intCast(height);
+        var fmt: c.SInt32 = c.kCVPixelFormatType_32BGRA;
+
+        const w_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &w);
+        const h_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &h);
+        const fmt_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &fmt);
+        const empty_dict = c.CFDictionaryCreate(null, null, null, 0, &c.kCFTypeDictionaryKeyCallBacks, &c.kCFTypeDictionaryValueCallBacks);
+
+        defer {
+            if (w_num != null) c.CFRelease(w_num);
+            if (h_num != null) c.CFRelease(h_num);
+            if (fmt_num != null) c.CFRelease(fmt_num);
+            if (empty_dict != null) c.CFRelease(empty_dict);
+        }
+
+        var pb_values = [_]c.CFTypeRef{
+            @ptrCast(w_num),
+            @ptrCast(h_num),
+            @ptrCast(fmt_num),
+            @ptrCast(empty_dict),
+        };
+
+        const pb_attrs = c.CFDictionaryCreate(
+            null,
+            @ptrCast(&pb_keys),
+            @ptrCast(&pb_values),
+            4,
+            &c.kCFTypeDictionaryKeyCallBacks,
+            &c.kCFTypeDictionaryValueCallBacks,
+        );
+        defer if (pb_attrs != null) c.CFRelease(pb_attrs);
+
+        var pool: c.CVPixelBufferPoolRef = null;
+        const status = c.CVPixelBufferPoolCreate(null, pool_attrs, pb_attrs, &pool);
+        if (status != 0) return null;
+
+        return pool;
     }
 
     fn configureSession(self: *VideoEncoder) !void {
@@ -169,8 +255,8 @@ pub const VideoEncoder = struct {
         // Set profile to Baseline (no B-frames, widely compatible)
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_ProfileLevel, c.kVTProfileLevel_H264_Baseline_AutoLevel);
 
-        // Keyframe interval (every 60 frames = 2 seconds at 30fps)
-        var interval: c.SInt32 = 60;
+        // Keyframe interval (every 120 frames = 4 seconds at 30fps)
+        var interval: c.SInt32 = 120;
         const keyframe_interval = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &interval);
         if (keyframe_interval != null) {
             _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_MaxKeyFrameInterval, keyframe_interval);
@@ -201,6 +287,9 @@ pub const VideoEncoder = struct {
         if (self.session != null) {
             c.VTCompressionSessionInvalidate(self.session);
             c.CFRelease(self.session);
+        }
+        if (self.pixel_buffer_pool != null) {
+            c.CVPixelBufferPoolRelease(self.pixel_buffer_pool);
         }
         if (self.scale_buffer) |buf| self.allocator.free(buf);
         self.allocator.free(self.output_buffer);
@@ -279,6 +368,13 @@ pub const VideoEncoder = struct {
             c.CFRelease(old_session);
         }
 
+        // Recreate pixel buffer pool for new dimensions
+        if (self.pixel_buffer_pool != null) {
+            c.CVPixelBufferPoolRelease(self.pixel_buffer_pool);
+        }
+        self.pixel_buffer_pool = createPixelBufferPool(encode_width, encode_height) orelse
+            return error.PixelBufferPoolCreationFailed;
+
         self.session = new_session;
         self.width = encode_width;
         self.height = encode_height;
@@ -305,8 +401,8 @@ pub const VideoEncoder = struct {
             .rowBytes = dst_w * 4,
         };
 
-        // Use high quality resampling for better image quality
-        _ = c.vImageScale_ARGB8888(&src_buffer, &dst_buffer, null, c.kvImageHighQualityResampling);
+        // Use fast scaling (no high quality resampling - faster for real-time)
+        _ = c.vImageScale_ARGB8888(&src_buffer, &dst_buffer, null, 0);
     }
 
     // Encode a BGRA frame, returns encoded H.264 data
@@ -324,9 +420,8 @@ pub const VideoEncoder = struct {
             break :blk scale_buf;
         } else bgra_data;
 
-        // Create CVPixelBuffer from BGRA data
+        // Create CVPixelBuffer wrapping existing data (zero-copy)
         var pixel_buffer: c.CVPixelBufferRef = null;
-
         const status = c.CVPixelBufferCreateWithBytes(
             null,
             @intCast(self.width),
@@ -346,6 +441,83 @@ pub const VideoEncoder = struct {
         }
         defer c.CVPixelBufferRelease(pixel_buffer);
 
+        const pts = c.CMTimeMake(self.frame_count, 30);
+        self.frame_count += 1;
+
+        const encode_status = c.VTCompressionSessionEncodeFrame(
+            self.session,
+            pixel_buffer,
+            pts,
+            c.kCMTimeInvalid,
+            null,
+            null,
+            null,
+        );
+
+        if (encode_status != 0) {
+            self.encode_pending = false;
+            return error.EncodeFailed;
+        }
+
+        // Force completion (synchronous output)
+        _ = c.VTCompressionSessionCompleteFrames(self.session, c.kCMTimeInvalid);
+
+        self.encode_pending = false;
+
+        if (self.output_len == 0) {
+            return null;
+        }
+
+        return .{
+            .data = self.output_buffer[0..self.output_len],
+            .is_keyframe = self.is_keyframe,
+        };
+    }
+
+    // Check if direct IOSurface encoding is possible (no scaling needed)
+    pub fn canEncodeDirectly(self: *VideoEncoder) bool {
+        return self.width == self.source_width and self.height == self.source_height;
+    }
+
+    // Encode directly from IOSurface - ZERO COPY path (fastest)
+    // Only works when no scaling is needed - check canEncodeDirectly() first
+    // Uses *anyopaque to avoid cimport module type mismatch
+    pub fn encodeFromIOSurface(self: *VideoEncoder, iosurface_ptr: *anyopaque, force_keyframe: bool) !?EncodeResult {
+        _ = force_keyframe;
+        const iosurface: c.IOSurfaceRef = @ptrCast(iosurface_ptr);
+
+        // Reset output
+        self.output_len = 0;
+        self.is_keyframe = false;
+        self.encode_pending = true;
+
+        // Create CVPixelBuffer directly from IOSurface (zero-copy)
+        var pixel_buffer: c.CVPixelBufferRef = null;
+
+        const status = c.CVPixelBufferCreateWithIOSurface(
+            null,
+            iosurface,
+            null,
+            &pixel_buffer,
+        );
+
+        if (status != 0 or pixel_buffer == null) {
+            self.encode_pending = false;
+            return error.PixelBufferCreationFailed;
+        }
+        defer c.CVPixelBufferRelease(pixel_buffer);
+
+        // Verify dimensions match (caller should have checked canEncodeDirectly)
+        const surf_width: u32 = @intCast(c.CVPixelBufferGetWidth(pixel_buffer));
+        const surf_height: u32 = @intCast(c.CVPixelBufferGetHeight(pixel_buffer));
+
+        if (surf_width != self.width or surf_height != self.height) {
+            // Scaling needed - caller should use regular encode() instead
+            self.encode_pending = false;
+            return error.ScalingRequired;
+        }
+
+        // Direct encode without scaling
         const pts = c.CMTimeMake(self.frame_count, 30);
         self.frame_count += 1;
 
