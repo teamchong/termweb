@@ -933,12 +933,12 @@ const Panel = struct {
         // Focus the surface so it accepts input
         c.ghostty_surface_set_focus(surface, true);
 
-        // Set size in points - ghostty multiplies by scale_factor internally
-        c.ghostty_surface_set_size(surface, width, height);
-
         // Frame buffer is at pixel dimensions (width * scale, height * scale)
         const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
         const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * scale);
+
+        // Set size in pixels - ghostty creates IOSurface at this size
+        c.ghostty_surface_set_size(surface, pixel_width, pixel_height);
 
         panel.* = .{
             .id = id,
@@ -1007,8 +1007,10 @@ const Panel = struct {
         // Resize the NSWindow and NSView at point dimensions
         resizeWindow(self.window, width, height);
 
-        // Tell ghostty about the new size in points - it multiplies by scale_factor internally
-        c.ghostty_surface_set_size(self.surface, width, height);
+        // Set ghostty size in pixels
+        const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * self.scale);
+        const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * self.scale);
+        c.ghostty_surface_set_size(self.surface, pixel_width, pixel_height);
 
         // Don't resize frame_buffer here - let captureFromIOSurface do it
         // when the IOSurface actually updates to the new size (at pixel dimensions)
