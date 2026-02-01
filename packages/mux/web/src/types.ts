@@ -136,6 +136,7 @@ export interface LayoutNode {
 export interface LayoutTab {
   id: number;
   root: LayoutNode;
+  activePanelId?: number;
 }
 
 export interface LayoutData {

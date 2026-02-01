@@ -195,6 +195,7 @@ pub const Tab = struct {
     id: u32,
     root: *SplitNode,
     title: []const u8,
+    active_panel_id: ?u32 = null, // Which panel is focused in this tab
 
     pub fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
         self.root.deinit(allocator);
@@ -326,6 +327,10 @@ pub const Layout = struct {
     pub fn removePanel(self: *Layout, panel_id: u32) void {
         for (self.tabs.items, 0..) |tab, i| {
             if (removePanelFromNode(self.allocator, &tab.root, panel_id)) {
+                // Clear active_panel_id if this was the active panel
+                if (tab.active_panel_id == panel_id) {
+                    tab.active_panel_id = null;
+                }
                 // If tab is now empty, remove it
                 if (tab.root.panel_id == null and tab.root.first == null) {
                     tab.deinit(self.allocator);
@@ -393,7 +398,11 @@ pub const Layout = struct {
         try writer.writeAll("{\"tabs\":[");
         for (self.tabs.items, 0..) |tab, i| {
             if (i > 0) try writer.writeAll(",");
-            try writer.print("{{\"id\":{},\"root\":", .{tab.id});
+            try writer.print("{{\"id\":{},", .{tab.id});
+            if (tab.active_panel_id) |apid| {
+                try writer.print("\"activePanelId\":{},", .{apid});
+            }
+            try writer.writeAll("\"root\":");
             try writeNodeJson(writer, tab.root);
             try writer.writeAll("}");
         }
@@ -1553,12 +1562,13 @@ const Server = struct {
             }) catch {};
             self.mutex.unlock();
         } else if (std.mem.indexOf(u8, data, "\"focus_panel\"")) |_| {
-            // Client focused a panel - update active tab
+            // Client focused a panel - update active tab and active panel within tab
             // {"type":"focus_panel","panel_id":1}
             const panel_id = self.parseJsonInt(data, "panel_id") orelse return;
             self.mutex.lock();
             if (self.layout.findTabByPanel(panel_id)) |tab| {
                 self.layout.active_tab_id = tab.id;
+                tab.active_panel_id = panel_id;
             }
             self.mutex.unlock();
         } else if (std.mem.indexOf(u8, data, "\"view_action\"")) |_| {

@@ -586,11 +586,15 @@ class App {
     this.activePanel = null;
 
     const serverToClientTabId = new Map<number, string>();
+    const tabActivePanels = new Map<string, number>(); // clientTabId -> activePanelId
 
     // Restore each tab
     for (const serverTab of layout.tabs || []) {
       const tabId = String(this.nextTabId++);
       serverToClientTabId.set(serverTab.id, tabId);
+      if (serverTab.activePanelId !== undefined) {
+        tabActivePanels.set(tabId, serverTab.activePanelId);
+      }
 
       const tabContent = document.createElement('div');
       tabContent.className = 'tab-content';
@@ -625,6 +629,16 @@ class App {
 
     if (targetTabId) {
       this.switchToTab(targetTabId);
+      // Restore active panel within tab
+      const activePanelId = tabActivePanels.get(targetTabId);
+      if (activePanelId !== undefined) {
+        for (const [, panel] of this.panels) {
+          if (panel.serverId === activePanelId) {
+            this.setActivePanel(panel);
+            break;
+          }
+        }
+      }
     } else {
       this.createTab();
     }
