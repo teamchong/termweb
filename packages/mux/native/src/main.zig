@@ -102,6 +102,7 @@ pub const BinaryCtrlMsg = enum(u8) {
     layout_update = 0x07,
     clipboard = 0x08,
     inspector_state = 0x09,
+    panel_notification = 0x0D,
 
     // Auth/Session Server → Client (0x0A-0x0F)
     auth_state = 0x0A,      // Current auth state (role, sessions, tokens)
@@ -429,6 +430,10 @@ const IOSurfacePtr = *c.struct___IOSurface;
 // Frame Buffer for XOR diff
 // ============================================================================
 
+const FrameStats = struct {
+    changed_bytes: usize,
+};
+
 const FrameBuffer = struct {
     rgba_current: []u8,    // Raw BGRA from IOSurface
     rgb_current: []u8,     // Converted RGB (3 bytes per pixel)
@@ -563,18 +568,30 @@ const FrameBuffer = struct {
         }
     }
 
-    fn computeDiff(self: *FrameBuffer) void {
+    fn computeDiff(self: *FrameBuffer) FrameStats {
         const len = self.rgb_current.len;
+        var changed_count: usize = 0;
+
         var i: usize = 0;
-        // SIMD-friendly loop
+        // SIMD-friendly loop with branchless counting
         while (i + 32 <= len) : (i += 32) {
+            var chunk_changed: usize = 0;
             inline for (0..32) |j| {
-                self.diff[i + j] = self.rgb_current[i + j] ^ self.rgb_previous[i + j];
+                const diff_val = self.rgb_current[i + j] ^ self.rgb_previous[i + j];
+                self.diff[i + j] = diff_val;
+                // Branchless: convert bool to 0 or 1
+                chunk_changed += @intFromBool(diff_val != 0);
             }
+            changed_count += chunk_changed;
         }
+        // Handle remaining bytes
         while (i < len) : (i += 1) {
-            self.diff[i] = self.rgb_current[i] ^ self.rgb_previous[i];
+            const diff_val = self.rgb_current[i] ^ self.rgb_previous[i];
+            self.diff[i] = diff_val;
+            changed_count += @intFromBool(diff_val != 0);
         }
+
+        return FrameStats{ .changed_bytes = changed_count };
     }
 
     fn swapBuffers(self: *FrameBuffer) void {
@@ -591,8 +608,8 @@ const FrameBuffer = struct {
 const Compressor = struct {
     compressor: *c.libdeflate_compressor,
 
-    fn init() !Compressor {
-        const comp = c.libdeflate_alloc_compressor(6) orelse return error.CompressorInitFailed;
+    fn init(level: c_int) !Compressor {
+        const comp = c.libdeflate_alloc_compressor(level) orelse return error.CompressorInitFailed;
         return .{ .compressor = comp };
     }
 
@@ -600,7 +617,7 @@ const Compressor = struct {
         c.libdeflate_free_compressor(self.compressor);
     }
 
-    fn compress(self: *Compressor, input: []const u8, output: []u8) !usize {
+    fn compress(self: *const Compressor, input: []const u8, output: []u8) !usize {
         // Use raw deflate (no zlib header) for native browser DecompressionStream
         const result = c.libdeflate_deflate_compress(
             self.compressor,
@@ -641,7 +658,8 @@ const Panel = struct {
     nsview: objc.id,
     window: objc.id,
     frame_buffer: FrameBuffer,
-    compressor: Compressor,
+    compressor_fast: Compressor, // Level 1 for video/scrolling
+    compressor_best: Compressor, // Level 6 for text/idle
     sequence: u32,
     last_keyframe: i64,
     width: u32,
@@ -703,7 +721,8 @@ const Panel = struct {
             .nsview = window_view.view,
             .window = window_view.window,
             .frame_buffer = try FrameBuffer.init(allocator, pixel_width, pixel_height),
-            .compressor = try Compressor.init(),
+            .compressor_fast = try Compressor.init(1), // Level 1 for video/scrolling
+            .compressor_best = try Compressor.init(6), // Level 6 for text/idle
             .sequence = 0,
             .last_keyframe = 0,
             .width = width,       // Store point dimensions
@@ -728,7 +747,8 @@ const Panel = struct {
     fn deinit(self: *Panel) void {
         c.ghostty_surface_free(self.surface);
         self.frame_buffer.deinit();
-        self.compressor.deinit();
+        self.compressor_fast.deinit();
+        self.compressor_best.deinit();
         self.input_queue.deinit(self.allocator);
         if (self.title.len > 0) self.allocator.free(self.title);
         if (self.pwd.len > 0) self.allocator.free(self.pwd);
@@ -809,7 +829,7 @@ const Panel = struct {
         self.frame_buffer.convertBgraToRgb();
     }
 
-    fn prepareFrame(self: *Panel) !struct { data: []u8, is_keyframe: bool } {
+    fn prepareFrame(self: *Panel) !?struct { data: []u8, is_keyframe: bool } {
         const now = std.time.milliTimestamp();
         const need_keyframe = self.force_keyframe or
             (now - self.last_keyframe >= KEYFRAME_INTERVAL_MS) or
@@ -817,22 +837,39 @@ const Panel = struct {
 
         var data_to_compress: []u8 = undefined;
         var is_keyframe: bool = undefined;
+        var compressor: *const Compressor = undefined;
 
         if (need_keyframe) {
-            // Send full RGB frame
+            // Send full RGB frame - use best compression (keyframes are infrequent)
             data_to_compress = self.frame_buffer.rgb_current;
             is_keyframe = true;
+            compressor = &self.compressor_best;
             self.last_keyframe = now;
             self.force_keyframe = false;
         } else {
             // Send XOR diff
-            self.frame_buffer.computeDiff();
+            const stats = self.frame_buffer.computeDiff();
+
+            // OPTIMIZATION 1: Early exit if nothing changed
+            if (stats.changed_bytes == 0) {
+                return null;
+            }
+
             data_to_compress = self.frame_buffer.diff;
             is_keyframe = false;
+
+            // OPTIMIZATION 2: Adaptive compression level
+            // If >15% of bytes changed, it's likely video/scrolling - use fast compression
+            const heavy_threshold = self.frame_buffer.diff.len / 7; // ~14%
+            if (stats.changed_bytes > heavy_threshold) {
+                compressor = &self.compressor_fast;
+            } else {
+                compressor = &self.compressor_best;
+            }
         }
 
         const header_size: usize = 13; // frame_type(1) + sequence(4) + width(2) + height(2) + compressed_size(4)
-        const compressed_size = try self.compressor.compress(
+        const compressed_size = try compressor.compress(
             data_to_compress,
             self.frame_buffer.compressed[header_size..],
         );
@@ -2727,6 +2764,27 @@ const Server = struct {
         }
     }
 
+    fn broadcastPanelNotification(self: *Server, panel_id: u32, title: []const u8, body: []const u8) void {
+        // Binary: [type:u8][panel_id:u32][title_len:u8][title...][body_len:u16][body...] = 8 + title.len + body.len bytes
+        const title_len: u8 = @min(@as(u8, @intCast(@min(title.len, 255))), 255);
+        const body_len: u16 = @min(@as(u16, @intCast(@min(body.len, 1024))), 1024);
+        const total_len: usize = 1 + 4 + 1 + title_len + 2 + body_len;
+        var buf: [1287]u8 = undefined; // 1 + 4 + 1 + 255 + 2 + 1024
+        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_notification);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        buf[5] = title_len;
+        @memcpy(buf[6..][0..title_len], title[0..title_len]);
+        std.mem.writeInt(u16, buf[6 + title_len ..][0..2], body_len, .little);
+        @memcpy(buf[8 + title_len ..][0..body_len], body[0..body_len]);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.control_connections.items) |conn| {
+            conn.sendBinary(buf[0..total_len]) catch {};
+        }
+    }
+
     fn broadcastLayoutUpdate(self: *Server) void {
         self.mutex.lock();
         const layout_json = self.layout.toJson(self.allocator) catch {
@@ -3280,8 +3338,10 @@ const Server = struct {
 
                     if (panel.getIOSurface()) |iosurface| {
                         panel.captureFromIOSurface(iosurface) catch continue;
-                        const result = panel.prepareFrame() catch continue;
-                        panel.sendFrame(result.data) catch {};
+                        // prepareFrame returns null if nothing changed (early exit optimization)
+                        if (panel.prepareFrame() catch null) |result| {
+                            panel.sendFrame(result.data) catch {};
+                        }
                     }
                 }
                 self.mutex.unlock();
@@ -3530,6 +3590,30 @@ fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.gh
                     if (panel.surface == surface) {
                         self.mutex.unlock();
                         self.broadcastPanelPwd(panel.id, pwd);
+                        return true;
+                    }
+                }
+                self.mutex.unlock();
+            }
+        },
+        c.GHOSTTY_ACTION_DESKTOP_NOTIFICATION => {
+            // Get notification title and body from action
+            const title_ptr = action.action.desktop_notification.title;
+            const body_ptr = action.action.desktop_notification.body;
+
+            const title = if (title_ptr != null) std.mem.span(title_ptr) else "";
+            const body = if (body_ptr != null) std.mem.span(body_ptr) else "";
+
+            // Find which panel this surface belongs to
+            if (target.tag == c.GHOSTTY_TARGET_SURFACE) {
+                const surface = target.target.surface;
+                self.mutex.lock();
+                var panel_it = self.panels.valueIterator();
+                while (panel_it.next()) |panel_ptr| {
+                    const panel = panel_ptr.*;
+                    if (panel.surface == surface) {
+                        self.mutex.unlock();
+                        self.broadcastPanelNotification(panel.id, title, body);
                         return true;
                     }
                 }

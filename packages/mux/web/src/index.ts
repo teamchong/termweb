@@ -374,6 +374,16 @@ class App {
         this.handleShareLinks(links);
         break;
       }
+      case 0x0D: { // panel_notification
+        // Format: [type:u8][panel_id:u32][title_len:u8][title...][body_len:u16][body...]
+        const panelId = view.getUint32(1, true);
+        const titleLen = view.getUint8(5);
+        const title = decoder.decode(bytes.slice(6, 6 + titleLen));
+        const bodyLen = view.getUint16(6 + titleLen, true);
+        const body = decoder.decode(bytes.slice(8 + titleLen, 8 + titleLen + bodyLen));
+        this.handleNotification(panelId, title, body);
+        break;
+      }
       case 0x12: // FILE_DATA (single file download response)
         this.handleFileData(data);
         break;
@@ -1178,6 +1188,64 @@ class App {
         }
       }, 2000);
     }
+  }
+
+  private handleNotification(serverId: number, title: string, body: string): void {
+    // Find which panel this notification is from
+    let targetPanel: Panel | null = null;
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === serverId) {
+        targetPanel = panel;
+        break;
+      }
+    }
+
+    // Check if we have notification permission
+    if (Notification.permission === 'granted') {
+      this.showBrowserNotification(title, body, targetPanel);
+    } else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then(permission => {
+        if (permission === 'granted') {
+          this.showBrowserNotification(title, body, targetPanel);
+        }
+      });
+    }
+
+    // Also show visual indicator in tab if panel is in a non-active tab
+    if (targetPanel) {
+      const tabId = this.findTabIdForPanel(targetPanel);
+      if (tabId !== null && tabId !== this.activeTab) {
+        const tabEl = this.tabsEl?.querySelector(`[data-id="${tabId}"]`);
+        if (tabEl) {
+          tabEl.classList.add('notification');
+          setTimeout(() => tabEl.classList.remove('notification'), 3000);
+        }
+      }
+    }
+  }
+
+  private showBrowserNotification(title: string, body: string, panel: Panel | null): void {
+    const notificationTitle = title || 'Terminal Notification';
+    const notification = new Notification(notificationTitle, {
+      body: body,
+      tag: `termweb-${panel?.serverId || 'unknown'}`,
+    });
+
+    notification.onclick = () => {
+      window.focus();
+      if (panel) {
+        // Find and switch to the tab containing this panel
+        const tabId = this.findTabIdForPanel(panel);
+        if (tabId) {
+          this.switchToTab(tabId);
+          this.setActivePanel(panel);
+        }
+      }
+      notification.close();
+    };
+
+    // Auto-close after 5 seconds
+    setTimeout(() => notification.close(), 5000);
   }
 
   private updateTitleIndicator(indicator: string, stateIndicator?: string): void {
