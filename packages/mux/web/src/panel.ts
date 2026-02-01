@@ -3,7 +3,7 @@
  * Lower latency than jMuxer/MSE by decoding directly to canvas
  */
 
-import { ClientMsg } from './protocol';
+import { ClientMsg, BinaryCtrlMsg } from './protocol';
 
 export interface PanelCallbacks {
   onResize?: (panelId: number, width: number, height: number) => void;
@@ -50,8 +50,12 @@ export class Panel {
   private decodeLatencies: number[] = [];
   private lastDecodeStart = 0;
 
-  // Inspector elements
+  // Inspector state
   private inspectorVisible = false;
+  private inspectorHeight = 200;
+  private inspectorActiveTab = 'screen';
+  private inspectorState: Record<string, number> | null = null;
+  private inspectorEl: HTMLElement | null = null;
 
   constructor(
     id: string,
@@ -71,26 +75,152 @@ export class Panel {
       <div class="panel-content">
         <canvas class="panel-canvas"></canvas>
       </div>
-      <div class="panel-inspector" style="display: none;">
-        <div class="inspector-header">
-          <span class="inspector-title">Inspector</span>
-          <button class="inspector-close">&times;</button>
-        </div>
-        <div class="inspector-tabs"></div>
-        <div class="inspector-content"></div>
-        <div class="inspector-resize"></div>
-      </div>
     `;
     container.appendChild(this.element);
 
     this.canvas = this.element.querySelector('.panel-canvas') as HTMLCanvasElement;
     this.ctx = this.canvas.getContext('2d');
 
+    this.createInspectorElement();
     this.setupEventHandlers();
     this.setupResizeObserver();
     this.initDecoder();
     this.setupStatsOverlay();
     this.showLoading();
+  }
+
+  private createInspectorElement(): void {
+    this.inspectorEl = document.createElement('div');
+    this.inspectorEl.className = 'panel-inspector';
+    this.inspectorEl.innerHTML = `
+      <div class="inspector-resize"></div>
+      <div class="inspector-content">
+        <div class="inspector-left">
+          <div class="inspector-left-header">
+            <div class="inspector-dock-wrapper">
+              <span class="inspector-dock-icon"></span>
+              <div class="inspector-dock-menu">
+                <div class="inspector-dock-menu-item" data-action="hide-header">Hide Tab Bar</div>
+              </div>
+            </div>
+            <div class="inspector-tabs">
+              <button class="inspector-tab active" data-tab="screen">Screen</button>
+            </div>
+          </div>
+          <div class="inspector-collapsed-toggle" data-panel="left"></div>
+          <div class="inspector-main"></div>
+        </div>
+        <div class="inspector-right">
+          <div class="inspector-right-header">
+            <div class="inspector-dock-wrapper">
+              <span class="inspector-dock-icon"></span>
+              <div class="inspector-dock-menu">
+                <div class="inspector-dock-menu-item" data-action="hide-header">Hide Tab Bar</div>
+              </div>
+            </div>
+            <span class="inspector-right-title">Surface Info</span>
+          </div>
+          <div class="inspector-collapsed-toggle" data-panel="right"></div>
+          <div class="inspector-sidebar"></div>
+        </div>
+      </div>
+    `;
+    this.element.appendChild(this.inspectorEl);
+    this.setupInspectorHandlers();
+  }
+
+  private setupInspectorHandlers(): void {
+    if (!this.inspectorEl) return;
+
+    // Tab switching
+    const tabs = this.inspectorEl.querySelectorAll('.inspector-tab');
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        this.inspectorActiveTab = (tab as HTMLElement).dataset.tab || 'screen';
+        this.renderInspectorView();
+      });
+    });
+
+    // Resize handle
+    const handle = this.inspectorEl.querySelector('.inspector-resize');
+    let startY: number, startHeight: number;
+    const onMouseMove = (e: MouseEvent) => {
+      const delta = startY - e.clientY;
+      const newHeight = Math.min(Math.max(startHeight + delta, 100), this.element.clientHeight * 0.6);
+      this.inspectorHeight = newHeight;
+      if (this.inspectorEl) {
+        this.inspectorEl.style.height = newHeight + 'px';
+      }
+    };
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      this.triggerResize();
+    };
+    handle?.addEventListener('mousedown', (e) => {
+      startY = (e as MouseEvent).clientY;
+      startHeight = this.inspectorHeight;
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+    });
+
+    // Dock icon dropdown
+    const dockIcons = this.inspectorEl.querySelectorAll('.inspector-dock-icon');
+    dockIcons.forEach(icon => {
+      icon.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const menu = icon.parentElement?.querySelector('.inspector-dock-menu');
+        // Close other menus
+        this.inspectorEl?.querySelectorAll('.inspector-dock-menu.visible').forEach(m => {
+          if (m !== menu) m.classList.remove('visible');
+        });
+        menu?.classList.toggle('visible');
+      });
+    });
+
+    // Hide menu when clicking elsewhere
+    document.addEventListener('click', () => {
+      this.inspectorEl?.querySelectorAll('.inspector-dock-menu.visible').forEach(m => {
+        m.classList.remove('visible');
+      });
+    });
+
+    // Menu item click - hide header
+    const menuItems = this.inspectorEl.querySelectorAll('.inspector-dock-menu-item');
+    menuItems.forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const panel = (item as HTMLElement).closest('.inspector-left, .inspector-right');
+        if (panel && (item as HTMLElement).dataset.action === 'hide-header') {
+          panel.classList.add('header-hidden');
+        }
+        (item as HTMLElement).closest('.inspector-dock-menu')?.classList.remove('visible');
+      });
+    });
+
+    // Collapsed toggle - show header again
+    const toggles = this.inspectorEl.querySelectorAll('.inspector-collapsed-toggle');
+    toggles.forEach(toggle => {
+      toggle.addEventListener('click', () => {
+        const panel = toggle.closest('.inspector-left, .inspector-right');
+        panel?.classList.remove('header-hidden');
+      });
+    });
+  }
+
+  private triggerResize(): void {
+    requestAnimationFrame(() => {
+      const rect = this.canvas.getBoundingClientRect();
+      const width = Math.floor(rect.width);
+      const height = Math.floor(rect.height);
+      if (width > 0 && height > 0 && this.serverId !== null && this.callbacks.onResize) {
+        this.lastReportedWidth = width;
+        this.lastReportedHeight = height;
+        this.callbacks.onResize(this.serverId, width, height);
+      }
+    });
   }
 
   private showLoading(): void {
@@ -577,11 +707,33 @@ export class Panel {
   }
 
   toggleInspector(visible?: boolean): void {
-    this.inspectorVisible = visible ?? !this.inspectorVisible;
-    const inspector = this.element.querySelector('.panel-inspector') as HTMLElement;
-    if (inspector) {
-      inspector.style.display = this.inspectorVisible ? 'flex' : 'none';
+    const newVisible = visible ?? !this.inspectorVisible;
+    if (newVisible) {
+      this.showInspector();
+    } else {
+      this.hideInspector();
     }
+  }
+
+  private showInspector(): void {
+    this.inspectorVisible = true;
+    if (this.inspectorEl) {
+      this.inspectorEl.classList.add('visible');
+      this.inspectorEl.style.height = this.inspectorHeight + 'px';
+    }
+    // Subscribe to inspector updates
+    this.callbacks.onViewAction?.('inspector_subscribe', { panelId: this.serverId });
+    this.triggerResize();
+  }
+
+  private hideInspector(): void {
+    this.inspectorVisible = false;
+    if (this.inspectorEl) {
+      this.inspectorEl.classList.remove('visible');
+    }
+    // Unsubscribe from inspector updates
+    this.callbacks.onViewAction?.('inspector_unsubscribe', { panelId: this.serverId });
+    this.triggerResize();
   }
 
   hide(): void {
@@ -607,12 +759,56 @@ export class Panel {
   }
 
   handleInspectorState(state: unknown): void {
-    if (!this.inspectorVisible) return;
-
-    const content = this.element.querySelector('.inspector-content');
-    if (content && state) {
-      content.textContent = JSON.stringify(state, null, 2);
+    if (state && typeof state === 'object') {
+      this.inspectorState = state as Record<string, number>;
+      this.renderInspectorSidebar();
+      this.renderInspectorView();
     }
+  }
+
+  private renderInspectorSidebar(): void {
+    const sidebarEl = this.inspectorEl?.querySelector('.inspector-sidebar') as HTMLElement;
+    if (!sidebarEl || !this.inspectorState) return;
+
+    const s = this.inspectorState;
+
+    if (!sidebarEl.dataset.initialized) {
+      sidebarEl.dataset.initialized = 'true';
+      sidebarEl.innerHTML = `
+        <div class="inspector-simple-section">
+          <span class="inspector-simple-title">Dimensions</span>
+          <hr>
+        </div>
+        <div class="inspector-row"><span class="inspector-label">Screen Size</span><span class="inspector-value" data-field="screen-size"></span></div>
+        <div class="inspector-row"><span class="inspector-label">Grid Size</span><span class="inspector-value" data-field="grid-size"></span></div>
+        <div class="inspector-row"><span class="inspector-label">Cell Size</span><span class="inspector-value" data-field="cell-size"></span></div>
+      `;
+    }
+
+    const f = (field: string) => sidebarEl.querySelector(`[data-field="${field}"]`);
+    const screenSize = f('screen-size');
+    const gridSize = f('grid-size');
+    const cellSize = f('cell-size');
+    if (screenSize) screenSize.textContent = `${s.width_px ?? 0}px × ${s.height_px ?? 0}px`;
+    if (gridSize) gridSize.textContent = `${s.cols ?? 0}c × ${s.rows ?? 0}r`;
+    if (cellSize) cellSize.textContent = `${s.cell_width ?? 0}px × ${s.cell_height ?? 0}px`;
+  }
+
+  private renderInspectorView(): void {
+    const mainEl = this.inspectorEl?.querySelector('.inspector-main');
+    if (!mainEl) return;
+
+    const s = this.inspectorState || {};
+
+    mainEl.innerHTML = `
+      <div class="inspector-simple-section">
+        <span class="inspector-simple-title">Terminal Size</span>
+        <hr>
+      </div>
+      <div class="inspector-row"><span class="inspector-label">Grid</span><span class="inspector-value">${s.cols ?? 0} columns × ${s.rows ?? 0} rows</span></div>
+      <div class="inspector-row"><span class="inspector-label">Screen</span><span class="inspector-value">${s.width_px ?? 0} × ${s.height_px ?? 0} px</span></div>
+      <div class="inspector-row"><span class="inspector-label">Cell</span><span class="inspector-value">${s.cell_width ?? 0} × ${s.cell_height ?? 0} px</span></div>
+    `;
   }
 
   sendTextInput(text: string): void {

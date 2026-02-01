@@ -258,7 +258,6 @@ export class DownloadDialog {
 
     if (input) {
       input.value = '';
-      input.focus();
 
       input.onkeydown = (e) => {
         if (e.key === 'Enter') {
@@ -276,6 +275,11 @@ export class DownloadDialog {
     });
 
     this.overlay.classList.add('visible');
+
+    // Focus after visible (needs slight delay for CSS transition)
+    if (input) {
+      requestAnimationFrame(() => input.focus());
+    }
 
     const closeBtn = this.overlay.querySelector('.dialog-btn.cancel');
     closeBtn?.addEventListener('click', () => this.hide());

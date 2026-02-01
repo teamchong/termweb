@@ -1589,7 +1589,6 @@ const Server = struct {
 
     fn handleBinaryControlMessageFromClient(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len < 1) return;
-        _ = conn;
 
         const msg_type = data[0];
         if (msg_type == 0x81) { // close_panel
@@ -1639,7 +1638,7 @@ const Server = struct {
             const tab_len = data[5];
             if (data.len < 6 + tab_len) return;
             const tab = data[6..][0..tab_len];
-            self.subscribeInspectorBinary(panel_id, tab);
+            self.subscribeInspectorBinary(panel_id, tab, conn);
         } else if (msg_type == 0x86) { // inspector_unsubscribe
             if (data.len < 5) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
@@ -1895,16 +1894,18 @@ const Server = struct {
         conn.sendBinary(buf[0 .. 3 + message.len]) catch {};
     }
 
-    fn subscribeInspectorBinary(self: *Server, panel_id: u32, tab: []const u8) void {
+    fn subscribeInspectorBinary(self: *Server, panel_id: u32, tab: []const u8, conn: *ws.Connection) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         if (self.panels.get(panel_id)) |panel| {
             panel.inspector_subscribed = true;
             const len = @min(tab.len, panel.inspector_tab.len);
             @memcpy(panel.inspector_tab[0..len], tab[0..len]);
             panel.inspector_tab_len = @intCast(len);
+            // Send initial state
+            self.sendInspectorStateToPanel(panel, conn);
         }
+        self.mutex.unlock();
     }
 
     fn unsubscribeInspectorBinary(self: *Server, panel_id: u32) void {
@@ -3108,18 +3109,10 @@ const Server = struct {
         var frame_blocks: u32 = 0;
         var fps_timer: i128 = std.time.nanoTimestamp();
 
-        var loop_start: i128 = std.time.nanoTimestamp();
         while (self.running.load(.acquire)) {
             // Create autorelease pool for this iteration (prevents ObjC object accumulation)
             const pool = objc_autoreleasePoolPush();
             defer objc_autoreleasePoolPop(pool);
-
-            const now = std.time.nanoTimestamp();
-            const loop_ms = @as(f64, @floatFromInt(now - loop_start)) / 1_000_000.0;
-            loop_start = now;
-            if (loop_ms > 50.0) {
-                std.debug.print("LOOP: {d:.1}ms\n", .{loop_ms});
-            }
 
             // Process pending panel creations/destructions/resizes/splits (NSWindow/ghostty must be on main thread)
             self.processPendingPanels();
@@ -3148,6 +3141,7 @@ const Server = struct {
             }
 
             // Only capture and send frames at target fps
+            const now = std.time.nanoTimestamp();
             const since_last_frame: u64 = @intCast(now - last_frame);
             if (since_last_frame >= frame_time_ns) {
                 last_frame = now;
@@ -3155,9 +3149,7 @@ const Server = struct {
                 frame_blocks += 1;
 
                 // Tick ghostty to render content to IOSurface
-                const tick_start = std.time.nanoTimestamp();
                 self.tick();
-                const tick_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - tick_start)) / 1_000_000.0;
 
                 var frames_sent: u32 = 0;
                 var frames_attempted: u32 = 0;
@@ -3176,22 +3168,15 @@ const Server = struct {
                     defer objc_autoreleasePoolPop(draw_pool);
 
                     // Render panel content to IOSurface
-                    const panel_tick_start = std.time.nanoTimestamp();
                     panel.tick();
-                    const panel_tick_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - panel_tick_start)) / 1_000_000.0;
 
                     if (panel.getIOSurface()) |iosurface| {
-                        const t1 = std.time.nanoTimestamp();
                         // Always capture - video encoder handles redundant frames efficiently
                         _ = panel.captureFromIOSurface(iosurface) catch continue;
-                        const capture_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t1)) / 1_000_000.0;
 
-                        const t2 = std.time.nanoTimestamp();
                         if (panel.prepareFrame() catch null) |result| {
-                            const encode_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t2)) / 1_000_000.0;
                             panel.sendFrame(result.data) catch {};
                             frames_sent += 1;
-                            std.debug.print("TIMING: app_tick={d:.1}ms panel_tick={d:.1}ms capture={d:.1}ms encode={d:.1}ms total={d:.1}ms\n", .{ tick_ms, panel_tick_ms, capture_ms, encode_ms, tick_ms + panel_tick_ms + capture_ms + encode_ms });
                         }
                     }
                 }
@@ -3200,10 +3185,9 @@ const Server = struct {
                 fps_counter += frames_sent;
                 fps_attempts += frames_attempted;
 
-                // Print FPS every second
+                // Reset FPS counters every second (no spam)
                 const fps_elapsed = std.time.nanoTimestamp() - fps_timer;
                 if (fps_elapsed >= std.time.ns_per_s) {
-                    std.debug.print("SERVER FPS: sent={d} attempts={d} blocks={d}\n", .{ fps_counter, fps_attempts, frame_blocks });
                     fps_counter = 0;
                     fps_attempts = 0;
                     frame_blocks = 0;

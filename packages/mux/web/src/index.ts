@@ -9,6 +9,7 @@ import { FileTransferHandler } from './file-transfer';
 import { CommandPalette, UploadDialog, DownloadDialog, AccessControlDialog } from './dialogs';
 import type { AppConfig, TabInfo, LayoutData, LayoutNode } from './types';
 import { generateId, applyColors, formatBytes, isLightColor, shadowColor } from './utils';
+import { BinaryCtrlMsg } from './protocol';
 
 // Re-export for external use
 export * from './protocol';
@@ -329,14 +330,18 @@ class App {
         });
         break;
       }
-      case 0x09: { // inspector_state
+      case 0x09: { // inspector_state (binary format)
+        // Format: [type:u8][panel_id:u32][cols:u16][rows:u16][width:u16][height:u16][cell_w:u8][cell_h:u8]
         const panelId = view.getUint32(1, true);
-        const jsonLen = view.getUint16(5, true);
-        const json = decoder.decode(bytes.slice(7, 7 + jsonLen));
-        try {
-          const state = JSON.parse(json);
-          this.updateInspectorState(panelId, state);
-        } catch { /* ignore */ }
+        const state = {
+          cols: view.getUint16(5, true),
+          rows: view.getUint16(7, true),
+          width_px: view.getUint16(9, true),
+          height_px: view.getUint16(11, true),
+          cell_width: view.getUint8(13),
+          cell_height: view.getUint8(14),
+        };
+        this.updateInspectorState(panelId, state);
         break;
       }
       case 0x0A: { // auth_state
@@ -1493,7 +1498,28 @@ class App {
   }
 
   private handleViewAction(panel: Panel, action: string, data?: unknown): void {
-    console.log(`View action from panel ${panel.id}:`, action, data);
+    const panelId = (data as { panelId?: number })?.panelId ?? panel.serverId;
+    if (panelId === null || panelId === undefined) return;
+
+    if (action === 'inspector_subscribe' || action === 'inspector_unsubscribe') {
+      this.sendInspectorSubscribe(panelId, action === 'inspector_subscribe');
+    }
+  }
+
+  private sendInspectorSubscribe(panelId: number, subscribe: boolean): void {
+    if (!this.controlWs || this.controlWs.readyState !== WebSocket.OPEN) return;
+
+    // Format: [type:u8][panel_id:u32][tab_len:u8][tab...]
+    // For subscribe: include empty tab (tab_len=0)
+    // For unsubscribe: just [type:u8][panel_id:u32]
+    const buf = new ArrayBuffer(subscribe ? 6 : 5);
+    const view = new DataView(buf);
+    view.setUint8(0, subscribe ? BinaryCtrlMsg.INSPECTOR_SUBSCRIBE : BinaryCtrlMsg.INSPECTOR_UNSUBSCRIBE);
+    view.setUint32(1, panelId, true);
+    if (subscribe) {
+      view.setUint8(5, 0); // Empty tab name (use default)
+    }
+    this.controlWs.send(buf);
   }
 
   // ============================================================================

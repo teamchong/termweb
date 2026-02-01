@@ -358,6 +358,7 @@
       object-fit: contain;
       object-position: top left;
       background: var(--bg);
+      outline: none;
     }
     .panel-content {
       flex: 1;
@@ -379,6 +380,29 @@
       color: #bbb;
     }
     .panel-inspector.visible { display: flex; }
+    .inspector-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: #252830;
+      border-bottom: 1px solid #333;
+    }
+    .inspector-title {
+      font-weight: 600;
+      color: #fff;
+    }
+    .inspector-close {
+      background: none;
+      border: none;
+      color: #888;
+      font-size: 18px;
+      cursor: pointer;
+      padding: 0 4px;
+    }
+    .inspector-close:hover {
+      color: #fff;
+    }
     /* Split container styles */
     .split-container {
       display: flex;
@@ -1326,14 +1350,28 @@
   <!-- Hidden file input for upload -->
   <input type="file" id="file-upload-input" style="display: none" multiple />
 
+  <!-- Upload dialog -->
+  <div id="upload-dialog" class="dialog-overlay">
+    <div class="dialog-box">
+      <div class="dialog-title">Upload File</div>
+      <div class="upload-dropzone" style="border: 2px dashed var(--border); border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; margin-bottom: 12px;">
+        <div style="color: var(--text-dim);">Drop file here or click to browse</div>
+      </div>
+      <input type="file" style="display: none" />
+      <div class="dialog-buttons">
+        <button class="dialog-btn cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Download path dialog -->
   <div id="download-dialog" class="dialog-overlay">
     <div class="dialog-box">
       <div class="dialog-title">Download File</div>
-      <input type="text" id="download-path-input" placeholder="Enter remote path (e.g., ~/file.txt)" autocomplete="off" />
+      <input type="text" class="download-input" placeholder="Enter remote path (e.g., ~/file.txt)" autocomplete="off" />
       <div class="dialog-buttons">
         <button class="dialog-btn cancel">Cancel</button>
-        <button class="dialog-btn confirm">Download</button>
+        <button class="dialog-btn primary">Download</button>
       </div>
     </div>
   </div>

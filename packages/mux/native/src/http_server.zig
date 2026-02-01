@@ -129,8 +129,8 @@ pub const HttpServer = struct {
             return;
         };
 
-        // Read file
-        const file = std.fs.openFileAbsolute(full_path, .{}) catch {
+        // Read file (use cwd for relative paths)
+        const file = std.fs.cwd().openFile(full_path, .{}) catch {
             self.sendError(stream, 404, "Not Found");
             return;
         };
