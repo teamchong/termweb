@@ -6,6 +6,10 @@ const c = @cImport({
     @cInclude("ghostty.h");
 });
 
+// Embedded web assets (~140KB total) - imported via build.zig addAnonymousImport
+const embedded_index_html = @embedFile("index_html");
+const embedded_client_js = @embedFile("client_js");
+
 // Color struct matching ghostty_config_color_s
 const Color = extern struct {
     r: u8,
@@ -13,18 +17,17 @@ const Color = extern struct {
     b: u8,
 };
 
-// Simple HTTP server for static files + config endpoint
+// Simple HTTP server for embedded static files + config endpoint
 pub const HttpServer = struct {
     listener: net.Server,
     allocator: Allocator,
-    web_root: []const u8,
     running: std.atomic.Value(bool),
     panel_ws_port: u16,
     control_ws_port: u16,
     file_ws_port: u16,
     ghostty_config: c.ghostty_config_t,
 
-    pub fn init(allocator: Allocator, address: []const u8, port: u16, web_root: []const u8, ghostty_config: c.ghostty_config_t) !*HttpServer {
+    pub fn init(allocator: Allocator, address: []const u8, port: u16, ghostty_config: c.ghostty_config_t) !*HttpServer {
         const server = try allocator.create(HttpServer);
         errdefer allocator.destroy(server);
 
@@ -32,7 +35,6 @@ pub const HttpServer = struct {
         server.* = .{
             .listener = try addr.listen(.{ .reuse_address = true }),
             .allocator = allocator,
-            .web_root = web_root,
             .running = std.atomic.Value(bool).init(false),
             .panel_ws_port = 0,
             .control_ws_port = 0,
@@ -115,44 +117,24 @@ pub const HttpServer = struct {
             return;
         }
 
-        // Sanitize path
+        // Serve embedded files
         const clean_path = if (std.mem.eql(u8, path, "/")) "/index.html" else path;
-        if (std.mem.indexOf(u8, clean_path, "..") != null) {
-            self.sendError(stream, 403, "Forbidden");
-            return;
-        }
 
-        // Build full path
-        var full_path_buf: [1024]u8 = undefined;
-        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ self.web_root, clean_path }) catch {
-            self.sendError(stream, 500, "Internal Error");
-            return;
-        };
-
-        // Read file (use cwd for relative paths)
-        const file = std.fs.cwd().openFile(full_path, .{}) catch {
+        const content: []const u8 = if (std.mem.eql(u8, clean_path, "/index.html"))
+            embedded_index_html
+        else if (std.mem.eql(u8, clean_path, "/client.js"))
+            embedded_client_js
+        else {
             self.sendError(stream, 404, "Not Found");
             return;
         };
-        defer file.close();
-
-        const stat = file.stat() catch {
-            self.sendError(stream, 500, "Internal Error");
-            return;
-        };
-
-        const content = file.readToEndAlloc(self.allocator, 10 * 1024 * 1024) catch {
-            self.sendError(stream, 500, "Internal Error");
-            return;
-        };
-        defer self.allocator.free(content);
 
         // Determine content type
         const content_type = getContentType(clean_path);
 
         // Send response
         var header_buf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ content_type, stat.size }) catch return;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ content_type, content.len }) catch return;
 
         _ = stream.write(header) catch return;
         _ = stream.write(content) catch return;

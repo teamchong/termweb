@@ -1233,7 +1233,7 @@ const Server = struct {
 
     var global_server: ?*Server = null;
 
-    fn init(allocator: std.mem.Allocator, http_port: u16, control_port: u16, panel_port: u16, web_root: []const u8) !*Server {
+    fn init(allocator: std.mem.Allocator, http_port: u16, control_port: u16, panel_port: u16) !*Server {
         const server = try allocator.create(Server);
         errdefer allocator.destroy(server);
 
@@ -1264,7 +1264,7 @@ const Server = struct {
         }
 
         // Create HTTP server for static files
-        const http_srv = try http.HttpServer.init(allocator, "0.0.0.0", http_port, web_root, config);
+        const http_srv = try http.HttpServer.init(allocator, "0.0.0.0", http_port, config);
 
         // Create control WebSocket server (for tab list, layout, etc.)
         const control_ws = try ws.Server.init(allocator, "0.0.0.0", control_port);
@@ -3426,10 +3426,10 @@ const Server = struct {
                     panel.tick();
 
                     if (panel.getIOSurface()) |iosurface| {
-                        // Capture BGRA from IOSurface (skips if unchanged)
+                        // BGRA copy path - faster than direct IOSurface encoding
+                        // (VideoToolbox has overhead reading from GPU memory)
                         _ = panel.captureFromIOSurface(iosurface) catch continue;
 
-                        // Encode with CVPixelBufferPool
                         if (panel.prepareFrame() catch null) |result| {
                             panel.sendFrame(result.data) catch {};
                             frames_sent += 1;
@@ -3859,7 +3859,6 @@ fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c)
 
 const Args = struct {
     http_port: u16 = 8080,
-    web_root: []const u8 = "../web",
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -3874,10 +3873,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         if (std.mem.eql(u8, arg, "--http-port") or std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             if (arg_it.next()) |val| {
                 args.http_port = std.fmt.parseInt(u16, val, 10) catch 8080;
-            }
-        } else if (std.mem.eql(u8, arg, "--web-root")) {
-            if (arg_it.next()) |val| {
-                args.web_root = val;
             }
         }
     }
@@ -3901,7 +3896,7 @@ fn handleSigint(_: c_int) callconv(.c) void {
 }
 
 /// Run mux server - can be called from CLI or standalone
-pub fn run(allocator: std.mem.Allocator, http_port: u16, web_root: []const u8) !void {
+pub fn run(allocator: std.mem.Allocator, http_port: u16) !void {
     // Setup SIGINT handler for graceful shutdown
     const act = std.posix.Sigaction{
         .handler = .{ .handler = handleSigint },
@@ -3913,7 +3908,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, web_root: []const u8) !
     std.debug.print("termweb-mux server starting...\n", .{});
 
     // WS ports use 0 to let OS assign random available ports
-    const server = try Server.init(allocator, http_port, 0, 0, web_root);
+    const server = try Server.init(allocator, http_port, 0, 0);
     defer server.deinit();
 
     const panel_port = server.panel_ws_server.listener.listen_address.getPort();
@@ -3927,7 +3922,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, web_root: []const u8) !
     std.debug.print("  Panel WebSocket:   ws://localhost:{}\n", .{panel_port});
     std.debug.print("  Control WebSocket: ws://localhost:{}\n", .{control_port});
     std.debug.print("  File WebSocket:    ws://localhost:{}\n", .{file_port});
-    std.debug.print("  Web root:          {s}\n", .{web_root});
+    std.debug.print("  Web assets:        embedded (~140KB)\n", .{});
     std.debug.print("\nServer initialized, waiting for connections...\n", .{});
 
     try server.run();
@@ -3939,5 +3934,5 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const args = try parseArgs(allocator);
-    try run(allocator, args.http_port, args.web_root);
+    try run(allocator, args.http_port);
 }

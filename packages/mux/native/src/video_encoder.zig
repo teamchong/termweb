@@ -1,8 +1,12 @@
 // VideoToolbox H.264 Encoder for macOS
 // Zero-latency configuration for real-time terminal streaming
-// Optimizations: CVPixelBufferPool, direct IOSurface encoding
+// Optimizations: CVPixelBufferPool, direct IOSurface encoding, Metal GPU sync
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Enable Metal GPU synchronization for direct IOSurface encoding (macOS only)
+pub const use_metal_sync = builtin.os.tag == .macos;
 
 // VideoToolbox and CoreMedia C imports
 const c = @cImport({
@@ -12,6 +16,17 @@ const c = @cImport({
     @cInclude("Accelerate/Accelerate.h");
     @cInclude("IOSurface/IOSurface.h");
 });
+
+// Metal imports for GPU synchronization (macOS only)
+const metal = if (use_metal_sync) @cImport({
+    @cInclude("Metal/Metal.h");
+}) else struct {};
+
+// Objective-C runtime for Metal calls
+const objc = if (use_metal_sync) @cImport({
+    @cInclude("objc/runtime.h");
+    @cInclude("objc/message.h");
+}) else struct {};
 
 pub const EncodeResult = struct {
     data: []const u8,
@@ -37,6 +52,9 @@ pub const VideoEncoder = struct {
 
     // Scale buffer for downscaling (null if no scaling needed)
     scale_buffer: ?[]u8,
+
+    // NV12 buffer for YUV420 conversion (Y plane + UV plane)
+    nv12_buffer: []u8,
 
     // CVPixelBuffer pool for buffer reuse (reduces allocation overhead)
     pixel_buffer_pool: c.CVPixelBufferPoolRef,
@@ -135,11 +153,17 @@ pub const VideoEncoder = struct {
             return error.EncoderCreationFailed;
         }
 
-        // Create CVPixelBufferPool for efficient buffer reuse
-        const pixel_buffer_pool = createPixelBufferPool(encode_width, encode_height) orelse {
+        // Allocate NV12 buffer for YUV420 conversion (Y + UV planes = 1.5 bytes per pixel)
+        const nv12_size = encode_width * encode_height * 3 / 2;
+        const nv12_buffer = try allocator.alloc(u8, nv12_size);
+        errdefer allocator.free(nv12_buffer);
+
+        // Create CVPixelBufferPool for efficient buffer reuse (NV12 format)
+        const pixel_buffer_pool = createNV12PixelBufferPool(encode_width, encode_height) orelse {
             c.VTCompressionSessionInvalidate(session);
             c.CFRelease(session);
             if (scale_buffer) |buf| allocator.free(buf);
+            allocator.free(nv12_buffer);
             allocator.free(output_buffer);
             return error.PixelBufferPoolCreationFailed;
         };
@@ -157,6 +181,7 @@ pub const VideoEncoder = struct {
             .is_keyframe = false,
             .encode_pending = false,
             .scale_buffer = scale_buffer,
+            .nv12_buffer = nv12_buffer,
             .pixel_buffer_pool = pixel_buffer_pool,
             .current_bitrate = 5_000_000, // Start at high quality
             .target_fps = 30,
@@ -240,6 +265,140 @@ pub const VideoEncoder = struct {
         return pool;
     }
 
+    fn createNV12PixelBufferPool(width: u32, height: u32) ?c.CVPixelBufferPoolRef {
+        // Pool attributes
+        var pool_keys = [_]c.CFStringRef{
+            c.kCVPixelBufferPoolMinimumBufferCountKey,
+        };
+        var min_count: c.SInt32 = 3;
+        const min_count_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &min_count);
+        defer if (min_count_num != null) c.CFRelease(min_count_num);
+
+        var pool_values = [_]c.CFTypeRef{
+            @ptrCast(min_count_num),
+        };
+
+        const pool_attrs = c.CFDictionaryCreate(
+            null,
+            @ptrCast(&pool_keys),
+            @ptrCast(&pool_values),
+            1,
+            &c.kCFTypeDictionaryKeyCallBacks,
+            &c.kCFTypeDictionaryValueCallBacks,
+        );
+        defer if (pool_attrs != null) c.CFRelease(pool_attrs);
+
+        // Pixel buffer attributes - NV12 format (420YpCbCr8BiPlanarVideoRange)
+        var pb_keys = [_]c.CFStringRef{
+            c.kCVPixelBufferWidthKey,
+            c.kCVPixelBufferHeightKey,
+            c.kCVPixelBufferPixelFormatTypeKey,
+            c.kCVPixelBufferIOSurfacePropertiesKey,
+        };
+
+        var w: c.SInt32 = @intCast(width);
+        var h: c.SInt32 = @intCast(height);
+        var fmt: c.SInt32 = c.kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange; // NV12
+
+        const w_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &w);
+        const h_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &h);
+        const fmt_num = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &fmt);
+        const empty_dict = c.CFDictionaryCreate(null, null, null, 0, &c.kCFTypeDictionaryKeyCallBacks, &c.kCFTypeDictionaryValueCallBacks);
+
+        defer {
+            if (w_num != null) c.CFRelease(w_num);
+            if (h_num != null) c.CFRelease(h_num);
+            if (fmt_num != null) c.CFRelease(fmt_num);
+            if (empty_dict != null) c.CFRelease(empty_dict);
+        }
+
+        var pb_values = [_]c.CFTypeRef{
+            @ptrCast(w_num),
+            @ptrCast(h_num),
+            @ptrCast(fmt_num),
+            @ptrCast(empty_dict),
+        };
+
+        const pb_attrs = c.CFDictionaryCreate(
+            null,
+            @ptrCast(&pb_keys),
+            @ptrCast(&pb_values),
+            4,
+            &c.kCFTypeDictionaryKeyCallBacks,
+            &c.kCFTypeDictionaryValueCallBacks,
+        );
+        defer if (pb_attrs != null) c.CFRelease(pb_attrs);
+
+        var pool: c.CVPixelBufferPoolRef = null;
+        const status = c.CVPixelBufferPoolCreate(null, pool_attrs, pb_attrs, &pool);
+        if (status != 0) return null;
+
+        return pool;
+    }
+
+    // Convert BGRA to NV12 (YUV420 biplanar) using vImage
+    // NV12 has Y plane (full res) followed by interleaved UV plane (half res)
+    fn convertBGRAtoNV12(bgra: []const u8, nv12: []u8, width: u32, height: u32) void {
+        const y_plane = nv12[0 .. width * height];
+        const uv_plane = nv12[width * height ..];
+
+        // Convert BGRA to Y plane (full resolution)
+        // Y = 0.299*R + 0.587*G + 0.114*B (BT.601)
+        // Using fixed point: Y = (77*R + 150*G + 29*B) >> 8
+        var y: u32 = 0;
+        while (y < height) : (y += 1) {
+            var x: u32 = 0;
+            while (x < width) : (x += 1) {
+                const i = (y * width + x) * 4;
+                const b = @as(u32, bgra[i]);
+                const g = @as(u32, bgra[i + 1]);
+                const r = @as(u32, bgra[i + 2]);
+                // Y with offset 16 for video range
+                y_plane[y * width + x] = @intCast(@min(255, 16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)));
+            }
+        }
+
+        // Convert BGRA to UV plane (half resolution, interleaved)
+        // U = -0.169*R - 0.331*G + 0.500*B + 128
+        // V = 0.500*R - 0.419*G - 0.081*B + 128
+        var uv_y: u32 = 0;
+        while (uv_y < height / 2) : (uv_y += 1) {
+            var uv_x: u32 = 0;
+            while (uv_x < width / 2) : (uv_x += 1) {
+                // Sample 2x2 block and average
+                const src_y = uv_y * 2;
+                const src_x = uv_x * 2;
+
+                var r_sum: u32 = 0;
+                var g_sum: u32 = 0;
+                var b_sum: u32 = 0;
+
+                // 2x2 block
+                inline for ([_]u32{ 0, 1 }) |dy| {
+                    inline for ([_]u32{ 0, 1 }) |dx| {
+                        const i = ((src_y + dy) * width + (src_x + dx)) * 4;
+                        b_sum += bgra[i];
+                        g_sum += bgra[i + 1];
+                        r_sum += bgra[i + 2];
+                    }
+                }
+
+                // Average
+                const r = r_sum / 4;
+                const g = g_sum / 4;
+                const b = b_sum / 4;
+
+                // U and V with video range offset
+                const u_val: i32 = 128 + @as(i32, @intCast((@as(i32, -38) * @as(i32, @intCast(r)) - 74 * @as(i32, @intCast(g)) + 112 * @as(i32, @intCast(b)) + 128) >> 8));
+                const v_val: i32 = 128 + @as(i32, @intCast((112 * @as(i32, @intCast(r)) - 94 * @as(i32, @intCast(g)) - 18 * @as(i32, @intCast(b)) + 128) >> 8));
+
+                const uv_idx = (uv_y * (width / 2) + uv_x) * 2;
+                uv_plane[uv_idx] = @intCast(@max(0, @min(255, u_val)));
+                uv_plane[uv_idx + 1] = @intCast(@max(0, @min(255, v_val)));
+            }
+        }
+    }
+
     fn configureSession(self: *VideoEncoder) !void {
         const session = self.session;
 
@@ -248,6 +407,9 @@ pub const VideoEncoder = struct {
 
         // Prioritize speed over power efficiency
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_MaximizePowerEfficiency, c.kCFBooleanFalse);
+
+        // Prioritize encoding speed over quality (macOS 13+)
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, c.kCFBooleanTrue);
 
         // Disable B-frames (critical for zero latency)
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_AllowFrameReordering, c.kCFBooleanFalse);
@@ -292,6 +454,7 @@ pub const VideoEncoder = struct {
             c.CVPixelBufferPoolRelease(self.pixel_buffer_pool);
         }
         if (self.scale_buffer) |buf| self.allocator.free(buf);
+        self.allocator.free(self.nv12_buffer);
         self.allocator.free(self.output_buffer);
         self.allocator.destroy(self);
     }
@@ -344,6 +507,11 @@ pub const VideoEncoder = struct {
         else
             null;
 
+        // Reallocate NV12 buffer for new dimensions
+        self.allocator.free(self.nv12_buffer);
+        const nv12_size = encode_width * encode_height * 3 / 2;
+        self.nv12_buffer = try self.allocator.alloc(u8, nv12_size);
+
         // Need to recreate session for new dimensions
         const old_session = self.session;
 
@@ -368,11 +536,11 @@ pub const VideoEncoder = struct {
             c.CFRelease(old_session);
         }
 
-        // Recreate pixel buffer pool for new dimensions
+        // Recreate pixel buffer pool for new dimensions (NV12 format)
         if (self.pixel_buffer_pool != null) {
             c.CVPixelBufferPoolRelease(self.pixel_buffer_pool);
         }
-        self.pixel_buffer_pool = createPixelBufferPool(encode_width, encode_height) orelse
+        self.pixel_buffer_pool = createNV12PixelBufferPool(encode_width, encode_height) orelse
             return error.PixelBufferPoolCreationFailed;
 
         self.session = new_session;
@@ -420,7 +588,7 @@ pub const VideoEncoder = struct {
             break :blk scale_buf;
         } else bgra_data;
 
-        // Create CVPixelBuffer wrapping existing data (zero-copy)
+        // Create CVPixelBuffer wrapping BGRA data (hardware encoder converts to YUV internally)
         var pixel_buffer: c.CVPixelBufferRef = null;
         const status = c.CVPixelBufferCreateWithBytes(
             null,
@@ -490,6 +658,15 @@ pub const VideoEncoder = struct {
         self.output_len = 0;
         self.is_keyframe = false;
         self.encode_pending = true;
+
+        // GPU SYNC: Lock IOSurface for the entire encode operation
+        // This ensures GPU has finished rendering and prevents modifications during encode
+        const lock_status = c.IOSurfaceLock(iosurface, c.kIOSurfaceLockReadOnly, null);
+        if (lock_status != 0) {
+            self.encode_pending = false;
+            return error.IOSurfaceLockFailed;
+        }
+        defer _ = c.IOSurfaceUnlock(iosurface, c.kIOSurfaceLockReadOnly, null);
 
         // Create CVPixelBuffer directly from IOSurface (zero-copy)
         var pixel_buffer: c.CVPixelBufferRef = null;
