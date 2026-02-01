@@ -61,6 +61,10 @@ export class SplitContainer {
 
     this.element = document.createElement('div');
     this.element.className = `split-container ${this.direction}`;
+    // Preserve flex style from old element so parent's ratio still works
+    if (oldElement.style.flex) {
+      this.element.style.flex = oldElement.style.flex;
+    }
 
     this.element.appendChild(this.first!.element);
 
@@ -272,9 +276,7 @@ export class SplitContainer {
     if (this.direction !== null && this.first && this.second) {
       const leftWeight = this.first.weight(this.direction);
       const rightWeight = this.second.weight(this.direction);
-      const newRatio = leftWeight / (leftWeight + rightWeight);
-      console.log(`equalize: dir=${this.direction}, leftWeight=${leftWeight}, rightWeight=${rightWeight}, ratio=${newRatio.toFixed(3)}`);
-      this.ratio = newRatio;
+      this.ratio = leftWeight / (leftWeight + rightWeight);
       this.applyRatio();
       this.first.equalize();
       this.second.equalize();
