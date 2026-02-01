@@ -124,7 +124,14 @@
       top: -4px;
       margin-right: 2px;
     }
-    .menu-submenu:hover > .menu-dropdown {
+    /* Non-touch devices: hover to show submenu */
+    @media (hover: hover) {
+      .menu-submenu:hover > .menu-dropdown {
+        display: block;
+      }
+    }
+    /* Touch devices: tap to show submenu */
+    .menu-submenu.open > .menu-dropdown {
       display: block;
     }
     .menu-tab-list {

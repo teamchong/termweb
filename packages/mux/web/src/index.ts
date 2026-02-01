@@ -2135,9 +2135,24 @@ class App {
       });
     });
 
+    // Touch devices: tap to toggle submenu
+    const isTouchDevice = () => !window.matchMedia('(hover: hover)').matches;
+    document.querySelectorAll('.menu-submenu').forEach(submenu => {
+      submenu.addEventListener('click', (e) => {
+        if (!isTouchDevice()) return;
+        e.stopPropagation();
+        const wasOpen = submenu.classList.contains('open');
+        // Close all submenus
+        document.querySelectorAll('.menu-submenu').forEach(s => s.classList.remove('open'));
+        // Toggle this one
+        if (!wasOpen) submenu.classList.add('open');
+      });
+    });
+
     // Close menus when clicking outside
     document.addEventListener('click', () => {
       document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+      document.querySelectorAll('.menu-submenu').forEach(s => s.classList.remove('open'));
       document.getElementById('menubar')?.classList.remove('open');
     });
 
