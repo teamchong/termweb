@@ -452,6 +452,13 @@
       height: 100%;
       display: flex;
     }
+    /* Dim non-focused panels in split view */
+    .split-container > .split-pane > .panel:not(.focused) {
+      opacity: 0.6;
+    }
+    .split-container > .split-pane > .panel.focused {
+      opacity: 1;
+    }
     .split-divider {
       background: rgba(128,128,128,0.3);
       flex-shrink: 0;

@@ -797,16 +797,16 @@ class App {
   private setActivePanel(panel: Panel | null): void {
     if (this.activePanel === panel) return;
 
-    // Remove active class from previous panel
+    // Remove active/focused class from previous panel
     if (this.activePanel) {
-      this.activePanel.element.classList.remove('active');
+      this.activePanel.element.classList.remove('active', 'focused');
     }
 
     this.activePanel = panel;
 
     if (panel) {
-      // Add active class to new panel
-      panel.element.classList.add('active');
+      // Add active/focused class to new panel
+      panel.element.classList.add('active', 'focused');
       panel.focus();
 
       if (panel.serverId !== null) {
