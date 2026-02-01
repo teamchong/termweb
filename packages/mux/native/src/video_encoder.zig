@@ -11,6 +11,11 @@ const c = @cImport({
     @cInclude("Accelerate/Accelerate.h");
 });
 
+pub const EncodeResult = struct {
+    data: []const u8,
+    is_keyframe: bool,
+};
+
 pub const VideoEncoder = struct {
     session: c.VTCompressionSessionRef,
     // Encode dimensions (may be scaled down from source)
@@ -40,7 +45,6 @@ pub const VideoEncoder = struct {
     const MAX_PIXELS: u64 = 1920 * 1080; // ~2MP, roughly 1080p
 
     // Quality presets - FPS fixed at 30, only bitrate varies
-    // Minimum 2 Mbps to keep encode time under 20ms for stable FPS
     const QUALITY_PRESETS = [_]struct { bitrate: u32, fps: u32 }{
         .{ .bitrate = 2_000_000, .fps = 30 }, // Level 0: Low (2 Mbps)
         .{ .bitrate = 3_000_000, .fps = 30 }, // Level 1: Medium (3 Mbps)
@@ -204,45 +208,30 @@ pub const VideoEncoder = struct {
     }
 
     // Adjust quality based on client buffer health (0-100)
-    // Called from server when client reports buffer stats
     pub fn adjustQuality(self: *VideoEncoder, buffer_health: u8) void {
-        // Ignore 0% health - usually means client is still loading
         if (buffer_health == 0) return;
 
         const new_level: u8 = if (buffer_health < 30)
-            // Buffer starving - drop quality by 1
             if (self.quality_level > 0) self.quality_level - 1 else 0
         else if (buffer_health > 70)
-            // Buffer healthy - increase quality by 1
             if (self.quality_level < 4) self.quality_level + 1 else 4
         else
-            // Buffer ok - maintain current quality
             self.quality_level;
 
         if (new_level != self.quality_level) {
-            std.debug.print("QUALITY: level {d}->{d} (health={d}%) fps={d} bitrate={d}\n", .{
+            std.debug.print("QUALITY: level {d}->{d} (health={d}%)\n", .{
                 self.quality_level, new_level, buffer_health,
-                QUALITY_PRESETS[new_level].fps, QUALITY_PRESETS[new_level].bitrate,
             });
             self.quality_level = new_level;
             const preset = QUALITY_PRESETS[new_level];
             self.current_bitrate = preset.bitrate;
             self.target_fps = preset.fps;
 
-            // Update encoder bitrate
             var bitrate: c.SInt32 = @intCast(preset.bitrate);
             const bitrate_number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &bitrate);
             if (bitrate_number != null) {
                 _ = c.VTSessionSetProperty(self.session, c.kVTCompressionPropertyKey_AverageBitRate, bitrate_number);
                 c.CFRelease(bitrate_number);
-            }
-
-            // Update expected frame rate
-            var fps: f64 = @floatFromInt(preset.fps);
-            const fps_number = c.CFNumberCreate(null, c.kCFNumberFloat64Type, &fps);
-            if (fps_number != null) {
-                _ = c.VTSessionSetProperty(self.session, c.kVTCompressionPropertyKey_ExpectedFrameRate, fps_number);
-                c.CFRelease(fps_number);
             }
         }
     }
@@ -250,7 +239,6 @@ pub const VideoEncoder = struct {
     pub fn resize(self: *VideoEncoder, width: u32, height: u32) !void {
         if (self.source_width == width and self.source_height == height) return;
 
-        // Calculate new encode dimensions
         const scaled = calcScaledDimensions(width, height);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
@@ -286,7 +274,6 @@ pub const VideoEncoder = struct {
 
         if (status != 0) return error.EncoderCreationFailed;
 
-        // Clean up old session
         if (old_session != null) {
             c.VTCompressionSessionInvalidate(old_session);
             c.CFRelease(old_session);
@@ -302,7 +289,7 @@ pub const VideoEncoder = struct {
         try self.configureSession();
     }
 
-    // Fast downscale using Accelerate vImage (hardware optimized)
+    // Fast downscale using Accelerate vImage
     fn scaleDown(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
         var src_buffer = c.vImage_Buffer{
             .data = @constCast(@ptrCast(src.ptr)),
@@ -318,30 +305,24 @@ pub const VideoEncoder = struct {
             .rowBytes = dst_w * 4,
         };
 
-        // Use vImageScale for fast hardware-accelerated scaling
-        // kvImageHighQualityResampling for better quality, kvImageNoFlags for speed
-        _ = c.vImageScale_ARGB8888(&src_buffer, &dst_buffer, null, c.kvImageNoFlags);
+        // Use high quality resampling for better image quality
+        _ = c.vImageScale_ARGB8888(&src_buffer, &dst_buffer, null, c.kvImageHighQualityResampling);
     }
 
     // Encode a BGRA frame, returns encoded H.264 data
-    pub fn encode(self: *VideoEncoder, bgra_data: []const u8, force_keyframe: bool) !?struct { data: []const u8, is_keyframe: bool } {
-        const t0 = std.time.nanoTimestamp();
-
+    pub fn encode(self: *VideoEncoder, bgra_data: []const u8, force_keyframe: bool) !?EncodeResult {
         // Reset output
         self.output_len = 0;
         self.is_keyframe = false;
         self.encode_pending = true;
 
-        // Force keyframe if requested - set via frame properties instead
-        _ = force_keyframe; // Will be handled by encoder automatically for first frame
+        _ = force_keyframe;
 
         // Scale down if needed
         const encode_data: []const u8 = if (self.scale_buffer) |scale_buf| blk: {
             scaleDown(bgra_data, self.source_width, self.source_height, scale_buf, self.width, self.height);
             break :blk scale_buf;
         } else bgra_data;
-
-        const t1 = std.time.nanoTimestamp();
 
         // Create CVPixelBuffer from BGRA data
         var pixel_buffer: c.CVPixelBufferRef = null;
@@ -352,10 +333,10 @@ pub const VideoEncoder = struct {
             @intCast(self.height),
             c.kCVPixelFormatType_32BGRA,
             @constCast(@ptrCast(encode_data.ptr)),
-            self.width * 4, // bytes per row
-            null, // release callback
-            null, // release callback context
-            null, // pixel buffer attributes
+            self.width * 4,
+            null,
+            null,
+            null,
             &pixel_buffer,
         );
 
@@ -365,21 +346,17 @@ pub const VideoEncoder = struct {
         }
         defer c.CVPixelBufferRelease(pixel_buffer);
 
-        const t2 = std.time.nanoTimestamp();
-
-        // Create presentation timestamp
-        const pts = c.CMTimeMake(self.frame_count, 30); // 30 fps timebase
+        const pts = c.CMTimeMake(self.frame_count, 30);
         self.frame_count += 1;
 
-        // Encode frame
         const encode_status = c.VTCompressionSessionEncodeFrame(
             self.session,
             pixel_buffer,
             pts,
-            c.kCMTimeInvalid, // duration
-            null, // frame properties
-            null, // source frame context
-            null, // info flags out
+            c.kCMTimeInvalid,
+            null,
+            null,
+            null,
         );
 
         if (encode_status != 0) {
@@ -387,25 +364,10 @@ pub const VideoEncoder = struct {
             return error.EncodeFailed;
         }
 
-        const t3 = std.time.nanoTimestamp();
-
         // Force completion (synchronous output)
         _ = c.VTCompressionSessionCompleteFrames(self.session, c.kCMTimeInvalid);
 
-        const t4 = std.time.nanoTimestamp();
-
         self.encode_pending = false;
-
-        // Debug timing (only every 30 frames to reduce spam)
-        if (@mod(self.frame_count, 30) == 0) {
-            const scale_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-            const pixbuf_ms = @as(f64, @floatFromInt(t2 - t1)) / 1_000_000.0;
-            const submit_ms = @as(f64, @floatFromInt(t3 - t2)) / 1_000_000.0;
-            const complete_ms = @as(f64, @floatFromInt(t4 - t3)) / 1_000_000.0;
-            std.debug.print("ENCODE: scale={d:.1}ms pixbuf={d:.1}ms submit={d:.1}ms complete={d:.1}ms\n", .{
-                scale_ms, pixbuf_ms, submit_ms, complete_ms,
-            });
-        }
 
         if (self.output_len == 0) {
             return null;
@@ -451,7 +413,6 @@ fn compressionOutputCallback(
 
     // For keyframes, prepend SPS and PPS
     if (is_keyframe and format_desc != null) {
-        // Get SPS
         var sps_size: usize = 0;
         var sps_count: usize = 0;
         var sps_ptr: [*c]const u8 = undefined;
@@ -459,7 +420,6 @@ fn compressionOutputCallback(
             format_desc, 0, &sps_ptr, &sps_size, &sps_count, null,
         );
 
-        // Get PPS
         var pps_size: usize = 0;
         var pps_count: usize = 0;
         var pps_ptr: [*c]const u8 = undefined;
@@ -467,7 +427,6 @@ fn compressionOutputCallback(
             format_desc, 1, &pps_ptr, &pps_size, &pps_count, null,
         );
 
-        // Write SPS with Annex B start code
         if (sps_size > 0 and encoder.output_len + 4 + sps_size < encoder.output_buffer.len) {
             encoder.output_buffer[encoder.output_len] = 0;
             encoder.output_buffer[encoder.output_len + 1] = 0;
@@ -477,7 +436,6 @@ fn compressionOutputCallback(
             encoder.output_len += 4 + sps_size;
         }
 
-        // Write PPS with Annex B start code
         if (pps_size > 0 and encoder.output_len + 4 + pps_size < encoder.output_buffer.len) {
             encoder.output_buffer[encoder.output_len] = 0;
             encoder.output_buffer[encoder.output_len + 1] = 0;
@@ -497,10 +455,9 @@ fn compressionOutputCallback(
     const data_status = c.CMBlockBufferGetDataPointer(data_buffer, 0, null, &length, &data_ptr);
     if (data_status != 0) return;
 
-    // Convert AVCC format (length-prefixed) to Annex B (start code prefixed)
+    // Convert AVCC format to Annex B
     var offset: usize = 0;
     while (offset < length) {
-        // Read 4-byte length prefix (big endian)
         if (offset + 4 > length) break;
         const nal_length: u32 = (@as(u32, data_ptr[offset]) << 24) |
             (@as(u32, data_ptr[offset + 1]) << 16) |
@@ -511,7 +468,6 @@ fn compressionOutputCallback(
         if (offset + nal_length > length) break;
         if (encoder.output_len + 4 + nal_length > encoder.output_buffer.len) break;
 
-        // Write NAL with Annex B start code
         encoder.output_buffer[encoder.output_len] = 0;
         encoder.output_buffer[encoder.output_len + 1] = 0;
         encoder.output_buffer[encoder.output_len + 2] = 0;

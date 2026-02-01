@@ -177,9 +177,9 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 std.debug.print("Error: Invalid FPS value: {s}\n", .{args[i]});
                 std.process.exit(1);
             };
-            // Clamp FPS to reasonable range
+            // Clamp FPS to reasonable range (max 30 for render, input is handled separately)
             if (fps < 1) fps = 1;
-            if (fps > 60) fps = 60;
+            if (fps > 30) fps = 30;
         }
         // --list-profiles and --list-browsers are handled at the start of cmdOpen
     }
@@ -365,7 +365,7 @@ fn printHelp() void {
         \\  --disable-hotkeys     Disable all keyboard shortcuts (except Ctrl+Q)
         \\  --disable-hints       Disable Ctrl+H hint mode
         \\  --browser-path <path> Path to browser executable
-        \\  --fps <N>             Set frame rate 1-60 (default: 30, use 12 for SSH)
+        \\  --fps <N>             Set frame rate 1-30 (default: 30, use 12 for SSH)
         \\  --list-profiles       Show available Chrome profiles
         \\  --list-browsers       Show available browsers
         \\
