@@ -370,7 +370,8 @@ pub const Server = struct {
             };
 
             if (frame == null) {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                // No data available - sleep longer to reduce CPU
+                std.Thread.sleep(5 * std.time.ns_per_ms);
                 continue;
             }
 

@@ -853,6 +853,11 @@ const Panel = struct {
         };
     }
 
+    // Check if there's queued input (non-locking for quick check)
+    fn hasQueuedInput(self: *Panel) bool {
+        return self.input_queue.items.len > 0;
+    }
+
     // Process queued input events (must be called from main thread)
     fn processInputQueue(self: *Panel) void {
         self.mutex.lock();
@@ -3223,10 +3228,26 @@ const Server = struct {
             }
 
 
-            // Sleep until next input processing interval
+            // Sleep until next frame/input interval
             const elapsed: u64 = @intCast(std.time.nanoTimestamp() - now);
-            if (elapsed < input_interval_ns) {
-                std.Thread.sleep(input_interval_ns - elapsed);
+            // Use frame_time_ns for lower CPU when no panels are streaming
+            var sleep_time = frame_time_ns;
+
+            // Check if any panel needs frequent updates (has input queued or is streaming)
+            var needs_fast_poll = false;
+            for (panels_buf[0..panels_count]) |panel| {
+                if (panel.streaming.load(.acquire) or panel.hasQueuedInput()) {
+                    needs_fast_poll = true;
+                    break;
+                }
+            }
+
+            if (needs_fast_poll) {
+                sleep_time = input_interval_ns;
+            }
+
+            if (elapsed < sleep_time) {
+                std.Thread.sleep(sleep_time - elapsed);
             }
         }
     }
