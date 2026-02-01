@@ -106,6 +106,31 @@
     .menu.open .menu-dropdown {
       display: block;
     }
+    .menu-submenu {
+      position: relative;
+    }
+    .menu-submenu > .menu-text::after {
+      content: '▶';
+      position: absolute;
+      right: 8px;
+      font-size: 10px;
+      opacity: 0.6;
+    }
+    .menu-submenu .menu-dropdown {
+      display: none;
+      position: absolute;
+      left: 100%;
+      right: auto;
+      top: -4px;
+      margin-left: 2px;
+    }
+    .menu-submenu:hover > .menu-dropdown {
+      display: block;
+    }
+    .menu-tab-list {
+      max-height: 300px;
+      overflow-y: auto;
+    }
     #hamburger {
       display: none;
       padding: 4px 8px;
@@ -1311,6 +1336,41 @@
             <div class="menu-item" data-action="quick-terminal"><span class="menu-icon">▼</span><span class="menu-text">Quick Terminal</span></div>
             <div class="menu-separator"></div>
             <div class="menu-item" data-action="toggle-inspector"><span class="menu-icon">🔍</span><span class="menu-text">Toggle Inspector</span><span class="shortcut">⌥⌘I</span></div>
+          </div>
+        </div>
+        <div class="menu">
+          <span class="menu-label">Window</span>
+          <div class="menu-dropdown">
+            <div class="menu-item" data-action="toggle-fullscreen"><span class="menu-icon">⛶</span><span class="menu-text">Toggle Full Screen</span></div>
+            <div class="menu-item" data-action="previous-tab"><span class="menu-icon">◀</span><span class="menu-text">Show Previous Tab</span><span class="shortcut">⌃<span class="shift">⇧</span>Tab</span></div>
+            <div class="menu-item" data-action="next-tab"><span class="menu-icon">▶</span><span class="menu-text">Show Next Tab</span><span class="shortcut">⌃Tab</span></div>
+            <div class="menu-separator"></div>
+            <div class="menu-item" data-action="zoom-split"><span class="menu-icon">⤢</span><span class="menu-text">Zoom Split</span><span class="shortcut">⌘<span class="shift">⇧</span>↵</span></div>
+            <div class="menu-item" data-action="previous-split"><span class="menu-icon">⇤</span><span class="menu-text">Select Previous Split</span><span class="shortcut">⌘[</span></div>
+            <div class="menu-item" data-action="next-split"><span class="menu-icon">⇥</span><span class="menu-text">Select Next Split</span><span class="shortcut">⌘]</span></div>
+            <div class="menu-item menu-submenu">
+              <span class="menu-icon">◫</span><span class="menu-text">Select Split</span>
+              <div class="menu-dropdown">
+                <div class="menu-item" data-action="select-split-above"><span class="menu-icon">↑</span><span class="menu-text">Select Split Above</span><span class="shortcut">⌘<span class="shift">⇧</span>↑</span></div>
+                <div class="menu-item" data-action="select-split-below"><span class="menu-icon">↓</span><span class="menu-text">Select Split Below</span><span class="shortcut">⌘<span class="shift">⇧</span>↓</span></div>
+                <div class="menu-item" data-action="select-split-left"><span class="menu-icon">←</span><span class="menu-text">Select Split Left</span><span class="shortcut">⌘<span class="shift">⇧</span>←</span></div>
+                <div class="menu-item" data-action="select-split-right"><span class="menu-icon">→</span><span class="menu-text">Select Split Right</span><span class="shortcut">⌘<span class="shift">⇧</span>→</span></div>
+              </div>
+            </div>
+            <div class="menu-item menu-submenu">
+              <span class="menu-icon">⇔</span><span class="menu-text">Resize Split</span>
+              <div class="menu-dropdown">
+                <div class="menu-item" data-action="equalize-splits"><span class="menu-icon">=</span><span class="menu-text">Equalize Splits</span></div>
+                <div class="menu-item" data-action="resize-split-up"><span class="menu-icon">↑</span><span class="menu-text">Move Divider Up</span></div>
+                <div class="menu-item" data-action="resize-split-down"><span class="menu-icon">↓</span><span class="menu-text">Move Divider Down</span></div>
+                <div class="menu-item" data-action="resize-split-left"><span class="menu-icon">←</span><span class="menu-text">Move Divider Left</span></div>
+                <div class="menu-item" data-action="resize-split-right"><span class="menu-icon">→</span><span class="menu-text">Move Divider Right</span></div>
+              </div>
+            </div>
+            <div class="menu-separator"></div>
+            <div class="menu-tab-list" id="window-tab-list">
+              <!-- Dynamically populated -->
+            </div>
           </div>
         </div>
         <div class="menu admin-only">

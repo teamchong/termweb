@@ -1868,11 +1868,19 @@ class App {
         return;
       }
 
-      // ⌘⇧F for folder sync
+      // ⌘⇧F for toggle fullscreen (hide title/tabbar)
       if (e.metaKey && e.shiftKey && (e.key === 'f' || e.key === 'F')) {
         e.preventDefault();
         e.stopPropagation();
-        this.showFolderTransferDialog();
+        this.toggleFullscreen();
+        return;
+      }
+
+      // ⌘⇧Enter for zoom split
+      if (e.metaKey && e.shiftKey && e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.zoomSplit();
         return;
       }
 
@@ -2236,9 +2244,212 @@ class App {
           case 'change-title':
             this.promptChangeTitle();
             break;
+          // Window menu actions
+          case 'toggle-fullscreen':
+            this.toggleFullscreen();
+            break;
+          case 'previous-tab':
+            this.switchToPreviousTab();
+            break;
+          case 'next-tab':
+            this.switchToNextTab();
+            break;
+          case 'zoom-split':
+            this.zoomSplit();
+            break;
+          case 'previous-split':
+            this.selectPreviousSplit();
+            break;
+          case 'next-split':
+            this.selectNextSplit();
+            break;
+          case 'select-split-above':
+            this.selectSplitDirection('up');
+            break;
+          case 'select-split-below':
+            this.selectSplitDirection('down');
+            break;
+          case 'select-split-left':
+            this.selectSplitDirection('left');
+            break;
+          case 'select-split-right':
+            this.selectSplitDirection('right');
+            break;
+          case 'equalize-splits':
+            this.equalizeSplits();
+            break;
+          case 'resize-split-up':
+            this.resizeSplit('up');
+            break;
+          case 'resize-split-down':
+            this.resizeSplit('down');
+            break;
+          case 'resize-split-left':
+            this.resizeSplit('left');
+            break;
+          case 'resize-split-right':
+            this.resizeSplit('right');
+            break;
+        }
+        // Handle dynamic tab selection (tab-id-xxx)
+        if (action.startsWith('select-tab-')) {
+          const tabId = action.replace('select-tab-', '');
+          this.switchToTab(tabId);
         }
       });
     });
+
+    // Populate window tab list on menu hover
+    const windowMenu = document.querySelector('.menu-label + .menu-dropdown #window-tab-list')?.closest('.menu');
+    windowMenu?.addEventListener('mouseenter', () => this.populateWindowTabList());
+  }
+
+  private populateWindowTabList(): void {
+    const tabListEl = document.getElementById('window-tab-list');
+    if (!tabListEl) return;
+
+    tabListEl.innerHTML = '';
+    let index = 1;
+    for (const [tabId, tab] of this.tabs) {
+      const item = document.createElement('div');
+      item.className = 'menu-item';
+      item.dataset.action = `select-tab-${tabId}`;
+      const shortcut = index <= 9 ? `<span class="shortcut">⌘${index}</span>` : '';
+      const activeMarker = tabId === this.activeTab ? '• ' : '';
+      item.innerHTML = `<span class="menu-icon">${activeMarker}</span><span class="menu-text">${tab.title || 'Terminal'}</span>${shortcut}`;
+      item.addEventListener('click', () => {
+        this.switchToTab(tabId);
+        document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+      });
+      tabListEl.appendChild(item);
+      index++;
+    }
+  }
+
+  private toggleFullscreen(): void {
+    const titlebar = document.getElementById('titlebar');
+    const toolbar = document.getElementById('toolbar');
+    const isFullscreen = document.body.classList.toggle('fullscreen');
+    if (titlebar) titlebar.style.display = isFullscreen ? 'none' : '';
+    if (toolbar) toolbar.style.display = isFullscreen ? 'none' : '';
+    // Trigger resize for panels to reclaim space
+    window.dispatchEvent(new Event('resize'));
+  }
+
+  private switchToPreviousTab(): void {
+    const tabIds = Array.from(this.tabs.keys());
+    if (tabIds.length < 2 || !this.activeTab) return;
+    const currentIndex = tabIds.indexOf(this.activeTab);
+    const prevIndex = (currentIndex - 1 + tabIds.length) % tabIds.length;
+    this.switchToTab(tabIds[prevIndex]);
+  }
+
+  private switchToNextTab(): void {
+    const tabIds = Array.from(this.tabs.keys());
+    if (tabIds.length < 2 || !this.activeTab) return;
+    const currentIndex = tabIds.indexOf(this.activeTab);
+    const nextIndex = (currentIndex + 1) % tabIds.length;
+    this.switchToTab(tabIds[nextIndex]);
+  }
+
+  private zoomSplit(): void {
+    // Toggle zoom - make active panel fill the entire tab (hide other splits)
+    if (!this.activeTab || !this.activePanel) return;
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab) return;
+
+    const container = tab.root.element;
+    const isZoomed = container.classList.toggle('zoomed');
+
+    if (isZoomed) {
+      // Store which panel is zoomed
+      container.dataset.zoomedPanel = this.activePanel.id;
+
+      // Hide all split-panes and dividers
+      container.querySelectorAll('.split-pane').forEach((pane: Element) => {
+        (pane as HTMLElement).dataset.zoomStyle = (pane as HTMLElement).style.cssText;
+        (pane as HTMLElement).style.display = 'none';
+      });
+      container.querySelectorAll('.split-divider').forEach((d: Element) => {
+        (d as HTMLElement).style.display = 'none';
+      });
+
+      // Show the active panel's container chain and make it fill
+      const activeEl = this.activePanel.element;
+      let el: HTMLElement | null = activeEl.closest('.split-pane');
+      while (el && container.contains(el)) {
+        el.style.display = 'flex';
+        el.style.flex = '1';
+        el.style.width = '100%';
+        el.style.height = '100%';
+        el = el.parentElement?.closest('.split-pane') || null;
+      }
+    } else {
+      // Restore all split-panes
+      container.querySelectorAll('.split-pane').forEach((pane: Element) => {
+        (pane as HTMLElement).style.cssText = (pane as HTMLElement).dataset.zoomStyle || '';
+        delete (pane as HTMLElement).dataset.zoomStyle;
+      });
+      // Show dividers
+      container.querySelectorAll('.split-divider').forEach((d: Element) => {
+        (d as HTMLElement).style.display = '';
+      });
+      delete container.dataset.zoomedPanel;
+    }
+    // Trigger resize after layout updates
+    requestAnimationFrame(() => {
+      // Force ResizeObserver to fire by toggling a style
+      const allPanels = tab.root.getAllPanels();
+      for (const panel of allPanels) {
+        const el = panel.element;
+        el.style.visibility = 'hidden';
+        el.offsetHeight; // Force reflow
+        el.style.visibility = '';
+      }
+    });
+  }
+
+  private selectPreviousSplit(): void {
+    if (this.activeTab) {
+      const tab = this.tabs.get(this.activeTab);
+      const panels = tab?.root?.getAllPanels?.() || [];
+      if (panels.length < 2 || !this.activePanel) return;
+      const currentIndex = panels.findIndex(p => p.id === this.activePanel?.id);
+      const prevIndex = (currentIndex - 1 + panels.length) % panels.length;
+      this.setActivePanel(panels[prevIndex]);
+    }
+  }
+
+  private selectNextSplit(): void {
+    if (this.activeTab) {
+      const tab = this.tabs.get(this.activeTab);
+      const panels = tab?.root?.getAllPanels?.() || [];
+      if (panels.length < 2 || !this.activePanel) return;
+      const currentIndex = panels.findIndex(p => p.id === this.activePanel?.id);
+      const nextIndex = (currentIndex + 1) % panels.length;
+      this.setActivePanel(panels[nextIndex]);
+    }
+  }
+
+  private selectSplitDirection(direction: 'up' | 'down' | 'left' | 'right'): void {
+    if (this.activeTab) {
+      const tab = this.tabs.get(this.activeTab);
+      tab?.root?.selectSplitInDirection?.(direction, this.activePanel?.id);
+    }
+  }
+
+  private equalizeSplits(): void {
+    if (this.activeTab) {
+      const tab = this.tabs.get(this.activeTab);
+      tab?.root?.equalize?.();
+    }
+  }
+
+  private resizeSplit(direction: 'up' | 'down' | 'left' | 'right'): void {
+    if (this.activeTab) {
+      const tab = this.tabs.get(this.activeTab);
+      tab?.root?.resizeSplit?.(direction, 50); // Move by 50px
+    }
   }
   // ============================================================================
   // iOS Accessory Bar
