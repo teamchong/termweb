@@ -897,8 +897,12 @@ const Panel = struct {
     inspector_tab: [16]u8,
     inspector_tab_len: u8,
     last_iosurface_seed: u32, // For detecting IOSurface changes without copying
+    last_delta_time: i64, // For adaptive FPS
+    last_input_time: i64, // Track input for responsive typing
 
     const KEYFRAME_INTERVAL_MS = 60000; // 60 seconds
+    const CURSOR_FPS: i64 = 15;
+    const ACTIVE_FPS: i64 = 60;
 
     fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64) !*Panel {
         const panel = try allocator.create(Panel);
@@ -961,6 +965,8 @@ const Panel = struct {
             .inspector_tab = undefined,
             .inspector_tab_len = 0,
             .last_iosurface_seed = 0,
+            .last_delta_time = 0,
+            .last_input_time = 0,
         };
 
         return panel;
@@ -1069,7 +1075,6 @@ const Panel = struct {
     }
 
     fn prepareFrame(self: *Panel) !?struct { data: []u8, is_keyframe: bool } {
-        const t_start = std.time.nanoTimestamp();
         const now = std.time.milliTimestamp();
         const need_keyframe = self.force_keyframe or
             (now - self.last_keyframe >= KEYFRAME_INTERVAL_MS) or
@@ -1088,6 +1093,18 @@ const Panel = struct {
             self.last_keyframe = now;
             self.force_keyframe = false;
         } else {
+            // Adaptive FPS: Use lower FPS when idle (cursor blink), higher when active
+            const time_since_input = now - self.last_input_time;
+            const target_fps: i64 = if (time_since_input < 100) ACTIVE_FPS else CURSOR_FPS;
+            const frame_interval_ms: i64 = @divFloor(1000, target_fps);
+            const time_since_delta = now - self.last_delta_time;
+
+            if (time_since_delta < frame_interval_ms) {
+                // Not time for next frame yet, skip
+                return null;
+            }
+            self.last_delta_time = now;
+
             // Delta frame: Use zero-copy diff (fused compare + convert + diff)
             // This only writes to memory where pixels actually changed
             const stats = self.frame_buffer.computeDiffZeroCopy();
@@ -1107,14 +1124,6 @@ const Panel = struct {
             // Use partial_delta (uncompressed) for small changes (<500KB)
             // Avoids 37ms compression overhead
             if (dirty_size < 500_000) {
-                const t_diff_end = std.time.nanoTimestamp();
-
-                // Print timing every 30 frames
-                if (self.sequence % 30 == 0) {
-                    const diff_us = @divFloor(t_diff_end - t_start, 1000);
-                    std.debug.print("  DETAIL: diff={}us partial_delta dirty={}/{}\n", .{ diff_us, dirty_size, self.frame_buffer.diff.len });
-                }
-
                 // Header: frame_type(1) + sequence(4) + width(2) + height(2) + offset(4) + length(4) = 17 bytes
                 const header_size: usize = 17;
                 const buf = self.frame_buffer.compressed;
@@ -1141,24 +1150,12 @@ const Panel = struct {
             is_keyframe = false;
             compressor = &self.compressor_fast;
         }
-        const t_diff = std.time.nanoTimestamp();
 
         const header_size: usize = 13;
         const compressed_size = try compressor.compress(
             data_to_compress,
             self.frame_buffer.compressed[header_size..],
         );
-        const t_compress = std.time.nanoTimestamp();
-
-        // Print timing every 30 frames
-        if (self.sequence % 30 == 0) {
-            const diff_us = @divFloor(t_diff - t_start, 1000);
-            const compress_us = @divFloor(t_compress - t_diff, 1000);
-            const dirty_size = self.frame_buffer.last_dirty_end - self.frame_buffer.last_dirty_start;
-            const total_size = self.frame_buffer.diff.len;
-            std.debug.print("  DETAIL: diff={}us compress={}us dirty={}/{} keyframe={}\n", .{ diff_us, compress_us, dirty_size, total_size, is_keyframe });
-        }
-
         // Write header
         const buf = self.frame_buffer.compressed;
         buf[0] = if (is_keyframe) @intFromEnum(FrameType.keyframe) else @intFromEnum(FrameType.delta);
@@ -1202,6 +1199,8 @@ const Panel = struct {
             self.mutex.unlock();
             return;
         }
+        // Track input time for adaptive FPS
+        self.last_input_time = std.time.milliTimestamp();
         // Copy events locally to release mutex quickly
         var events_buf: [256]InputEvent = undefined;
         const events_count = @min(count, events_buf.len);
@@ -3633,25 +3632,11 @@ const Server = struct {
                     if (!panel.streaming.load(.acquire)) continue;
 
                     if (panel.getIOSurface()) |iosurface| {
-                        // TIMING: measure each stage
-                        const t0 = std.time.nanoTimestamp();
                         const changed = panel.captureFromIOSurface(iosurface) catch continue;
-                        const t1 = std.time.nanoTimestamp();
-
                         if (!changed) continue;
 
                         if (panel.prepareFrame() catch null) |result| {
-                            const t2 = std.time.nanoTimestamp();
                             panel.sendFrame(result.data) catch {};
-                            const t3 = std.time.nanoTimestamp();
-
-                            // Print timing every 30 frames (~1 second)
-                            if (panel.sequence % 30 == 0) {
-                                const capture_us = @divFloor(t1 - t0, 1000);
-                                const prepare_us = @divFloor(t2 - t1, 1000);
-                                const send_us = @divFloor(t3 - t2, 1000);
-                                std.debug.print("TIMING: capture={}us prepare={}us send={}us\n", .{ capture_us, prepare_us, send_us });
-                            }
                         }
                     }
                 }
