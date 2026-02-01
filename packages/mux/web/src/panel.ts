@@ -43,7 +43,7 @@ export class Panel {
   // Debug stats overlay (enable with #debug=1 or ?debug=1 in URL)
   private static debugEnabled = window.location.hash.includes('debug') ||
     window.location.search.includes('debug');
-  private statsOverlay: HTMLElement | null = null;
+  private static statsOverlay: HTMLElement | null = null; // Singleton overlay
   private renderedFrames = 0;
   private lastStatsUpdate = 0;
   private displayedFps = 0;
@@ -246,30 +246,30 @@ export class Panel {
   }
 
   private setupStatsOverlay(): void {
-    if (!Panel.debugEnabled) return;
+    if (!Panel.debugEnabled || Panel.statsOverlay) return; // Only create once
     console.log('Debug stats overlay enabled');
 
-    this.statsOverlay = document.createElement('div');
-    this.statsOverlay.className = 'panel-stats-overlay';
-    this.statsOverlay.style.cssText = `
-      position: absolute;
-      top: 8px;
+    Panel.statsOverlay = document.createElement('div');
+    Panel.statsOverlay.className = 'panel-stats-overlay';
+    Panel.statsOverlay.style.cssText = `
+      position: fixed;
+      bottom: 8px;
       right: 8px;
-      background: rgba(0, 0, 0, 0.8);
+      background: rgba(0, 0, 0, 0.5);
       color: #0f0;
       font-family: monospace;
       font-size: 11px;
       padding: 6px 10px;
       border-radius: 4px;
-      z-index: 1000;
+      z-index: 10000;
       pointer-events: none;
       line-height: 1.4;
     `;
-    this.element.appendChild(this.statsOverlay);
+    document.body.appendChild(Panel.statsOverlay);
   }
 
   private updateStatsOverlay(): void {
-    if (!this.statsOverlay) return;
+    if (!Panel.statsOverlay) return;
 
     const now = performance.now();
 
@@ -297,7 +297,7 @@ export class Panel {
     // Buffer health
     const health = Math.max(0, 100 - this.pendingDecode * 20);
 
-    this.statsOverlay.innerHTML = `
+    Panel.statsOverlay.innerHTML = `
       FPS: <span style="color: ${this.displayedFps >= 25 ? '#0f0' : this.displayedFps >= 15 ? '#ff0' : '#f00'}">${this.displayedFps}</span> render / ${receivedFps} recv<br>
       Queue: <span style="color: ${this.pendingDecode <= 1 ? '#0f0' : this.pendingDecode <= 3 ? '#ff0' : '#f00'}">${this.pendingDecode}</span> frames<br>
       Decode: ${avgLatency}ms<br>
@@ -846,10 +846,7 @@ export class Panel {
       this.decoder = null;
     }
 
-    if (this.statsOverlay) {
-      this.statsOverlay.remove();
-      this.statsOverlay = null;
-    }
+    // Note: statsOverlay is shared/static, don't remove it
 
     if (this.element.parentElement) {
       this.element.parentElement.removeChild(this.element);
