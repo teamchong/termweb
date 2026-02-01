@@ -101,6 +101,9 @@
       min-width: 160px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.3);
       z-index: 100;
+    }
+    /* Only main menu dropdowns should scroll, not submenus */
+    .menu > .menu-dropdown {
       max-height: calc(100vh - 80px);
       overflow-y: auto;
     }
@@ -125,8 +128,6 @@
       left: auto;
       top: -4px;
       padding-right: 8px;
-      max-height: none;
-      overflow-y: visible;
     }
     /* Non-touch devices: hover to show submenu */
     @media (hover: hover) {
