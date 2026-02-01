@@ -60,12 +60,17 @@ pub fn showTabPicker(viewer: anytype) !void {
 
 const render_mod = @import("render.zig");
 
-/// Clear the content area (delete main content image)
+/// Clear the content area (delete main content image and terminal text)
 /// Call this when switching tabs to avoid stale content showing
 fn clearContentArea(viewer: anytype) void {
-    // Delete content image (ID 100) to clear previous page
     const stdout = std.fs.File.stdout();
-    _ = stdout.write("\x1b_Ga=d,d=i,i=100\x1b\\") catch {};
+    // Delete content image (ID 100) to clear previous page
+    // Also clear terminal text in content area (row 2 onwards) to remove error page text
+    _ = stdout.write("\x1b_Ga=d,d=i,i=100\x1b\\" ++ // Delete image
+        "\x1b[2;1H" ++ // Move to row 2, column 1
+        "\x1b[0m" ++ // Reset attributes
+        "\x1b[J" // Clear from cursor to end of screen
+    ) catch {};
     viewer.last_content_image_id = null;
     viewer.last_rendered_generation = 0; // Reset generation to accept new frames
 }

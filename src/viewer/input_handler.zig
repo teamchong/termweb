@@ -434,6 +434,11 @@ pub fn handleUrlPromptKey(viewer: anytype, event: NormalizedKeyEvent) !void {
                 viewer.log("[URL] Navigating to: {s}\n", .{url_copy});
 
                 // Clear blank page placeholder if showing (allow screencast rendering)
+                // Also clear terminal text (error page text) so it doesn't show through hints
+                if (viewer.showing_blank_placeholder) {
+                    const stdout = std.fs.File.stdout();
+                    _ = stdout.write("\x1b[2;1H\x1b[0m\x1b[J") catch {}; // Clear row 2 onwards
+                }
                 viewer.showing_blank_placeholder = false;
 
                 screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, url_copy) catch |err| {
