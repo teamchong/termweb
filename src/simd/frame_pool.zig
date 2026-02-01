@@ -105,6 +105,20 @@ pub const FramePool = struct {
         self.allocator.destroy(self);
     }
 
+    /// Reset pool - invalidate all frames (for screencast restart)
+    /// This ensures stale frames aren't returned after reset
+    pub fn reset(self: *FramePool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.slots) |*slot| {
+            slot.len = 0;
+            slot.generation = 0;
+        }
+        self.write_idx = 0;
+        // Keep generation counter going up to avoid confusion
+    }
+
     /// Write a frame into the pool (zero-copy if possible)
     /// Returns the generation number for this write, or null if all slots are in use
     pub fn writeFrame(

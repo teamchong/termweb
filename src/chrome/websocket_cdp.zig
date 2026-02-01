@@ -663,6 +663,9 @@ pub const WebSocketCdpClient = struct {
         self.response_mutex.lock();
         defer self.response_mutex.unlock();
 
+        // Skip if shutting down (prevents race with deinit)
+        if (!self.running.load(.acquire)) return;
+
         // Limit queue size to prevent memory growth from fire-and-forget commands
         // Drop oldest responses if queue is too large
         const MAX_QUEUE_SIZE = 50;

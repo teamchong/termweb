@@ -188,6 +188,7 @@ pub const Viewer = struct {
     debug_input: bool,
     ui_dirty: bool, // Track if UI needs re-rendering
     needs_nav_state_update: bool, // Deferred nav state update (avoid blocking CDP thread)
+    needs_screencast_reset: std.atomic.Value(bool), // Deferred screencast reset (SPA navigation)
     last_toolbar_render: i128, // Throttle toolbar renders (expensive)
 
     // Background toolbar rendering - composites to single RGBA image
@@ -366,6 +367,7 @@ pub const Viewer = struct {
             .debug_input = enable_input_debug,
             .ui_dirty = true,
             .needs_nav_state_update = false,
+            .needs_screencast_reset = std.atomic.Value(bool).init(false),
             .last_toolbar_render = 0,
             .toolbar_thread = null,
             .toolbar_rgba = try allocator.alloc(u8, 8192 * 100 * 4), // Max 8192px wide, 100px tall, RGBA (supports 8K/HiDPI)
@@ -694,6 +696,9 @@ pub const Viewer = struct {
                 if (maybe_input == null) break;
                 const input = maybe_input.?;
 
+                // Update last input time for stall detection
+                self.last_input_time = std.time.nanoTimestamp();
+
                 // Log significant events only
                 switch (input) {
                     .key => |key| {
@@ -725,9 +730,14 @@ pub const Viewer = struct {
                 };
                 const t1 = std.time.nanoTimestamp();
 
+                // Update last_frame_time when we receive a new frame
+                const now_ns = std.time.nanoTimestamp();
+                if (new_frame) {
+                    self.last_frame_time = now_ns;
+                }
+
                 // Auto-recovery: if no frame rendered for 3+ seconds AND there was recent input
                 // Don't reset for static pages with no user activity
-                const now_ns = std.time.nanoTimestamp();
                 const no_frame_for_3s = self.last_frame_time > 0 and (now_ns - self.last_frame_time) > 3 * std.time.ns_per_s;
                 const had_recent_input = self.last_input_time > 0 and (now_ns - self.last_input_time) < 5 * std.time.ns_per_s;
                 if (no_frame_for_3s and had_recent_input) {
@@ -851,6 +861,22 @@ pub const Viewer = struct {
                 self.forceUpdateNavigationState();
                 // Note: viewport is updated by ResizeObserver polyfill
             }
+
+            // Process deferred screencast reset (triggered by SPA navigation)
+            // Take screenshot immediately to show new page content
+            if (self.needs_screencast_reset.swap(false, .acq_rel)) {
+                self.log("[SPA NAV] Taking immediate screenshot\n", .{});
+                // Small delay to let page render
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                if (screenshot_api.captureScreenshot(self.cdp_client, self.allocator, .{ .format = .jpeg })) |screenshot| {
+                    defer self.allocator.free(screenshot);
+                    self.displayFrameWithDimensions(screenshot) catch {};
+                    self.last_frame_time = std.time.nanoTimestamp();
+                } else |_| {}
+            }
+
+            // Try to reconnect dead WebSockets in background (non-blocking)
+            _ = self.cdp_client.tryReconnectIfNeeded();
 
             // Flush pending ACK (no-op, kept for API compatibility)
             self.cdp_client.flushPendingAck();
@@ -1071,6 +1097,12 @@ pub const Viewer = struct {
         }
         self.last_nav_state_update = now;
 
+        // Skip if WebSocket is dead - would block on sendNavCommand
+        if (!self.cdp_client.isPageWsAlive()) {
+            self.log("[NAV STATE] Skipping - WebSocket dead\n", .{});
+            return;
+        }
+
         self.log("[NAV STATE] Fetching navigation state (blocking CDP call)...\n", .{});
         const nav_state = screenshot_api.getNavigationState(self.cdp_client, self.allocator) catch return;
         self.ui_state.can_go_back = nav_state.can_go_back;
@@ -1092,8 +1124,13 @@ pub const Viewer = struct {
             self.screencast_mode = false;
         }
 
-        // Small yield to let Chrome process stop
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        // Refresh the PIPE session to recover from stale session after navigation
+        self.cdp_client.refreshSession() catch |err| {
+            self.log("[RESET] refreshSession failed: {}, continuing anyway\n", .{err});
+        };
+
+        // Longer yield to let Chrome fully process stop before restart
+        std.Thread.sleep(50 * std.time.ns_per_ms);
 
         // Restart screencast with adaptive quality
         const reset_total_pixels: u64 = @as(u64, self.viewport_width) * @as(u64, self.viewport_height);
@@ -1111,11 +1148,22 @@ pub const Viewer = struct {
         };
         self.screencast_mode = true;
 
+        // Force Chrome to refresh by bringing page to front
+        self.cdp_client.sendCommandAsync("Page.bringToFront", null) catch {};
+
+        // Take a screenshot as fallback - ensures user sees current page even if screencast is broken
+        if (screenshot_api.captureScreenshot(self.cdp_client, self.allocator, .{ .format = .jpeg })) |screenshot| {
+            defer self.allocator.free(screenshot);
+            self.log("[RESET] Got fallback screenshot, {} bytes\n", .{screenshot.len});
+            self.displayFrameWithDimensions(screenshot) catch {};
+        } else |_| {
+            self.log("[RESET] Fallback screenshot failed\n", .{});
+        }
+
         // Reset frame tracking - next frame will render immediately
         self.last_frame_time = 0;
         self.last_rendered_generation = 0;
         self.frames_skipped = 0;
-        // Keep image IDs - new frames overwrite using same ID (no memory leak)
 
         self.log("[RESET] Screencast reset complete (quality={})\n", .{reset_quality});
     }

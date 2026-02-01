@@ -104,6 +104,9 @@ pub fn handleNavigatedWithinDocument(viewer: anytype, payload: []const u8) void 
 
     // Defer nav state update to main loop (avoid blocking CDP thread)
     viewer.needs_nav_state_update = true;
+
+    // Trigger screencast reset - Chrome's screencast often becomes stale after SPA navigation
+    viewer.needs_screencast_reset.store(true, .release);
 }
 
 /// Handle Target.targetCreated event

@@ -109,10 +109,7 @@ pub fn captureScreenshot(
     allocator: std.mem.Allocator,
     options: ScreenshotOptions,
 ) ![]const u8 {
-    // Inject JavaScript to force white background - use nav_ws (pipe is for screencast only)
-    const js_params = "{\"expression\":\"document.body.style.backgroundColor = 'white'; document.documentElement.style.backgroundColor = 'white';\"}";
-    const js_result = try client.sendNavCommand("Runtime.evaluate", js_params);
-    defer allocator.free(js_result);
+    // Note: Removed white background injection - it was causing side effects on SPA pages
 
     const params = try std.fmt.allocPrint(
         allocator,

@@ -79,6 +79,10 @@ pub const CdpClient = struct {
     browser_ws: ?*websocket_cdp.WebSocketCdpClient, // Browser-level for downloads
     page_ws_mutex: std.Thread.Mutex, // Protects page_ws reconnection
 
+    // Background reconnect - never blocks main thread
+    reconnect_thread: ?std.Thread,
+    reconnect_in_progress: std.atomic.Value(bool),
+
     /// Initialize CDP client from pipe file descriptors
     /// read_fd: FD to read from Chrome (Chrome's FD 4)
     /// write_fd: FD to write to Chrome (Chrome's FD 3)
@@ -94,6 +98,8 @@ pub const CdpClient = struct {
             .page_ws = null,
             .browser_ws = null,
             .page_ws_mutex = .{},
+            .reconnect_thread = null,
+            .reconnect_in_progress = std.atomic.Value(bool).init(false),
         };
 
         // Attach to page target to enable page-level commands
@@ -221,6 +227,8 @@ pub const CdpClient = struct {
             .page_ws = null,
             .browser_ws = null,
             .page_ws_mutex = .{},
+            .reconnect_thread = null,
+            .reconnect_in_progress = std.atomic.Value(bool).init(false),
         };
 
         // Create downloads directory
@@ -308,12 +316,16 @@ pub const CdpClient = struct {
         };
         defer stream.close();
 
+        // Set read timeout to 1 second to avoid hanging forever
+        const timeout = std.posix.timeval{ .sec = 1, .usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+
         // Send HTTP request
         var request_buf: [128]u8 = undefined;
         const request = std.fmt.bufPrint(&request_buf, "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", .{self.debug_port}) catch return CdpError.OutOfMemory;
         _ = stream.write(request) catch return CdpError.WebSocketConnectionFailed;
 
-        // Read response
+        // Read response (will timeout after 1 second if Chrome is busy)
         var buf: [8192]u8 = undefined;
         const n = stream.read(&buf) catch return CdpError.WebSocketConnectionFailed;
         const response = buf[0..n];
@@ -387,6 +399,10 @@ pub const CdpClient = struct {
             return err;
         };
         defer stream.close();
+
+        // Set read timeout to 1 second to avoid hanging forever
+        const timeout = std.posix.timeval{ .sec = 1, .usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
         var request_buf: [128]u8 = undefined;
         const request = std.fmt.bufPrint(&request_buf, "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", .{self.debug_port}) catch return CdpError.OutOfMemory;
@@ -477,6 +493,10 @@ pub const CdpClient = struct {
     }
 
     pub fn deinit(self: *CdpClient) void {
+        // Wait for background reconnect thread if running
+        if (self.reconnect_thread) |thread| {
+            thread.join();
+        }
         if (self.page_ws) |ws| ws.deinit();
         if (self.browser_ws) |ws| ws.deinit();
         if (self.session_id) |sid| self.allocator.free(sid);
@@ -507,67 +527,71 @@ pub const CdpClient = struct {
         }
     }
 
-    /// Send mouse command (fire-and-forget) - uses page WebSocket with lazy recovery
+    /// Send mouse command (fire-and-forget) - uses page WebSocket
+    /// Does NOT attempt reconnect - input is dropped if ws is dead (avoids blocking)
     /// Silently ignores errors - safe during shutdown
     pub fn sendMouseCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        // Lazy recovery: try to reconnect if dead
-        self.ensurePageWsConnected() catch {};
-
+        // Don't try to reconnect here - it blocks. Just drop input if dead.
         if (self.page_ws) |ws| {
-            ws.sendCommandAsync(method, params);
+            if (ws.running.load(.acquire)) {
+                ws.sendCommandAsync(method, params);
+            }
         }
     }
 
-    /// Send keyboard command (fire-and-forget) - uses page WebSocket with lazy recovery
+    /// Send keyboard command (fire-and-forget) - uses page WebSocket
+    /// Does NOT attempt reconnect - input is dropped if ws is dead (avoids blocking)
     /// Silently ignores errors - safe during shutdown
     pub fn sendKeyboardCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        // Lazy recovery: try to reconnect if dead
-        self.ensurePageWsConnected() catch {};
-
+        // Don't try to reconnect here - it blocks. Just drop input if dead.
         if (self.page_ws) |ws| {
-            ws.sendCommandAsync(method, params);
+            if (ws.running.load(.acquire)) {
+                ws.sendCommandAsync(method, params);
+            }
         }
     }
 
-    /// Send navigation command and wait for response - uses page WebSocket with lazy recovery
+    /// Send navigation command and wait for response - uses page WebSocket
+    /// Does NOT attempt reconnect - returns error if ws is dead (avoids blocking)
     pub fn sendNavCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // Lazy recovery: try to reconnect if dead
-        try self.ensurePageWsConnected();
-
+        // Don't try to reconnect here - it blocks. Return error if dead.
         if (self.page_ws) |ws| {
-            return ws.sendCommand(method, params);
+            if (ws.running.load(.acquire)) {
+                return ws.sendCommand(method, params);
+            }
         }
         return CdpError.WebSocketConnectionFailed;
     }
 
-    /// Send navigation command (fire-and-forget) - uses page WebSocket with lazy recovery
+    /// Send navigation command (fire-and-forget) - uses page WebSocket
+    /// Does NOT attempt reconnect - command is dropped if ws is dead (avoids blocking)
     pub fn sendNavCommandAsync(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) void {
-        // Lazy recovery: try to reconnect if dead
-        self.ensurePageWsConnected() catch {};
-
+        // Don't try to reconnect here - it blocks. Just drop if dead.
         if (self.page_ws) |ws| {
-            ws.sendCommandAsync(method, params);
+            if (ws.running.load(.acquire)) {
+                ws.sendCommandAsync(method, params);
+            }
         }
     }
 
-    /// Check if page WebSocket is alive
-    fn isPageWsAlive(self: *CdpClient) bool {
+    /// Check if page WebSocket is alive (public for viewer to check)
+    pub fn isPageWsAlive(self: *CdpClient) bool {
         if (self.page_ws) |ws| {
             return ws.running.load(.acquire);
         }
@@ -582,11 +606,82 @@ pub const CdpClient = struct {
         return false;
     }
 
+    /// Try to reconnect dead WebSockets in background (never blocks main thread)
+    /// Spawns a background thread to handle reconnection
+    /// Returns true if reconnection was started
+    pub fn tryReconnectIfNeeded(self: *CdpClient) bool {
+        const page_alive = self.isPageWsAlive();
+        const browser_alive = self.isBrowserWsAlive();
+
+        // Check if both are alive - nothing to do
+        if (page_alive and browser_alive) {
+            return false;
+        }
+
+        logToFile("[CDP tryReconnect] page_alive={} browser_alive={}\n", .{ page_alive, browser_alive });
+
+        // Check if reconnect already in progress
+        if (self.reconnect_in_progress.load(.acquire)) {
+            logToFile("[CDP tryReconnect] already in progress, skipping\n", .{});
+            return false;
+        }
+
+        // Start background reconnect thread
+        logToFile("[CDP tryReconnect] spawning background thread\n", .{});
+        if (!self.reconnect_in_progress.swap(true, .acq_rel)) {
+            self.reconnect_thread = std.Thread.spawn(.{}, reconnectThreadFn, .{self}) catch |err| {
+                logToFile("[CDP tryReconnect] spawn failed: {}\n", .{err});
+                self.reconnect_in_progress.store(false, .release);
+                return false;
+            };
+            return true;
+        }
+        return false;
+    }
+
+    /// Background thread function for reconnection
+    fn reconnectThreadFn(self: *CdpClient) void {
+        defer self.reconnect_in_progress.store(false, .release);
+
+        logToFile("[CDP] Background reconnect thread started\n", .{});
+
+        // Try page_ws
+        if (!self.isPageWsAlive()) {
+            self.page_ws_mutex.lock();
+            defer self.page_ws_mutex.unlock();
+
+            if (!self.isPageWsAlive()) {
+                logToFile("[CDP] Reconnecting page_ws in background...\n", .{});
+                self.reconnectPageWebSocket() catch |err| {
+                    logToFile("[CDP] Background page_ws reconnect failed: {}\n", .{err});
+                };
+            }
+        }
+
+        // Try browser_ws
+        if (!self.isBrowserWsAlive()) {
+            logToFile("[CDP] Reconnecting browser_ws in background...\n", .{});
+            self.reconnectBrowserWebSocket() catch |err| {
+                logToFile("[CDP] Background browser_ws reconnect failed: {}\n", .{err});
+            };
+        }
+
+        logToFile("[CDP] Background reconnect thread done\n", .{});
+    }
+
     /// Ensure page WebSocket is connected (lazy recovery)
     /// Thread-safe: uses mutex to prevent multiple simultaneous reconnections
+    /// Uses backoff to avoid spamming reconnect attempts (which can hang on TCP read)
     fn ensurePageWsConnected(self: *CdpClient) !void {
         // Quick check without mutex (common case - ws is alive)
         if (self.isPageWsAlive()) return;
+
+        // Backoff: skip if we tried reconnecting within last 2 seconds
+        const now = std.time.nanoTimestamp();
+        const backoff_ns: i128 = 2 * std.time.ns_per_s;
+        if (now - self.last_page_ws_reconnect_ns < backoff_ns) {
+            return CdpError.WebSocketConnectionFailed;
+        }
 
         // Take mutex before reconnecting to prevent race condition
         self.page_ws_mutex.lock();
@@ -595,15 +690,36 @@ pub const CdpClient = struct {
         // Double-check after acquiring mutex (another thread may have reconnected)
         if (self.isPageWsAlive()) return;
 
+        // Update timestamp before attempting (so we don't spam even on failure)
+        self.last_page_ws_reconnect_ns = now;
+
         logToFile("[CDP] page_ws dead, attempting lazy recovery...\n", .{});
-        try self.reconnectPageWebSocket();
+        self.reconnectPageWebSocket() catch |err| {
+            logToFile("[CDP] page_ws reconnect failed: {}, will retry after backoff\n", .{err});
+            return err;
+        };
     }
 
     /// Ensure browser WebSocket is connected (lazy recovery)
+    /// Uses backoff to avoid spamming reconnect attempts
     fn ensureBrowserWsConnected(self: *CdpClient) !void {
         if (self.isBrowserWsAlive()) return;
+
+        // Backoff: skip if we tried reconnecting within last 2 seconds
+        const now = std.time.nanoTimestamp();
+        const backoff_ns: i128 = 2 * std.time.ns_per_s;
+        if (now - self.last_browser_ws_reconnect_ns < backoff_ns) {
+            return CdpError.WebSocketConnectionFailed;
+        }
+
+        // Update timestamp before attempting
+        self.last_browser_ws_reconnect_ns = now;
+
         logToFile("[CDP] browser_ws dead, attempting lazy recovery...\n", .{});
-        try self.reconnectBrowserWebSocket();
+        self.reconnectBrowserWebSocket() catch |err| {
+            logToFile("[CDP] browser_ws reconnect failed: {}, will retry after backoff\n", .{err});
+            return err;
+        };
     }
 
     /// Reconnect browser WebSocket
@@ -666,24 +782,18 @@ pub const CdpClient = struct {
         logToFile("[CDP reconnectWS] Done\n", .{});
     }
 
-    /// Send CDP command and wait for response - uses session (pipe) or WebSocket
+    /// Send CDP command and wait for response
+    /// All commands go through page_ws - pipe is ONLY for receiving screencast frames
     pub fn sendCommand(
         self: *CdpClient,
         method: []const u8,
         params: ?[]const u8,
     ) ![]u8 {
-        // WebSocket-only mode: use page_ws
-        if (self.pipe_client == null) {
-            if (self.page_ws) |ws| {
-                return ws.sendCommand(method, params);
-            }
-            return CdpError.WebSocketConnectionFailed;
+        if (self.page_ws) |ws| {
+            return ws.sendCommand(method, params);
         }
-        // Pipe mode: use pipe_client with session
-        if (self.session_id != null) {
-            return self.pipe_client.?.sendSessionCommand(self.session_id.?, method, params);
-        }
-        return self.pipe_client.?.sendCommand(method, params);
+        logToFile("[CDP] sendCommand failed: page_ws is null for {s}\n", .{method});
+        return CdpError.WebSocketConnectionFailed;
     }
 
     /// Send CDP command without waiting for response - uses session (pipe) or WebSocket
@@ -692,19 +802,34 @@ pub const CdpClient = struct {
         method: []const u8,
         params: ?[]const u8,
     ) !void {
-        // WebSocket-only mode: use page_ws
-        if (self.pipe_client == null) {
-            if (self.page_ws) |ws| {
-                ws.sendCommandAsync(method, params);
-                return;
+        // Try PIPE with session first for screencast commands
+        // If that fails or session is stale, fall through to WebSocket
+        const is_screencast = std.mem.startsWith(u8, method, "Page.screencast") or
+            std.mem.eql(u8, method, "Page.startScreencast") or
+            std.mem.eql(u8, method, "Page.stopScreencast");
+
+        if (is_screencast) {
+            if (self.pipe_client) |pc| {
+                if (self.session_id) |sid| {
+                    logToFile("[CDP] Routing {s} through PIPE with session\n", .{method});
+                    pc.sendSessionCommandAsync(sid, method, params) catch {};
+                    // ALSO send through WebSocket as backup (Chrome may respond to either)
+                    if (self.page_ws) |ws| {
+                        logToFile("[CDP] ALSO routing {s} through WebSocket\n", .{method});
+                        ws.sendCommandAsync(method, params);
+                    }
+                    return;
+                }
             }
-            return CdpError.WebSocketConnectionFailed;
         }
-        // Pipe mode: use pipe_client with session
-        if (self.session_id != null) {
-            return self.pipe_client.?.sendSessionCommandAsync(self.session_id.?, method, params);
+
+        // All other commands through page_ws
+        if (self.page_ws) |ws| {
+            ws.sendCommandAsync(method, params);
+            return;
         }
-        return self.pipe_client.?.sendCommandAsync(method, params);
+        logToFile("[CDP] sendCommandAsync failed: no channel for {s}\n", .{method});
+        return CdpError.WebSocketConnectionFailed;
     }
 
     /// Start screencast streaming
@@ -737,8 +862,15 @@ pub const CdpClient = struct {
         );
         defer self.allocator.free(params);
 
+        // Log which channel we're using
+        const has_pipe = self.pipe_client != null;
+        const has_session = self.session_id != null;
+        logToFile("[SCREENCAST] startScreencast: pipe={} session={} params={s}\n", .{ has_pipe, has_session, params });
+
         // Async - Chrome will start sending frames
-        self.sendCommandAsync("Page.startScreencast", params) catch {};
+        self.sendCommandAsync("Page.startScreencast", params) catch |err| {
+            logToFile("[SCREENCAST] startScreencast FAILED: {}\n", .{err});
+        };
     }
 
     /// Stop screencast streaming (for resize - keeps reader thread alive)
@@ -800,6 +932,43 @@ pub const CdpClient = struct {
         return self.pipe_client.?.getFrameCount();
     }
 
+    /// Reset frame pool - invalidate all cached frames (for screencast restart)
+    pub fn resetFramePool(self: *CdpClient) void {
+        if (self.pipe_client) |pc| {
+            pc.resetFramePool();
+        }
+        // TODO: Add WebSocket mode support if needed
+    }
+
+    /// Refresh PIPE session - re-attach to target to get fresh session_id
+    /// Call this when screencast stops working after navigation
+    pub fn refreshSession(self: *CdpClient) !void {
+        if (self.pipe_client == null) return; // WebSocket-only mode
+
+        const target_id = self.current_target_id orelse return error.NoTarget;
+
+        logToFile("[CDP] Refreshing session for target {s}\n", .{target_id});
+
+        // Free old session
+        if (self.session_id) |old_sid| {
+            self.allocator.free(old_sid);
+            self.session_id = null;
+        }
+
+        // Re-attach to target
+        var params_buf: [256]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"targetId\":\"{s}\",\"flatten\":true}}", .{target_id}) catch return error.OutOfMemory;
+
+        const attach_response = self.pipe_client.?.sendCommand("Target.attachToTarget", params) catch |err| {
+            logToFile("[CDP] refreshSession attachToTarget failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(attach_response);
+
+        self.session_id = try self.extractSessionId(attach_response);
+        logToFile("[CDP] Session refreshed, new session_id acquired\n", .{});
+    }
+
     /// Flush pending ACK (call from main loop)
     pub fn flushPendingAck(self: *CdpClient) void {
         if (self.pipe_client) |pc| {
@@ -813,29 +982,26 @@ pub const CdpClient = struct {
 
     /// Get next event from WebSockets
     /// Pipe is ONLY for screencast frames - all events come from WebSockets
-    /// Uses lazy recovery: reconnects dead WebSockets on demand
+    /// Does NOT attempt reconnect - returns null if ws is dead (avoids blocking)
     pub fn nextEvent(self: *CdpClient, allocator: std.mem.Allocator) !?CdpEvent {
         _ = allocator;
 
-        // Lazy recovery for browser_ws (download events)
-        self.ensureBrowserWsConnected() catch {};
-
-        // Check browser_ws for download events
+        // Check browser_ws for download events (no reconnect - would block)
         if (self.browser_ws) |bws| {
-            if (bws.nextEvent()) |raw| {
-                return CdpEvent{
-                    .method = raw.method,
-                    .payload = raw.payload,
-                    .allocator = bws.allocator,
-                };
+            if (bws.running.load(.acquire)) {
+                if (bws.nextEvent()) |raw| {
+                    return CdpEvent{
+                        .method = raw.method,
+                        .payload = raw.payload,
+                        .allocator = bws.allocator,
+                    };
+                }
             }
         }
 
-        // Lazy recovery for page_ws (page events)
-        self.ensurePageWsConnected() catch {};
-
-        // Check page_ws for page events
+        // Check page_ws for page events (no reconnect - would block)
         const ws = self.page_ws orelse return null;
+        if (!ws.running.load(.acquire)) return null;
         const raw = ws.nextEvent() orelse return null;
         return CdpEvent{
             .method = raw.method,

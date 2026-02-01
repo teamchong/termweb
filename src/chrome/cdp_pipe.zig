@@ -492,6 +492,11 @@ pub const PipeCdpClient = struct {
         return self.frame_count.load(.monotonic);
     }
 
+    /// Reset frame pool - invalidate all cached frames (for screencast restart)
+    pub fn resetFramePool(self: *PipeCdpClient) void {
+        self.frame_pool.reset();
+    }
+
     // NOTE: nextEvent removed - events come from nav_ws, not pipe
 
     fn readerThreadMain(self: *PipeCdpClient) void {
