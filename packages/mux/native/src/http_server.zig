@@ -21,6 +21,7 @@ pub const HttpServer = struct {
     running: std.atomic.Value(bool),
     panel_ws_port: u16,
     control_ws_port: u16,
+    file_ws_port: u16,
     ghostty_config: c.ghostty_config_t,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16, web_root: []const u8, ghostty_config: c.ghostty_config_t) !*HttpServer {
@@ -35,15 +36,17 @@ pub const HttpServer = struct {
             .running = std.atomic.Value(bool).init(false),
             .panel_ws_port = 0,
             .control_ws_port = 0,
+            .file_ws_port = 0,
             .ghostty_config = ghostty_config,
         };
 
         return server;
     }
 
-    pub fn setWsPorts(self: *HttpServer, panel_port: u16, control_port: u16) void {
+    pub fn setWsPorts(self: *HttpServer, panel_port: u16, control_port: u16, file_port: u16) void {
         self.panel_ws_port = panel_port;
         self.control_ws_port = control_port;
+        self.file_ws_port = file_port;
     }
 
     pub fn deinit(self: *HttpServer) void {
@@ -168,10 +171,11 @@ pub const HttpServer = struct {
 
         var body_buf: [512]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf,
-            \\{{"panelWsPort":{},"controlWsPort":{},"colors":{{"background":"#{x:0>2}{x:0>2}{x:0>2}","foreground":"#{x:0>2}{x:0>2}{x:0>2}"}}}}
+            \\{{"panelWsPort":{},"controlWsPort":{},"fileWsPort":{},"colors":{{"background":"#{x:0>2}{x:0>2}{x:0>2}","foreground":"#{x:0>2}{x:0>2}{x:0>2}"}}}}
         , .{
             self.panel_ws_port,
             self.control_ws_port,
+            self.file_ws_port,
             bg.r, bg.g, bg.b,
             fg.r, fg.g, fg.b,
         }) catch return;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
+const transfer = @import("transfer.zig");
 
 const c = @cImport({
     @cInclude("libdeflate.h");
@@ -1241,7 +1242,10 @@ const Server = struct {
     next_panel_id: u32,
     panel_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
+    file_ws_server: *ws.Server,
     http_server: *http.HttpServer,
+    transfer_manager: transfer.TransferManager,
+    file_connections: std.ArrayList(*ws.Connection),
     running: std.atomic.Value(bool),
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
@@ -1298,6 +1302,10 @@ const Server = struct {
         const panel_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
         panel_ws.setCallbacks(onPanelConnect, onPanelMessage, onPanelDisconnect);
 
+        // Create file WebSocket server (for file transfers - no deflate, we compress manually)
+        const file_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", 0);
+        file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
+
         server.* = .{
             .app = app,
             .config = config,
@@ -1313,6 +1321,9 @@ const Server = struct {
             .http_server = http_srv,
             .panel_ws_server = panel_ws,
             .control_ws_server = control_ws,
+            .file_ws_server = file_ws,
+            .transfer_manager = transfer.TransferManager.init(allocator),
+            .file_connections = .{},
             .running = std.atomic.Value(bool).init(false),
             .allocator = allocator,
             .mutex = .{},
@@ -1343,6 +1354,9 @@ const Server = struct {
         self.http_server.deinit();
         self.panel_ws_server.deinit();
         self.control_ws_server.deinit();
+        self.file_ws_server.deinit();
+        self.transfer_manager.deinit();
+        self.file_connections.deinit(self.allocator);
         c.ghostty_app_free(self.app);
         c.ghostty_config_free(self.config);
         global_server = null;
@@ -2474,6 +2488,282 @@ const Server = struct {
         };
     }
 
+    // Run file WebSocket server
+    fn runFileWebSocket(self: *Server) void {
+        self.file_ws_server.run() catch |err| {
+            std.debug.print("File WebSocket server error: {}\n", .{err});
+        };
+    }
+
+    // ========== File WebSocket callbacks ==========
+
+    fn onFileConnect(conn: *ws.Connection) void {
+        const self = global_server orelse return;
+
+        self.mutex.lock();
+        self.file_connections.append(self.allocator, conn) catch {};
+        self.mutex.unlock();
+
+        std.debug.print("File transfer client connected\n", .{});
+    }
+
+    fn onFileMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
+        const self = global_server orelse return;
+        if (!is_binary or data.len == 0) return;
+
+        const msg_type = data[0];
+
+        switch (msg_type) {
+            @intFromEnum(transfer.ClientMsgType.transfer_init) => self.handleTransferInit(conn, data),
+            @intFromEnum(transfer.ClientMsgType.file_list_request) => self.handleFileListRequest(conn, data),
+            @intFromEnum(transfer.ClientMsgType.file_data) => self.handleFileData(conn, data),
+            @intFromEnum(transfer.ClientMsgType.transfer_resume) => self.handleTransferResume(conn, data),
+            @intFromEnum(transfer.ClientMsgType.transfer_cancel) => self.handleTransferCancel(conn, data),
+            else => std.debug.print("Unknown file message type: 0x{x:0>2}\n", .{msg_type}),
+        }
+    }
+
+    fn onFileDisconnect(conn: *ws.Connection) void {
+        const self = global_server orelse return;
+
+        self.mutex.lock();
+        // Remove from file connections
+        for (self.file_connections.items, 0..) |fc, i| {
+            if (fc == conn) {
+                _ = self.file_connections.orderedRemove(i);
+                break;
+            }
+        }
+        self.mutex.unlock();
+
+        std.debug.print("File transfer client disconnected\n", .{});
+    }
+
+    // Handle TRANSFER_INIT message
+    fn handleTransferInit(self: *Server, conn: *ws.Connection, data: []u8) void {
+        var init_data = transfer.parseTransferInit(self.allocator, data) catch |err| {
+            std.debug.print("Failed to parse TRANSFER_INIT: {}\n", .{err});
+            return;
+        };
+        defer init_data.deinit(self.allocator);
+
+        // Expand ~ in path
+        const expanded_path = self.expandPath(init_data.path) catch init_data.path;
+        defer if (expanded_path.ptr != init_data.path.ptr) self.allocator.free(expanded_path);
+
+        // Create session
+        const session = self.transfer_manager.createSession(init_data.direction, init_data.flags, expanded_path) catch |err| {
+            std.debug.print("Failed to create transfer session: {}\n", .{err});
+            return;
+        };
+
+        // Add exclude patterns
+        for (init_data.excludes) |pattern| {
+            session.addExcludePattern(pattern) catch {};
+        }
+
+        // Store connection in session
+        conn.user_data = session;
+
+        // Send TRANSFER_READY
+        const ready_msg = transfer.buildTransferReady(self.allocator, session.id) catch return;
+        defer self.allocator.free(ready_msg);
+        conn.sendBinary(ready_msg) catch {};
+
+        std.debug.print("Transfer session {d} created: {s} -> {s}\n", .{
+            session.id,
+            if (init_data.direction == .upload) "browser" else "server",
+            if (init_data.direction == .upload) "server" else "browser",
+        });
+
+        // For downloads, build file list and send
+        if (init_data.direction == .download) {
+            session.buildFileList() catch |err| {
+                std.debug.print("Failed to build file list: {}\n", .{err});
+                const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read directory") catch return;
+                defer self.allocator.free(error_msg);
+                conn.sendBinary(error_msg) catch {};
+                return;
+            };
+
+            // If dry run, send report instead of file list
+            if (init_data.flags.dry_run) {
+                self.sendDryRunReport(conn, session);
+            } else {
+                const list_msg = transfer.buildFileList(self.allocator, session) catch return;
+                defer self.allocator.free(list_msg);
+                conn.sendBinary(list_msg) catch {};
+            }
+        }
+    }
+
+    // Handle FILE_LIST_REQUEST message
+    fn handleFileListRequest(self: *Server, conn: *ws.Connection, data: []u8) void {
+        if (data.len < 5) return;
+
+        const transfer_id = std.mem.readInt(u32, data[1..5], .little);
+        const session = self.transfer_manager.getSession(transfer_id) orelse return;
+
+        // Build file list
+        session.buildFileList() catch |err| {
+            std.debug.print("Failed to build file list: {}\n", .{err});
+            return;
+        };
+
+        const list_msg = transfer.buildFileList(self.allocator, session) catch return;
+        defer self.allocator.free(list_msg);
+        conn.sendBinary(list_msg) catch {};
+    }
+
+    // Handle FILE_DATA message (upload from browser)
+    fn handleFileData(self: *Server, conn: *ws.Connection, data: []u8) void {
+        const file_data = transfer.parseFileData(data) catch |err| {
+            std.debug.print("Failed to parse FILE_DATA: {}\n", .{err});
+            return;
+        };
+
+        const session = self.transfer_manager.getSession(file_data.transfer_id) orelse return;
+
+        if (file_data.file_index >= session.files.items.len) return;
+        const file_entry = session.files.items[file_data.file_index];
+
+        // Decompress the data
+        const uncompressed = session.decompress(file_data.compressed_data, file_data.uncompressed_size) catch |err| {
+            std.debug.print("Failed to decompress file data: {}\n", .{err});
+            return;
+        };
+        defer self.allocator.free(uncompressed);
+
+        // Build full path
+        const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ session.base_path, file_entry.path }) catch return;
+        defer self.allocator.free(full_path);
+
+        // Create parent directories if needed
+        if (std.mem.lastIndexOf(u8, full_path, "/")) |last_slash| {
+            const dir_path = full_path[0..last_slash];
+            std.fs.makeDirAbsolute(dir_path) catch |err| {
+                if (err != error.PathAlreadyExists) {
+                    // Try to create recursively
+                    var iter_path: []const u8 = "";
+                    var iter = std.mem.splitScalar(u8, dir_path, '/');
+                    while (iter.next()) |component| {
+                        if (component.len == 0) continue;
+                        iter_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ iter_path, component }) catch break;
+                        std.fs.makeDirAbsolute(iter_path) catch {};
+                    }
+                }
+            };
+        }
+
+        // Write to file
+        if (file_data.chunk_offset == 0) {
+            // Create new file
+            var file = std.fs.createFileAbsolute(full_path, .{}) catch |err| {
+                std.debug.print("Failed to create file {s}: {}\n", .{ full_path, err });
+                return;
+            };
+            defer file.close();
+            file.writeAll(uncompressed) catch {};
+        } else {
+            // Append to existing file
+            var file = std.fs.openFileAbsolute(full_path, .{ .mode = .write_only }) catch return;
+            defer file.close();
+            file.seekTo(file_data.chunk_offset) catch return;
+            file.writeAll(uncompressed) catch {};
+        }
+
+        // Update progress
+        session.bytes_transferred += uncompressed.len;
+
+        // Send ACK
+        const ack_msg = transfer.buildFileAck(self.allocator, file_data.transfer_id, file_data.file_index, session.bytes_transferred) catch return;
+        defer self.allocator.free(ack_msg);
+        conn.sendBinary(ack_msg) catch {};
+
+        // Check if transfer is complete
+        if (session.bytes_transferred >= session.total_bytes) {
+            const complete_msg = transfer.buildTransferComplete(self.allocator, session.id, session.bytes_transferred) catch return;
+            defer self.allocator.free(complete_msg);
+            conn.sendBinary(complete_msg) catch {};
+            session.deleteState();
+        } else {
+            // Save state for resume
+            session.saveState() catch {};
+        }
+    }
+
+    // Handle TRANSFER_RESUME message
+    fn handleTransferResume(self: *Server, conn: *ws.Connection, data: []u8) void {
+        if (data.len < 5) return;
+
+        const transfer_id = std.mem.readInt(u32, data[1..5], .little);
+
+        // Try to load saved state
+        const session = self.transfer_manager.resumeSession(transfer_id) catch |err| {
+            std.debug.print("Failed to resume transfer {d}: {}\n", .{ transfer_id, err });
+            const error_msg = transfer.buildTransferError(self.allocator, transfer_id, "Transfer state not found") catch return;
+            defer self.allocator.free(error_msg);
+            conn.sendBinary(error_msg) catch {};
+            return;
+        };
+
+        conn.user_data = session;
+
+        // Send TRANSFER_READY
+        const ready_msg = transfer.buildTransferReady(self.allocator, session.id) catch return;
+        defer self.allocator.free(ready_msg);
+        conn.sendBinary(ready_msg) catch {};
+
+        // Send file list with current progress
+        const list_msg = transfer.buildFileList(self.allocator, session) catch return;
+        defer self.allocator.free(list_msg);
+        conn.sendBinary(list_msg) catch {};
+
+        std.debug.print("Resumed transfer {d} at {d}/{d} bytes\n", .{ session.id, session.bytes_transferred, session.total_bytes });
+    }
+
+    // Handle TRANSFER_CANCEL message
+    fn handleTransferCancel(self: *Server, conn: *ws.Connection, data: []u8) void {
+        if (data.len < 5) return;
+
+        const transfer_id = std.mem.readInt(u32, data[1..5], .little);
+
+        if (self.transfer_manager.getSession(transfer_id)) |session| {
+            session.deleteState();
+        }
+        self.transfer_manager.removeSession(transfer_id);
+        conn.user_data = null;
+
+        std.debug.print("Transfer {d} cancelled\n", .{transfer_id});
+    }
+
+    // Send dry run report
+    fn sendDryRunReport(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
+        var entries: std.ArrayListUnmanaged(transfer.DryRunEntry) = .{};
+        defer entries.deinit(self.allocator);
+
+        for (session.files.items) |file| {
+            entries.append(self.allocator, .{
+                .action = .create, // TODO: Compare with destination to determine update/create
+                .path = file.path,
+                .size = file.size,
+            }) catch {};
+        }
+
+        const report_msg = transfer.buildDryRunReport(self.allocator, session.id, entries.items) catch return;
+        defer self.allocator.free(report_msg);
+        conn.sendBinary(report_msg) catch {};
+    }
+
+    // Expand ~ in path to home directory
+    fn expandPath(self: *Server, path: []const u8) ![]u8 {
+        if (path.len > 0 and path[0] == '~') {
+            const home = std.posix.getenv("HOME") orelse return error.NoHome;
+            return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home, path[1..] });
+        }
+        return self.allocator.dupe(u8, path);
+    }
+
     // Process pending panel creation requests (must run on main thread)
     fn processPendingPanels(self: *Server) void {
         self.mutex.lock();
@@ -2692,6 +2982,10 @@ const Server = struct {
         // Start panel WebSocket server in background
         const panel_thread = try std.Thread.spawn(.{}, runPanelWebSocket, .{self});
         defer panel_thread.join();
+
+        // Start file WebSocket server in background
+        const file_thread = try std.Thread.spawn(.{}, runFileWebSocket, .{self});
+        defer file_thread.join();
 
         // Run render loop in main thread
         self.runRenderLoop();
@@ -3027,13 +3321,15 @@ pub fn main() !void {
 
     const panel_port = server.panel_ws_server.listener.listen_address.getPort();
     const control_port = server.control_ws_server.listener.listen_address.getPort();
+    const file_port = server.file_ws_server.listener.listen_address.getPort();
 
     // Tell HTTP server about the WS ports so it can serve /config
-    server.http_server.setWsPorts(panel_port, control_port);
+    server.http_server.setWsPorts(panel_port, control_port, file_port);
 
     std.debug.print("  HTTP:              http://localhost:{}\n", .{args.http_port});
     std.debug.print("  Panel WebSocket:   ws://localhost:{}\n", .{panel_port});
     std.debug.print("  Control WebSocket: ws://localhost:{}\n", .{control_port});
+    std.debug.print("  File WebSocket:    ws://localhost:{}\n", .{file_port});
     std.debug.print("  Web root:          {s}\n", .{args.web_root});
     std.debug.print("\nServer initialized, waiting for connections...\n", .{});
 

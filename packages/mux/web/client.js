@@ -4,6 +4,7 @@
 // WebSocket ports are fetched from /config endpoint
 let PANEL_PORT = 0;
 let CONTROL_PORT = 0;
+let FILE_PORT = 0;
 
 // Message types (must match server)
 const ClientMsg = {
@@ -570,6 +571,13 @@ class Panel {
       this.height = height;
       this.canvas.width = width;
       this.canvas.height = height;
+      // Reconfigure context for new canvas size
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      this.context.configure({
+        device: this.device,
+        format: format,
+        alphaMode: 'opaque',
+      });
       this.createGPUBuffers(width, height);
     }
 
@@ -1242,6 +1250,7 @@ class SplitContainer {
 class App {
   constructor() {
     this.controlWs = null;
+    this.fileWs = null;             // File transfer WebSocket
     this.panels = new Map();        // panelId -> Panel
     this.tabs = new Map();          // tabId -> { root: SplitContainer, element: DOM, title: string }
     this.tabHistory = [];           // Tab activation history (most recent at end) for LRU switching
@@ -1250,6 +1259,10 @@ class App {
     this.nextLocalId = 1;
     this.nextTabId = 1;
     this.pendingSplit = null;       // Pending split operation waiting for panel_created
+
+    // File transfer state
+    this.activeTransfers = new Map();  // transferId -> TransferState
+    this.transferChunkSize = 256 * 1024; // 256KB chunks
 
     this.tabsEl = document.getElementById('tabs');
     this.panelsEl = document.getElementById('panels');
@@ -1332,6 +1345,13 @@ class App {
         e.preventDefault();
         e.stopPropagation();
         this.showDownloadDialog();
+        return;
+      }
+      // ⌘⇧F for folder sync
+      if (e.metaKey && e.shiftKey && (e.key === 'f' || e.key === 'F')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.showFolderTransferDialog();
         return;
       }
       // ⌘A for select all
@@ -1479,13 +1499,33 @@ class App {
     
     this.controlWs.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
-        // Binary message (file transfer)
-        this.handleBinaryFileData(event.data);
+        // Binary message - check first byte to distinguish control vs file transfer
+        const view = new DataView(event.data);
+        if (event.data.byteLength > 0) {
+          const msgType = view.getUint8(0);
+          if (msgType >= 0x01 && msgType <= 0x0F) {
+            // Binary control message (server -> client)
+            this.handleBinaryControlMessage(event.data);
+          } else {
+            // File transfer message (0x10-0x13) or client control echo
+            this.handleBinaryFileData(event.data);
+          }
+        }
       } else if (event.data instanceof Blob) {
         // Blob - convert to ArrayBuffer
-        event.data.arrayBuffer().then(buf => this.handleBinaryFileData(buf));
+        event.data.arrayBuffer().then(buf => {
+          const view = new DataView(buf);
+          if (buf.byteLength > 0) {
+            const msgType = view.getUint8(0);
+            if (msgType >= 0x01 && msgType <= 0x0F) {
+              this.handleBinaryControlMessage(buf);
+            } else {
+              this.handleBinaryFileData(buf);
+            }
+          }
+        });
       } else {
-        // Text message (JSON)
+        // Text message (JSON fallback)
         this.handleControlMessage(JSON.parse(event.data));
       }
     };
@@ -1499,8 +1539,11 @@ class App {
       this.setStatus('error', 'Connection error');
       console.error('Control error:', err);
     };
+
+    // Connect file transfer WebSocket
+    this.connectFileWs(host);
   }
-  
+
   handleControlMessage(msg) {
     console.log('Control message:', msg);
 
@@ -1581,7 +1624,108 @@ class App {
       // File transfer uses binary messages now (0x10, 0x11, 0x12, 0x13)
     }
   }
-  
+
+  // Handle binary control messages from server (0x01-0x0F)
+  // Parses binary protocol and converts to same format as handleControlMessage
+  handleBinaryControlMessage(data) {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+    const msgType = view.getUint8(0);
+    const decoder = new TextDecoder();
+
+    switch (msgType) {
+      case 0x01: { // panel_list
+        // Format: [type:u8][count:u8][panel_id:u32, title_len:u8, title...]*[layout_len:u16][layout_json]
+        const count = view.getUint8(1);
+        const panels = [];
+        let offset = 2;
+        for (let i = 0; i < count; i++) {
+          const panelId = view.getUint32(offset, true);
+          offset += 4;
+          const titleLen = view.getUint8(offset);
+          offset += 1;
+          const title = decoder.decode(bytes.slice(offset, offset + titleLen));
+          offset += titleLen;
+          panels.push({ panel_id: panelId, title });
+        }
+        const layoutLen = view.getUint16(offset, true);
+        offset += 2;
+        const layoutJson = decoder.decode(bytes.slice(offset, offset + layoutLen));
+        let layout = null;
+        try { layout = JSON.parse(layoutJson); } catch (e) {}
+        this.handleControlMessage({ type: 'panel_list', panels, layout });
+        break;
+      }
+      case 0x02: { // panel_created
+        // Format: [type:u8][panel_id:u32]
+        const panelId = view.getUint32(1, true);
+        this.handleControlMessage({ type: 'panel_created', panel_id: panelId });
+        break;
+      }
+      case 0x03: { // panel_closed
+        // Format: [type:u8][panel_id:u32]
+        const panelId = view.getUint32(1, true);
+        this.handleControlMessage({ type: 'panel_closed', panel_id: panelId });
+        break;
+      }
+      case 0x04: { // panel_title
+        // Format: [type:u8][panel_id:u32][title_len:u8][title...]
+        const panelId = view.getUint32(1, true);
+        const titleLen = view.getUint8(5);
+        const title = decoder.decode(bytes.slice(6, 6 + titleLen));
+        this.handleControlMessage({ type: 'panel_title', panel_id: panelId, title });
+        break;
+      }
+      case 0x05: { // panel_pwd
+        // Format: [type:u8][panel_id:u32][pwd_len:u16][pwd...]
+        const panelId = view.getUint32(1, true);
+        const pwdLen = view.getUint16(5, true);
+        const pwd = decoder.decode(bytes.slice(7, 7 + pwdLen));
+        this.handleControlMessage({ type: 'panel_pwd', panel_id: panelId, pwd });
+        break;
+      }
+      case 0x06: { // panel_bell
+        // Format: [type:u8][panel_id:u32]
+        const panelId = view.getUint32(1, true);
+        this.handleControlMessage({ type: 'panel_bell', panel_id: panelId });
+        break;
+      }
+      case 0x07: { // layout_update
+        // Format: [type:u8][layout_len:u16][layout_json...]
+        const layoutLen = view.getUint16(1, true);
+        const layoutJson = decoder.decode(bytes.slice(3, 3 + layoutLen));
+        let layout = null;
+        try { layout = JSON.parse(layoutJson); } catch (e) {}
+        this.handleControlMessage({ type: 'layout_update', layout });
+        break;
+      }
+      case 0x08: { // clipboard
+        // Format: [type:u8][data_len:u32][data...] (raw UTF-8, not base64)
+        const dataLen = view.getUint32(1, true);
+        const text = decoder.decode(bytes.slice(5, 5 + dataLen));
+        navigator.clipboard.writeText(text).then(() => {
+          console.log('Clipboard updated from terminal');
+        }).catch(err => {
+          console.error('Failed to write clipboard:', err);
+        });
+        break;
+      }
+      case 0x09: { // inspector_state
+        // Format: [type:u8][panel_id:u32][json_len:u16][json...]
+        const panelId = view.getUint32(1, true);
+        const jsonLen = view.getUint16(5, true);
+        const json = decoder.decode(bytes.slice(7, 7 + jsonLen));
+        try {
+          const state = JSON.parse(json);
+          this.updateInspectorUI(panelId, state);
+        } catch (e) {}
+        break;
+      }
+      default:
+        console.log('Unknown binary control message type:', msgType);
+    }
+  }
+
   // Create a new panel (used internally)
   createPanel(container, serverId = null) {
     const localId = this.nextLocalId++;
@@ -3116,6 +3260,563 @@ class App {
     console.log(`Downloaded ${filename}: ${compressedData.length} -> ${fileData.length} bytes (${ratio}% saved)`);
   }
 
+  // ============================================================================
+  // Fast File Transfer (Folder sync with resume support)
+  // ============================================================================
+
+  // Message types for file transfer protocol
+  static TransferMsgType = {
+    // Client -> Server
+    TRANSFER_INIT: 0x20,
+    FILE_LIST_REQUEST: 0x21,
+    FILE_DATA: 0x22,
+    TRANSFER_RESUME: 0x23,
+    TRANSFER_CANCEL: 0x24,
+    // Server -> Client
+    TRANSFER_READY: 0x30,
+    FILE_LIST: 0x31,
+    FILE_REQUEST: 0x32,
+    FILE_ACK: 0x33,
+    TRANSFER_COMPLETE: 0x34,
+    TRANSFER_ERROR: 0x35,
+    DRY_RUN_REPORT: 0x36,
+  };
+
+  connectFileWs(host = 'localhost') {
+    if (!FILE_PORT) {
+      console.log('File transfer port not available');
+      return;
+    }
+
+    this.fileWs = new WebSocket(`ws://${host}:${FILE_PORT}`);
+    this.fileWs.binaryType = 'arraybuffer';
+
+    this.fileWs.onopen = () => {
+      console.log('File transfer channel connected');
+    };
+
+    this.fileWs.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        this.handleFileTransferMessage(event.data);
+      }
+    };
+
+    this.fileWs.onclose = () => {
+      console.log('File transfer channel disconnected');
+    };
+
+    this.fileWs.onerror = (err) => {
+      console.error('File transfer error:', err);
+    };
+  }
+
+  handleFileTransferMessage(data) {
+    const view = new DataView(data);
+    const msgType = view.getUint8(0);
+
+    switch (msgType) {
+      case App.TransferMsgType.TRANSFER_READY:
+        this.handleTransferReady(data);
+        break;
+      case App.TransferMsgType.FILE_LIST:
+        this.handleFileList(data);
+        break;
+      case App.TransferMsgType.FILE_REQUEST:
+        this.handleFileRequest(data);
+        break;
+      case App.TransferMsgType.FILE_ACK:
+        this.handleFileAck(data);
+        break;
+      case App.TransferMsgType.TRANSFER_COMPLETE:
+        this.handleTransferComplete(data);
+        break;
+      case App.TransferMsgType.TRANSFER_ERROR:
+        this.handleTransferError(data);
+        break;
+      case App.TransferMsgType.DRY_RUN_REPORT:
+        this.handleDryRunReport(data);
+        break;
+      default:
+        console.error('Unknown file transfer message type:', msgType);
+    }
+  }
+
+  handleTransferReady(data) {
+    const view = new DataView(data);
+    const transferId = view.getUint32(1, true);
+    console.log(`Transfer ${transferId} ready`);
+
+    const transfer = this.activeTransfers.get(transferId) || {};
+    transfer.id = transferId;
+    transfer.state = 'ready';
+    this.activeTransfers.set(transferId, transfer);
+  }
+
+  handleFileList(data) {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+
+    let offset = 1;
+    const transferId = view.getUint32(offset, true); offset += 4;
+    const fileCount = view.getUint32(offset, true); offset += 4;
+    const totalBytes = Number(view.getBigUint64(offset, true)); offset += 8;
+
+    const files = [];
+    for (let i = 0; i < fileCount; i++) {
+      const pathLen = view.getUint16(offset, true); offset += 2;
+      const path = new TextDecoder().decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
+      const size = Number(view.getBigUint64(offset, true)); offset += 8;
+      const mtime = Number(view.getBigUint64(offset, true)); offset += 8;
+      const hash = view.getBigUint64(offset, true); offset += 8;
+      const isDir = bytes[offset] !== 0; offset += 1;
+
+      files.push({ path, size, mtime, hash, isDir });
+    }
+
+    console.log(`Transfer ${transferId}: ${fileCount} files, ${this.formatBytes(totalBytes)}`);
+
+    const transfer = this.activeTransfers.get(transferId) || {};
+    transfer.files = files;
+    transfer.totalBytes = totalBytes;
+    transfer.currentFileIndex = 0;
+    transfer.bytesTransferred = 0;
+    this.activeTransfers.set(transferId, transfer);
+
+    // If this is a download, start requesting files
+    if (transfer.direction === 'download') {
+      this.requestNextFile(transferId);
+    }
+  }
+
+  handleFileRequest(data) {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+
+    let offset = 1;
+    const transferId = view.getUint32(offset, true); offset += 4;
+    const fileIndex = view.getUint32(offset, true); offset += 4;
+    const chunkOffset = Number(view.getBigUint64(offset, true)); offset += 8;
+    const uncompressedSize = view.getUint32(offset, true); offset += 4;
+    const compressedData = bytes.slice(offset);
+
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer) return;
+
+    // Decompress using native DecompressionStream
+    this.decompressData(compressedData).then(fileData => {
+      const file = transfer.files[fileIndex];
+      console.log(`Received ${file.path}: ${this.formatBytes(fileData.length)}`);
+
+      // For downloads, collect file data
+      if (!transfer.receivedFiles) transfer.receivedFiles = new Map();
+      if (!transfer.receivedFiles.has(fileIndex)) {
+        transfer.receivedFiles.set(fileIndex, []);
+      }
+      transfer.receivedFiles.get(fileIndex).push({ offset: chunkOffset, data: fileData });
+
+      transfer.bytesTransferred += fileData.length;
+
+      // Check if file is complete
+      if (transfer.bytesTransferred >= file.size) {
+        // Combine chunks and save
+        const chunks = transfer.receivedFiles.get(fileIndex);
+        chunks.sort((a, b) => a.offset - b.offset);
+        const fullData = new Uint8Array(file.size);
+        let writeOffset = 0;
+        for (const chunk of chunks) {
+          fullData.set(chunk.data, writeOffset);
+          writeOffset += chunk.data.length;
+        }
+
+        // Trigger browser download for this file
+        this.saveFile(file.path, fullData);
+        transfer.receivedFiles.delete(fileIndex);
+        transfer.currentFileIndex++;
+
+        // Request next file
+        this.requestNextFile(transferId);
+      }
+    }).catch(err => {
+      console.error('Decompression failed:', err);
+    });
+  }
+
+  handleFileAck(data) {
+    const view = new DataView(data);
+    const transferId = view.getUint32(1, true);
+    const fileIndex = view.getUint32(5, true);
+    const bytesReceived = Number(view.getBigUint64(9, true));
+
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer) return;
+
+    transfer.bytesTransferred = bytesReceived;
+
+    // Send next chunk
+    this.sendNextChunk(transferId);
+  }
+
+  handleTransferComplete(data) {
+    const view = new DataView(data);
+    const transferId = view.getUint32(1, true);
+    const totalBytes = Number(view.getBigUint64(5, true));
+
+    console.log(`Transfer ${transferId} complete: ${this.formatBytes(totalBytes)}`);
+
+    const transfer = this.activeTransfers.get(transferId);
+    if (transfer) {
+      transfer.state = 'complete';
+    }
+    this.activeTransfers.delete(transferId);
+  }
+
+  handleTransferError(data) {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+
+    const transferId = view.getUint32(1, true);
+    const errorLen = view.getUint16(5, true);
+    const error = new TextDecoder().decode(bytes.slice(7, 7 + errorLen));
+
+    console.error(`Transfer ${transferId} error: ${error}`);
+    alert(`Transfer failed: ${error}`);
+    this.activeTransfers.delete(transferId);
+  }
+
+  handleDryRunReport(data) {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+
+    let offset = 1;
+    const transferId = view.getUint32(offset, true); offset += 4;
+    const newCount = view.getUint32(offset, true); offset += 4;
+    const updateCount = view.getUint32(offset, true); offset += 4;
+    const deleteCount = view.getUint32(offset, true); offset += 4;
+
+    const entries = [];
+    while (offset < data.byteLength) {
+      const action = bytes[offset]; offset += 1;
+      const pathLen = view.getUint16(offset, true); offset += 2;
+      const path = new TextDecoder().decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
+      const size = Number(view.getBigUint64(offset, true)); offset += 8;
+
+      entries.push({ action: ['create', 'update', 'delete'][action], path, size });
+    }
+
+    console.log(`Dry run report: ${newCount} new, ${updateCount} update, ${deleteCount} delete`);
+    console.table(entries);
+
+    // Show preview dialog
+    this.showDryRunPreview(transferId, { newCount, updateCount, deleteCount, entries });
+  }
+
+  // Compress data using native CompressionStream
+  async compressData(data) {
+    const cs = new CompressionStream('deflate-raw');
+    const writer = cs.writable.getWriter();
+    writer.write(data);
+    writer.close();
+
+    const chunks = [];
+    const reader = cs.readable.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+
+    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return result;
+  }
+
+  // Decompress data using native DecompressionStream
+  async decompressData(data) {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    writer.write(data);
+    writer.close();
+
+    const chunks = [];
+    const reader = ds.readable.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+
+    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return result;
+  }
+
+  // Start a folder upload
+  async startFolderUpload(dirHandle, serverPath, options = {}) {
+    if (!this.fileWs || this.fileWs.readyState !== WebSocket.OPEN) {
+      console.error('File transfer WebSocket not connected');
+      return;
+    }
+
+    const { deleteExtra = false, dryRun = false, excludes = [] } = options;
+
+    // Collect files from directory handle
+    const files = await this.collectFilesFromHandle(dirHandle, '');
+
+    // Build TRANSFER_INIT message
+    const pathBytes = new TextEncoder().encode(serverPath);
+    const excludeBytes = excludes.map(p => new TextEncoder().encode(p));
+    const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
+
+    const msgLen = 1 + 1 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, App.TransferMsgType.TRANSFER_INIT); offset += 1;
+    view.setUint8(offset, 0); // direction: upload offset += 1;
+    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0)); offset += 1;
+    view.setUint8(offset, excludes.length); offset += 1;
+    view.setUint16(offset, pathBytes.length, true); offset += 2;
+    bytes.set(pathBytes, offset); offset += pathBytes.length;
+
+    for (const exclude of excludeBytes) {
+      view.setUint8(offset, exclude.length); offset += 1;
+      bytes.set(exclude, offset); offset += exclude.length;
+    }
+
+    this.fileWs.send(msg);
+
+    // Store transfer state
+    const transferId = Date.now(); // Temporary ID until server responds
+    this.activeTransfers.set(transferId, {
+      direction: 'upload',
+      files,
+      dirHandle,
+      options,
+      state: 'pending',
+    });
+  }
+
+  // Start a folder download
+  async startFolderDownload(serverPath, options = {}) {
+    if (!this.fileWs || this.fileWs.readyState !== WebSocket.OPEN) {
+      console.error('File transfer WebSocket not connected');
+      return;
+    }
+
+    const { deleteExtra = false, dryRun = false, excludes = [] } = options;
+
+    // Build TRANSFER_INIT message
+    const pathBytes = new TextEncoder().encode(serverPath);
+    const excludeBytes = excludes.map(p => new TextEncoder().encode(p));
+    const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
+
+    const msgLen = 1 + 1 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, App.TransferMsgType.TRANSFER_INIT); offset += 1;
+    view.setUint8(offset, 1); // direction: download offset += 1;
+    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0)); offset += 1;
+    view.setUint8(offset, excludes.length); offset += 1;
+    view.setUint16(offset, pathBytes.length, true); offset += 2;
+    bytes.set(pathBytes, offset); offset += pathBytes.length;
+
+    for (const exclude of excludeBytes) {
+      view.setUint8(offset, exclude.length); offset += 1;
+      bytes.set(exclude, offset); offset += exclude.length;
+    }
+
+    this.fileWs.send(msg);
+
+    // Store transfer state
+    const transferId = Date.now(); // Temporary ID until server responds
+    this.activeTransfers.set(transferId, {
+      direction: 'download',
+      serverPath,
+      options,
+      state: 'pending',
+    });
+  }
+
+  // Collect files from a directory handle (File System Access API)
+  async collectFilesFromHandle(dirHandle, prefix) {
+    const files = [];
+
+    for await (const [name, handle] of dirHandle.entries()) {
+      const path = prefix ? `${prefix}/${name}` : name;
+
+      if (handle.kind === 'directory') {
+        files.push({ path, isDir: true, size: 0 });
+        const subFiles = await this.collectFilesFromHandle(handle, path);
+        files.push(...subFiles);
+      } else {
+        const file = await handle.getFile();
+        files.push({
+          path,
+          isDir: false,
+          size: file.size,
+          handle,
+          file,
+        });
+      }
+    }
+
+    return files;
+  }
+
+  // Send next chunk of an upload
+  async sendNextChunk(transferId) {
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer || transfer.direction !== 'upload') return;
+
+    const file = transfer.files[transfer.currentFileIndex];
+    if (!file || file.isDir) {
+      transfer.currentFileIndex++;
+      if (transfer.currentFileIndex < transfer.files.length) {
+        this.sendNextChunk(transferId);
+      }
+      return;
+    }
+
+    const fileData = await file.file.arrayBuffer();
+    const chunkStart = transfer.currentChunkOffset || 0;
+    const chunkEnd = Math.min(chunkStart + this.transferChunkSize, fileData.byteLength);
+    const chunk = new Uint8Array(fileData.slice(chunkStart, chunkEnd));
+
+    // Compress the chunk
+    const compressed = await this.compressData(chunk);
+
+    // Build FILE_DATA message
+    const msgLen = 1 + 4 + 4 + 8 + 4 + compressed.length;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, App.TransferMsgType.FILE_DATA); offset += 1;
+    view.setUint32(offset, transfer.id, true); offset += 4;
+    view.setUint32(offset, transfer.currentFileIndex, true); offset += 4;
+    view.setBigUint64(offset, BigInt(chunkStart), true); offset += 8;
+    view.setUint32(offset, chunk.length, true); offset += 4;
+    bytes.set(compressed, offset);
+
+    this.fileWs.send(msg);
+
+    // Update chunk offset
+    transfer.currentChunkOffset = chunkEnd;
+    if (chunkEnd >= fileData.byteLength) {
+      transfer.currentFileIndex++;
+      transfer.currentChunkOffset = 0;
+    }
+  }
+
+  requestNextFile(transferId) {
+    // For downloads, the server pushes FILE_REQUEST messages
+    // This is called after we've fully received a file
+  }
+
+  saveFile(path, data) {
+    const filename = path.split('/').pop();
+    const blob = new Blob([data]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  showDryRunPreview(transferId, report) {
+    // TODO: Show a nice modal with the dry run results
+    const msg = `Preview:\n- ${report.newCount} new files\n- ${report.updateCount} updated files\n- ${report.deleteCount} files to delete\n\nProceed with transfer?`;
+    if (confirm(msg)) {
+      // Send actual transfer
+      const transfer = this.activeTransfers.get(transferId);
+      if (transfer) {
+        transfer.options.dryRun = false;
+        if (transfer.direction === 'upload') {
+          this.startFolderUpload(transfer.dirHandle, transfer.serverPath, transfer.options);
+        } else {
+          this.startFolderDownload(transfer.serverPath, transfer.options);
+        }
+      }
+    }
+    this.activeTransfers.delete(transferId);
+  }
+
+  // Show folder transfer dialog
+  showFolderTransferDialog() {
+    const overlay = document.getElementById('folder-transfer-dialog');
+    if (!overlay) return;
+
+    overlay.classList.add('visible');
+    const pathInput = overlay.querySelector('#folder-transfer-path');
+    const excludeInput = overlay.querySelector('#folder-transfer-exclude');
+    const deleteCheckbox = overlay.querySelector('#folder-transfer-delete');
+    const previewCheckbox = overlay.querySelector('#folder-transfer-preview');
+
+    pathInput.value = '~/';
+    excludeInput.value = 'node_modules,.git,.DS_Store';
+    deleteCheckbox.checked = false;
+    previewCheckbox.checked = true;
+
+    const cleanup = () => {
+      overlay.classList.remove('visible');
+    };
+
+    const uploadBtn = overlay.querySelector('.folder-upload-btn');
+    const downloadBtn = overlay.querySelector('.folder-download-btn');
+    const cancelBtn = overlay.querySelector('.dialog-btn.cancel');
+
+    uploadBtn.onclick = async () => {
+      try {
+        const dirHandle = await window.showDirectoryPicker();
+        const serverPath = pathInput.value.trim() || '~/';
+        const excludes = excludeInput.value.split(',').map(s => s.trim()).filter(s => s);
+        const deleteExtra = deleteCheckbox.checked;
+        const dryRun = previewCheckbox.checked;
+
+        await this.startFolderUpload(dirHandle, serverPath, { deleteExtra, dryRun, excludes });
+        cleanup();
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          console.error('Folder picker error:', err);
+        }
+      }
+    };
+
+    downloadBtn.onclick = async () => {
+      const serverPath = pathInput.value.trim() || '~/';
+      const excludes = excludeInput.value.split(',').map(s => s.trim()).filter(s => s);
+      const deleteExtra = deleteCheckbox.checked;
+      const dryRun = previewCheckbox.checked;
+
+      await this.startFolderDownload(serverPath, { deleteExtra, dryRun, excludes });
+      cleanup();
+    };
+
+    cancelBtn.onclick = cleanup;
+    overlay.onclick = (e) => {
+      if (e.target === overlay) cleanup();
+    };
+  }
+
   promptChangeTitle() {
     // Get current title
     const tab = this.tabs.get(this.activeTab);
@@ -3309,6 +4010,9 @@ function setupMenus() {
         case 'download':
           app.showDownloadDialog();
           break;
+        case 'folder-transfer':
+          app.showFolderTransferDialog();
+          break;
         case 'split-right':
           if (app.activePanel) {
             app.splitActivePanel('right');
@@ -3432,6 +4136,7 @@ async function init() {
     const config = await response.json();
     PANEL_PORT = config.panelWsPort;
     CONTROL_PORT = config.controlWsPort;
+    FILE_PORT = config.fileWsPort;
     console.log('Config loaded:', config);
 
     // Apply colors from ghostty config

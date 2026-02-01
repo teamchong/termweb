@@ -64,6 +64,11 @@ pub fn build(b: *std.Build) !void {
         server.addCSourceFile(.{ .file = b.path("../../../vendor/libdeflate/lib/x86/cpu_features.c"), .flags = &.{"-O2"} });
     }
     server.addIncludePath(b.path("../../../vendor/libdeflate"));
+
+    // Add xxHash for SIMD-accelerated hashing (XXH3)
+    server.addIncludePath(b.path("../../../vendor/xxhash"));
+    server.addCSourceFile(.{ .file = b.path("../../../vendor/xxhash/xxhash.c"), .flags = &.{"-O2"} });
+
     server.linkLibC();
 
     b.installArtifact(server);

@@ -1108,6 +1108,7 @@
             <div class="menu-separator"></div>
             <div class="menu-item" data-action="upload"><span class="menu-icon">⬆</span><span class="menu-text">Upload...</span><span class="shortcut">⌘U</span></div>
             <div class="menu-item" data-action="download"><span class="menu-icon">⬇</span><span class="menu-text">Download...</span><span class="shortcut">⌘<span class="shift">⇧</span>S</span></div>
+            <div class="menu-item" data-action="folder-transfer"><span class="menu-icon">📁</span><span class="menu-text">Folder Sync...</span><span class="shortcut">⌘<span class="shift">⇧</span>F</span></div>
             <div class="menu-separator"></div>
             <div class="menu-item" data-action="split-right"><span class="menu-icon">⬚▐</span><span class="menu-text">Split Right</span><span class="shortcut">⌘D</span></div>
             <div class="menu-item" data-action="split-down"><span class="menu-icon">⬚▄</span><span class="menu-text">Split Down</span><span class="shortcut">⌘<span class="shift">⇧</span>D</span></div>
@@ -1182,6 +1183,38 @@
       <div class="dialog-buttons">
         <button class="dialog-btn cancel">Cancel</button>
         <button class="dialog-btn confirm">Download</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Folder transfer dialog -->
+  <div id="folder-transfer-dialog" class="dialog-overlay">
+    <div class="dialog-box" style="min-width: 400px;">
+      <div class="dialog-title">Folder Sync</div>
+      <div style="margin-bottom: 12px;">
+        <label style="display: block; margin-bottom: 4px; color: var(--text-dim); font-size: 12px;">Remote Path</label>
+        <input type="text" id="folder-transfer-path" placeholder="~/folder" autocomplete="off" />
+      </div>
+      <div style="margin-bottom: 12px;">
+        <label style="display: block; margin-bottom: 4px; color: var(--text-dim); font-size: 12px;">Exclude patterns (comma-separated)</label>
+        <input type="text" id="folder-transfer-exclude" placeholder="node_modules,.git,.DS_Store" autocomplete="off" />
+      </div>
+      <div style="margin-bottom: 12px; display: flex; gap: 16px;">
+        <label style="display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; cursor: pointer;">
+          <input type="checkbox" id="folder-transfer-delete" />
+          Delete extra files
+        </label>
+        <label style="display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; cursor: pointer;">
+          <input type="checkbox" id="folder-transfer-preview" checked />
+          Preview changes
+        </label>
+      </div>
+      <div class="dialog-buttons" style="justify-content: space-between;">
+        <button class="dialog-btn cancel">Cancel</button>
+        <div style="display: flex; gap: 8px;">
+          <button class="dialog-btn confirm folder-download-btn">⬇ Download</button>
+          <button class="dialog-btn confirm folder-upload-btn">⬆ Upload</button>
+        </div>
       </div>
     </div>
   </div>
