@@ -256,13 +256,23 @@ export class SplitContainer {
     }
   }
 
-  // Equalize all split ratios to 50/50
+  // Count the number of leaf panels in this subtree
+  private weight(): number {
+    if (this.panel) return 1;
+    const leftWeight = this.first?.weight() ?? 0;
+    const rightWeight = this.second?.weight() ?? 0;
+    return leftWeight + rightWeight;
+  }
+
+  // Equalize splits based on the number of leaves on each side (like Ghostty)
   equalize(): void {
-    if (this.direction !== null) {
-      this.ratio = 0.5;
+    if (this.direction !== null && this.first && this.second) {
+      const leftWeight = this.first.weight();
+      const rightWeight = this.second.weight();
+      this.ratio = leftWeight / (leftWeight + rightWeight);
       this.applyRatio();
-      this.first?.equalize();
-      this.second?.equalize();
+      this.first.equalize();
+      this.second.equalize();
     }
   }
 
