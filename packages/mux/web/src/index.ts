@@ -1610,16 +1610,16 @@ class App {
       path = path.slice(0, -1);
     }
 
+    // Log options (server doesn't support these yet)
+    if (preview || deleteExtra || excludes.length > 0) {
+      console.log('Download options (not yet implemented server-side):', { preview, deleteExtra, excludes });
+    }
+
     const panelId = this.activePanel.serverId;
     const pathBytes = new TextEncoder().encode(path);
 
-    // Encode exclude patterns
-    const excludeBytes = excludes.map(e => new TextEncoder().encode(e));
-    const excludeTotalLen = excludeBytes.reduce((sum, b) => sum + 1 + b.length, 0);
-
-    // Message format: type(1) + panelId(4) + flags(1) + excludeCount(1) + pathLen(2) + path + excludes
-    const flags = (deleteExtra ? 0x01 : 0) | (preview ? 0x02 : 0);
-    const msgLen = 1 + 4 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
+    // Message format: type(1) + panelId(4) + pathLen(2) + path
+    const msgLen = 1 + 4 + 2 + pathBytes.length;
     const msg = new ArrayBuffer(msgLen);
     const view = new DataView(msg);
     const bytes = new Uint8Array(msg);
@@ -1627,22 +1627,11 @@ class App {
     let offset = 0;
     view.setUint8(offset, isFolder ? 0x14 : 0x11); offset += 1;
     view.setUint32(offset, panelId, true); offset += 4;
-    view.setUint8(offset, flags); offset += 1;
-    view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
-    bytes.set(pathBytes, offset); offset += pathBytes.length;
-
-    for (const eb of excludeBytes) {
-      view.setUint8(offset, eb.length); offset += 1;
-      bytes.set(eb, offset); offset += eb.length;
-    }
+    bytes.set(pathBytes, offset);
 
     this.controlWs?.send(msg);
-    console.log(`Requesting ${isFolder ? 'folder' : 'file'} download: ${path}`, { preview, deleteExtra, excludes });
-
-    if (preview) {
-      console.log('Preview mode - will show dry-run results');
-    }
+    console.log(`Requesting ${isFolder ? 'folder' : 'file'} download: ${path}`);
   }
 
   private uploadFile(file: File): void {
