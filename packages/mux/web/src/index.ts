@@ -39,6 +39,7 @@ class App {
   private host: string;
   private nextTabId = 1;
   private pendingSplit: { parentPanelId: number; direction: string; container: SplitContainer } | null = null;
+  private pendingDownload: DownloadOptions | null = null;
   private quickTerminalPanel: Panel | null = null;
   private previousActivePanel: Panel | null = null;
 
@@ -395,8 +396,17 @@ class App {
       case 0x12: // FILE_DATA (single file download response)
         this.handleFileData(data);
         break;
+      case 0x13: // FILE_ERROR
+        this.handleFileError(data);
+        break;
       case 0x15: // FOLDER_DATA (zip download response)
         this.handleFolderData(data);
+        break;
+      case 0x19: // FILE_PREVIEW response
+        this.handleFilePreview(data);
+        break;
+      case 0x1A: // FOLDER_PREVIEW response
+        this.handleFolderPreview(data);
         break;
     }
   }
@@ -742,6 +752,55 @@ class App {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     console.log(`Downloaded ${filename}: ${formatBytes(data.length)}`);
+  }
+
+  private handleFileError(data: ArrayBuffer): void {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+    const errorLen = view.getUint16(1, true);
+    const error = new TextDecoder().decode(bytes.slice(3, 3 + errorLen));
+    console.error('File transfer error:', error);
+    alert(`Download error: ${error}`);
+  }
+
+  private handleFilePreview(data: ArrayBuffer): void {
+    // Format: [0x19][name_len:u16][name][size:u64]
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+    const nameLen = view.getUint16(1, true);
+    const name = new TextDecoder().decode(bytes.slice(3, 3 + nameLen));
+    const size = Number(view.getBigUint64(3 + nameLen, true));
+
+    this.showDownloadPreview(name, size, false, 1);
+  }
+
+  private handleFolderPreview(data: ArrayBuffer): void {
+    // Format: [0x1A][name_len:u16][name.zip][size:u64][file_count:u32]
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+    const nameLen = view.getUint16(1, true);
+    const name = new TextDecoder().decode(bytes.slice(3, 3 + nameLen));
+    const size = Number(view.getBigUint64(3 + nameLen, true));
+    const fileCount = view.getUint32(3 + nameLen + 8, true);
+
+    this.showDownloadPreview(name, size, true, fileCount);
+  }
+
+  private showDownloadPreview(name: string, size: number, isFolder: boolean, fileCount: number): void {
+    const message = isFolder
+      ? `Folder: ${name}\nFiles: ${fileCount}\nEstimated size: ${formatBytes(size)}\n\nProceed with download?`
+      : `File: ${name}\nSize: ${formatBytes(size)}\n\nProceed with download?`;
+
+    if (confirm(message)) {
+      // Send actual download request
+      if (this.pendingDownload) {
+        const opts = { ...this.pendingDownload, preview: false };
+        this.pendingDownload = null;
+        this.requestDownload(opts);
+      }
+    } else {
+      this.pendingDownload = null;
+    }
   }
 
   // ============================================================================
@@ -1602,17 +1661,12 @@ class App {
       return;
     }
 
-    let { path, excludes, deleteExtra, preview } = options;
+    let { path, preview } = options;
     let isFolder = false;
 
     if (path.endsWith('/')) {
       isFolder = true;
       path = path.slice(0, -1);
-    }
-
-    // Log options (server doesn't support these yet)
-    if (preview || deleteExtra || excludes.length > 0) {
-      console.log('Download options (not yet implemented server-side):', { preview, deleteExtra, excludes });
     }
 
     const panelId = this.activePanel.serverId;
@@ -1625,13 +1679,22 @@ class App {
     const bytes = new Uint8Array(msg);
 
     let offset = 0;
-    view.setUint8(offset, isFolder ? 0x14 : 0x11); offset += 1;
+
+    if (preview) {
+      // Send preview request (0x17 for file, 0x18 for folder)
+      this.pendingDownload = { ...options, path }; // Store for later use
+      view.setUint8(offset, isFolder ? 0x18 : 0x17); offset += 1;
+    } else {
+      // Send actual download request (0x11 for file, 0x14 for folder)
+      view.setUint8(offset, isFolder ? 0x14 : 0x11); offset += 1;
+    }
+
     view.setUint32(offset, panelId, true); offset += 4;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset);
 
     this.controlWs?.send(msg);
-    console.log(`Requesting ${isFolder ? 'folder' : 'file'} download: ${path}`);
+    console.log(`Requesting ${preview ? 'preview' : 'download'} for ${isFolder ? 'folder' : 'file'}: ${path}`);
   }
 
   private uploadFile(file: File): void {

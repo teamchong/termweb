@@ -694,7 +694,8 @@ const Panel = struct {
         };
     }
 
-    // OPTIMIZED: Encode directly from IOSurface - skips BGRA copy when no scaling needed
+    // OPTIMIZED: Encode directly from IOSurface when no scaling needed
+    // Falls back to BGRA copy path when scaling is required
     fn prepareFrameFromIOSurface(self: *Panel, iosurface: IOSurfacePtr) !?struct { data: []const u8, is_keyframe: bool } {
         // Check IOSurface seed - if unchanged, surface wasn't modified, skip encoding
         const seed = c.IOSurfaceGetSeed(iosurface);
@@ -705,25 +706,26 @@ const Panel = struct {
 
         const surf_width: u32 = @intCast(c.IOSurfaceGetWidth(iosurface));
         const surf_height: u32 = @intCast(c.IOSurfaceGetHeight(iosurface));
+        const new_size = surf_width * surf_height * 4;
 
         // Lazy init video encoder on first frame
         if (self.video_encoder == null) {
-            std.debug.print("ENCODER: Creating encoder for {}x{} (direct IOSurface)\n", .{ surf_width, surf_height });
             self.video_encoder = try video.VideoEncoder.init(self.allocator, surf_width, surf_height);
-            // Allocate BGRA buffer only if scaling is needed
-            const scaled_w = self.video_encoder.?.width;
-            const scaled_h = self.video_encoder.?.height;
-            if (scaled_w != surf_width or scaled_h != surf_height) {
-                self.bgra_buffer = try self.allocator.alloc(u8, scaled_w * scaled_h * 4);
+            // Only allocate BGRA buffer if scaling is needed
+            if (!self.video_encoder.?.canEncodeDirectly()) {
+                std.debug.print("ENCODER: {}x{} -> {}x{} (scaling, BGRA path)\n", .{
+                    surf_width, surf_height, self.video_encoder.?.width, self.video_encoder.?.height,
+                });
+                self.bgra_buffer = try self.allocator.alloc(u8, new_size);
+            } else {
+                std.debug.print("ENCODER: {}x{} (zero-copy path)\n", .{ surf_width, surf_height });
             }
         } else if (surf_width != self.video_encoder.?.source_width or surf_height != self.video_encoder.?.source_height) {
             // Resize encoder if needed
             try self.video_encoder.?.resize(surf_width, surf_height);
-            const scaled_w = self.video_encoder.?.width;
-            const scaled_h = self.video_encoder.?.height;
-            if (scaled_w != surf_width or scaled_h != surf_height) {
+            if (!self.video_encoder.?.canEncodeDirectly()) {
                 if (self.bgra_buffer) |buf| self.allocator.free(buf);
-                self.bgra_buffer = try self.allocator.alloc(u8, scaled_w * scaled_h * 4);
+                self.bgra_buffer = try self.allocator.alloc(u8, new_size);
             }
         }
 
@@ -732,16 +734,49 @@ const Panel = struct {
             self.force_keyframe = false;
         }
 
-        // Use direct IOSurface encoding (zero-copy when no scaling needed)
-        const result = try self.video_encoder.?.encodeFromIOSurface(iosurface, need_keyframe);
+        // Try zero-copy path if no scaling needed
+        if (self.video_encoder.?.canEncodeDirectly()) {
+            const result = self.video_encoder.?.encodeFromIOSurface(@ptrCast(iosurface), need_keyframe) catch |err| {
+                // If direct encoding fails, fall back to BGRA path
+                if (err == error.ScalingRequired) {
+                    // Shouldn't happen since we checked canEncodeDirectly, but handle gracefully
+                    return null;
+                }
+                return err;
+            };
+            if (result == null) return null;
+
+            self.sequence +%= 1;
+            return .{ .data = result.?.data, .is_keyframe = result.?.is_keyframe };
+        }
+
+        // Scaling needed - use BGRA copy path
+        // Copy from IOSurface to BGRA buffer
+        _ = c.IOSurfaceLock(iosurface, c.kIOSurfaceLockReadOnly, null);
+        defer _ = c.IOSurfaceUnlock(iosurface, c.kIOSurfaceLockReadOnly, null);
+
+        const base_addr: ?[*]u8 = @ptrCast(c.IOSurfaceGetBaseAddress(iosurface));
+        if (base_addr == null) return error.NoBaseAddress;
+
+        const src_bytes_per_row = c.IOSurfaceGetBytesPerRow(iosurface);
+        const dst_bytes_per_row = surf_width * 4;
+
+        if (src_bytes_per_row == dst_bytes_per_row) {
+            @memcpy(self.bgra_buffer.?[0..new_size], base_addr.?[0..new_size]);
+        } else {
+            for (0..surf_height) |y| {
+                const src_offset = y * src_bytes_per_row;
+                const dst_offset = y * dst_bytes_per_row;
+                @memcpy(self.bgra_buffer.?[dst_offset..][0..dst_bytes_per_row], base_addr.?[src_offset..][0..dst_bytes_per_row]);
+            }
+        }
+
+        // Encode with scaling
+        const result = try self.video_encoder.?.encode(self.bgra_buffer.?, need_keyframe);
         if (result == null) return null;
 
         self.sequence +%= 1;
-
-        return .{
-            .data = result.?.data,
-            .is_keyframe = result.?.is_keyframe,
-        };
+        return .{ .data = result.?.data, .is_keyframe = result.?.is_keyframe };
     }
 
     // Check if there's queued input (non-locking for quick check)
@@ -3391,8 +3426,11 @@ const Server = struct {
                     panel.tick();
 
                     if (panel.getIOSurface()) |iosurface| {
-                        // OPTIMIZED: Encode directly from IOSurface (zero-copy when no scaling needed)
-                        if (panel.prepareFrameFromIOSurface(iosurface) catch null) |result| {
+                        // Capture BGRA from IOSurface (skips if unchanged)
+                        _ = panel.captureFromIOSurface(iosurface) catch continue;
+
+                        // Encode with CVPixelBufferPool
+                        if (panel.prepareFrame() catch null) |result| {
                             panel.sendFrame(result.data) catch {};
                             frames_sent += 1;
                         }
