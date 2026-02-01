@@ -204,6 +204,23 @@
         padding: 4px 0 8px 0;
         width: 100%;
       }
+      /* Submenu dropdowns on mobile */
+      .menu-submenu .menu-dropdown {
+        position: static;
+        right: auto;
+        padding: 4px 0 4px 20px;
+      }
+      .menu-submenu.open > .menu-dropdown {
+        display: block;
+      }
+      .menu-submenu > .menu-text::after {
+        content: '▼';
+        left: auto;
+        right: 12px;
+      }
+      .menu-submenu.open > .menu-text::after {
+        content: '▲';
+      }
       .menu-item {
         font-size: 18px;
         padding: 20px 28px;
