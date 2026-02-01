@@ -1721,6 +1721,66 @@ class App {
         } catch (e) {}
         break;
       }
+      case 0x0A: { // auth_state
+        // Format: [type:u8][role:u8][auth_required:u8][has_password:u8][passkey_count:u8]
+        const role = view.getUint8(1);
+        const authRequired = view.getUint8(2) === 1;
+        const hasPassword = view.getUint8(3) === 1;
+        const passkeyCount = view.getUint8(4);
+        this.handleAuthState({ role, authRequired, hasPassword, passkeyCount });
+        break;
+      }
+      case 0x0B: { // session_list
+        // Format: [type:u8][count:u16][sessions...]
+        // session: [id_len:u16][id][name_len:u16][name][editor_token:44][viewer_token:44]
+        const count = view.getUint16(1, true);
+        const sessions = [];
+        let offset = 3;
+        for (let i = 0; i < count; i++) {
+          const idLen = view.getUint16(offset, true);
+          offset += 2;
+          const id = decoder.decode(bytes.slice(offset, offset + idLen));
+          offset += idLen;
+          const nameLen = view.getUint16(offset, true);
+          offset += 2;
+          const name = decoder.decode(bytes.slice(offset, offset + nameLen));
+          offset += nameLen;
+          const editorToken = decoder.decode(bytes.slice(offset, offset + 44));
+          offset += 44;
+          const viewerToken = decoder.decode(bytes.slice(offset, offset + 44));
+          offset += 44;
+          sessions.push({ id, name, editorToken, viewerToken });
+        }
+        this.handleSessionList(sessions);
+        break;
+      }
+      case 0x0C: { // share_links
+        // Format: [type:u8][count:u16][links...]
+        // link: [token:44][type:u8][use_count:u32][valid:u8]
+        const count = view.getUint16(1, true);
+        const links = [];
+        let offset = 3;
+        for (let i = 0; i < count; i++) {
+          const token = decoder.decode(bytes.slice(offset, offset + 44));
+          offset += 44;
+          const type = view.getUint8(offset);
+          offset += 1;
+          const useCount = view.getUint32(offset, true);
+          offset += 4;
+          const valid = view.getUint8(offset) === 1;
+          offset += 1;
+          links.push({ token, type, useCount, valid });
+        }
+        this.handleShareLinks(links);
+        break;
+      }
+      case 0x35: { // transfer_error (reused for auth errors)
+        // Format: [type:u8][len:u16][message...]
+        const msgLen = view.getUint16(1, true);
+        const message = decoder.decode(bytes.slice(3, 3 + msgLen));
+        this.showAuthError(message);
+        break;
+      }
       default:
         console.log('Unknown binary control message type:', msgType);
     }
@@ -3817,6 +3877,260 @@ class App {
     };
   }
 
+  // ============================================================================
+  // Auth / Access Control
+  // ============================================================================
+
+  handleAuthState({ role, authRequired, hasPassword, passkeyCount }) {
+    console.log('Auth state:', { role, authRequired, hasPassword, passkeyCount });
+    this.authState = { role, authRequired, hasPassword, passkeyCount };
+
+    // Role: 0=admin, 1=editor, 2=viewer, 255=none
+    const isAdmin = role === 0;
+
+    // Update body class for CSS admin-only visibility
+    document.body.classList.toggle('is-admin', isAdmin);
+
+    // Update auth status in dialog
+    const statusEl = document.getElementById('auth-status');
+    if (statusEl) {
+      if (!authRequired) {
+        statusEl.textContent = 'Not Set Up';
+        statusEl.style.color = 'var(--text-dim)';
+      } else if (hasPassword) {
+        statusEl.textContent = 'Password Set';
+        statusEl.style.color = '#8f8';
+      } else if (passkeyCount > 0) {
+        statusEl.textContent = `${passkeyCount} Passkey(s)`;
+        statusEl.style.color = '#8f8';
+      }
+    }
+  }
+
+  handleSessionList(sessions) {
+    console.log('Sessions:', sessions);
+    this.sessions = sessions;
+    this.updateSessionsUI();
+  }
+
+  handleShareLinks(links) {
+    console.log('Share links:', links);
+    this.shareLinks = links;
+    this.updateShareLinksUI();
+  }
+
+  showAuthError(message) {
+    console.error('Auth error:', message);
+    alert('Auth error: ' + message);
+  }
+
+  updateSessionsUI() {
+    const listEl = document.getElementById('sessions-list');
+    if (!listEl) return;
+
+    listEl.innerHTML = '';
+    for (const session of this.sessions || []) {
+      const itemEl = document.createElement('div');
+      itemEl.className = 'session-item';
+      itemEl.innerHTML = `
+        <span class="session-name">${session.name}</span>
+        <div class="token-group">
+          <span class="token editor" title="Click to copy editor link" data-token="${session.editorToken}">Editor</span>
+          <span class="token viewer" title="Click to copy viewer link" data-token="${session.viewerToken}">Viewer</span>
+          <button class="regen-btn" data-session="${session.id}" data-type="editor" title="Regenerate editor token">🔄</button>
+        </div>
+      `;
+
+      // Click to copy tokens
+      itemEl.querySelectorAll('.token').forEach(el => {
+        el.onclick = () => {
+          const url = `${location.origin}?token=${el.dataset.token}`;
+          navigator.clipboard.writeText(url).then(() => {
+            el.style.background = 'rgba(100,200,100,0.3)';
+            setTimeout(() => el.style.background = '', 500);
+          });
+        };
+      });
+
+      // Regenerate button
+      itemEl.querySelector('.regen-btn').onclick = (e) => {
+        const sessionId = e.target.dataset.session;
+        const tokenType = e.target.dataset.type === 'editor' ? 1 : 2;
+        this.sendRegenerateToken(sessionId, tokenType);
+      };
+
+      listEl.appendChild(itemEl);
+    }
+  }
+
+  updateShareLinksUI() {
+    const listEl = document.getElementById('share-links-list');
+    if (!listEl) return;
+
+    listEl.innerHTML = '';
+    for (const link of this.shareLinks || []) {
+      const typeLabel = link.type === 1 ? 'Editor' : 'Viewer';
+      const typeClass = link.type === 1 ? 'editor' : 'viewer';
+
+      const itemEl = document.createElement('div');
+      itemEl.className = 'share-link-item';
+      itemEl.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span class="link-type ${typeClass}">${typeLabel}</span>
+          <span class="link-token" title="Click to copy" style="font-family: monospace; font-size: 11px; cursor: pointer;">${link.token.slice(0, 12)}...</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span class="link-uses">${link.useCount} uses</span>
+          <button class="revoke-btn" data-token="${link.token}" style="padding: 2px 6px; font-size: 11px;">Revoke</button>
+        </div>
+      `;
+
+      // Click to copy
+      itemEl.querySelector('.link-token').onclick = () => {
+        const url = `${location.origin}?token=${link.token}`;
+        navigator.clipboard.writeText(url);
+      };
+
+      // Revoke button
+      itemEl.querySelector('.revoke-btn').onclick = (e) => {
+        this.sendRevokeShareLink(e.target.dataset.token);
+      };
+
+      listEl.appendChild(itemEl);
+    }
+
+    if ((this.shareLinks || []).length === 0) {
+      listEl.innerHTML = '<div style="color: var(--text-dim); font-size: 12px; padding: 8px;">No active share links</div>';
+    }
+  }
+
+  showAccessControlDialog() {
+    const overlay = document.getElementById('access-control-dialog');
+    if (!overlay) return;
+
+    overlay.classList.add('visible');
+
+    // Request current auth state
+    this.sendGetAuthState();
+
+    const cleanup = () => overlay.classList.remove('visible');
+
+    // Password setup
+    const passwordInput = overlay.querySelector('#admin-password-input');
+    const setPasswordBtn = overlay.querySelector('#set-password-btn');
+    setPasswordBtn.onclick = () => {
+      const password = passwordInput.value;
+      if (password) {
+        this.sendSetPassword(password);
+        passwordInput.value = '';
+      }
+    };
+
+    // Passkey setup
+    const addPasskeyBtn = overlay.querySelector('#add-passkey-btn');
+    addPasskeyBtn.onclick = () => {
+      // TODO: Implement WebAuthn passkey registration
+      alert('Passkey registration coming soon');
+    };
+
+    // Create session
+    const newSessionInput = overlay.querySelector('#new-session-name');
+    const createSessionBtn = overlay.querySelector('#create-session-btn');
+    createSessionBtn.onclick = () => {
+      const name = newSessionInput.value.trim();
+      if (name) {
+        const id = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+        this.sendCreateSession(id, name);
+        newSessionInput.value = '';
+      }
+    };
+
+    // Generate share links
+    overlay.querySelector('#generate-editor-link').onclick = () => this.sendCreateShareLink(1);
+    overlay.querySelector('#generate-viewer-link').onclick = () => this.sendCreateShareLink(2);
+    overlay.querySelector('#revoke-all-btn').onclick = () => this.sendRevokeAllShares();
+
+    // Close button
+    overlay.querySelector('.dialog-btn.cancel').onclick = cleanup;
+    overlay.onclick = (e) => {
+      if (e.target === overlay) cleanup();
+    };
+  }
+
+  // Send auth commands to server
+  sendGetAuthState() {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const msg = new Uint8Array([0x90]);
+      this.controlWs.send(msg);
+    }
+  }
+
+  sendSetPassword(password) {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const encoder = new TextEncoder();
+      const pwdBytes = encoder.encode(password);
+      const msg = new Uint8Array(3 + pwdBytes.length);
+      msg[0] = 0x91;
+      new DataView(msg.buffer).setUint16(1, pwdBytes.length, true);
+      msg.set(pwdBytes, 3);
+      this.controlWs.send(msg);
+    }
+  }
+
+  sendCreateSession(id, name) {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const encoder = new TextEncoder();
+      const idBytes = encoder.encode(id);
+      const nameBytes = encoder.encode(name);
+      const msg = new Uint8Array(5 + idBytes.length + nameBytes.length);
+      msg[0] = 0x93;
+      const view = new DataView(msg.buffer);
+      view.setUint16(1, idBytes.length, true);
+      view.setUint16(3, nameBytes.length, true);
+      msg.set(idBytes, 5);
+      msg.set(nameBytes, 5 + idBytes.length);
+      this.controlWs.send(msg);
+    }
+  }
+
+  sendRegenerateToken(sessionId, tokenType) {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const encoder = new TextEncoder();
+      const idBytes = encoder.encode(sessionId);
+      const msg = new Uint8Array(4 + idBytes.length);
+      msg[0] = 0x95;
+      new DataView(msg.buffer).setUint16(1, idBytes.length, true);
+      msg[3] = tokenType;
+      msg.set(idBytes, 4);
+      this.controlWs.send(msg);
+    }
+  }
+
+  sendCreateShareLink(tokenType) {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const msg = new Uint8Array([0x96, tokenType]);
+      this.controlWs.send(msg);
+    }
+  }
+
+  sendRevokeShareLink(token) {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const encoder = new TextEncoder();
+      const tokenBytes = encoder.encode(token);
+      const msg = new Uint8Array(1 + tokenBytes.length);
+      msg[0] = 0x97;
+      msg.set(tokenBytes, 1);
+      this.controlWs.send(msg);
+    }
+  }
+
+  sendRevokeAllShares() {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const msg = new Uint8Array([0x98]);
+      this.controlWs.send(msg);
+    }
+  }
+
   promptChangeTitle() {
     // Get current title
     const tab = this.tabs.get(this.activeTab);
@@ -4012,6 +4326,12 @@ function setupMenus() {
           break;
         case 'folder-transfer':
           app.showFolderTransferDialog();
+          break;
+        case 'sessions':
+          app.showAccessControlDialog();
+          break;
+        case 'access-control':
+          app.showAccessControlDialog();
           break;
         case 'split-right':
           if (app.activePanel) {

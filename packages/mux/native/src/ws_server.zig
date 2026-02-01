@@ -38,6 +38,7 @@ pub const Connection = struct {
     allocator: Allocator,
     is_open: bool,
     user_data: ?*anyopaque,
+    request_uri: ?[]const u8 = null,  // Request URI for auth token extraction
     // permessage-deflate fields
     deflate_enabled: bool = false,
     compressor: ?*c.libdeflate_compressor = null,
@@ -49,6 +50,7 @@ pub const Connection = struct {
             .allocator = allocator,
             .is_open = true,
             .user_data = null,
+            .request_uri = null,
             .deflate_enabled = false,
             .compressor = null,
             .decompressor = null,
@@ -59,6 +61,7 @@ pub const Connection = struct {
         // Free deflate resources
         if (self.compressor) |comp| c.libdeflate_free_compressor(comp);
         if (self.decompressor) |decomp| c.libdeflate_free_decompressor(decomp);
+        if (self.request_uri) |uri| self.allocator.free(uri);
         self.stream.close();
         self.is_open = false;
     }
@@ -79,6 +82,14 @@ pub const Connection = struct {
         if (n == 0) return error.ConnectionClosed;
 
         const request = buf[0..n];
+
+        // Extract request URI from first line (e.g., "GET /control?token=xyz HTTP/1.1")
+        if (std.mem.indexOf(u8, request, " ")) |method_end| {
+            const uri_start = method_end + 1;
+            if (std.mem.indexOfPos(u8, request, uri_start, " ")) |uri_end| {
+                self.request_uri = self.allocator.dupe(u8, request[uri_start..uri_end]) catch null;
+            }
+        }
 
         // Find Sec-WebSocket-Key header
         const key_header = "Sec-WebSocket-Key: ";

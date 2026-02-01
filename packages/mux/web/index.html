@@ -583,6 +583,62 @@
       color: var(--text);
       margin-bottom: 12px;
     }
+    /* Admin-only elements (hidden when not admin) */
+    .admin-only {
+      display: none;
+    }
+    body.is-admin .admin-only {
+      display: block;
+    }
+    body.is-admin .menu.admin-only {
+      display: block;
+    }
+    /* Session/token item styling */
+    .session-item, .share-link-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 6px;
+    }
+    .session-item .session-name {
+      font-weight: 500;
+    }
+    .session-item .token-group {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-family: ui-monospace, "SF Mono", Menlo, Monaco, monospace;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .token-group .token {
+      padding: 2px 6px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .token-group .token:hover {
+      background: rgba(255,255,255,0.2);
+    }
+    .share-link-item .link-type {
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .share-link-item .link-type.editor {
+      background: rgba(100,200,100,0.2);
+      color: #8f8;
+    }
+    .share-link-item .link-type.viewer {
+      background: rgba(100,150,255,0.2);
+      color: #8af;
+    }
+    .share-link-item .link-uses {
+      font-size: 11px;
+      color: var(--text-dim);
+    }
     /* Dialog overlay (download, etc.) */
     .dialog-overlay {
       display: none;
@@ -1145,6 +1201,13 @@
             <div class="menu-item" data-action="toggle-inspector"><span class="menu-icon">🔍</span><span class="menu-text">Toggle Inspector</span><span class="shortcut">⌥⌘I</span></div>
           </div>
         </div>
+        <div class="menu admin-only">
+          <span class="menu-label">Admin</span>
+          <div class="menu-dropdown">
+            <div class="menu-item" data-action="sessions"><span class="menu-icon">📂</span><span class="menu-text">Sessions</span></div>
+            <div class="menu-item" data-action="access-control"><span class="menu-icon">🔐</span><span class="menu-text">Access Control</span></div>
+          </div>
+        </div>
       </div>
       <span id="hamburger">☰</span>
       <span id="status-dot" title="Disconnected"></span>
@@ -1215,6 +1278,74 @@
           <button class="dialog-btn confirm folder-download-btn">⬇ Download</button>
           <button class="dialog-btn confirm folder-upload-btn">⬆ Upload</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Access Control Dialog -->
+  <div id="access-control-dialog" class="dialog-overlay">
+    <div class="dialog-box" style="min-width: 500px; max-height: 80vh; overflow-y: auto;">
+      <div class="dialog-title">Access Control</div>
+
+      <!-- Admin Authentication Section -->
+      <div style="margin-bottom: 20px;">
+        <div style="font-weight: 500; margin-bottom: 8px; display: flex; align-items: center; gap: 8px;">
+          Admin Authentication
+          <span id="auth-status" style="font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(255,255,255,0.1);"></span>
+        </div>
+        <div id="auth-setup" style="display: flex; flex-direction: column; gap: 8px;">
+          <div id="password-setup" style="display: flex; gap: 8px;">
+            <input type="password" id="admin-password-input" placeholder="Set admin password" style="flex: 1;" autocomplete="new-password" />
+            <button class="dialog-btn confirm" id="set-password-btn">Set Password</button>
+          </div>
+          <div id="passkey-setup" style="display: flex; gap: 8px;">
+            <button class="dialog-btn" id="add-passkey-btn" style="flex: 1;">Add Passkey</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sessions Section -->
+      <div style="margin-bottom: 20px;">
+        <div style="font-weight: 500; margin-bottom: 8px;">Sessions</div>
+        <div id="sessions-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 200px; overflow-y: auto;">
+          <!-- Sessions will be populated here -->
+        </div>
+        <div style="margin-top: 8px; display: flex; gap: 8px;">
+          <input type="text" id="new-session-name" placeholder="New session name" style="flex: 1;" autocomplete="off" />
+          <button class="dialog-btn confirm" id="create-session-btn">Create</button>
+        </div>
+      </div>
+
+      <!-- Share Links Section -->
+      <div style="margin-bottom: 20px;">
+        <div style="font-weight: 500; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+          <span>Share Access</span>
+          <button class="dialog-btn" id="revoke-all-btn" style="font-size: 11px; padding: 4px 8px;">Revoke All</button>
+        </div>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+          <button class="dialog-btn" id="generate-editor-link">Generate Editor Link</button>
+          <button class="dialog-btn" id="generate-viewer-link">Generate Viewer Link</button>
+        </div>
+        <div id="share-links-list" style="display: flex; flex-direction: column; gap: 6px; max-height: 150px; overflow-y: auto;">
+          <!-- Share links will be populated here -->
+        </div>
+      </div>
+
+      <div class="dialog-buttons">
+        <button class="dialog-btn cancel">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sessions Dialog -->
+  <div id="sessions-dialog" class="dialog-overlay">
+    <div class="dialog-box" style="min-width: 400px;">
+      <div class="dialog-title">Sessions</div>
+      <div id="sessions-dialog-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; margin-bottom: 12px;">
+        <!-- Sessions will be populated here -->
+      </div>
+      <div class="dialog-buttons">
+        <button class="dialog-btn cancel">Close</button>
       </div>
     </div>
   </div>

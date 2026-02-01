@@ -2,6 +2,7 @@ const std = @import("std");
 const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
+const auth = @import("auth.zig");
 
 const c = @cImport({
     @cInclude("libdeflate.h");
@@ -101,6 +102,11 @@ pub const BinaryCtrlMsg = enum(u8) {
     clipboard = 0x08,
     inspector_state = 0x09,
 
+    // Auth/Session Server → Client (0x0A-0x0F)
+    auth_state = 0x0A,      // Current auth state (role, sessions, tokens)
+    session_list = 0x0B,    // List of sessions
+    share_links = 0x0C,     // List of active share links
+
     // Client → Server (0x80-0x8F)
     close_panel = 0x81,
     resize_panel = 0x82,
@@ -110,6 +116,19 @@ pub const BinaryCtrlMsg = enum(u8) {
     inspector_unsubscribe = 0x86,
     inspector_tab = 0x87,
     view_action = 0x88,
+
+    // Auth/Session Client → Server (0x90-0x9F)
+    get_auth_state = 0x90,       // Request auth state
+    set_password = 0x91,         // Set admin password
+    verify_password = 0x92,      // Verify password (login)
+    create_session = 0x93,       // Create new session
+    delete_session = 0x94,       // Delete session
+    regenerate_token = 0x95,     // Regenerate session token
+    create_share_link = 0x96,    // Create share link
+    revoke_share_link = 0x97,    // Revoke share link
+    revoke_all_shares = 0x98,    // Revoke all share links
+    add_passkey = 0x99,          // Add passkey credential
+    remove_passkey = 0x9A,       // Remove passkey credential
 };
 
 // Control message types (text/JSON - legacy)
@@ -1234,6 +1253,7 @@ const Server = struct {
     panels: std.AutoHashMap(u32, *Panel),
     panel_connections: std.AutoHashMap(*ws.Connection, *Panel),
     control_connections: std.ArrayList(*ws.Connection),
+    connection_roles: std.AutoHashMap(*ws.Connection, auth.Role),  // Track connection roles
     layout: Layout,
     pending_panels: std.ArrayList(PanelRequest),
     pending_destroys: std.ArrayList(PanelDestroyRequest),
@@ -1244,6 +1264,7 @@ const Server = struct {
     control_ws_server: *ws.Server,
     file_ws_server: *ws.Server,
     http_server: *http.HttpServer,
+    auth_state: *auth.AuthState,  // Session and access control
     transfer_manager: transfer.TransferManager,
     file_connections: std.ArrayList(*ws.Connection),
     running: std.atomic.Value(bool),
@@ -1306,12 +1327,16 @@ const Server = struct {
         const file_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", 0);
         file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
 
+        // Initialize auth state
+        const auth_state = try auth.AuthState.init(allocator);
+
         server.* = .{
             .app = app,
             .config = config,
             .panels = std.AutoHashMap(u32, *Panel).init(allocator),
             .panel_connections = std.AutoHashMap(*ws.Connection, *Panel).init(allocator),
             .control_connections = .{},
+            .connection_roles = std.AutoHashMap(*ws.Connection, auth.Role).init(allocator),
             .layout = Layout.init(allocator),
             .pending_panels = .{},
             .pending_destroys = .{},
@@ -1322,6 +1347,7 @@ const Server = struct {
             .panel_ws_server = panel_ws,
             .control_ws_server = control_ws,
             .file_ws_server = file_ws,
+            .auth_state = auth_state,
             .transfer_manager = transfer.TransferManager.init(allocator),
             .file_connections = .{},
             .running = std.atomic.Value(bool).init(false),
@@ -1355,8 +1381,10 @@ const Server = struct {
         self.panel_ws_server.deinit();
         self.control_ws_server.deinit();
         self.file_ws_server.deinit();
+        self.auth_state.deinit();
         self.transfer_manager.deinit();
         self.file_connections.deinit(self.allocator);
+        self.connection_roles.deinit();
         c.ghostty_app_free(self.app);
         c.ghostty_config_free(self.config);
         global_server = null;
@@ -1428,6 +1456,9 @@ const Server = struct {
         self.control_connections.append(self.allocator, conn) catch {};
         self.mutex.unlock();
 
+        // Send auth state first (so client knows its role)
+        self.sendAuthState(conn);
+
         // Send current panel list
         self.sendPanelList(conn);
     }
@@ -1440,6 +1471,9 @@ const Server = struct {
             if (msg_type >= 0x80 and msg_type <= 0x8F) {
                 // Binary control message (client -> server)
                 self.handleBinaryControlMessageFromClient(conn, data);
+            } else if (msg_type >= 0x90 and msg_type <= 0x9F) {
+                // Binary auth message (client -> server)
+                self.handleAuthMessage(conn, data);
             } else {
                 // Binary file transfer message
                 self.handleBinaryControlMessage(conn, data);
@@ -1460,6 +1494,9 @@ const Server = struct {
                 break;
             }
         }
+
+        // Remove connection role
+        _ = self.connection_roles.remove(conn);
 
         // Remove any inspector subscriptions for this connection
         var i: usize = 0;
@@ -1773,6 +1810,232 @@ const Server = struct {
         } else {
             std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type});
         }
+    }
+
+    // ========== Auth/Session Message Handlers ==========
+
+    fn handleAuthMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 1) return;
+
+        const msg_type = data[0];
+        const role = self.getConnectionRole(conn);
+
+        switch (msg_type) {
+            0x90 => { // get_auth_state
+                self.sendAuthState(conn);
+            },
+            0x91 => { // set_password
+                // Only admin can set password
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 3) return;
+                const pwd_len = std.mem.readInt(u16, data[1..3], .little);
+                if (data.len < 3 + pwd_len) return;
+                const password = data[3..][0..pwd_len];
+                self.auth_state.setAdminPassword(password) catch {
+                    self.sendAuthError(conn, "Failed to set password");
+                    return;
+                };
+                self.sendAuthState(conn);
+            },
+            0x92 => { // verify_password
+                if (data.len < 3) return;
+                const pwd_len = std.mem.readInt(u16, data[1..3], .little);
+                if (data.len < 3 + pwd_len) return;
+                const password = data[3..][0..pwd_len];
+                if (self.auth_state.verifyAdminPassword(password)) {
+                    // Set connection role to admin
+                    self.connection_roles.put(conn, .admin) catch {};
+                    self.sendAuthState(conn);
+                } else {
+                    self.sendAuthError(conn, "Invalid password");
+                }
+            },
+            0x93 => { // create_session
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 5) return;
+                const id_len = std.mem.readInt(u16, data[1..3], .little);
+                const name_len = std.mem.readInt(u16, data[3..5], .little);
+                if (data.len < 5 + id_len + name_len) return;
+                const session_id = data[5..][0..id_len];
+                const session_name = data[5 + id_len ..][0..name_len];
+                self.auth_state.createSession(session_id, session_name) catch {
+                    self.sendAuthError(conn, "Failed to create session");
+                    return;
+                };
+                self.sendSessionList(conn);
+            },
+            0x94 => { // delete_session
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 3) return;
+                const id_len = std.mem.readInt(u16, data[1..3], .little);
+                if (data.len < 3 + id_len) return;
+                const session_id = data[3..][0..id_len];
+                self.auth_state.deleteSession(session_id) catch {};
+                self.sendSessionList(conn);
+            },
+            0x95 => { // regenerate_token
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 4) return;
+                const id_len = std.mem.readInt(u16, data[1..3], .little);
+                const token_type: auth.TokenType = @enumFromInt(data[3]);
+                if (data.len < 4 + id_len) return;
+                const session_id = data[4..][0..id_len];
+                self.auth_state.regenerateSessionToken(session_id, token_type) catch {};
+                self.sendSessionList(conn);
+            },
+            0x96 => { // create_share_link
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 2) return;
+                const token_type: auth.TokenType = @enumFromInt(data[1]);
+                // Optional: expires_in_secs (i64), max_uses (u32), label
+                const token = self.auth_state.createShareLink(token_type, null, null, null) catch {
+                    self.sendAuthError(conn, "Failed to create share link");
+                    return;
+                };
+                self.sendShareLinks(conn);
+                _ = token;
+            },
+            0x97 => { // revoke_share_link
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 45) return; // 1 + 44 (token length)
+                const token = data[1..45];
+                self.auth_state.revokeShareLink(token) catch {};
+                self.sendShareLinks(conn);
+            },
+            0x98 => { // revoke_all_shares
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                self.auth_state.revokeAllShareLinks() catch {};
+                self.sendShareLinks(conn);
+            },
+            else => {
+                std.log.warn("Unknown auth message type: 0x{x:0>2}", .{msg_type});
+            },
+        }
+    }
+
+    fn getConnectionRole(self: *Server, conn: *ws.Connection) auth.Role {
+        // Check if we have a cached role for this connection
+        if (self.connection_roles.get(conn)) |role| {
+            return role;
+        }
+
+        // Check token from connection URI
+        if (conn.request_uri) |uri| {
+            if (auth.extractTokenFromQuery(uri)) |token| {
+                const role = self.auth_state.validateToken(token);
+                // Cache the role
+                self.connection_roles.put(conn, role) catch {};
+                return role;
+            }
+        }
+
+        // No auth required = admin access
+        if (!self.auth_state.auth_required) {
+            return .admin;
+        }
+
+        return .none;
+    }
+
+    fn sendAuthState(self: *Server, conn: *ws.Connection) void {
+        const role = self.getConnectionRole(conn);
+
+        // Build auth state message
+        // [0x0A][role:u8][auth_required:u8][has_password:u8][passkey_count:u8]
+        var msg: [5]u8 = undefined;
+        msg[0] = 0x0A; // auth_state
+        msg[1] = @intFromEnum(role);
+        msg[2] = if (self.auth_state.auth_required) 1 else 0;
+        msg[3] = if (self.auth_state.admin_password_hash != null) 1 else 0;
+        msg[4] = @intCast(self.auth_state.passkey_credentials.items.len);
+
+        conn.sendBinary(&msg) catch {};
+    }
+
+    fn sendSessionList(self: *Server, conn: *ws.Connection) void {
+        const role = self.getConnectionRole(conn);
+        if (role != .admin) return;
+
+        // Build session list message
+        // [0x0B][count:u16][sessions...]
+        // session: [id_len:u16][id][name_len:u16][name][editor_token:44][viewer_token:44]
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(self.allocator);
+
+        buf.append(self.allocator, 0x0B) catch return; // session_list
+
+        const sessions = self.auth_state.sessions;
+        var count: u16 = 0;
+        var iter = sessions.valueIterator();
+        while (iter.next()) |_| count += 1;
+
+        buf.writer(self.allocator).writeInt(u16, count, .little) catch return;
+
+        iter = sessions.valueIterator();
+        while (iter.next()) |session| {
+            buf.writer(self.allocator).writeInt(u16, @intCast(session.id.len), .little) catch return;
+            buf.appendSlice(self.allocator, session.id) catch return;
+            buf.writer(self.allocator).writeInt(u16, @intCast(session.name.len), .little) catch return;
+            buf.appendSlice(self.allocator, session.name) catch return;
+            buf.appendSlice(self.allocator, &session.editor_token) catch return;
+            buf.appendSlice(self.allocator, &session.viewer_token) catch return;
+        }
+
+        conn.sendBinary(buf.items) catch {};
+    }
+
+    fn sendShareLinks(self: *Server, conn: *ws.Connection) void {
+        const role = self.getConnectionRole(conn);
+        if (role != .admin) return;
+
+        // Build share links message
+        // [0x0C][count:u16][links...]
+        // link: [token:44][type:u8][use_count:u32][valid:u8]
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(self.allocator);
+
+        buf.append(self.allocator, 0x0C) catch return; // share_links
+        buf.writer(self.allocator).writeInt(u16, @intCast(self.auth_state.share_links.items.len), .little) catch return;
+
+        for (self.auth_state.share_links.items) |link| {
+            buf.appendSlice(self.allocator, &link.token) catch return;
+            buf.append(self.allocator, @intFromEnum(link.token_type)) catch return;
+            buf.writer(self.allocator).writeInt(u32, link.use_count, .little) catch return;
+            buf.append(self.allocator, if (link.isValid()) 1 else 0) catch return;
+        }
+
+        conn.sendBinary(buf.items) catch {};
+    }
+
+    fn sendAuthError(self: *Server, conn: *ws.Connection, message: []const u8) void {
+        _ = self;
+        // [0x35][len:u16][message] - reuse transfer error format
+        var buf: [259]u8 = undefined;
+        buf[0] = 0x35;
+        std.mem.writeInt(u16, buf[1..3], @intCast(message.len), .little);
+        @memcpy(buf[3..][0..message.len], message);
+        conn.sendBinary(buf[0 .. 3 + message.len]) catch {};
     }
 
     fn subscribeInspectorBinary(self: *Server, panel_id: u32, tab: []const u8) void {
