@@ -227,8 +227,8 @@ fn cmdOpen(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Original viewport (before any limits) - used for coordinate ratio calculation
     // Use sensible defaults if terminal pixel detection fails (common over SSH)
-    const MIN_WIDTH: u32 = 800;
-    const MIN_HEIGHT: u32 = 600;
+    const MIN_WIDTH: u32 = 100;
+    const MIN_HEIGHT: u32 = 100;
     const original_viewport_width: u32 = @max(raw_width / dpr, MIN_WIDTH);
     const original_viewport_height: u32 = @max(content_pixel_height / dpr, MIN_HEIGHT);
 

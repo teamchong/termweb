@@ -98,6 +98,94 @@ pub fn renderBlankPage(viewer: anytype) void {
     viewer.showing_blank_placeholder = true;
 }
 
+/// Render an error page when the page fails to load
+/// Shows error message with instructions to try another URL
+pub fn renderErrorPage(viewer: anytype, url: []const u8) void {
+    const stdout = std.fs.File.stdout();
+    const size = viewer.terminal.getSize() catch return;
+
+    const title = "This site can't be reached";
+    const help_lines = [_][]const u8{
+        "The connection timed out.",
+        "",
+        "Try:",
+        "  - Checking the URL for typos",
+        "  - Checking your internet connection",
+        "",
+        "Press Ctrl+L to enter a new URL",
+        "Press Ctrl+Q to quit",
+    };
+
+    // Calculate vertical center
+    const total_lines = 1 + 2 + 1 + help_lines.len; // title + url + gap + help
+    const start_row = if (size.rows > total_lines) (size.rows - @as(u16, @intCast(total_lines))) / 2 else 2;
+
+    var buf: [4096]u8 = undefined;
+    var offset: usize = 0;
+
+    // Delete content image by ID=100
+    const delete_cmd = "\x1b_Ga=d,d=I,i=100\x1b\\";
+    @memcpy(buf[offset..][0..delete_cmd.len], delete_cmd);
+    offset += delete_cmd.len;
+
+    // Move to row 2, column 1 and set dark gray background
+    const bg_seq = "\x1b[2;1H\x1b[48;5;234m";
+    @memcpy(buf[offset..][0..bg_seq.len], bg_seq);
+    offset += bg_seq.len;
+
+    // Clear from cursor to end of screen
+    const clear_seq = "\x1b[J";
+    @memcpy(buf[offset..][0..clear_seq.len], clear_seq);
+    offset += clear_seq.len;
+
+    // Print title (bold red on dark bg)
+    const title_col = if (size.cols > title.len) (size.cols - @as(u16, @intCast(title.len))) / 2 else 1;
+    const title_seq = std.fmt.bufPrint(buf[offset..], "\x1b[{d};{d}H\x1b[1;91;48;5;234m{s}", .{
+        start_row,
+        title_col,
+        title,
+    }) catch return;
+    offset += title_seq.len;
+
+    // Print URL (gray, truncated if too long)
+    const max_url_len: usize = @min(url.len, @as(usize, size.cols) -| 4);
+    const display_url = url[0..max_url_len];
+    const url_col = if (size.cols > max_url_len) (size.cols - @as(u16, @intCast(max_url_len))) / 2 else 1;
+    const url_seq = std.fmt.bufPrint(buf[offset..], "\x1b[{d};{d}H\x1b[0;38;5;245;48;5;234m{s}", .{
+        start_row + 1,
+        url_col,
+        display_url,
+    }) catch return;
+    offset += url_seq.len;
+
+    // Print help lines
+    for (help_lines, 0..) |line, i| {
+        const row = start_row + 3 + @as(u16, @intCast(i));
+        const line_col = if (size.cols > line.len) (size.cols - @as(u16, @intCast(line.len))) / 2 else 1;
+
+        const line_seq = std.fmt.bufPrint(buf[offset..], "\x1b[{d};{d}H\x1b[0;38;5;250;48;5;234m{s}", .{
+            row,
+            line_col,
+            line,
+        }) catch break;
+        offset += line_seq.len;
+    }
+
+    // Reset attributes
+    const reset_seq = "\x1b[0m";
+    @memcpy(buf[offset..][0..reset_seq.len], reset_seq);
+    offset += reset_seq.len;
+
+    // Write all at once
+    _ = stdout.write(buf[0..offset]) catch {};
+
+    viewer.last_content_image_id = null;
+    viewer.last_rendered_generation = 0;
+
+    // Mark as showing placeholder to prevent screencast overwrite
+    viewer.showing_blank_placeholder = true;
+}
+
 /// Get maximum FPS (returns viewer's target_fps)
 pub fn getTargetFps(viewer: anytype) u32 {
     return viewer.target_fps;

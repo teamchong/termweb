@@ -40,6 +40,7 @@ pub const renderToolbar = render.renderToolbar;
 pub const getMaxFpsForResolution = render.getMaxFpsForResolution;
 pub const getMinFrameInterval = render.getMinFrameInterval;
 pub const renderBlankPage = render.renderBlankPage;
+pub const renderErrorPage = render.renderErrorPage;
 
 // Re-export input handler functions
 pub const handleInput = input_handler.handleInput;

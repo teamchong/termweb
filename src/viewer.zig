@@ -644,7 +644,9 @@ pub const Viewer = struct {
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
         if (retries >= 300) {
-            return error.ScreencastTimeout;
+            // Show error page instead of crashing - user can press Ctrl+L to try another URL
+            self.log("[DEBUG] Screencast timeout - showing error page\n", .{});
+            render_mod.renderErrorPage(self, self.current_url);
         }
 
         // Get initial navigation state (after page has loaded)
@@ -956,8 +958,8 @@ pub const Viewer = struct {
         const size = try self.terminal.getSize();
 
         // Calculate new viewport dimensions (same logic as cli.zig)
-        const MIN_WIDTH: u32 = 800;
-        const MIN_HEIGHT: u32 = 600;
+        const MIN_WIDTH: u32 = 100;
+        const MIN_HEIGHT: u32 = 100;
 
         const raw_width: u32 = if (size.width_px > 0) size.width_px else @as(u32, size.cols) * 10;
 

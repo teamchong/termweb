@@ -694,6 +694,56 @@ const Panel = struct {
         };
     }
 
+    // OPTIMIZED: Encode directly from IOSurface - skips BGRA copy when no scaling needed
+    fn prepareFrameFromIOSurface(self: *Panel, iosurface: IOSurfacePtr) !?struct { data: []const u8, is_keyframe: bool } {
+        // Check IOSurface seed - if unchanged, surface wasn't modified, skip encoding
+        const seed = c.IOSurfaceGetSeed(iosurface);
+        if (seed == self.last_iosurface_seed and !self.force_keyframe) {
+            return null; // Surface unchanged, skip encode
+        }
+        self.last_iosurface_seed = seed;
+
+        const surf_width: u32 = @intCast(c.IOSurfaceGetWidth(iosurface));
+        const surf_height: u32 = @intCast(c.IOSurfaceGetHeight(iosurface));
+
+        // Lazy init video encoder on first frame
+        if (self.video_encoder == null) {
+            std.debug.print("ENCODER: Creating encoder for {}x{} (direct IOSurface)\n", .{ surf_width, surf_height });
+            self.video_encoder = try video.VideoEncoder.init(self.allocator, surf_width, surf_height);
+            // Allocate BGRA buffer only if scaling is needed
+            const scaled_w = self.video_encoder.?.width;
+            const scaled_h = self.video_encoder.?.height;
+            if (scaled_w != surf_width or scaled_h != surf_height) {
+                self.bgra_buffer = try self.allocator.alloc(u8, scaled_w * scaled_h * 4);
+            }
+        } else if (surf_width != self.video_encoder.?.source_width or surf_height != self.video_encoder.?.source_height) {
+            // Resize encoder if needed
+            try self.video_encoder.?.resize(surf_width, surf_height);
+            const scaled_w = self.video_encoder.?.width;
+            const scaled_h = self.video_encoder.?.height;
+            if (scaled_w != surf_width or scaled_h != surf_height) {
+                if (self.bgra_buffer) |buf| self.allocator.free(buf);
+                self.bgra_buffer = try self.allocator.alloc(u8, scaled_w * scaled_h * 4);
+            }
+        }
+
+        const need_keyframe = self.force_keyframe or self.sequence == 0;
+        if (need_keyframe) {
+            self.force_keyframe = false;
+        }
+
+        // Use direct IOSurface encoding (zero-copy when no scaling needed)
+        const result = try self.video_encoder.?.encodeFromIOSurface(iosurface, need_keyframe);
+        if (result == null) return null;
+
+        self.sequence +%= 1;
+
+        return .{
+            .data = result.?.data,
+            .is_keyframe = result.?.is_keyframe,
+        };
+    }
+
     // Check if there's queued input (non-locking for quick check)
     fn hasQueuedInput(self: *Panel) bool {
         return self.input_queue.items.len > 0;
@@ -2007,6 +2057,9 @@ const Server = struct {
             0x10 => self.handleBinaryFileUpload(conn, data[1..]),
             0x11 => self.handleBinaryFileDownload(conn, data[1..]),
             0x14 => self.handleBinaryFolderDownload(conn, data[1..]),
+            // Preview (dry-run)
+            0x17 => self.handleBinaryFilePreview(conn, data[1..]),
+            0x18 => self.handleBinaryFolderPreview(conn, data[1..]),
             // Client control messages
             0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88 => {
                 self.handleBinaryControlMessageFromClient(conn, data);
@@ -2325,6 +2378,162 @@ const Server = struct {
             return;
         };
         std.log.info("Folder downloaded: {s} -> {s} ({d} bytes)", .{ resolved_path, zip_name, zip_data.len });
+    }
+
+    // Binary file preview (dry-run): [panel_id:u32][path_len:u16][path]
+    // Response: [0x19][name_len:u16][name][size:u64]
+    fn handleBinaryFilePreview(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 6) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const panel_id = std.mem.readInt(u32, data[0..4], .little);
+        const path_len = std.mem.readInt(u16, data[4..6], .little);
+
+        if (data.len < 6 + path_len) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        var path = data[6 .. 6 + path_len];
+
+        // Get panel for cwd resolution
+        self.mutex.lock();
+        const panel = self.panels.get(panel_id);
+        self.mutex.unlock();
+
+        // Expand ~ or relative paths
+        var resolved_path_buf: [4096]u8 = undefined;
+        var resolved_path: []const u8 = path;
+
+        if (path.len > 0 and path[0] == '~') {
+            const home = std.posix.getenv("HOME") orelse "/tmp";
+            if (path.len > 1 and path[1] == '/') {
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
+            } else {
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
+            }
+        } else if (path.len > 0 and path[0] != '/') {
+            if (panel) |p| {
+                if (p.pwd.len > 0) {
+                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
+                }
+            }
+        }
+
+        const filename = std.fs.path.basename(resolved_path);
+
+        // Stat file to get size
+        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch {
+            self.sendBinaryFileError(conn, "Cannot open file");
+            return;
+        };
+        defer file.close();
+
+        const stat = file.stat() catch {
+            self.sendBinaryFileError(conn, "Cannot stat file");
+            return;
+        };
+
+        // Send preview response: [0x19][name_len:u16][name][size:u64]
+        var buf: [512]u8 = undefined;
+        buf[0] = 0x19; // file_preview type
+        std.mem.writeInt(u16, buf[1..3], @intCast(filename.len), .little);
+        @memcpy(buf[3 .. 3 + filename.len], filename);
+        std.mem.writeInt(u64, buf[3 + filename.len ..][0..8], stat.size, .little);
+
+        conn.sendBinary(buf[0 .. 3 + filename.len + 8]) catch {
+            std.log.err("Failed to send file preview", .{});
+        };
+    }
+
+    // Binary folder preview (dry-run): [panel_id:u32][path_len:u16][path]
+    // Response: [0x1A][name_len:u16][name.zip][size:u64][file_count:u32]
+    fn handleBinaryFolderPreview(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 6) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const panel_id = std.mem.readInt(u32, data[0..4], .little);
+        const path_len = std.mem.readInt(u16, data[4..6], .little);
+
+        if (data.len < 6 + path_len) {
+            self.sendBinaryFileError(conn, "Invalid message");
+            return;
+        }
+
+        const path = data[6 .. 6 + path_len];
+
+        // Get panel for cwd resolution
+        self.mutex.lock();
+        const panel = self.panels.get(panel_id);
+        self.mutex.unlock();
+
+        // Expand ~ or relative paths
+        var resolved_path_buf: [4096]u8 = undefined;
+        var resolved_path: []const u8 = path;
+
+        if (path.len > 0 and path[0] == '~') {
+            const home = std.posix.getenv("HOME") orelse "/tmp";
+            if (path.len > 1 and path[1] == '/') {
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
+            } else {
+                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
+            }
+        } else if (path.len > 0 and path[0] != '/') {
+            if (panel) |p| {
+                if (p.pwd.len > 0) {
+                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
+                }
+            }
+        }
+
+        const folder_name = std.fs.path.basename(resolved_path);
+        var zip_name_buf: [256]u8 = undefined;
+        const zip_name = std.fmt.bufPrint(&zip_name_buf, "{s}.zip", .{folder_name}) catch "folder.zip";
+
+        // Open directory and count files + total size
+        var dir = std.fs.openDirAbsolute(resolved_path, .{ .iterate = true }) catch {
+            self.sendBinaryFileError(conn, "Cannot open directory");
+            return;
+        };
+        defer dir.close();
+
+        var total_size: u64 = 0;
+        var file_count: u32 = 0;
+
+        var walker = dir.walk(self.allocator) catch {
+            self.sendBinaryFileError(conn, "Cannot iterate directory");
+            return;
+        };
+        defer walker.deinit();
+
+        while (walker.next() catch null) |entry| {
+            if (entry.kind == .file) {
+                file_count += 1;
+                // Get file size
+                if (dir.statFile(entry.path)) |stat| {
+                    total_size += stat.size;
+                } else |_| {}
+            }
+        }
+
+        // Estimate zip size (rough compression estimate: 60% of original)
+        const estimated_zip_size = total_size * 6 / 10;
+
+        // Send preview response: [0x1A][name_len:u16][name.zip][size:u64][file_count:u32]
+        var buf: [512]u8 = undefined;
+        buf[0] = 0x1A; // folder_preview type
+        std.mem.writeInt(u16, buf[1..3], @intCast(zip_name.len), .little);
+        @memcpy(buf[3 .. 3 + zip_name.len], zip_name);
+        std.mem.writeInt(u64, buf[3 + zip_name.len ..][0..8], estimated_zip_size, .little);
+        std.mem.writeInt(u32, buf[3 + zip_name.len + 8 ..][0..4], file_count, .little);
+
+        conn.sendBinary(buf[0 .. 3 + zip_name.len + 12]) catch {
+            std.log.err("Failed to send folder preview", .{});
+        };
     }
 
     // Keep old JSON handlers for backwards compatibility (will be removed later)
@@ -3182,10 +3391,8 @@ const Server = struct {
                     panel.tick();
 
                     if (panel.getIOSurface()) |iosurface| {
-                        // Always capture - video encoder handles redundant frames efficiently
-                        _ = panel.captureFromIOSurface(iosurface) catch continue;
-
-                        if (panel.prepareFrame() catch null) |result| {
+                        // OPTIMIZED: Encode directly from IOSurface (zero-copy when no scaling needed)
+                        if (panel.prepareFrameFromIOSurface(iosurface) catch null) |result| {
                             panel.sendFrame(result.data) catch {};
                             frames_sent += 1;
                         }
