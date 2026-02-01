@@ -1962,8 +1962,8 @@ class App {
         return;
       }
 
-      // ⌘] and ⌘[ to cycle through splits
-      if (e.metaKey && (e.key === ']' || e.key === '[')) {
+      // ⌘⇧] and ⌘⇧[ to cycle through splits
+      if (e.metaKey && e.shiftKey && (e.key === ']' || e.key === '[' || e.key === '}' || e.key === '{')) {
         e.preventDefault();
         e.stopPropagation();
         this.cycleSplit(e.key === ']' ? 1 : -1);
