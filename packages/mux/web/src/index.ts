@@ -2297,9 +2297,10 @@ class App {
 
   private updateSplitMenuVisibility(): void {
     const tab = this.activeTab ? this.tabs.get(this.activeTab) : null;
-    const hasSplits = tab && tab.panels.size > 1;
+    const panelCount = tab?.root?.getAllPanels().length ?? 0;
+    const hasSplits = panelCount > 1;
     document.querySelectorAll('.split-menu-item').forEach(item => {
-      item.classList.toggle('visible', !!hasSplits);
+      item.classList.toggle('visible', hasSplits);
     });
   }
 
