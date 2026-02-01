@@ -282,6 +282,21 @@ pub fn build(b: *std.Build) void {
         mux.addIncludePath(b.path("vendor/xxhash"));
         mux.addCSourceFile(.{ .file = b.path("vendor/xxhash/xxhash.c"), .flags = &.{"-O2"} });
 
+        // Build web client (bun build) before embedding
+        const build_web = b.addSystemCommand(&.{
+            "bun", "build", "src/index.ts", "--outfile=client.js", "--format=iife",
+        });
+        build_web.setCwd(b.path("packages/mux/web"));
+
+        // Web assets module (~140KB embedded)
+        const web_assets = b.createModule(.{
+            .root_source_file = b.path("packages/mux/web/assets.zig"),
+        });
+        mux.root_module.addImport("web_assets", web_assets);
+
+        // Ensure web is built before mux compiles
+        mux.step.dependOn(&build_web.step);
+
         mux.linkLibC();
         b.installArtifact(mux);
 

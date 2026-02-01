@@ -73,13 +73,11 @@ pub fn build(b: *std.Build) !void {
     server.addIncludePath(b.path("../../../vendor/xxhash"));
     server.addCSourceFile(.{ .file = b.path("../../../vendor/xxhash/xxhash.c"), .flags = &.{"-O2"} });
 
-    // Add embedded web assets (for http_server.zig @embedFile)
-    server.root_module.addAnonymousImport("index_html", .{
-        .root_source_file = b.path("../web/index.html"),
+    // Web assets module (~140KB total) - separate module so @embedFile can access web/ directory
+    const web_assets = b.createModule(.{
+        .root_source_file = b.path("../web/assets.zig"),
     });
-    server.root_module.addAnonymousImport("client_js", .{
-        .root_source_file = b.path("../web/client.js"),
-    });
+    server.root_module.addImport("web_assets", web_assets);
 
     server.linkLibC();
 

@@ -807,6 +807,23 @@
     .dialog-btn:hover {
       filter: brightness(1.1);
     }
+    /* Preview dialog */
+    .preview-stat {
+      color: var(--text-dim);
+    }
+    .preview-count {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .preview-entry {
+      padding: 2px 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .preview-entry.create { color: #8f8; }
+    .preview-entry.update { color: #ff8; }
+    .preview-entry.delete { color: #f88; }
     /* Command Palette */
     #command-palette {
       display: none;
@@ -1585,6 +1602,23 @@
       </div>
       <div class="dialog-buttons">
         <button class="dialog-btn cancel">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Download Preview Dialog -->
+  <div id="preview-dialog" class="dialog-overlay">
+    <div class="dialog-box" style="min-width: 450px; max-width: 600px;">
+      <div class="dialog-title">Download Preview</div>
+      <div class="preview-summary" style="display: flex; gap: 16px; margin-bottom: 12px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px;">
+        <div class="preview-stat"><span class="preview-count" id="preview-new">0</span> new</div>
+        <div class="preview-stat"><span class="preview-count" id="preview-update">0</span> update</div>
+        <div class="preview-stat"><span class="preview-count" id="preview-delete">0</span> delete</div>
+      </div>
+      <div id="preview-entries" style="max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; background: rgba(0,0,0,0.2); border-radius: 4px; padding: 8px;"></div>
+      <div class="dialog-buttons">
+        <button class="dialog-btn cancel">Cancel</button>
+        <button class="dialog-btn primary">Proceed</button>
       </div>
     </div>
   </div>

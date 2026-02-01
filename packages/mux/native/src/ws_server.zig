@@ -323,7 +323,7 @@ pub const Server = struct {
 
         const addr = try net.Address.parseIp4(address, port);
         server.* = .{
-            .listener = try addr.listen(.{ .reuse_address = true }),
+            .listener = try addr.listen(.{ .reuse_address = true, .force_nonblocking = true }),
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
             .enable_deflate = enable_deflate,

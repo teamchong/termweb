@@ -6,9 +6,10 @@ const c = @cImport({
     @cInclude("ghostty.h");
 });
 
-// Embedded web assets (~140KB total) - imported via build.zig addAnonymousImport
-const embedded_index_html = @embedFile("index_html");
-const embedded_client_js = @embedFile("client_js");
+// Embedded web assets (~140KB total) - from web_assets module
+const web_assets = @import("web_assets");
+const embedded_index_html = web_assets.index_html;
+const embedded_client_js = web_assets.client_js;
 
 // Color struct matching ghostty_config_color_s
 const Color = extern struct {
@@ -33,7 +34,7 @@ pub const HttpServer = struct {
 
         const addr = try net.Address.parseIp4(address, port);
         server.* = .{
-            .listener = try addr.listen(.{ .reuse_address = true }),
+            .listener = try addr.listen(.{ .reuse_address = true, .force_nonblocking = true }),
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
             .panel_ws_port = 0,

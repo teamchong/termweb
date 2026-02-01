@@ -500,21 +500,45 @@ export function showDryRunPreview(
   report: { newCount: number; updateCount: number; deleteCount: number; entries: Array<{ action: string; path: string; size: number }> },
   onConfirm: () => void
 ): void {
-  const entriesHtml = report.entries.map(e => {
-    const icon = e.action === 'create' ? '+' : e.action === 'update' ? '~' : '-';
-    return `<div class="dry-run-entry ${e.action}">${icon} ${e.path} (${formatBytes(e.size)})</div>`;
-  }).join('');
+  const overlay = document.getElementById('preview-dialog');
+  if (!overlay) return;
 
-  const msg = `
-    <div class="dry-run-summary">
-      <div>New: ${report.newCount}</div>
-      <div>Update: ${report.updateCount}</div>
-      <div>Delete: ${report.deleteCount}</div>
-    </div>
-    <div class="dry-run-entries">${entriesHtml}</div>
-  `;
+  // Update summary counts
+  const newEl = document.getElementById('preview-new');
+  const updateEl = document.getElementById('preview-update');
+  const deleteEl = document.getElementById('preview-delete');
+  if (newEl) newEl.textContent = String(report.newCount);
+  if (updateEl) updateEl.textContent = String(report.updateCount);
+  if (deleteEl) deleteEl.textContent = String(report.deleteCount);
 
-  if (confirm(`Preview:\n- ${report.newCount} new files\n- ${report.updateCount} updated files\n- ${report.deleteCount} files to delete\n\nProceed with transfer?`)) {
-    onConfirm();
+  // Build entries list
+  const entriesEl = document.getElementById('preview-entries');
+  if (entriesEl) {
+    const entriesHtml = report.entries.map(e => {
+      const icon = e.action === 'create' ? '+' : e.action === 'update' ? '~' : '-';
+      return `<div class="preview-entry ${e.action}">${icon} ${e.path} (${formatBytes(e.size)})</div>`;
+    }).join('');
+    entriesEl.innerHTML = entriesHtml || '<div style="color: var(--text-dim);">No changes</div>';
   }
+
+  // Show dialog
+  overlay.classList.add('visible');
+
+  // Handle buttons
+  const cancelBtn = overlay.querySelector('.dialog-btn.cancel');
+  const proceedBtn = overlay.querySelector('.dialog-btn.primary');
+
+  const hide = () => {
+    overlay.classList.remove('visible');
+    cancelBtn?.removeEventListener('click', hide);
+    proceedBtn?.removeEventListener('click', handleProceed);
+  };
+
+  const handleProceed = () => {
+    hide();
+    onConfirm();
+  };
+
+  cancelBtn?.addEventListener('click', hide);
+  proceedBtn?.addEventListener('click', handleProceed);
 }

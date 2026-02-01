@@ -787,20 +787,63 @@ class App {
   }
 
   private showDownloadPreview(name: string, size: number, isFolder: boolean, fileCount: number): void {
-    const message = isFolder
-      ? `Folder: ${name}\nFiles: ${fileCount}\nEstimated size: ${formatBytes(size)}\n\nProceed with download?`
-      : `File: ${name}\nSize: ${formatBytes(size)}\n\nProceed with download?`;
+    const overlay = document.getElementById('preview-dialog');
+    if (!overlay) return;
 
-    if (confirm(message)) {
-      // Send actual download request
+    // Update summary - repurpose the counts for file info
+    const newEl = document.getElementById('preview-new');
+    const updateEl = document.getElementById('preview-update');
+    const deleteEl = document.getElementById('preview-delete');
+
+    // Update dialog title
+    const titleEl = overlay.querySelector('.dialog-title');
+    if (titleEl) titleEl.textContent = isFolder ? 'Download Folder' : 'Download File';
+
+    // Update summary labels
+    const summaryEl = overlay.querySelector('.preview-summary');
+    if (summaryEl) {
+      summaryEl.innerHTML = isFolder
+        ? `<div class="preview-stat">Folder: <span class="preview-count">${name}</span></div>
+           <div class="preview-stat">Files: <span class="preview-count">${fileCount}</span></div>
+           <div class="preview-stat">Size: <span class="preview-count">${formatBytes(size)}</span></div>`
+        : `<div class="preview-stat">File: <span class="preview-count">${name}</span></div>
+           <div class="preview-stat">Size: <span class="preview-count">${formatBytes(size)}</span></div>`;
+    }
+
+    // Hide entries list for simple preview
+    const entriesEl = document.getElementById('preview-entries');
+    if (entriesEl) entriesEl.style.display = 'none';
+
+    // Show dialog
+    overlay.classList.add('visible');
+
+    // Handle buttons
+    const cancelBtn = overlay.querySelector('.dialog-btn.cancel');
+    const proceedBtn = overlay.querySelector('.dialog-btn.primary');
+
+    const hide = () => {
+      overlay.classList.remove('visible');
+      if (entriesEl) entriesEl.style.display = '';
+      cancelBtn?.removeEventListener('click', handleCancel);
+      proceedBtn?.removeEventListener('click', handleProceed);
+    };
+
+    const handleCancel = () => {
+      hide();
+      this.pendingDownload = null;
+    };
+
+    const handleProceed = () => {
+      hide();
       if (this.pendingDownload) {
         const opts = { ...this.pendingDownload, preview: false };
         this.pendingDownload = null;
         this.requestDownload(opts);
       }
-    } else {
-      this.pendingDownload = null;
-    }
+    };
+
+    cancelBtn?.addEventListener('click', handleCancel);
+    proceedBtn?.addEventListener('click', handleProceed);
   }
 
   // ============================================================================
