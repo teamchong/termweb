@@ -20,11 +20,11 @@ A high-performance terminal multiplexer for the web, powered by [Ghostty](https:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Browser (client.js)                       │
+│                    Browser (client.js)                      │
 │  ┌─────────┐  ┌─────────┐  ┌─────────┐                      │
 │  │  Tab 1  │  │  Tab 2  │  │  Tab 3  │  ← Tab bar           │
 │  └────┬────┘  └─────────┘  └─────────┘                      │
-│       │                                                      │
+│       │                                                     │
 │  ┌────┴────────────────────────────────┐                    │
 │  │ Panel (canvas + WebSocket)          │                    │
 │  │  ┌────────────────────────────────┐ │                    │
@@ -36,13 +36,10 @@ A high-performance terminal multiplexer for the web, powered by [Ghostty](https:
                       │ WebSocket
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                    Server (main.zig)                         │
-│                                                              │
-│  libghostty (terminal + shell) → IOSurface → VideoToolbox   │
-│         │                            │             │         │
-│    (VT emulation,               (GPU texture)  (H.264)      │
-│     spawns shell)                                            │
-│                                                              │
+│                    Server (main.zig)                        │
+│                                                             │
+│    libghostty → IOSurface (GPU) → VideoToolbox (H.264)      │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
