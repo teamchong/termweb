@@ -1,5 +1,6 @@
 const std = @import("std");
 const net = std.net;
+const posix = std.posix;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
@@ -8,6 +9,15 @@ const c = @cImport({
 });
 
 const simd_mask = @import("simd_mask");
+
+// Set socket read timeout for blocking I/O with periodic wakeup
+fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
+    const tv = posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+}
 
 // ============================================================================
 // WebSocket Protocol
@@ -353,6 +363,9 @@ pub const Server = struct {
         const conn = try self.allocator.create(Connection);
         conn.* = Connection.init(stream.stream, self.allocator);
 
+        // Set socket read timeout for blocking I/O (100ms wakeup for shutdown check)
+        setReadTimeout(stream.stream.handle, 100);
+
         // Perform handshake (with or without deflate based on server config)
         try conn.acceptHandshakeWithOptions(self.enable_deflate);
 
@@ -369,11 +382,8 @@ pub const Server = struct {
                 break;
             };
 
-            if (frame == null) {
-                // No data available - sleep longer to reduce CPU
-                std.Thread.sleep(5 * std.time.ns_per_ms);
-                continue;
-            }
+            // readFrame returns null on timeout - just continue to check running flag
+            if (frame == null) continue;
 
             const f = frame.?;
             defer conn.allocator.free(f.payload);

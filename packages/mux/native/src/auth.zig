@@ -199,7 +199,9 @@ pub const AuthState = struct {
     // ========================================================================
 
     pub fn generateToken(token_type: TokenType) [44]u8 {
-        var random_bytes: [32]u8 = undefined;
+        // 30 random bytes → 40 base64 chars (no padding)
+        // 4 byte prefix + 40 base64 = 44 total
+        var random_bytes: [30]u8 = undefined;
         crypto.random.bytes(&random_bytes);
 
         var token: [44]u8 = undefined;
