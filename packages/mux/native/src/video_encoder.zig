@@ -12,8 +12,12 @@ const c = @cImport({
 
 pub const VideoEncoder = struct {
     session: c.VTCompressionSessionRef,
+    // Encode dimensions (may be scaled down from source)
     width: u32,
     height: u32,
+    // Source dimensions (original input size)
+    source_width: u32,
+    source_height: u32,
     frame_count: i64,
     allocator: std.mem.Allocator,
 
@@ -23,21 +27,40 @@ pub const VideoEncoder = struct {
     is_keyframe: bool,
     encode_pending: bool,
 
+    // Scale buffer for downscaling (null if no scaling needed)
+    scale_buffer: ?[]u8,
+
     // Adaptive bitrate/FPS
     current_bitrate: u32,
     target_fps: u32,
     quality_level: u8, // 0-4: 0=lowest, 4=highest
 
     const MAX_OUTPUT_SIZE = 2 * 1024 * 1024; // 2MB max per frame
+    const MAX_PIXELS: u64 = 1920 * 1080; // ~2MP, roughly 1080p
 
-    // Quality presets (bitrate, fps)
+    // Quality presets - FPS fixed at 30, only bitrate varies
+    // Minimum 2 Mbps to keep encode time under 20ms for stable FPS
     const QUALITY_PRESETS = [_]struct { bitrate: u32, fps: u32 }{
-        .{ .bitrate = 1_000_000, .fps = 15 }, // Level 0: Very low (1 Mbps, 15fps)
-        .{ .bitrate = 2_000_000, .fps = 20 }, // Level 1: Low (2 Mbps, 20fps)
-        .{ .bitrate = 3_000_000, .fps = 24 }, // Level 2: Medium (3 Mbps, 24fps)
-        .{ .bitrate = 5_000_000, .fps = 30 }, // Level 3: High (5 Mbps, 30fps)
-        .{ .bitrate = 8_000_000, .fps = 30 }, // Level 4: Max (8 Mbps, 30fps)
+        .{ .bitrate = 2_000_000, .fps = 30 }, // Level 0: Low (2 Mbps)
+        .{ .bitrate = 3_000_000, .fps = 30 }, // Level 1: Medium (3 Mbps)
+        .{ .bitrate = 4_000_000, .fps = 30 }, // Level 2: High (4 Mbps)
+        .{ .bitrate = 5_000_000, .fps = 30 }, // Level 3: Very high (5 Mbps)
+        .{ .bitrate = 8_000_000, .fps = 30 }, // Level 4: Max (8 Mbps)
     };
+
+    // Calculate scaled dimensions to fit within MAX_PIXELS while keeping aspect ratio
+    fn calcScaledDimensions(width: u32, height: u32) struct { w: u32, h: u32 } {
+        const pixels: u64 = @as(u64, width) * @as(u64, height);
+        if (pixels <= MAX_PIXELS) {
+            return .{ .w = width, .h = height };
+        }
+        // Scale down to fit within MAX_PIXELS
+        const scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(pixels)));
+        const new_w: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
+        const new_h: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * scale);
+        // Round to even numbers (required for H.264)
+        return .{ .w = (new_w / 2) * 2, .h = (new_h / 2) * 2 };
+    }
 
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !*VideoEncoder {
         const encoder = try allocator.create(VideoEncoder);
@@ -46,15 +69,49 @@ pub const VideoEncoder = struct {
         const output_buffer = try allocator.alloc(u8, MAX_OUTPUT_SIZE);
         errdefer allocator.free(output_buffer);
 
+        // Calculate encode dimensions (may be scaled down)
+        const scaled = calcScaledDimensions(width, height);
+        const encode_width = scaled.w;
+        const encode_height = scaled.h;
+        const needs_scaling = (encode_width != width or encode_height != height);
+
+        std.debug.print("ENCODER: source={}x{} encode={}x{} scale={}\n", .{
+            width, height, encode_width, encode_height, needs_scaling,
+        });
+
+        // Allocate scale buffer if needed
+        var scale_buffer: ?[]u8 = null;
+        if (needs_scaling) {
+            scale_buffer = try allocator.alloc(u8, encode_width * encode_height * 4);
+        }
+        errdefer if (scale_buffer) |buf| allocator.free(buf);
+
         var session: c.VTCompressionSessionRef = null;
 
-        // Create compression session
+        // Create encoder specification to require hardware acceleration
+        var encoder_spec_keys = [_]c.CFStringRef{
+            c.kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
+        };
+        var encoder_spec_values = [_]c.CFTypeRef{
+            @ptrCast(c.kCFBooleanTrue),
+        };
+        const encoder_spec = c.CFDictionaryCreate(
+            null,
+            @ptrCast(&encoder_spec_keys),
+            @ptrCast(&encoder_spec_values),
+            1,
+            &c.kCFTypeDictionaryKeyCallBacks,
+            &c.kCFTypeDictionaryValueCallBacks,
+        );
+        defer if (encoder_spec != null) c.CFRelease(encoder_spec);
+
+        // Create compression session with SCALED dimensions
         const status = c.VTCompressionSessionCreate(
             null, // allocator
-            @intCast(width),
-            @intCast(height),
+            @intCast(encode_width),
+            @intCast(encode_height),
             c.kCMVideoCodecType_H264,
-            null, // encoder specification (null = default hardware)
+            encoder_spec, // encoder specification (prefer hardware)
             null, // source image buffer attributes
             null, // compressed data allocator
             compressionOutputCallback,
@@ -63,20 +120,24 @@ pub const VideoEncoder = struct {
         );
 
         if (status != 0) {
+            if (scale_buffer) |buf| allocator.free(buf);
             allocator.free(output_buffer);
             return error.EncoderCreationFailed;
         }
 
         encoder.* = .{
             .session = session,
-            .width = width,
-            .height = height,
+            .width = encode_width,
+            .height = encode_height,
+            .source_width = width,
+            .source_height = height,
             .frame_count = 0,
             .allocator = allocator,
             .output_buffer = output_buffer,
             .output_len = 0,
             .is_keyframe = false,
             .encode_pending = false,
+            .scale_buffer = scale_buffer,
             .current_bitrate = 5_000_000, // Start at high quality
             .target_fps = 30,
             .quality_level = 3, // High
@@ -93,6 +154,9 @@ pub const VideoEncoder = struct {
 
         // Real-time encoding (no buffering)
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_RealTime, c.kCFBooleanTrue);
+
+        // Prioritize speed over power efficiency
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_MaximizePowerEfficiency, c.kCFBooleanFalse);
 
         // Disable B-frames (critical for zero latency)
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_AllowFrameReordering, c.kCFBooleanFalse);
@@ -116,8 +180,8 @@ pub const VideoEncoder = struct {
             c.CFRelease(fps_number);
         }
 
-        // Average bitrate (5 Mbps for good quality text)
-        var bitrate: c.SInt32 = 5_000_000;
+        // Lower bitrate for faster encoding (2 Mbps is enough for terminal text)
+        var bitrate: c.SInt32 = 2_000_000;
         const bitrate_number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &bitrate);
         if (bitrate_number != null) {
             _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_AverageBitRate, bitrate_number);
@@ -133,6 +197,7 @@ pub const VideoEncoder = struct {
             c.VTCompressionSessionInvalidate(self.session);
             c.CFRelease(self.session);
         }
+        if (self.scale_buffer) |buf| self.allocator.free(buf);
         self.allocator.free(self.output_buffer);
         self.allocator.destroy(self);
     }
@@ -140,20 +205,24 @@ pub const VideoEncoder = struct {
     // Adjust quality based on client buffer health (0-100)
     // Called from server when client reports buffer stats
     pub fn adjustQuality(self: *VideoEncoder, buffer_health: u8) void {
-        const new_level: u8 = if (buffer_health < 20)
-            // Buffer starving - drop quality significantly
+        // Ignore 0% health - usually means client is still loading
+        if (buffer_health == 0) return;
+
+        const new_level: u8 = if (buffer_health < 30)
+            // Buffer starving - drop quality by 1
             if (self.quality_level > 0) self.quality_level - 1 else 0
-        else if (buffer_health < 40)
-            // Buffer low - drop quality gradually
-            if (self.quality_level > 1) self.quality_level - 1 else self.quality_level
-        else if (buffer_health > 80)
-            // Buffer healthy - can increase quality
+        else if (buffer_health > 70)
+            // Buffer healthy - increase quality by 1
             if (self.quality_level < 4) self.quality_level + 1 else 4
         else
             // Buffer ok - maintain current quality
             self.quality_level;
 
         if (new_level != self.quality_level) {
+            std.debug.print("QUALITY: level {d}->{d} (health={d}%) fps={d} bitrate={d}\n", .{
+                self.quality_level, new_level, buffer_health,
+                QUALITY_PRESETS[new_level].fps, QUALITY_PRESETS[new_level].bitrate,
+            });
             self.quality_level = new_level;
             const preset = QUALITY_PRESETS[new_level];
             self.current_bitrate = preset.bitrate;
@@ -178,7 +247,24 @@ pub const VideoEncoder = struct {
     }
 
     pub fn resize(self: *VideoEncoder, width: u32, height: u32) !void {
-        if (self.width == width and self.height == height) return;
+        if (self.source_width == width and self.source_height == height) return;
+
+        // Calculate new encode dimensions
+        const scaled = calcScaledDimensions(width, height);
+        const encode_width = scaled.w;
+        const encode_height = scaled.h;
+        const needs_scaling = (encode_width != width or encode_height != height);
+
+        std.debug.print("ENCODER RESIZE: source={}x{} encode={}x{} scale={}\n", .{
+            width, height, encode_width, encode_height, needs_scaling,
+        });
+
+        // Reallocate scale buffer if needed
+        if (self.scale_buffer) |buf| self.allocator.free(buf);
+        self.scale_buffer = if (needs_scaling)
+            try self.allocator.alloc(u8, encode_width * encode_height * 4)
+        else
+            null;
 
         // Need to recreate session for new dimensions
         const old_session = self.session;
@@ -186,8 +272,8 @@ pub const VideoEncoder = struct {
         var new_session: c.VTCompressionSessionRef = null;
         const status = c.VTCompressionSessionCreate(
             null,
-            @intCast(width),
-            @intCast(height),
+            @intCast(encode_width),
+            @intCast(encode_height),
             c.kCMVideoCodecType_H264,
             null,
             null,
@@ -206,11 +292,39 @@ pub const VideoEncoder = struct {
         }
 
         self.session = new_session;
-        self.width = width;
-        self.height = height;
+        self.width = encode_width;
+        self.height = encode_height;
+        self.source_width = width;
+        self.source_height = height;
         self.frame_count = 0;
 
         try self.configureSession();
+    }
+
+    // Fast bilinear-ish downscale (point sample with offset for speed)
+    fn scaleDown(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
+        const x_ratio: u32 = (src_w << 16) / dst_w;
+        const y_ratio: u32 = (src_h << 16) / dst_h;
+
+        var dst_offset: usize = 0;
+        var y: u32 = 0;
+        while (y < dst_h) : (y += 1) {
+            const src_y = (y * y_ratio) >> 16;
+            const src_row_offset = src_y * src_w * 4;
+
+            var x: u32 = 0;
+            while (x < dst_w) : (x += 1) {
+                const src_x = (x * x_ratio) >> 16;
+                const src_offset = src_row_offset + src_x * 4;
+
+                // Copy BGRA pixel
+                dst[dst_offset] = src[src_offset];
+                dst[dst_offset + 1] = src[src_offset + 1];
+                dst[dst_offset + 2] = src[src_offset + 2];
+                dst[dst_offset + 3] = src[src_offset + 3];
+                dst_offset += 4;
+            }
+        }
     }
 
     // Encode a BGRA frame, returns encoded H.264 data
@@ -223,6 +337,12 @@ pub const VideoEncoder = struct {
         // Force keyframe if requested - set via frame properties instead
         _ = force_keyframe; // Will be handled by encoder automatically for first frame
 
+        // Scale down if needed
+        const encode_data: []const u8 = if (self.scale_buffer) |scale_buf| blk: {
+            scaleDown(bgra_data, self.source_width, self.source_height, scale_buf, self.width, self.height);
+            break :blk scale_buf;
+        } else bgra_data;
+
         // Create CVPixelBuffer from BGRA data
         var pixel_buffer: c.CVPixelBufferRef = null;
 
@@ -231,7 +351,7 @@ pub const VideoEncoder = struct {
             @intCast(self.width),
             @intCast(self.height),
             c.kCVPixelFormatType_32BGRA,
-            @constCast(@ptrCast(bgra_data.ptr)),
+            @constCast(@ptrCast(encode_data.ptr)),
             self.width * 4, // bytes per row
             null, // release callback
             null, // release callback context

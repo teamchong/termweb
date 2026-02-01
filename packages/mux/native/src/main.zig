@@ -473,6 +473,7 @@ const Panel = struct {
     inspector_tab_len: u8,
     last_iosurface_seed: u32, // For detecting IOSurface changes without copying
     last_frame_time: i64, // For FPS control
+    last_tick_time: i128, // For rate limiting panel.tick()
 
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
@@ -505,6 +506,8 @@ const Panel = struct {
 
         // Focus the surface so it accepts input
         c.ghostty_surface_set_focus(surface, true);
+        // Tell ghostty the surface is visible (not occluded) so it renders properly
+        c.ghostty_surface_set_occlusion(surface, true);
 
         // Frame buffer is at pixel dimensions (width * scale, height * scale)
         const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
@@ -540,6 +543,7 @@ const Panel = struct {
             .inspector_tab_len = 0,
             .last_iosurface_seed = 0,
             .last_frame_time = 0,
+            .last_tick_time = 0,
         };
 
         return panel;
@@ -624,6 +628,7 @@ const Panel = struct {
 
         // Lazy init video encoder and BGRA buffer on first frame capture
         if (self.video_encoder == null) {
+            std.debug.print("ENCODER: Creating encoder for {}x{} ({} MB)\n", .{ surf_width, surf_height, new_size / 1024 / 1024 });
             self.video_encoder = try video.VideoEncoder.init(self.allocator, surf_width, surf_height);
             self.bgra_buffer = try self.allocator.alloc(u8, new_size);
         } else if (new_size != self.bgra_buffer.?.len) {
@@ -655,13 +660,7 @@ const Panel = struct {
     }
 
     fn prepareFrame(self: *Panel) !?struct { data: []const u8, is_keyframe: bool } {
-        const now = std.time.milliTimestamp();
-
-        // FPS throttling - 30 FPS target
-        if (now - self.last_frame_time < FRAME_INTERVAL_MS) {
-            return null;
-        }
-        self.last_frame_time = now;
+        // FPS throttling is handled by runRenderLoop, no throttling here
 
         // Video encoder is lazily initialized in captureFromIOSurface
         if (self.video_encoder == null or self.bgra_buffer == null) {
@@ -3103,17 +3102,30 @@ const Server = struct {
 
         var last_frame: i128 = 0;
 
+        // DEBUG: FPS counter
+        var fps_counter: u32 = 0;
+        var fps_attempts: u32 = 0;
+        var frame_blocks: u32 = 0;
+        var fps_timer: i128 = std.time.nanoTimestamp();
+
+        var loop_start: i128 = std.time.nanoTimestamp();
         while (self.running.load(.acquire)) {
+            // Create autorelease pool for this iteration (prevents ObjC object accumulation)
+            const pool = objc_autoreleasePoolPush();
+            defer objc_autoreleasePoolPop(pool);
+
             const now = std.time.nanoTimestamp();
+            const loop_ms = @as(f64, @floatFromInt(now - loop_start)) / 1_000_000.0;
+            loop_start = now;
+            if (loop_ms > 50.0) {
+                std.debug.print("LOOP: {d:.1}ms\n", .{loop_ms});
+            }
 
             // Process pending panel creations/destructions/resizes/splits (NSWindow/ghostty must be on main thread)
             self.processPendingPanels();
             self.processPendingDestroys();
             self.processPendingResizes();
             self.processPendingSplits();
-
-            // Tick ghostty
-            self.tick();
 
             // Process input for all panels (more responsive than frame rate)
             // Collect panels first, then release mutex before calling ghostty
@@ -3130,10 +3142,9 @@ const Server = struct {
             }
             self.mutex.unlock();
 
-            // Now process input without holding the mutex
+            // Process input (fast - no rendering)
             for (panels_buf[0..panels_count]) |panel| {
                 panel.processInputQueue();
-                panel.tick();
             }
 
             // Only capture and send frames at target fps
@@ -3141,8 +3152,15 @@ const Server = struct {
             if (since_last_frame >= frame_time_ns) {
                 last_frame = now;
 
-                // Small delay for Metal render
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                frame_blocks += 1;
+
+                // Tick ghostty to render content to IOSurface
+                const tick_start = std.time.nanoTimestamp();
+                self.tick();
+                const tick_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - tick_start)) / 1_000_000.0;
+
+                var frames_sent: u32 = 0;
+                var frames_attempted: u32 = 0;
 
                 // Capture and send frames
                 self.mutex.lock();
@@ -3151,16 +3169,46 @@ const Server = struct {
                     const panel = panel_ptr.*;
                     if (!panel.streaming.load(.acquire)) continue;
 
+                    frames_attempted += 1;
+
+                    // Scoped autorelease pool for ALL ObjC/Metal objects created during this panel's frame
+                    const draw_pool = objc_autoreleasePoolPush();
+                    defer objc_autoreleasePoolPop(draw_pool);
+
+                    // Render panel content to IOSurface
+                    const panel_tick_start = std.time.nanoTimestamp();
+                    panel.tick();
+                    const panel_tick_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - panel_tick_start)) / 1_000_000.0;
+
                     if (panel.getIOSurface()) |iosurface| {
+                        const t1 = std.time.nanoTimestamp();
                         const changed = panel.captureFromIOSurface(iosurface) catch continue;
+                        const capture_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t1)) / 1_000_000.0;
                         if (!changed) continue;
 
+                        const t2 = std.time.nanoTimestamp();
                         if (panel.prepareFrame() catch null) |result| {
+                            const encode_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t2)) / 1_000_000.0;
                             panel.sendFrame(result.data) catch {};
+                            frames_sent += 1;
+                            std.debug.print("TIMING: app_tick={d:.1}ms panel_tick={d:.1}ms capture={d:.1}ms encode={d:.1}ms total={d:.1}ms\n", .{ tick_ms, panel_tick_ms, capture_ms, encode_ms, tick_ms + panel_tick_ms + capture_ms + encode_ms });
                         }
                     }
                 }
                 self.mutex.unlock();
+
+                fps_counter += frames_sent;
+                fps_attempts += frames_attempted;
+
+                // Print FPS every second
+                const fps_elapsed = std.time.nanoTimestamp() - fps_timer;
+                if (fps_elapsed >= std.time.ns_per_s) {
+                    std.debug.print("SERVER FPS: sent={d} attempts={d} blocks={d}\n", .{ fps_counter, fps_attempts, frame_blocks });
+                    fps_counter = 0;
+                    fps_attempts = 0;
+                    frame_blocks = 0;
+                    fps_timer = std.time.nanoTimestamp();
+                }
             }
 
 
@@ -3288,6 +3336,54 @@ fn createHiddenWindow(width: u32, height: u32) ?WindowView {
 
     return .{ .window = initialized, .view = view };
 }
+
+fn beginCATransaction() void {
+    const CATransaction = getClass("CATransaction");
+    if (CATransaction != null) {
+        const cls_as_id: objc.id = @ptrCast(@alignCast(CATransaction));
+        const MsgSend = *const fn (objc.id, objc.SEL) callconv(.c) void;
+        const begin: MsgSend = @ptrCast(&objc.objc_msgSend);
+        begin(cls_as_id, sel("begin"));
+        // Disable animations for immediate updates
+        const MsgSendBool = *const fn (objc.id, objc.SEL, bool) callconv(.c) void;
+        const setDisable: MsgSendBool = @ptrCast(&objc.objc_msgSend);
+        setDisable(cls_as_id, sel("setDisableActions:"), true);
+    }
+}
+
+fn commitCATransaction() void {
+    const CATransaction = getClass("CATransaction");
+    if (CATransaction != null) {
+        const cls_as_id: objc.id = @ptrCast(@alignCast(CATransaction));
+        const MsgSend = *const fn (objc.id, objc.SEL) callconv(.c) void;
+        const commit: MsgSend = @ptrCast(&objc.objc_msgSend);
+        commit(cls_as_id, sel("commit"));
+    }
+}
+
+fn flushCATransaction() void {
+    const CATransaction = getClass("CATransaction");
+    if (CATransaction != null) {
+        const cls_as_id: objc.id = @ptrCast(@alignCast(CATransaction));
+        const MsgSendFlush = *const fn (objc.id, objc.SEL) callconv(.c) void;
+        const flush: MsgSendFlush = @ptrCast(&objc.objc_msgSend);
+        flush(cls_as_id, sel("flush"));
+    }
+}
+
+// Import CoreFoundation for CFRunLoop
+const cf = @cImport({
+    @cInclude("CoreFoundation/CoreFoundation.h");
+});
+
+fn runLoopRunOnce() void {
+    // Run one iteration of the run loop to process pending events
+    _ = cf.CFRunLoopRunInMode(cf.kCFRunLoopDefaultMode, 0.0, 1); // 1 = true for Boolean
+}
+
+// Use low-level runtime functions for autorelease pool
+extern fn objc_autoreleasePoolPush() ?*anyopaque;
+extern fn objc_autoreleasePoolPop(?*anyopaque) void;
 
 fn resizeWindow(window: objc.id, width: u32, height: u32) void {
     if (window == null) return;
