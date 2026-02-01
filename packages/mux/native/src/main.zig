@@ -454,8 +454,8 @@ const Panel = struct {
     surface: c.ghostty_surface_t,
     nsview: objc.id,
     window: objc.id,
-    video_encoder: *video.VideoEncoder,
-    bgra_buffer: []u8, // For IOSurface capture
+    video_encoder: ?*video.VideoEncoder, // Lazy init on first frame
+    bgra_buffer: ?[]u8, // For IOSurface capture - lazy init
     sequence: u32,
     width: u32,
     height: u32,
@@ -513,22 +513,16 @@ const Panel = struct {
         // Set size in pixels - ghostty creates IOSurface at this size
         c.ghostty_surface_set_size(surface, pixel_width, pixel_height);
 
-        // Create video encoder for H.264
-        const video_encoder = try video.VideoEncoder.init(allocator, pixel_width, pixel_height);
-        errdefer video_encoder.deinit();
-
-        // Allocate BGRA buffer for IOSurface capture
-        const bgra_size = pixel_width * pixel_height * 4;
-        const bgra_buffer = try allocator.alloc(u8, bgra_size);
-        errdefer allocator.free(bgra_buffer);
+        // Video encoder and BGRA buffer are lazily initialized on first frame
+        // This speeds up panel creation significantly
 
         panel.* = .{
             .id = id,
             .surface = surface,
             .nsview = window_view.view,
             .window = window_view.window,
-            .video_encoder = video_encoder,
-            .bgra_buffer = bgra_buffer,
+            .video_encoder = null,
+            .bgra_buffer = null,
             .sequence = 0,
             .width = width,       // Store point dimensions
             .height = height,     // Store point dimensions
@@ -553,8 +547,8 @@ const Panel = struct {
 
     fn deinit(self: *Panel) void {
         c.ghostty_surface_free(self.surface);
-        self.video_encoder.deinit();
-        self.allocator.free(self.bgra_buffer);
+        if (self.video_encoder) |encoder| encoder.deinit();
+        if (self.bgra_buffer) |buf| self.allocator.free(buf);
         self.input_queue.deinit(self.allocator);
         if (self.title.len > 0) self.allocator.free(self.title);
         if (self.pwd.len > 0) self.allocator.free(self.pwd);
@@ -626,12 +620,16 @@ const Panel = struct {
         const src_bytes_per_row = c.IOSurfaceGetBytesPerRow(iosurface);
         const surf_width: u32 = @intCast(c.IOSurfaceGetWidth(iosurface));
         const surf_height: u32 = @intCast(c.IOSurfaceGetHeight(iosurface));
-
-        // Resize video encoder and buffer if needed
         const new_size = surf_width * surf_height * 4;
-        if (new_size != self.bgra_buffer.len) {
-            try self.video_encoder.resize(surf_width, surf_height);
-            self.allocator.free(self.bgra_buffer);
+
+        // Lazy init video encoder and BGRA buffer on first frame capture
+        if (self.video_encoder == null) {
+            self.video_encoder = try video.VideoEncoder.init(self.allocator, surf_width, surf_height);
+            self.bgra_buffer = try self.allocator.alloc(u8, new_size);
+        } else if (new_size != self.bgra_buffer.?.len) {
+            // Resize video encoder and buffer if needed
+            try self.video_encoder.?.resize(surf_width, surf_height);
+            self.allocator.free(self.bgra_buffer.?);
             self.bgra_buffer = try self.allocator.alloc(u8, new_size);
         }
 
@@ -640,14 +638,14 @@ const Panel = struct {
         if (src_bytes_per_row == dst_bytes_per_row) {
             // Fast path: single memcpy
             const total_bytes = surf_height * dst_bytes_per_row;
-            @memcpy(self.bgra_buffer[0..total_bytes], base_addr.?[0..total_bytes]);
+            @memcpy(self.bgra_buffer.?[0..total_bytes], base_addr.?[0..total_bytes]);
         } else {
             // Slow path: row by row
             for (0..surf_height) |y| {
                 const src_offset = y * src_bytes_per_row;
                 const dst_offset = y * dst_bytes_per_row;
                 @memcpy(
-                    self.bgra_buffer[dst_offset..][0..dst_bytes_per_row],
+                    self.bgra_buffer.?[dst_offset..][0..dst_bytes_per_row],
                     base_addr.?[src_offset..][0..dst_bytes_per_row],
                 );
             }
@@ -665,6 +663,11 @@ const Panel = struct {
         }
         self.last_frame_time = now;
 
+        // Video encoder is lazily initialized in captureFromIOSurface
+        if (self.video_encoder == null or self.bgra_buffer == null) {
+            return null;
+        }
+
         // Check if we need a keyframe
         const need_keyframe = self.force_keyframe or self.sequence == 0;
         if (need_keyframe) {
@@ -672,7 +675,7 @@ const Panel = struct {
         }
 
         // Encode frame using H.264 VideoToolbox
-        const result = try self.video_encoder.encode(self.bgra_buffer, need_keyframe);
+        const result = try self.video_encoder.?.encode(self.bgra_buffer.?, need_keyframe);
         if (result == null) return null;
 
         self.sequence +%= 1;
@@ -1063,7 +1066,9 @@ const Panel = struct {
         // Adjust quality based on buffer health
         // health < 30: buffer starving, reduce quality
         // health > 70: buffer growing, can increase quality
-        self.video_encoder.adjustQuality(health);
+        if (self.video_encoder) |encoder| {
+            encoder.adjustQuality(health);
+        }
     }
 };
 
