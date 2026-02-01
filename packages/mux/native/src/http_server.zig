@@ -109,6 +109,12 @@ pub const HttpServer = struct {
             return;
         }
 
+        // Handle /favicon.ico - return 204 No Content (we use inline SVG)
+        if (std.mem.eql(u8, path, "/favicon.ico")) {
+            stream.writeAll("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n") catch return;
+            return;
+        }
+
         // Sanitize path
         const clean_path = if (std.mem.eql(u8, path, "/")) "/index.html" else path;
         if (std.mem.indexOf(u8, clean_path, "..") != null) {
