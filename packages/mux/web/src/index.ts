@@ -1769,69 +1769,6 @@ class App {
     this.accessControlDialog.show();
   }
 
-  showFolderTransferDialog(): void {
-    const overlay = document.getElementById('folder-transfer-dialog');
-    if (!overlay) return;
-
-    overlay.classList.add('visible');
-    const pathInput = overlay.querySelector<HTMLInputElement>('#folder-transfer-path');
-    const excludeInput = overlay.querySelector<HTMLInputElement>('#folder-transfer-exclude');
-    const deleteCheckbox = overlay.querySelector<HTMLInputElement>('#folder-transfer-delete');
-    const previewCheckbox = overlay.querySelector<HTMLInputElement>('#folder-transfer-preview');
-
-    if (pathInput) pathInput.value = '~/';
-    if (excludeInput) excludeInput.value = 'node_modules,.git,.DS_Store';
-    if (deleteCheckbox) deleteCheckbox.checked = false;
-    if (previewCheckbox) previewCheckbox.checked = true;
-
-    const cleanup = () => {
-      overlay.classList.remove('visible');
-    };
-
-    const uploadBtn = overlay.querySelector('.folder-upload-btn');
-    const downloadBtn = overlay.querySelector('.folder-download-btn');
-    const cancelBtn = overlay.querySelector('.dialog-btn.cancel');
-
-    if (uploadBtn) {
-      uploadBtn.addEventListener('click', async () => {
-        try {
-          const dirHandle = await (window as unknown as { showDirectoryPicker(): Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
-          const serverPath = pathInput?.value.trim() || '~/';
-          const excludes = (excludeInput?.value || '').split(',').map(s => s.trim()).filter(s => s);
-          const deleteExtra = deleteCheckbox?.checked || false;
-          const dryRun = previewCheckbox?.checked || true;
-
-          await this.fileTransfer.startFolderUpload(dirHandle, serverPath, { deleteExtra, dryRun, excludes });
-          cleanup();
-        } catch (err) {
-          if ((err as Error).name !== 'AbortError') {
-            console.error('Folder picker error:', err);
-          }
-        }
-      }, { once: true });
-    }
-
-    if (downloadBtn) {
-      downloadBtn.addEventListener('click', () => {
-        const serverPath = pathInput?.value.trim() || '~/';
-        this.requestDownload(serverPath.endsWith('/') ? serverPath : serverPath + '/');
-        cleanup();
-      }, { once: true });
-    }
-
-    if (cancelBtn) {
-      cancelBtn.addEventListener('click', cleanup, { once: true });
-    }
-
-    // Close on escape
-    const escHandler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        cleanup();
-        document.removeEventListener('keydown', escHandler);
-      }
-    };
-    document.addEventListener('keydown', escHandler);
-  }
 
   // ============================================================================
   // Keyboard Shortcuts
@@ -2231,9 +2168,6 @@ class App {
           case 'download':
             this.showDownloadDialog();
             break;
-          case 'folder-transfer':
-            this.showFolderTransferDialog();
-            break;
           case 'sessions':
           case 'access-control':
             this.showAccessControlDialog();
@@ -2252,6 +2186,9 @@ class App {
             break;
           case 'quick-terminal':
             this.toggleQuickTerminal();
+            break;
+          case 'show-all-tabs':
+            this.showTabOverview();
             break;
           case 'toggle-inspector':
             this.toggleInspector();
