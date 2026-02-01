@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "bun build src/index.ts --outfile=dist/client.js --minify",
-    "build:dev": "bun build src/index.ts --outfile=dist/client.js",
-    "dev": "bun build src/index.ts --outfile=dist/client.js --watch",
+    "build": "bun build src/index.ts --outfile=client.js --minify",
+    "build:dev": "bun build src/index.ts --outfile=client.js",
+    "build:all": "bun run build && cd ../native && zig build",
+    "dev": "bun build src/index.ts --outfile=client.js --watch",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
