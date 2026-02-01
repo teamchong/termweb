@@ -222,6 +222,76 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&napi_install.step);
     }
 
+    // =========================================================================
+    // Mux server (macOS only - requires ghostty, VideoToolbox)
+    // =========================================================================
+    if (target.result.os.tag == .macos) {
+        const mux = b.addExecutable(.{
+            .name = "termweb-mux",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("packages/mux/native/src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+
+        // Link pre-built libghostty
+        mux.addObjectFile(b.path("packages/mux/vendor/ghostty/zig-out/lib/libghostty.a"));
+        mux.addIncludePath(b.path("packages/mux/vendor/ghostty/include"));
+
+        // macOS frameworks required by libghostty and VideoToolbox
+        mux.linkFramework("Foundation");
+        mux.linkFramework("CoreFoundation");
+        mux.linkFramework("CoreGraphics");
+        mux.linkFramework("CoreText");
+        mux.linkFramework("CoreVideo");
+        mux.linkFramework("QuartzCore");
+        mux.linkFramework("IOSurface");
+        mux.linkFramework("Metal");
+        mux.linkFramework("MetalKit");
+        mux.linkFramework("Carbon");
+        mux.linkFramework("AppKit");
+        mux.linkFramework("VideoToolbox");
+        mux.linkFramework("CoreMedia");
+        mux.linkLibCpp();
+
+        // Websocket module
+        mux.root_module.addImport("websocket", websocket_mod);
+
+        // SIMD mask module
+        const mux_simd_mod = b.createModule(.{
+            .root_source_file = b.path("src/simd/mask.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mux.root_module.addImport("simd_mask", mux_simd_mod);
+
+        // libdeflate
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_compress.c"), .flags = &.{"-O2"} });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_decompress.c"), .flags = &.{"-O2"} });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_compress.c"), .flags = &.{"-O2"} });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_decompress.c"), .flags = &.{"-O2"} });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = &.{"-O2"} });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/crc32.c"), .flags = &.{"-O2"} });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/utils.c"), .flags = &.{"-O2"} });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/arm/cpu_features.c"), .flags = &.{"-O2"} });
+        mux.addIncludePath(b.path("vendor/libdeflate"));
+
+        // xxHash
+        mux.addIncludePath(b.path("vendor/xxhash"));
+        mux.addCSourceFile(.{ .file = b.path("vendor/xxhash/xxhash.c"), .flags = &.{"-O2"} });
+
+        mux.linkLibC();
+        b.installArtifact(mux);
+
+        // Mux run step
+        const mux_run = b.addRunArtifact(mux);
+        mux_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| mux_run.addArgs(args);
+        const mux_step = b.step("mux", "Run termweb-mux server");
+        mux_step.dependOn(&mux_run.step);
+    }
+
     // Run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

@@ -3564,13 +3564,8 @@ fn handleSigint(_: c_int) callconv(.c) void {
     std.debug.print("\nShutting down...\n", .{});
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const args = try parseArgs(allocator);
-
+/// Run mux server - can be called from CLI or standalone
+pub fn run(allocator: std.mem.Allocator, http_port: u16, web_root: []const u8) !void {
     // Setup SIGINT handler for graceful shutdown
     const act = std.posix.Sigaction{
         .handler = .{ .handler = handleSigint },
@@ -3582,7 +3577,7 @@ pub fn main() !void {
     std.debug.print("termweb-mux server starting...\n", .{});
 
     // WS ports use 0 to let OS assign random available ports
-    const server = try Server.init(allocator, args.http_port, 0, 0, args.web_root);
+    const server = try Server.init(allocator, http_port, 0, 0, web_root);
     defer server.deinit();
 
     const panel_port = server.panel_ws_server.listener.listen_address.getPort();
@@ -3592,12 +3587,21 @@ pub fn main() !void {
     // Tell HTTP server about the WS ports so it can serve /config
     server.http_server.setWsPorts(panel_port, control_port, file_port);
 
-    std.debug.print("  HTTP:              http://localhost:{}\n", .{args.http_port});
+    std.debug.print("  HTTP:              http://localhost:{}\n", .{http_port});
     std.debug.print("  Panel WebSocket:   ws://localhost:{}\n", .{panel_port});
     std.debug.print("  Control WebSocket: ws://localhost:{}\n", .{control_port});
     std.debug.print("  File WebSocket:    ws://localhost:{}\n", .{file_port});
-    std.debug.print("  Web root:          {s}\n", .{args.web_root});
+    std.debug.print("  Web root:          {s}\n", .{web_root});
     std.debug.print("\nServer initialized, waiting for connections...\n", .{});
 
     try server.run();
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try parseArgs(allocator);
+    try run(allocator, args.http_port, args.web_root);
 }

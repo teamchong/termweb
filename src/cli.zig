@@ -16,6 +16,7 @@ const VERSION = build_options.version;
 
 const Command = enum {
     open,
+    mux,
     help,
     version,
     unknown,
@@ -34,6 +35,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     switch (command) {
         .open => try cmdOpen(allocator, args[2..]),
+        .mux => try cmdMux(allocator, args),
         .version => try cmdVersion(),
         .help => printHelp(),
         .unknown => {
@@ -46,6 +48,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
 fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "open")) return .open;
+    if (std.mem.eql(u8, arg, "mux")) return .mux;
     if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return .help;
     if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) return .version;
     return .unknown;
@@ -394,15 +397,50 @@ fn printHelp() void {
         \\
         \\Other commands:
         \\  termweb version       Show version
+        \\  termweb mux           Start terminal multiplexer server (macOS)
         \\  termweb help          Show this help
         \\
         \\Examples:
         \\  termweb open https://example.com
         \\  termweb open https://github.com --profile Default
+        \\  termweb mux --port 8080
         \\
         \\Requirements:
         \\  - Chrome or Chromium (set CHROME_BIN if not auto-detected)
         \\  - Kitty-compatible terminal: Ghostty, Kitty, or WezTerm
         \\
     , .{});
+}
+
+fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // Find termweb-mux binary in same directory as termweb
+    var self_path_buf: [4096]u8 = undefined;
+    const self_path = std.fs.selfExePath(&self_path_buf) catch |err| {
+        std.debug.print("Error getting self path: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    // Replace "termweb" with "termweb-mux" in path
+    var mux_path_buf: [4096]u8 = undefined;
+    const dir_end = std.mem.lastIndexOf(u8, self_path, "/") orelse 0;
+    const mux_path = std.fmt.bufPrint(&mux_path_buf, "{s}/termweb-mux", .{self_path[0..dir_end]}) catch {
+        std.debug.print("Path too long\n", .{});
+        std.process.exit(1);
+    };
+
+    // Build argv: termweb-mux + remaining args (skip "termweb" and "mux")
+    var argv: std.ArrayListUnmanaged([]const u8) = .{};
+    defer argv.deinit(allocator);
+    try argv.append(allocator, mux_path);
+    if (args.len > 2) {
+        for (args[2..]) |arg| {
+            try argv.append(allocator, arg);
+        }
+    }
+
+    // Execute termweb-mux (doesn't return on success)
+    const err = std.process.execv(allocator, argv.items);
+    std.debug.print("Failed to exec termweb-mux: {}\n", .{err});
+    std.debug.print("Make sure termweb-mux is installed alongside termweb\n", .{});
+    std.process.exit(1);
 }
