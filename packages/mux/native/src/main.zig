@@ -436,6 +436,7 @@ const FrameStats = struct {
 
 const FrameBuffer = struct {
     rgba_current: []u8,    // Raw BGRA from IOSurface
+    rgba_previous: []u8,   // Previous BGRA for fast comparison
     rgb_current: []u8,     // Converted RGB (3 bytes per pixel)
     rgb_previous: []u8,    // Previous frame RGB
     diff: []u8,            // XOR diff
@@ -455,6 +456,7 @@ const FrameBuffer = struct {
 
         return .{
             .rgba_current = try allocator.alloc(u8, rgba_size),
+            .rgba_previous = try allocator.alloc(u8, rgba_size),
             .rgb_current = try allocator.alloc(u8, rgb_size),
             .rgb_previous = try allocator.alloc(u8, rgb_size),
             .diff = try allocator.alloc(u8, rgb_size),
@@ -470,6 +472,7 @@ const FrameBuffer = struct {
 
     fn deinit(self: *FrameBuffer) void {
         self.allocator.free(self.rgba_current);
+        self.allocator.free(self.rgba_previous);
         self.allocator.free(self.rgb_current);
         self.allocator.free(self.rgb_previous);
         self.allocator.free(self.diff);
@@ -569,35 +572,62 @@ const FrameBuffer = struct {
     }
 
     fn computeDiff(self: *FrameBuffer) FrameStats {
-        const len = self.rgb_current.len;
-        var changed_count: usize = 0;
+        const VecSize = 32; // 256-bit vectors (AVX2/NEON friendly)
+        const Vec = @Vector(VecSize, u8);
 
+        const current = self.rgb_current;
+        const prev = self.rgb_previous;
+        const diff_buf = self.diff;
+        const len = current.len;
+
+        var changed_chunks: usize = 0;
         var i: usize = 0;
-        // SIMD-friendly loop with branchless counting
-        while (i + 32 <= len) : (i += 32) {
-            var chunk_changed: usize = 0;
-            inline for (0..32) |j| {
-                const diff_val = self.rgb_current[i + j] ^ self.rgb_previous[i + j];
-                self.diff[i + j] = diff_val;
-                // Branchless: convert bool to 0 or 1
-                chunk_changed += @intFromBool(diff_val != 0);
+
+        // Vectorized loop - XOR 32 bytes at a time in CPU registers
+        while (i + VecSize <= len) : (i += VecSize) {
+            const v_curr: Vec = current[i..][0..VecSize].*;
+            const v_prev: Vec = prev[i..][0..VecSize].*;
+
+            // XOR in one instruction
+            const v_diff = v_curr ^ v_prev;
+
+            // Store result
+            diff_buf[i..][0..VecSize].* = v_diff;
+
+            // Fast check: count chunks with any changes (for threshold logic)
+            // @reduce(.Or) collapses vector to check if ANY byte differs
+            if (@reduce(.Or, v_diff) != 0) {
+                changed_chunks += 1;
             }
-            changed_count += chunk_changed;
         }
+
         // Handle remaining bytes
         while (i < len) : (i += 1) {
-            const diff_val = self.rgb_current[i] ^ self.rgb_previous[i];
-            self.diff[i] = diff_val;
-            changed_count += @intFromBool(diff_val != 0);
+            const diff_val = current[i] ^ prev[i];
+            diff_buf[i] = diff_val;
+            if (diff_val != 0) changed_chunks += 1;
         }
 
-        return FrameStats{ .changed_bytes = changed_count };
+        // Convert chunk count to approximate byte count for threshold logic
+        // (each chunk represents up to VecSize changed bytes)
+        return FrameStats{ .changed_bytes = changed_chunks * VecSize };
     }
 
     fn swapBuffers(self: *FrameBuffer) void {
         const tmp = self.rgb_previous;
         self.rgb_previous = self.rgb_current;
         self.rgb_current = tmp;
+    }
+
+    fn swapRgbaBuffers(self: *FrameBuffer) void {
+        const tmp = self.rgba_previous;
+        self.rgba_previous = self.rgba_current;
+        self.rgba_current = tmp;
+    }
+
+    // Fast check if RGBA buffer changed (runs at memory-read speed, stops at first difference)
+    fn rgbaChanged(self: *FrameBuffer) bool {
+        return !std.mem.eql(u8, self.rgba_current, self.rgba_previous);
     }
 };
 
@@ -800,7 +830,8 @@ const Panel = struct {
         self.force_keyframe = true;
     }
 
-    fn captureFromIOSurface(self: *Panel, iosurface: IOSurfacePtr) !void {
+    // Returns true if frame changed, false if identical to previous
+    fn captureFromIOSurface(self: *Panel, iosurface: IOSurfacePtr) !bool {
         _ = c.IOSurfaceLock(iosurface, c.kIOSurfaceLockReadOnly, null);
         defer _ = c.IOSurfaceUnlock(iosurface, c.kIOSurfaceLockReadOnly, null);
 
@@ -825,8 +856,17 @@ const Panel = struct {
             );
         }
 
-        // Convert BGRA to RGB
+        // FAST CHECK: Skip expensive BGRA->RGB conversion if frame unchanged
+        if (!self.frame_buffer.rgbaChanged()) {
+            // Swap buffers so next comparison works correctly
+            self.frame_buffer.swapRgbaBuffers();
+            return false; // No change - skip everything
+        }
+
+        // Frame changed - convert BGRA to RGB
         self.frame_buffer.convertBgraToRgb();
+        self.frame_buffer.swapRgbaBuffers();
+        return true;
     }
 
     fn prepareFrame(self: *Panel) !?struct { data: []u8, is_keyframe: bool } {
@@ -847,10 +887,15 @@ const Panel = struct {
             self.last_keyframe = now;
             self.force_keyframe = false;
         } else {
+            // FAST CHECK: Skip entirely if buffers are identical (runs at memory-read speed)
+            if (std.mem.eql(u8, self.frame_buffer.rgb_current, self.frame_buffer.rgb_previous)) {
+                return null; // No changes - CPU usage -> 0%
+            }
+
             // Send XOR diff
             const stats = self.frame_buffer.computeDiff();
 
-            // OPTIMIZATION 1: Early exit if nothing changed
+            // Early exit if diff is all zeros (shouldn't happen after eql check, but safety)
             if (stats.changed_bytes == 0) {
                 return null;
             }
@@ -3337,7 +3382,10 @@ const Server = struct {
                     if (!panel.streaming.load(.acquire)) continue;
 
                     if (panel.getIOSurface()) |iosurface| {
-                        panel.captureFromIOSurface(iosurface) catch continue;
+                        // captureFromIOSurface returns false if frame unchanged (skips BGRA->RGB)
+                        const changed = panel.captureFromIOSurface(iosurface) catch continue;
+                        if (!changed) continue;
+
                         // prepareFrame returns null if nothing changed (early exit optimization)
                         if (panel.prepareFrame() catch null) |result| {
                             panel.sendFrame(result.data) catch {};
@@ -3734,11 +3782,18 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 }
 
 
+var sigint_received = std.atomic.Value(bool).init(false);
+
 fn handleSigint(_: c_int) callconv(.c) void {
+    if (sigint_received.swap(true, .acq_rel)) {
+        // Second Ctrl+C - force exit immediately
+        std.posix.exit(1);
+    }
+    // First Ctrl+C - graceful shutdown
     if (Server.global_server) |server| {
         server.running.store(false, .release);
-        std.debug.print("\nShutting down...\n", .{});
     }
+    std.debug.print("\nShutting down...\n", .{});
 }
 
 pub fn main() !void {
