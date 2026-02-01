@@ -3290,20 +3290,12 @@ class App {
       return;
     }
 
-    // Parse file data
+    // Parse file data: [0x12][name_len:u16][name][file_data]
+    // Data comes uncompressed - WebSocket permessage-deflate handles transport compression
     let offset = 1;
     const nameLen = view.getUint16(offset, true); offset += 2;
     const filename = new TextDecoder().decode(bytes.slice(offset, offset + nameLen)); offset += nameLen;
-    const compressedData = bytes.slice(offset);
-
-    // Decompress with pako (raw deflate, not zlib)
-    let fileData;
-    try {
-      fileData = pako.inflateRaw(compressedData);
-    } catch (e) {
-      console.error('Decompression failed:', e);
-      fileData = compressedData; // Fallback
-    }
+    const fileData = bytes.slice(offset);
 
     // Trigger browser download
     const blob = new Blob([fileData]);
@@ -3316,8 +3308,7 @@ class App {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 
-    const ratio = ((1 - compressedData.length / fileData.length) * 100).toFixed(1);
-    console.log(`Downloaded ${filename}: ${compressedData.length} -> ${fileData.length} bytes (${ratio}% saved)`);
+    console.log(`Downloaded ${filename}: ${fileData.length} bytes`);
   }
 
   // ============================================================================

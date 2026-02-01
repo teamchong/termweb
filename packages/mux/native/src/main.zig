@@ -2347,35 +2347,9 @@ const Server = struct {
         };
         defer self.allocator.free(file_data);
 
-        // Compress with libdeflate
-        const compressor = c.libdeflate_alloc_compressor(6) orelse {
-            self.sendBinaryFileError(conn, "Compressor init failed");
-            return;
-        };
-        defer c.libdeflate_free_compressor(compressor);
-
-        const max_compressed = c.libdeflate_deflate_compress_bound(compressor, file_data.len);
-        const compressed = self.allocator.alloc(u8, max_compressed) catch {
-            self.sendBinaryFileError(conn, "Out of memory");
-            return;
-        };
-        defer self.allocator.free(compressed);
-
-        const compressed_size = c.libdeflate_deflate_compress(
-            compressor,
-            file_data.ptr,
-            file_data.len,
-            compressed.ptr,
-            compressed.len,
-        );
-
-        if (compressed_size == 0) {
-            self.sendBinaryFileError(conn, "Compression failed");
-            return;
-        }
-
-        // Build binary response: [0x12][name_len:u16][name][compressed_data]
-        const msg_len = 1 + 2 + filename.len + compressed_size;
+        // Send uncompressed - WebSocket permessage-deflate handles compression
+        // Format: [0x12][name_len:u16][name][file_data]
+        const msg_len = 1 + 2 + filename.len + file_data.len;
         const msg = self.allocator.alloc(u8, msg_len) catch {
             self.sendBinaryFileError(conn, "Out of memory");
             return;
@@ -2385,13 +2359,13 @@ const Server = struct {
         msg[0] = 0x12; // file_data type
         std.mem.writeInt(u16, msg[1..3], @intCast(filename.len), .little);
         @memcpy(msg[3 .. 3 + filename.len], filename);
-        @memcpy(msg[3 + filename.len ..][0..compressed_size], compressed[0..compressed_size]);
+        @memcpy(msg[3 + filename.len ..], file_data);
 
         conn.sendBinary(msg) catch {
             std.log.err("Failed to send file data", .{});
             return;
         };
-        std.log.info("File downloaded: {s} ({d} -> {d} bytes)", .{ resolved_path, file_data.len, compressed_size });
+        std.log.info("File downloaded: {s} ({d} bytes)", .{ resolved_path, file_data.len });
     }
 
     fn sendBinaryFileError(self: *Server, conn: *ws.Connection, err: []const u8) void {
