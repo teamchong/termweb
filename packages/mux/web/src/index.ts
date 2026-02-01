@@ -7,7 +7,7 @@ import { Panel } from './panel';
 import { SplitContainer } from './split-container';
 import { FileTransferHandler } from './file-transfer';
 import { CommandPalette, UploadDialog, DownloadDialog, AccessControlDialog } from './dialogs';
-import type { AppConfig, TabInfo } from './types';
+import type { AppConfig, TabInfo, LayoutData, LayoutNode } from './types';
 import { generateId, applyColors, formatBytes, isLightColor, shadowColor } from './utils';
 
 // Re-export for external use
@@ -38,6 +38,8 @@ class App {
   private host: string;
   private nextTabId = 1;
   private pendingSplit: { parentPanelId: number; direction: string; container: SplitContainer } | null = null;
+  private quickTerminalPanel: Panel | null = null;
+  private previousActivePanel: Panel | null = null;
 
   // UI elements
   private tabsEl: HTMLElement | null = null;
@@ -51,12 +53,18 @@ class App {
   private accessControlDialog: AccessControlDialog;
 
   // Auth state
+  private role = 0;
+  private authRequired = false;
   private sessions: Array<{ id: string; name: string; editorToken: string; viewerToken: string }> = [];
   private shareLinks: Array<{ token: string; type: number; useCount: number }> = [];
 
   // Tab overview state
   private tabOverviewTabs: Array<{ tabId: string; tab: TabInfo; element: HTMLElement }> | null = null;
   private tabOverviewCloseHandler: ((e: KeyboardEvent | MouseEvent) => void) | null = null;
+
+  // Cleanup state
+  private destroyed = false;
+  private reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     this.host = window.location.hostname || 'localhost';
@@ -96,14 +104,54 @@ class App {
       this.fileTransfer.connect(this.host, FILE_PORT);
     }
 
-    // Create initial tab and panel
-    this.createTab();
+    // Wait for panel_list from server to decide whether to create or connect
+    // createTab() will be called in handleJsonMessage if no panels exist
 
     // Setup keyboard shortcuts
     this.setupShortcuts();
 
     // Setup menus
     this.setupMenus();
+
+    // Setup unload handler for cleanup
+    window.addEventListener('beforeunload', () => this.destroy());
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+
+    // Cancel pending reconnection
+    if (this.reconnectTimeoutId) {
+      clearTimeout(this.reconnectTimeoutId);
+      this.reconnectTimeoutId = null;
+    }
+
+    // Close control WebSocket
+    if (this.controlWs) {
+      this.controlWs.close();
+      this.controlWs = null;
+    }
+
+    // Disconnect file transfer handler
+    this.fileTransfer.disconnect();
+
+    // Destroy all panels
+    for (const [, panel] of this.panels) {
+      panel.destroy();
+    }
+    this.panels.clear();
+
+    // Clean up tabs
+    for (const [, tab] of this.tabs) {
+      tab.root.destroy();
+    }
+    this.tabs.clear();
+
+    // Clean up quick terminal if exists
+    if (this.quickTerminalPanel) {
+      this.quickTerminalPanel.destroy();
+      this.quickTerminalPanel = null;
+    }
   }
 
   private async fetchConfig(): Promise<AppConfig> {
@@ -118,6 +166,8 @@ class App {
   }
 
   private connectControl(): void {
+    if (this.destroyed) return;
+
     const wsUrl = `ws://${this.host}:${CONTROL_PORT}`;
     this.controlWs = new WebSocket(wsUrl);
     this.controlWs.binaryType = 'arraybuffer';
@@ -128,6 +178,7 @@ class App {
     };
 
     this.controlWs.onmessage = (event) => {
+      if (this.destroyed) return;
       if (typeof event.data === 'string') {
         this.handleJsonMessage(JSON.parse(event.data));
       } else if (event.data instanceof ArrayBuffer) {
@@ -138,7 +189,9 @@ class App {
     this.controlWs.onclose = () => {
       console.log('Control channel disconnected');
       this.setStatus('disconnected');
-      setTimeout(() => this.connectControl(), 1000);
+      if (!this.destroyed) {
+        this.reconnectTimeoutId = setTimeout(() => this.connectControl(), 1000);
+      }
     };
 
     this.controlWs.onerror = () => {
@@ -150,8 +203,40 @@ class App {
     const type = msg.type as string;
 
     switch (type) {
+      case 'panel_list':
+        if (msg.layout && typeof msg.layout === 'object') {
+          this.restoreLayoutFromServer(msg.layout as LayoutData);
+        } else if (Array.isArray(msg.panels) && msg.panels.length > 0) {
+          this.reconnectPanelsAsSplits(msg.panels as Array<{ panel_id: number; title: string }>);
+        } else {
+          this.createTab();
+        }
+        break;
+      case 'panel_created':
+        this.handlePanelCreated(msg.panel_id as number);
+        break;
+      case 'panel_closed':
+        this.handlePanelClosed(msg.panel_id as number);
+        break;
+      case 'panel_title':
+        this.updatePanelTitle(msg.panel_id as number, msg.title as string);
+        break;
+      case 'panel_pwd':
+        this.updatePanelPwd(msg.panel_id as number, msg.pwd as string);
+        break;
+      case 'panel_bell':
+        this.handleBell(msg.panel_id as number);
+        break;
+      case 'clipboard':
+        try {
+          const text = atob(msg.data as string);
+          navigator.clipboard.writeText(text).catch(err => {
+            console.error('Failed to write clipboard:', err);
+          });
+        } catch { /* ignore */ }
+        break;
       case 'auth_state':
-        this.handleAuthState(msg);
+        this.handleAuthState(msg as { role: number; authRequired: boolean; hasPassword: boolean; passkeyCount: number });
         break;
       case 'sessions':
         this.handleSessionList(msg.sessions as typeof this.sessions);
@@ -167,24 +252,128 @@ class App {
 
   private handleBinaryMessage(data: ArrayBuffer): void {
     const view = new DataView(data);
+    const bytes = new Uint8Array(data);
     const msgType = view.getUint8(0);
+    const decoder = new TextDecoder();
 
     switch (msgType) {
-      case 0x01: // PANEL_CREATED
-        this.handlePanelCreated(data);
+      case 0x01: { // panel_list
+        // Format: [type:u8][count:u8][panel_id:u32, title_len:u8, title...]*[layout_len:u16][layout_json]
+        const count = view.getUint8(1);
+        const panels: Array<{ panel_id: number; title: string }> = [];
+        let offset = 2;
+        for (let i = 0; i < count; i++) {
+          const panelId = view.getUint32(offset, true);
+          offset += 4;
+          const titleLen = view.getUint8(offset);
+          offset += 1;
+          const title = decoder.decode(bytes.slice(offset, offset + titleLen));
+          offset += titleLen;
+          panels.push({ panel_id: panelId, title });
+        }
+        const layoutLen = view.getUint16(offset, true);
+        offset += 2;
+        const layoutJson = decoder.decode(bytes.slice(offset, offset + layoutLen));
+        let layout = null;
+        try { layout = JSON.parse(layoutJson); } catch { /* ignore */ }
+        this.handlePanelList(panels, layout);
         break;
-      case 0x02: // PANEL_CLOSED
-        this.handlePanelClosed(data);
+      }
+      case 0x02: { // panel_created
+        const panelId = view.getUint32(1, true);
+        this.handlePanelCreated(panelId);
         break;
-      case 0x03: // TITLE_CHANGED
-        this.handleTitleChanged(data);
+      }
+      case 0x03: { // panel_closed
+        const panelId = view.getUint32(1, true);
+        this.handlePanelClosed(panelId);
         break;
-      case 0x04: // PWD_CHANGED
-        this.handlePwdChanged(data);
+      }
+      case 0x04: { // panel_title
+        // Format: [type:u8][panel_id:u32][title_len:u8][title...]
+        const panelId = view.getUint32(1, true);
+        const titleLen = view.getUint8(5);
+        const title = decoder.decode(bytes.slice(6, 6 + titleLen));
+        this.updatePanelTitle(panelId, title);
         break;
-      case 0x05: // BELL
-        this.handleBell(data);
+      }
+      case 0x05: { // panel_pwd
+        // Format: [type:u8][panel_id:u32][pwd_len:u16][pwd...]
+        const panelId = view.getUint32(1, true);
+        const pwdLen = view.getUint16(5, true);
+        const pwd = decoder.decode(bytes.slice(7, 7 + pwdLen));
+        this.updatePanelPwd(panelId, pwd);
         break;
+      }
+      case 0x06: { // panel_bell
+        const panelId = view.getUint32(1, true);
+        this.handleBell(panelId);
+        break;
+      }
+      case 0x07: { // layout_update
+        const layoutLen = view.getUint16(1, true);
+        const layoutJson = decoder.decode(bytes.slice(3, 3 + layoutLen));
+        let layout = null;
+        try { layout = JSON.parse(layoutJson); } catch { /* ignore */ }
+        this.handleLayoutUpdate(layout);
+        break;
+      }
+      case 0x08: { // clipboard
+        const dataLen = view.getUint32(1, true);
+        const text = decoder.decode(bytes.slice(5, 5 + dataLen));
+        navigator.clipboard.writeText(text).catch(err => {
+          console.error('Failed to write clipboard:', err);
+        });
+        break;
+      }
+      case 0x09: { // inspector_state
+        const panelId = view.getUint32(1, true);
+        const jsonLen = view.getUint16(5, true);
+        const json = decoder.decode(bytes.slice(7, 7 + jsonLen));
+        try {
+          const state = JSON.parse(json);
+          this.updateInspectorState(panelId, state);
+        } catch { /* ignore */ }
+        break;
+      }
+      case 0x0A: { // auth_state
+        const role = view.getUint8(1);
+        const authRequired = view.getUint8(2) === 1;
+        const hasPassword = view.getUint8(3) === 1;
+        const passkeyCount = view.getUint8(4);
+        this.handleAuthState({ role, authRequired, hasPassword, passkeyCount });
+        break;
+      }
+      case 0x0B: { // session_list
+        const count = view.getUint16(1, true);
+        const sessions: typeof this.sessions = [];
+        let offset = 3;
+        for (let i = 0; i < count; i++) {
+          const idLen = view.getUint16(offset, true); offset += 2;
+          const id = decoder.decode(bytes.slice(offset, offset + idLen)); offset += idLen;
+          const nameLen = view.getUint16(offset, true); offset += 2;
+          const name = decoder.decode(bytes.slice(offset, offset + nameLen)); offset += nameLen;
+          const editorToken = decoder.decode(bytes.slice(offset, offset + 44)); offset += 44;
+          const viewerToken = decoder.decode(bytes.slice(offset, offset + 44)); offset += 44;
+          sessions.push({ id, name, editorToken, viewerToken });
+        }
+        this.handleSessionList(sessions);
+        break;
+      }
+      case 0x0C: { // share_links
+        const count = view.getUint16(1, true);
+        const links: typeof this.shareLinks = [];
+        let offset = 3;
+        for (let i = 0; i < count; i++) {
+          const token = decoder.decode(bytes.slice(offset, offset + 44)); offset += 44;
+          const type = view.getUint8(offset); offset += 1;
+          const useCount = view.getUint32(offset, true); offset += 4;
+          offset += 1; // valid byte (unused)
+          links.push({ token, type, useCount });
+        }
+        this.handleShareLinks(links);
+        break;
+      }
       case 0x12: // FILE_DATA (single file download response)
         this.handleFileData(data);
         break;
@@ -194,53 +383,295 @@ class App {
     }
   }
 
-  private handlePanelCreated(data: ArrayBuffer): void {
-    const view = new DataView(data);
-    const panelId = view.getUint32(1, true);
-
-    if (this.pendingSplit) {
-      this.completePendingSplit(panelId);
+  private handlePanelList(panels: Array<{ panel_id: number; title: string }>, layout: unknown): void {
+    if (layout && typeof layout === 'object' && (layout as LayoutData).tabs?.length > 0) {
+      this.restoreLayoutFromServer(layout as LayoutData);
+    } else if (panels.length > 0) {
+      this.reconnectPanelsAsSplits(panels);
+    } else {
+      this.createTab();
     }
   }
 
-  private handlePanelClosed(data: ArrayBuffer): void {
-    const view = new DataView(data);
-    const serverId = view.getUint32(1, true);
+  private reconnectPanelsAsSplits(panels: Array<{ panel_id: number; title: string }>): void {
+    // Put all panels in one tab with horizontal splits
+    if (panels.length === 0) {
+      this.createTab();
+      return;
+    }
+
+    // Create first panel as tab
+    const tabId = this.createTab(panels[0].panel_id, panels[0].title);
+    const tab = this.tabs.get(tabId);
+    if (!tab) return;
+
+    // Add remaining panels as splits
+    for (let i = 1; i < panels.length; i++) {
+      const panel = this.createPanel(tab.element, panels[i].panel_id);
+      tab.root.split('right', panel);
+    }
+  }
+
+  private handlePanelCreated(panelId: number): void {
+    if (this.pendingSplit) {
+      console.log(`Completing pending split with new panel ${panelId}`);
+      this.completePendingSplit(panelId);
+    } else {
+      // New panel created on server - update local panel's serverId
+      for (const [, panel] of this.panels) {
+        if (panel.serverId === null) {
+          panel.serverId = panelId;
+          console.log(`Local panel ${panel.id} assigned server ID ${panelId}`);
+          break;
+        }
+      }
+    }
+  }
+
+  private handlePanelClosed(serverId: number): void {
+    let targetPanel: Panel | null = null;
+    let targetPanelId: string | null = null;
 
     for (const [id, panel] of this.panels) {
       if (panel.serverId === serverId) {
-        this.panels.delete(id);
-        panel.destroy();
+        targetPanel = panel;
+        targetPanelId = id;
+        break;
+      }
+    }
+
+    if (!targetPanel || !targetPanelId) return;
+
+    // Check if this is the quick terminal panel
+    if (targetPanel === this.quickTerminalPanel) {
+      this.quickTerminalPanel = null;
+      const container = document.getElementById('quick-terminal');
+      if (container?.classList.contains('visible')) {
+        container.classList.remove('visible');
+        if (this.previousActivePanel) {
+          this.setActivePanel(this.previousActivePanel);
+          this.previousActivePanel = null;
+        } else if (this.activeTab) {
+          // Update title for current active tab
+          const tab = this.tabs.get(this.activeTab);
+          if (tab) {
+            const tabPanels = tab.root.getAllPanels();
+            if (tabPanels.length > 0) {
+              this.setActivePanel(tabPanels[0]);
+            }
+          }
+        }
+      }
+      this.panels.delete(targetPanelId);
+      targetPanel.destroy();
+      return;
+    }
+
+    // Clear previousActivePanel if it's the panel being closed
+    if (this.previousActivePanel === targetPanel) {
+      this.previousActivePanel = null;
+    }
+
+    // Find which tab contains this panel
+    let containingTabId: string | null = null;
+    for (const [tabId, tab] of this.tabs) {
+      if (tab.root.findContainer(targetPanel)) {
+        containingTabId = tabId;
+        break;
+      }
+    }
+
+    // Remove from panels map
+    this.panels.delete(targetPanelId);
+
+    if (!containingTabId) {
+      // Panel not in any tab - just destroy it
+      targetPanel.destroy();
+      return;
+    }
+
+    const tab = this.tabs.get(containingTabId);
+    if (!tab) {
+      targetPanel.destroy();
+      return;
+    }
+
+    const allPanels = tab.root.getAllPanels();
+
+    if (allPanels.length <= 1) {
+      // Last panel in tab - close the whole tab
+      // But first create a new tab if this is the last tab
+      if (this.tabs.size === 1) {
+        this.createTab();
+      }
+
+      tab.root.destroy();
+      tab.element.remove();
+      this.tabs.delete(containingTabId);
+      this.removeTabUI(containingTabId);
+
+      // Remove from tab history
+      const histIndex = this.tabHistory.indexOf(containingTabId);
+      if (histIndex !== -1) {
+        this.tabHistory.splice(histIndex, 1);
+      }
+
+      if (this.activeTab === containingTabId) {
+        this.activeTab = null;
+        this.activePanel = null;
+        // Find most recently used tab that still exists
+        for (let i = this.tabHistory.length - 1; i >= 0; i--) {
+          if (this.tabs.has(this.tabHistory[i])) {
+            this.switchToTab(this.tabHistory[i]);
+            return;
+          }
+        }
+        // Fallback: switch to any remaining tab
+        const remaining = this.tabs.keys().next();
+        if (!remaining.done) {
+          this.switchToTab(remaining.value);
+        }
+      }
+    } else {
+      // Multiple panels - just close this one
+      const wasActive = targetPanel === this.activePanel;
+      const otherPanel = allPanels.find(p => p !== targetPanel);
+
+      // Remove from split container
+      tab.root.removePanel(targetPanel);
+
+      // Destroy panel
+      targetPanel.destroy();
+
+      // Focus other panel if needed
+      if (wasActive && otherPanel) {
+        this.setActivePanel(otherPanel);
+      }
+    }
+  }
+
+  private handleLayoutUpdate(_layout: unknown): void {
+    // Layout updates from server are ignored - client is source of truth
+    // Server sends these for multi-client sync but we don't support that yet
+  }
+
+  private restoreLayoutFromServer(layout: LayoutData): void {
+    // Clear existing panels/tabs
+    for (const [tabId, tab] of this.tabs) {
+      tab.root.destroy();
+      tab.element.remove();
+      this.removeTabUI(tabId);
+    }
+    this.tabs.clear();
+    this.panels.clear();
+    this.activeTab = null;
+    this.activePanel = null;
+
+    const serverToClientTabId = new Map<number, string>();
+
+    // Restore each tab
+    for (const serverTab of layout.tabs || []) {
+      const tabId = String(this.nextTabId++);
+      serverToClientTabId.set(serverTab.id, tabId);
+
+      const tabContent = document.createElement('div');
+      tabContent.className = 'tab-content';
+      tabContent.id = `tab-${tabId}`;
+      this.panelsEl?.appendChild(tabContent);
+
+      const root = this.buildSplitTreeFromNode(serverTab.root, tabContent);
+      if (!root) {
+        tabContent.remove();
+        continue;
+      }
+
+      tabContent.appendChild(root.element);
+
+      this.tabs.set(tabId, {
+        id: tabId,
+        title: '',
+        root,
+        element: tabContent,
+      });
+
+      this.addTabUI(tabId, '');
+    }
+
+    // Switch to active tab
+    let targetTabId: string | null = null;
+    if (layout.activeTabId !== undefined && serverToClientTabId.has(layout.activeTabId)) {
+      targetTabId = serverToClientTabId.get(layout.activeTabId) || null;
+    } else if (this.tabs.size > 0) {
+      targetTabId = this.tabs.keys().next().value || null;
+    }
+
+    if (targetTabId) {
+      this.switchToTab(targetTabId);
+    } else {
+      this.createTab();
+    }
+  }
+
+  private buildSplitTreeFromNode(node: LayoutNode | null, parentContainer: HTMLElement): SplitContainer | null {
+    if (!node) return null;
+
+    if (node.type === 'leaf' && node.panelId !== undefined) {
+      const panel = this.createPanel(parentContainer, node.panelId);
+      return SplitContainer.createLeaf(panel);
+    }
+
+    if (node.type === 'split' && node.first && node.second) {
+      const container = new SplitContainer(null);
+      container.direction = node.direction || 'horizontal';
+      container.ratio = node.ratio || 0.5;
+
+      const first = this.buildSplitTreeFromNode(node.first, parentContainer);
+      if (!first) return null;
+      first.parent = container;
+
+      const second = this.buildSplitTreeFromNode(node.second, parentContainer);
+      if (!second) return null;
+      second.parent = container;
+
+      container.first = first;
+      container.second = second;
+
+      container.element = document.createElement('div');
+      container.element.className = `split-container ${container.direction}`;
+
+      container.element.appendChild(first.element);
+
+      container.divider = document.createElement('div');
+      container.divider.className = 'split-divider';
+      container.setupDividerDrag();
+      container.element.appendChild(container.divider);
+
+      container.element.appendChild(second.element);
+
+      container.applyRatio();
+
+      return container;
+    }
+
+    return null;
+  }
+
+  private updateInspectorState(panelId: number, state: unknown): void {
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === panelId) {
+        panel.handleInspectorState(state);
         break;
       }
     }
   }
 
-  private handleTitleChanged(data: ArrayBuffer): void {
-    const view = new DataView(data);
-    const bytes = new Uint8Array(data);
-
-    const serverId = view.getUint32(1, true);
-    const titleLen = view.getUint16(5, true);
-    const title = new TextDecoder().decode(bytes.slice(7, 7 + titleLen));
-
-    this.updatePanelTitle(serverId, title);
+  private handleAuthState(state: { role: number; authRequired: boolean; hasPassword: boolean; passkeyCount: number }): void {
+    this.role = state.role;
+    this.authRequired = state.authRequired;
+    console.log('Auth state:', state);
   }
 
-  private handlePwdChanged(data: ArrayBuffer): void {
-    const view = new DataView(data);
-    const bytes = new Uint8Array(data);
-
-    const serverId = view.getUint32(1, true);
-    const pwdLen = view.getUint16(5, true);
-    const pwd = new TextDecoder().decode(bytes.slice(7, 7 + pwdLen));
-
-    this.updatePanelPwd(serverId, pwd);
-  }
-
-  private handleBell(data: ArrayBuffer): void {
-    const view = new DataView(data);
-    const serverId = view.getUint32(1, true);
+  private handleBell(serverId: number): void {
     this.handlePanelBell(serverId);
   }
 
@@ -285,7 +716,21 @@ class App {
   // Tab Management
   // ============================================================================
 
-  createTab(title = 'Terminal'): string {
+  createTab(serverIdOrTitle?: number | string, title?: string): string {
+    // Handle overloaded signatures:
+    // createTab() - new panel with empty title (shows 👻)
+    // createTab("Title") - new panel with custom title
+    // createTab(serverId, "Title") - connect to existing server panel
+    let serverId: number | null = null;
+    let tabTitle = '';
+
+    if (typeof serverIdOrTitle === 'number') {
+      serverId = serverIdOrTitle;
+      tabTitle = title || '';
+    } else if (typeof serverIdOrTitle === 'string') {
+      tabTitle = serverIdOrTitle;
+    }
+
     const tabId = String(this.nextTabId++);
     const container = document.createElement('div');
     container.className = 'tab-content';
@@ -293,18 +738,18 @@ class App {
 
     this.panelsEl?.appendChild(container);
 
-    const panel = this.createPanel(container);
+    const panel = this.createPanel(container, serverId);
     const root = SplitContainer.createLeaf(panel);
     container.appendChild(root.element);
 
     this.tabs.set(tabId, {
       id: tabId,
-      title,
+      title: tabTitle,
       root,
       element: container,
     });
 
-    this.addTabUI(tabId, title);
+    this.addTabUI(tabId, tabTitle);
     this.switchToTab(tabId);
     return tabId;
   }
@@ -319,6 +764,11 @@ class App {
     this.panels.set(id, panel);
     panel.connect(this.host, PANEL_PORT);
 
+    // Add click handler to focus this panel
+    panel.element.addEventListener('mousedown', () => {
+      this.setActivePanel(panel);
+    });
+
     if (!this.activePanel) {
       this.setActivePanel(panel);
     }
@@ -326,71 +776,134 @@ class App {
     return panel;
   }
 
-  private setActivePanel(panel: Panel): void {
+  private setActivePanel(panel: Panel | null): void {
+    if (this.activePanel === panel) return;
+
     this.activePanel = panel;
-    panel.focus();
 
-    if (panel.serverId !== null) {
-      this.sendFocusPanel(panel.serverId);
+    if (panel) {
+      panel.focus();
+
+      if (panel.serverId !== null) {
+        this.sendFocusPanel(panel.serverId);
+      }
+
+      this.updateTitleForPanel(panel);
     }
-
-    this.updateTitleForPanel(panel);
   }
 
   switchToTab(tabId: string): void {
-    if (this.activeTab) {
-      const currentTab = this.tabs.get(this.activeTab);
-      currentTab?.element.classList.remove('active');
+    console.log(`switchToTab: switching to tab ${tabId}, total tabs: ${this.tabs.size}`);
+
+    // Update tab history (LRU: move to end)
+    const histIndex = this.tabHistory.indexOf(tabId);
+    if (histIndex !== -1) {
+      this.tabHistory.splice(histIndex, 1);
+    }
+    this.tabHistory.push(tabId);
+
+    // Hide ALL tabs first (ensures clean state)
+    for (const [tid, t] of this.tabs) {
+      t.element.classList.remove('active');
+      if (tid !== tabId) {
+        // Pause panels in non-active tabs
+        for (const panel of t.root.getAllPanels()) {
+          panel.hide();
+        }
+      }
     }
 
+    // Show the target tab
     const tab = this.tabs.get(tabId);
     if (tab) {
       tab.element.classList.add('active');
       this.activeTab = tabId;
       this.updateTabUIActive(tabId);
 
-      // Update tab history
-      const histIndex = this.tabHistory.indexOf(tabId);
-      if (histIndex !== -1) {
-        this.tabHistory.splice(histIndex, 1);
+      // Resume all panels in new tab
+      const tabPanels = tab.root.getAllPanels();
+      for (const panel of tabPanels) {
+        panel.show();
       }
-      this.tabHistory.push(tabId);
 
-      // Focus the first panel in this tab
-      const panels = tab.root.getAllPanels();
-      if (panels.length > 0) {
-        this.setActivePanel(panels[0]);
+      // Set active panel to first panel if none set (use setActivePanel to notify server)
+      if (!this.activePanel || !tabPanels.includes(this.activePanel)) {
+        this.setActivePanel(tabPanels[0] || null);
+      } else {
+        // Still notify server of the focus change even if panel didn't change
+        if (this.activePanel && this.activePanel.serverId !== null) {
+          this.sendFocusPanel(this.activePanel.serverId);
+        }
+        this.updateTitleForPanel(this.activePanel);
       }
     }
   }
 
   closeTab(tabId: string): void {
     const tab = this.tabs.get(tabId);
-    if (!tab || this.tabs.size <= 1) return;
+    if (!tab) return;
 
-    // Destroy all panels in this tab
+    // If last tab, create new one first
+    if (this.tabs.size === 1) {
+      this.createTab();
+    }
+
+    // Get all panels in tab
+    const tabPanels = tab.root.getAllPanels();
+
+    // Close all panels on server and remove from map
+    for (const panel of tabPanels) {
+      if (panel.serverId !== null) {
+        this.sendClosePanel(panel.serverId);
+      }
+      // Find and delete from panels map
+      for (const [id, p] of this.panels) {
+        if (p === panel) {
+          this.panels.delete(id);
+          break;
+        }
+      }
+    }
+
+    // Destroy the split container (will destroy panels)
     tab.root.destroy();
-
     tab.element.remove();
-    this.removeTabUI(tabId);
     this.tabs.delete(tabId);
+    this.removeTabUI(tabId);
 
-    // Remove from history
+    // Remove from tab history
     const histIndex = this.tabHistory.indexOf(tabId);
     if (histIndex !== -1) {
       this.tabHistory.splice(histIndex, 1);
     }
 
-    // Switch to most recent tab
+    // Switch to last recently used tab if this was active
     if (this.activeTab === tabId) {
-      const nextTab = this.tabHistory[this.tabHistory.length - 1] || Array.from(this.tabs.keys())[0];
-      if (nextTab) {
-        this.switchToTab(nextTab);
+      this.activeTab = null;
+      this.activePanel = null;
+      // Find most recently used tab that still exists
+      for (let i = this.tabHistory.length - 1; i >= 0; i--) {
+        if (this.tabs.has(this.tabHistory[i])) {
+          this.switchToTab(this.tabHistory[i]);
+          return;
+        }
+      }
+      // Fallback: switch to any remaining tab
+      const remaining = this.tabs.keys().next();
+      if (!remaining.done) {
+        this.switchToTab(remaining.value);
       }
     }
   }
 
   closeActivePanel(): void {
+    // If quick terminal is visible, close it first
+    const quickTerminal = document.getElementById('quick-terminal');
+    if (quickTerminal?.classList.contains('visible')) {
+      this.toggleQuickTerminal();
+      return;
+    }
+
     if (!this.activePanel || !this.activeTab) return;
 
     const tab = this.tabs.get(this.activeTab);
@@ -431,9 +944,14 @@ class App {
 
   closeAllTabs(): void {
     const tabIds = Array.from(this.tabs.keys());
-    // Keep at least one tab
-    for (let i = 0; i < tabIds.length - 1; i++) {
-      this.closeTab(tabIds[i]);
+    if (tabIds.length === 0) return;
+
+    // Create new tab first
+    this.createTab();
+
+    // Close old tabs
+    for (const tabId of tabIds) {
+      this.closeTab(tabId);
     }
   }
 
@@ -493,14 +1011,7 @@ class App {
     const hotkeyHint = tabIndex <= 9 ? `⌘${tabIndex}` : '';
     const displayTitle = title || '👻';
 
-    tab.innerHTML = `
-      <span class="close">×</span>
-      <span class="title-wrapper">
-        <span class="indicator">•</span>
-        <span class="title">${displayTitle}</span>
-      </span>
-      <span class="hotkey">${hotkeyHint}</span>
-    `;
+    tab.innerHTML = `<span class="close">×</span><span class="title-wrapper"><span class="indicator">•</span><span class="title">${displayTitle}</span></span><span class="hotkey">${hotkeyHint}</span>`;
 
     tab.addEventListener('click', (e) => {
       if (!(e.target as HTMLElement).classList.contains('close')) {
@@ -543,11 +1054,19 @@ class App {
     for (const [tabId, tab] of this.tabs) {
       if (tab.root.findContainer(panel)) {
         const tabEl = this.tabsEl?.querySelector(`[data-id="${tabId}"] .title`);
-        const title = tabEl?.textContent || '';
+        let title = tabEl?.textContent || '';
+        // Ghost emoji means no title set yet
+        if (title === '👻') title = '';
 
-        document.title = title || '👻';
         const appTitle = document.getElementById('app-title');
-        if (appTitle) appTitle.textContent = title || '👻';
+        if (title) {
+          document.title = title;
+          if (appTitle) appTitle.textContent = title;
+        } else {
+          document.title = '👻';
+          if (appTitle) appTitle.textContent = '👻';
+        }
+        this.updateIndicatorForPanel(panel, title);
         break;
       }
     }
@@ -582,15 +1101,38 @@ class App {
       document.title = title;
       const appTitle = document.getElementById('app-title');
       if (appTitle) appTitle.textContent = title;
+      this.updateIndicatorForPanel(targetPanel, title);
     }
   }
 
   private updatePanelPwd(serverId: number, pwd: string): void {
+    let targetPanel: Panel | null = null;
     for (const [, panel] of this.panels) {
       if (panel.serverId === serverId) {
+        targetPanel = panel;
         panel.pwd = pwd;
         break;
       }
+    }
+    if (!targetPanel) return;
+
+    // Update tab indicator to match (both tab and title should show same state)
+    const tabId = this.findTabIdForPanel(targetPanel);
+    if (tabId !== null) {
+      const tab = this.tabs.get(tabId);
+      const currentTitle = tab?.title || '';
+      const indicatorEl = this.tabsEl?.querySelector(`[data-id="${tabId}"] .indicator`);
+      if (indicatorEl) {
+        const isAtPrompt = this.isAtPrompt(targetPanel, currentTitle);
+        indicatorEl.textContent = isAtPrompt ? '•' : '✱';
+      }
+    }
+
+    // If this is the active panel, update the title indicator
+    if (targetPanel === this.activePanel) {
+      const appTitle = document.getElementById('app-title');
+      const currentTitle = appTitle ? appTitle.textContent || '' : '';
+      this.updateIndicatorForPanel(targetPanel, currentTitle);
     }
   }
 
@@ -625,6 +1167,32 @@ class App {
         setTimeout(() => tabEl.classList.remove('bell'), 500);
       }
     }
+
+    // Show bell indicator in title bar if this is the active panel
+    if (targetPanel === this.activePanel) {
+      this.updateTitleIndicator('🔔', '');
+      setTimeout(() => {
+        if (targetPanel) {
+          const appTitle = document.getElementById('app-title');
+          this.updateIndicatorForPanel(targetPanel, appTitle?.textContent || '');
+        }
+      }, 2000);
+    }
+  }
+
+  private updateTitleIndicator(indicator: string, stateIndicator?: string): void {
+    const el = document.getElementById('title-indicator');
+    if (el) el.innerHTML = indicator;
+    const elState = document.getElementById('title-state-indicator');
+    if (elState && stateIndicator !== undefined) elState.innerHTML = stateIndicator;
+  }
+
+  private updateIndicatorForPanel(panel: Panel, title: string): void {
+    // Format: folder + indicator (• at prompt, ✱ running)
+    const isAtPrompt = this.isAtPrompt(panel, title);
+    const stateIndicator = isAtPrompt ? '•' : '✱';
+    const indicator = panel.pwd ? '📁' : '';
+    this.updateTitleIndicator(indicator, stateIndicator);
   }
 
   // ============================================================================
@@ -686,10 +1254,17 @@ class App {
 
       const titleBar = document.createElement('div');
       titleBar.className = 'tab-preview-title';
+
+      // Calculate indicator based on whether command is running
+      const panels = tab.root.getAllPanels();
+      const firstPanel = panels[0];
+      const isAtPrompt = firstPanel ? this.isAtPrompt(firstPanel, tab.title) : true;
+      const indicator = isAtPrompt ? '•' : '✱';
+
       titleBar.innerHTML = `
         <span class="tab-preview-close">✕</span>
         <span class="tab-preview-title-text">
-          <span class="tab-preview-indicator">•</span>
+          <span class="tab-preview-indicator">${indicator}</span>
           <span class="tab-preview-title-label">${tab.title || '👻'}</span>
         </span>
         <span class="tab-preview-spacer"></span>
@@ -729,6 +1304,12 @@ class App {
     grid.appendChild(newTabCard);
 
     overlay.classList.add('visible');
+
+    // Clean up any existing handlers before adding new ones
+    if (this.tabOverviewCloseHandler) {
+      document.removeEventListener('keydown', this.tabOverviewCloseHandler);
+      overlay.removeEventListener('click', this.tabOverviewCloseHandler);
+    }
 
     this.tabOverviewCloseHandler = (e: KeyboardEvent | MouseEvent) => {
       if ((e as KeyboardEvent).key === 'Escape' || e.target === overlay) {
@@ -843,60 +1424,53 @@ class App {
 
   private sendFocusPanel(serverId: number): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      const msg = new ArrayBuffer(5);
-      const view = new DataView(msg);
-      view.setUint8(0, 0x81); // FOCUS_PANEL
-      view.setUint32(1, serverId, true);
-      this.controlWs.send(msg);
+      this.controlWs.send(JSON.stringify({
+        type: 'focus_panel',
+        panel_id: serverId
+      }));
     }
   }
 
   private sendResizePanel(serverId: number, width: number, height: number): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      const msg = new ArrayBuffer(13);
-      const view = new DataView(msg);
-      view.setUint8(0, 0x82); // RESIZE_PANEL
-      view.setUint32(1, serverId, true);
-      view.setUint32(5, width, true);
-      view.setUint32(9, height, true);
-      this.controlWs.send(msg);
+      this.controlWs.send(JSON.stringify({
+        type: 'resize_panel',
+        panel_id: serverId,
+        width,
+        height
+      }));
     }
   }
 
   private sendClosePanel(serverId: number): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      const msg = new ArrayBuffer(5);
-      const view = new DataView(msg);
-      view.setUint8(0, 0x83); // CLOSE_PANEL
-      view.setUint32(1, serverId, true);
-      this.controlWs.send(msg);
+      this.controlWs.send(JSON.stringify({
+        type: 'close_panel',
+        panel_id: serverId
+      }));
     }
   }
 
   private sendSplitPanel(parentPanelId: number, direction: string, width: number, height: number): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      const dirCode = { right: 0, down: 1, left: 2, up: 3 }[direction] ?? 0;
-      const msg = new ArrayBuffer(14);
-      const view = new DataView(msg);
-      view.setUint8(0, 0x84); // SPLIT_PANEL
-      view.setUint32(1, parentPanelId, true);
-      view.setUint8(5, dirCode);
-      view.setUint32(6, width, true);
-      view.setUint32(10, height, true);
-      this.controlWs.send(msg);
+      this.controlWs.send(JSON.stringify({
+        type: 'split_panel',
+        panel_id: parentPanelId,
+        direction,
+        width,
+        height,
+        scale: window.devicePixelRatio || 1
+      }));
     }
   }
 
   private sendViewAction(serverId: number, action: string): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      const actionBytes = new TextEncoder().encode(action);
-      const msg = new ArrayBuffer(7 + actionBytes.length);
-      const view = new DataView(msg);
-      view.setUint8(0, 0x85); // VIEW_ACTION
-      view.setUint32(1, serverId, true);
-      view.setUint16(5, actionBytes.length, true);
-      new Uint8Array(msg).set(actionBytes, 7);
-      this.controlWs.send(msg);
+      this.controlWs.send(JSON.stringify({
+        type: 'view_action',
+        panel_id: serverId,
+        action
+      }));
     }
   }
 
@@ -974,10 +1548,6 @@ class App {
     this.accessControlDialog.onCreateShareLink = (tokenType) => this.sendCreateShareLink(tokenType);
     this.accessControlDialog.onRevokeShareLink = (token) => this.sendRevokeShareLink(token);
     this.accessControlDialog.onRevokeAllShares = () => this.sendRevokeAllShares();
-  }
-
-  private handleAuthState(msg: Record<string, unknown>): void {
-    console.log('Auth state:', msg);
   }
 
   private handleSessionList(sessions: typeof this.sessions): void {
@@ -1095,6 +1665,70 @@ class App {
     this.accessControlDialog.show();
   }
 
+  showFolderTransferDialog(): void {
+    const overlay = document.getElementById('folder-transfer-dialog');
+    if (!overlay) return;
+
+    overlay.classList.add('visible');
+    const pathInput = overlay.querySelector<HTMLInputElement>('#folder-transfer-path');
+    const excludeInput = overlay.querySelector<HTMLInputElement>('#folder-transfer-exclude');
+    const deleteCheckbox = overlay.querySelector<HTMLInputElement>('#folder-transfer-delete');
+    const previewCheckbox = overlay.querySelector<HTMLInputElement>('#folder-transfer-preview');
+
+    if (pathInput) pathInput.value = '~/';
+    if (excludeInput) excludeInput.value = 'node_modules,.git,.DS_Store';
+    if (deleteCheckbox) deleteCheckbox.checked = false;
+    if (previewCheckbox) previewCheckbox.checked = true;
+
+    const cleanup = () => {
+      overlay.classList.remove('visible');
+    };
+
+    const uploadBtn = overlay.querySelector('.folder-upload-btn');
+    const downloadBtn = overlay.querySelector('.folder-download-btn');
+    const cancelBtn = overlay.querySelector('.dialog-btn.cancel');
+
+    if (uploadBtn) {
+      uploadBtn.addEventListener('click', async () => {
+        try {
+          const dirHandle = await (window as unknown as { showDirectoryPicker(): Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
+          const serverPath = pathInput?.value.trim() || '~/';
+          const excludes = (excludeInput?.value || '').split(',').map(s => s.trim()).filter(s => s);
+          const deleteExtra = deleteCheckbox?.checked || false;
+          const dryRun = previewCheckbox?.checked || true;
+
+          await this.fileTransfer.startFolderUpload(dirHandle, serverPath, { deleteExtra, dryRun, excludes });
+          cleanup();
+        } catch (err) {
+          if ((err as Error).name !== 'AbortError') {
+            console.error('Folder picker error:', err);
+          }
+        }
+      }, { once: true });
+    }
+
+    if (downloadBtn) {
+      downloadBtn.addEventListener('click', () => {
+        const serverPath = pathInput?.value.trim() || '~/';
+        this.requestDownload(serverPath.endsWith('/') ? serverPath : serverPath + '/');
+        cleanup();
+      }, { once: true });
+    }
+
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', cleanup, { once: true });
+    }
+
+    // Close on escape
+    const escHandler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        cleanup();
+        document.removeEventListener('keydown', escHandler);
+      }
+    };
+    document.addEventListener('keydown', escHandler);
+  }
+
   // ============================================================================
   // Keyboard Shortcuts
   // ============================================================================
@@ -1192,7 +1826,238 @@ class App {
         this.splitActivePanel('down');
         return;
       }
+
+      // ⌘⇧F for folder sync
+      if (e.metaKey && e.shiftKey && (e.key === 'f' || e.key === 'F')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.showFolderTransferDialog();
+        return;
+      }
+
+      // ⌘A for select all
+      if (e.metaKey && !e.shiftKey && e.key === 'a') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          this.sendViewAction(this.activePanel!.serverId!, 'select_all');
+        }
+        return;
+      }
+
+      // ⌘C for copy
+      if (e.metaKey && !e.shiftKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          this.sendViewAction(this.activePanel!.serverId!, 'copy_to_clipboard');
+        }
+        return;
+      }
+
+      // ⌘V for paste from system clipboard
+      if (e.metaKey && !e.shiftKey && e.key === 'v') {
+        e.preventDefault();
+        e.stopPropagation();
+        navigator.clipboard.readText().then(text => {
+          if (this.activePanel) {
+            this.activePanel.sendTextInput(text);
+          }
+        });
+        return;
+      }
+
+      // ⌘⇧V for paste selection
+      if (e.metaKey && e.shiftKey && e.key === 'v') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          this.sendViewAction(this.activePanel!.serverId!, 'paste_from_selection');
+        }
+        return;
+      }
+
+      // Font size shortcuts ⌘-/+/0
+      if (e.metaKey && (e.key === '-' || e.key === '=' || e.key === '0')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.activePanel?.serverId !== null) {
+          if (e.key === '=') this.sendViewAction(this.activePanel!.serverId!, 'increase_font_size:1');
+          else if (e.key === '-') this.sendViewAction(this.activePanel!.serverId!, 'decrease_font_size:1');
+          else if (e.key === '0') this.sendViewAction(this.activePanel!.serverId!, 'reset_font_size');
+        }
+        return;
+      }
+
+      // ⌘⌥I to toggle inspector
+      if (e.metaKey && e.altKey && e.code === 'KeyI') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleInspector();
+        return;
+      }
+
+      // ⌘` for quick terminal
+      if (e.metaKey && e.key === '`') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleQuickTerminal();
+        return;
+      }
+
+      // ⌘⌥Arrow to navigate between splits
+      if (e.metaKey && e.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.navigateSplit(e.key.replace('Arrow', '').toLowerCase());
+        return;
+      }
+
+      // ⌘] and ⌘[ to cycle through splits
+      if (e.metaKey && (e.key === ']' || e.key === '[')) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.cycleSplit(e.key === ']' ? 1 : -1);
+        return;
+      }
+
+      // Forward all other keys to active panel
+      if (this.activePanel) {
+        e.preventDefault();
+        this.activePanel.sendKeyInput(e, 1); // press
+      }
+    }, true); // capture phase
+
+    // Also capture keyup at document level
+    document.addEventListener('keyup', (e) => {
+      if (e.metaKey) return;
+      if (this.activePanel) {
+        e.preventDefault();
+        this.activePanel.sendKeyInput(e, 0); // release
+      }
+    }, true);
+
+    // Handle paste at document level
+    document.addEventListener('paste', (e) => {
+      // Skip if dialog is open
+      const commandPalette = document.getElementById('command-palette');
+      const downloadDialog = document.getElementById('download-dialog');
+      if ((commandPalette?.classList.contains('visible')) ||
+          (downloadDialog?.classList.contains('visible'))) {
+        return;
+      }
+
+      e.preventDefault();
+      const text = e.clipboardData?.getData('text');
+      if (text && this.activePanel) {
+        this.activePanel.sendTextInput(text);
+      }
     });
+  }
+
+  private toggleInspector(): void {
+    this.activePanel?.toggleInspector();
+  }
+
+  private navigateSplit(direction: string): void {
+    if (!this.activePanel || this.activeTab === null) return;
+
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab) return;
+
+    const panels = tab.root.getAllPanels();
+    if (panels.length <= 1) return;
+
+    const activeRect = this.activePanel.element.getBoundingClientRect();
+    const activeCenterX = activeRect.left + activeRect.width / 2;
+    const activeCenterY = activeRect.top + activeRect.height / 2;
+
+    let bestPanel: Panel | null = null;
+    let bestDistance = Infinity;
+
+    for (const panel of panels) {
+      if (panel === this.activePanel) continue;
+
+      const rect = panel.element.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+
+      let isInDirection = false;
+      let distance = 0;
+
+      switch (direction) {
+        case 'left':
+          isInDirection = centerX < activeCenterX;
+          distance = activeCenterX - centerX + Math.abs(centerY - activeCenterY) * 0.1;
+          break;
+        case 'right':
+          isInDirection = centerX > activeCenterX;
+          distance = centerX - activeCenterX + Math.abs(centerY - activeCenterY) * 0.1;
+          break;
+        case 'up':
+          isInDirection = centerY < activeCenterY;
+          distance = activeCenterY - centerY + Math.abs(centerX - activeCenterX) * 0.1;
+          break;
+        case 'down':
+          isInDirection = centerY > activeCenterY;
+          distance = centerY - activeCenterY + Math.abs(centerX - activeCenterX) * 0.1;
+          break;
+      }
+
+      if (isInDirection && distance < bestDistance) {
+        bestDistance = distance;
+        bestPanel = panel;
+      }
+    }
+
+    if (bestPanel) {
+      this.setActivePanel(bestPanel);
+    }
+  }
+
+  private cycleSplit(delta: number): void {
+    if (!this.activePanel || this.activeTab === null) return;
+
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab) return;
+
+    const panels = tab.root.getAllPanels();
+    if (panels.length <= 1) return;
+
+    const currentIndex = panels.indexOf(this.activePanel);
+    if (currentIndex === -1) return;
+
+    let newIndex = currentIndex + delta;
+    if (newIndex < 0) newIndex = panels.length - 1;
+    if (newIndex >= panels.length) newIndex = 0;
+
+    this.setActivePanel(panels[newIndex]);
+  }
+
+  toggleQuickTerminal(): void {
+    const container = document.getElementById('quick-terminal');
+    if (!container) return;
+
+    if (container.classList.contains('visible')) {
+      container.classList.remove('visible');
+      if (this.previousActivePanel) {
+        this.setActivePanel(this.previousActivePanel);
+        this.previousActivePanel = null;
+      }
+    } else {
+      container.classList.add('visible');
+      this.previousActivePanel = this.activePanel;
+      if (!this.quickTerminalPanel) {
+        const content = container.querySelector('.quick-terminal-content');
+        if (content) {
+          content.innerHTML = '';
+          this.quickTerminalPanel = this.createPanel(content as HTMLElement, null);
+        }
+      }
+      if (this.quickTerminalPanel) {
+        this.setActivePanel(this.quickTerminalPanel);
+      }
+    }
   }
 
   // ============================================================================
@@ -1221,6 +2086,9 @@ class App {
           case 'download':
             this.showDownloadDialog();
             break;
+          case 'folder-transfer':
+            this.showFolderTransferDialog();
+            break;
           case 'sessions':
           case 'access-control':
             this.showAccessControlDialog();
@@ -1236,6 +2104,55 @@ class App {
             break;
           case 'split-up':
             this.splitActivePanel('up');
+            break;
+          case 'quick-terminal':
+            this.toggleQuickTerminal();
+            break;
+          case 'toggle-inspector':
+            this.toggleInspector();
+            break;
+          case 'copy':
+            if (this.activePanel?.serverId !== null) {
+              this.sendViewAction(this.activePanel!.serverId!, 'copy_to_clipboard');
+            }
+            break;
+          case 'paste':
+            navigator.clipboard.readText().then(text => {
+              if (this.activePanel) {
+                this.activePanel.sendTextInput(text);
+              }
+            });
+            break;
+          case 'paste-selection':
+            if (this.activePanel?.serverId !== null) {
+              this.sendViewAction(this.activePanel!.serverId!, 'paste_from_selection');
+            }
+            break;
+          case 'select-all':
+            if (this.activePanel?.serverId !== null) {
+              this.sendViewAction(this.activePanel!.serverId!, 'select_all');
+            }
+            break;
+          case 'zoom-in':
+            if (this.activePanel?.serverId !== null) {
+              this.sendViewAction(this.activePanel!.serverId!, 'increase_font_size:1');
+            }
+            break;
+          case 'zoom-out':
+            if (this.activePanel?.serverId !== null) {
+              this.sendViewAction(this.activePanel!.serverId!, 'decrease_font_size:1');
+            }
+            break;
+          case 'zoom-reset':
+            if (this.activePanel?.serverId !== null) {
+              this.sendViewAction(this.activePanel!.serverId!, 'reset_font_size');
+            }
+            break;
+          case 'command-palette':
+            this.showCommandPalette();
+            break;
+          case 'change-title':
+            this.promptChangeTitle();
             break;
         }
       });
