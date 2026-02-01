@@ -1539,8 +1539,9 @@ const Server = struct {
             const height = self.parseJsonInt(data, "height") orelse 600;
             const scale = self.parseJsonFloat(data, "scale") orelse 2.0;
 
-            const dir_str = self.parseJsonString(data, "direction") orelse "horizontal";
-            const direction: SplitDirection = if (std.mem.eql(u8, dir_str, "vertical")) .vertical else .horizontal;
+            const dir_str = self.parseJsonString(data, "direction") orelse "right";
+            // "down" or "up" = vertical split, "right" or "left" = horizontal split
+            const direction: SplitDirection = if (std.mem.eql(u8, dir_str, "down") or std.mem.eql(u8, dir_str, "up")) .vertical else .horizontal;
 
             self.mutex.lock();
             self.pending_splits.append(self.allocator, .{
