@@ -102,11 +102,6 @@
       box-shadow: 0 4px 12px rgba(0,0,0,0.3);
       z-index: 100;
     }
-    /* Only main menu dropdowns should scroll, not submenus */
-    .menu > .menu-dropdown {
-      max-height: calc(100vh - 80px);
-      overflow-y: auto;
-    }
     .menu:hover > .menu-dropdown,
     .menu.open > .menu-dropdown {
       display: block;
@@ -185,6 +180,8 @@
         box-shadow: 0 4px 12px rgba(0,0,0,0.3);
         min-width: 280px;
         gap: 4px;
+        max-height: calc(100vh - 80px);
+        overflow-y: auto;
       }
       #menubar.open {
         display: flex;
