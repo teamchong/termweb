@@ -1968,11 +1968,12 @@ class App {
         return;
       }
 
-      // ⌘⌥Arrow to navigate between splits
-      if (e.metaKey && e.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+      // ⌘⇧Arrow to select split in direction
+      if (e.metaKey && e.shiftKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
         e.preventDefault();
         e.stopPropagation();
-        this.navigateSplit(e.key.replace('Arrow', '').toLowerCase());
+        const dir = e.key.replace('Arrow', '').toLowerCase() as 'up' | 'down' | 'left' | 'right';
+        this.selectSplitDirection(dir);
         return;
       }
 
@@ -1980,7 +1981,8 @@ class App {
       if (e.metaKey && (e.key === ']' || e.key === '[')) {
         e.preventDefault();
         e.stopPropagation();
-        this.cycleSplit(e.key === ']' ? 1 : -1);
+        if (e.key === ']') this.selectNextSplit();
+        else this.selectPreviousSplit();
         return;
       }
 
@@ -2025,81 +2027,6 @@ class App {
 
   private toggleInspector(): void {
     this.activePanel?.toggleInspector();
-  }
-
-  private navigateSplit(direction: string): void {
-    if (!this.activePanel || this.activeTab === null) return;
-
-    const tab = this.tabs.get(this.activeTab);
-    if (!tab) return;
-
-    const panels = tab.root.getAllPanels();
-    if (panels.length <= 1) return;
-
-    const activeRect = this.activePanel.element.getBoundingClientRect();
-    const activeCenterX = activeRect.left + activeRect.width / 2;
-    const activeCenterY = activeRect.top + activeRect.height / 2;
-
-    let bestPanel: Panel | null = null;
-    let bestDistance = Infinity;
-
-    for (const panel of panels) {
-      if (panel === this.activePanel) continue;
-
-      const rect = panel.element.getBoundingClientRect();
-      const centerX = rect.left + rect.width / 2;
-      const centerY = rect.top + rect.height / 2;
-
-      let isInDirection = false;
-      let distance = 0;
-
-      switch (direction) {
-        case 'left':
-          isInDirection = centerX < activeCenterX;
-          distance = activeCenterX - centerX + Math.abs(centerY - activeCenterY) * 0.1;
-          break;
-        case 'right':
-          isInDirection = centerX > activeCenterX;
-          distance = centerX - activeCenterX + Math.abs(centerY - activeCenterY) * 0.1;
-          break;
-        case 'up':
-          isInDirection = centerY < activeCenterY;
-          distance = activeCenterY - centerY + Math.abs(centerX - activeCenterX) * 0.1;
-          break;
-        case 'down':
-          isInDirection = centerY > activeCenterY;
-          distance = centerY - activeCenterY + Math.abs(centerX - activeCenterX) * 0.1;
-          break;
-      }
-
-      if (isInDirection && distance < bestDistance) {
-        bestDistance = distance;
-        bestPanel = panel;
-      }
-    }
-
-    if (bestPanel) {
-      this.setActivePanel(bestPanel);
-    }
-  }
-
-  private cycleSplit(delta: number): void {
-    if (!this.activePanel || this.activeTab === null) return;
-
-    const tab = this.tabs.get(this.activeTab);
-    if (!tab) return;
-
-    const panels = tab.root.getAllPanels();
-    if (panels.length <= 1) return;
-
-    const currentIndex = panels.indexOf(this.activePanel);
-    if (currentIndex === -1) return;
-
-    let newIndex = currentIndex + delta;
-    if (newIndex < 0) newIndex = panels.length - 1;
-    if (newIndex >= panels.length) newIndex = 0;
-
-    this.setActivePanel(panels[newIndex]);
   }
 
   toggleQuickTerminal(): void {
