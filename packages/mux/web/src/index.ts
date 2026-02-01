@@ -113,6 +113,9 @@ class App {
     // Setup menus
     this.setupMenus();
 
+    // Setup iOS accessory bar
+    this.setupAccessoryBar();
+
     // Setup unload handler for cleanup
     window.addEventListener('beforeunload', () => this.destroy());
   }
@@ -1999,7 +2002,9 @@ class App {
       // Forward all other keys to active panel
       if (this.activePanel) {
         e.preventDefault();
-        this.activePanel.sendKeyInput(e, 1); // press
+        // Apply sticky modifiers from accessory bar
+        const modEvent = this.applyingStickyModifiers(e);
+        this.activePanel.sendKeyInput(modEvent, 1); // press
       }
     }, true); // capture phase
 
@@ -2008,7 +2013,10 @@ class App {
       if (e.metaKey) return;
       if (this.activePanel) {
         e.preventDefault();
-        this.activePanel.sendKeyInput(e, 0); // release
+        const modEvent = this.applyingStickyModifiers(e);
+        this.activePanel.sendKeyInput(modEvent, 0); // release
+        // Clear sticky modifiers after key release
+        this.clearStickyModifiers();
       }
     }, true);
 
@@ -2266,6 +2274,125 @@ class App {
             this.promptChangeTitle();
             break;
         }
+      });
+    });
+  }
+  // ============================================================================
+  // iOS Accessory Bar
+  // ============================================================================
+
+  // Sticky modifiers from accessory bar (shared with keyboard handler)
+  private stickyModifiers = { ctrl: false, alt: false, meta: false };
+
+  private applyingStickyModifiers(e: KeyboardEvent): KeyboardEvent {
+    if (!this.stickyModifiers.ctrl && !this.stickyModifiers.alt && !this.stickyModifiers.meta) {
+      return e; // No sticky modifiers active
+    }
+    // Create new event with sticky modifiers applied
+    return new KeyboardEvent(e.type, {
+      key: e.key,
+      code: e.code,
+      ctrlKey: e.ctrlKey || this.stickyModifiers.ctrl,
+      altKey: e.altKey || this.stickyModifiers.alt,
+      metaKey: e.metaKey || this.stickyModifiers.meta,
+      shiftKey: e.shiftKey,
+      bubbles: e.bubbles,
+    });
+  }
+
+  private clearStickyModifiers(): void {
+    this.stickyModifiers.ctrl = false;
+    this.stickyModifiers.alt = false;
+    this.stickyModifiers.meta = false;
+    document.querySelectorAll('#accessory-bar .modifier').forEach(m => m.classList.remove('active'));
+  }
+
+  private setupAccessoryBar(): void {
+    const accessoryBar = document.getElementById('accessory-bar');
+    if (!accessoryBar) return;
+
+    const modifiers = this.stickyModifiers;
+
+    // Handle drawer toggle
+    const handle = accessoryBar.querySelector('.accessory-handle');
+    handle?.addEventListener('click', () => {
+      accessoryBar.classList.toggle('collapsed');
+    });
+
+    // Handle modifier toggles
+    const toggleModifier = (btn: Element) => {
+      const mod = (btn as HTMLElement).dataset.modifier as keyof typeof modifiers;
+      modifiers[mod] = !modifiers[mod];
+      btn.classList.toggle('active', modifiers[mod]);
+      console.log('Modifier toggled:', mod, modifiers[mod]);
+    };
+
+    let lastTouchTime = 0;
+    accessoryBar.querySelectorAll('.modifier').forEach(btn => {
+      btn.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        lastTouchTime = Date.now();
+        toggleModifier(btn);
+      });
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        // Ignore click if touch just happened (prevents double toggle)
+        if (Date.now() - lastTouchTime < 300) return;
+        toggleModifier(btn);
+      });
+    });
+
+    // Handle key buttons
+    const sendKey = (btn: Element) => {
+      const key = (btn as HTMLElement).dataset.key;
+      if (!key) return;
+
+      if (!this.activePanel) {
+        console.log('No active panel');
+        return;
+      }
+
+      console.log('Sending key:', key, 'modifiers:', modifiers);
+
+      // Create synthetic keyboard event
+      const event = new KeyboardEvent('keydown', {
+        key: key,
+        code: key,
+        ctrlKey: modifiers.ctrl,
+        altKey: modifiers.alt,
+        metaKey: modifiers.meta,
+        bubbles: true,
+      });
+
+      // Send to active panel
+      this.activePanel.sendKeyInput(event, 1); // press
+
+      // Also send release
+      setTimeout(() => {
+        const releaseEvent = new KeyboardEvent('keyup', {
+          key: key,
+          code: key,
+          ctrlKey: modifiers.ctrl,
+          altKey: modifiers.alt,
+          metaKey: modifiers.meta,
+          bubbles: true,
+        });
+        this.activePanel?.sendKeyInput(releaseEvent, 0);
+
+        this.clearStickyModifiers();
+      }, 50);
+    };
+
+    accessoryBar.querySelectorAll('.accessory-key:not(.modifier)').forEach(btn => {
+      btn.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        lastTouchTime = Date.now();
+        sendKey(btn);
+      });
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        if (Date.now() - lastTouchTime < 300) return;
+        sendKey(btn);
       });
     });
   }

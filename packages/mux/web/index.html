@@ -1155,6 +1155,85 @@
       padding: 30px;
       text-align: center;
     }
+
+    /* iOS Accessory Drawer */
+    #accessory-bar {
+      display: none;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 10000;
+      flex-direction: column;
+      transition: transform 0.2s ease;
+    }
+    /* Show on touch-only devices (no mouse/trackpad) */
+    @media (hover: none) and (pointer: coarse) {
+      #accessory-bar {
+        display: flex;
+      }
+    }
+    #accessory-bar.collapsed {
+      transform: translateY(52px);
+    }
+    .accessory-handle {
+      height: 24px;
+      background: linear-gradient(to bottom, #d1d5db, #c5c9cf);
+      border-top: 1px solid #e5e5e5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .accessory-handle::before {
+      content: '';
+      width: 36px;
+      height: 4px;
+      background: #999;
+      border-radius: 2px;
+    }
+    .accessory-keys {
+      height: 52px;
+      background: linear-gradient(to bottom, #d1d5db, #c5c9cf);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 6px 10px 6px;
+      box-sizing: border-box;
+    }
+    .accessory-left, .accessory-right {
+      display: flex;
+      gap: 5px;
+    }
+    .accessory-key {
+      height: 36px;
+      min-width: 42px;
+      padding: 0 8px;
+      background: linear-gradient(to bottom, #fff, #f0f0f0);
+      border: none;
+      border-radius: 5px;
+      color: #000;
+      font-size: 13px;
+      font-weight: 500;
+      box-shadow: 0 1px 0 #888, 0 1px 3px rgba(0,0,0,0.2);
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    .accessory-key:active {
+      background: linear-gradient(to bottom, #ccc, #bbb);
+      transform: translateY(1px);
+      box-shadow: 0 0 0 #888;
+    }
+    .accessory-key.modifier.active {
+      background: linear-gradient(to bottom, #007aff, #0066dd);
+      color: #fff;
+    }
+    .accessory-key.arrow {
+      min-width: 36px;
+      padding: 0 6px;
+      font-size: 16px;
+    }
   </style>
 </head>
 <body>
@@ -1355,6 +1434,26 @@
       </div>
       <div class="dialog-buttons">
         <button class="dialog-btn cancel">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- iOS Accessory Drawer -->
+  <div id="accessory-bar" class="collapsed">
+    <div class="accessory-handle"></div>
+    <div class="accessory-keys">
+      <div class="accessory-left">
+        <button class="accessory-key" data-key="Escape">esc</button>
+        <button class="accessory-key" data-key="Tab">tab</button>
+        <button class="accessory-key modifier" data-modifier="ctrl">ctrl</button>
+        <button class="accessory-key modifier" data-modifier="alt">alt</button>
+        <button class="accessory-key modifier" data-modifier="meta">⌘</button>
+      </div>
+      <div class="accessory-right">
+        <button class="accessory-key arrow" data-key="ArrowUp">▲</button>
+        <button class="accessory-key arrow" data-key="ArrowDown">▼</button>
+        <button class="accessory-key arrow" data-key="ArrowLeft">◀</button>
+        <button class="accessory-key arrow" data-key="ArrowRight">▶</button>
       </div>
     </div>
   </div>

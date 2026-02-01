@@ -26,7 +26,7 @@ export class Panel {
   // WebCodecs decoder
   private decoder: VideoDecoder | null = null;
   private decoderConfigured = false;
-  private pendingFrames: Uint8Array[] = []; // Buffer frames until decoder ready
+  private gotFirstKeyframe = false; // Must receive keyframe before decoding
   private frameCount = 0;
   private ctx: CanvasRenderingContext2D | null = null;
 
@@ -40,8 +40,9 @@ export class Panel {
   private frameTimestamps: number[] = [];
   private pendingDecode = 0; // Frames waiting to be decoded
 
-  // Debug stats overlay (enable with #debug=1 in URL)
-  private static debugEnabled = window.location.hash.includes('debug=1');
+  // Debug stats overlay (enable with #debug=1 or ?debug=1 in URL)
+  private static debugEnabled = window.location.hash.includes('debug') ||
+    window.location.search.includes('debug');
   private statsOverlay: HTMLElement | null = null;
   private renderedFrames = 0;
   private lastStatsUpdate = 0;
@@ -100,6 +101,7 @@ export class Panel {
 
   private setupStatsOverlay(): void {
     if (!Panel.debugEnabled) return;
+    console.log('Debug stats overlay enabled');
 
     this.statsOverlay = document.createElement('div');
     this.statsOverlay.className = 'panel-stats-overlay';
@@ -349,7 +351,7 @@ export class Panel {
       }
     }
 
-    // Configure decoder on first keyframe with SPS
+    // Configure decoder on first SPS
     if (sps && !this.decoderConfigured) {
       const codec = this.getCodecFromSps(sps);
 
@@ -360,22 +362,24 @@ export class Panel {
         });
         this.decoderConfigured = true;
         console.log('Decoder configured:', codec);
-
-        // Process any pending frames
-        for (const pending of this.pendingFrames) {
-          this.decodeFrame(pending, false);
-        }
-        this.pendingFrames = [];
       } catch (e) {
         console.error('Failed to configure decoder:', e);
         return;
       }
     }
 
-    // If not configured yet, buffer the frame
+    // Must have decoder configured
     if (!this.decoderConfigured) {
-      this.pendingFrames.push(nalData);
       return;
+    }
+
+    // Must receive keyframe first after configure
+    if (!this.gotFirstKeyframe) {
+      if (!isKeyframe) {
+        return; // Skip until we get a keyframe
+      }
+      this.gotFirstKeyframe = true;
+      console.log('Got first keyframe, starting decode');
     }
 
     this.decodeFrame(nalData, isKeyframe);
