@@ -2119,12 +2119,12 @@ class App {
   // ============================================================================
 
   private setupMenus(): void {
-    const isMobile = () => window.innerWidth < 768;
+    const isTouchDevice = () => !window.matchMedia('(hover: hover)').matches;
 
-    // Mobile: click to toggle menu dropdown
+    // Touch devices: click to toggle menu dropdown
     document.querySelectorAll('.menu-label').forEach(label => {
       label.addEventListener('click', (e) => {
-        if (!isMobile()) return;
+        if (!isTouchDevice()) return;
         e.stopPropagation();
         const menu = label.parentElement;
         const wasOpen = menu?.classList.contains('open');
@@ -2136,7 +2136,6 @@ class App {
     });
 
     // Touch devices: tap to toggle submenu
-    const isTouchDevice = () => !window.matchMedia('(hover: hover)').matches;
     document.querySelectorAll('.menu-submenu').forEach(submenu => {
       submenu.addEventListener('click', (e) => {
         if (!isTouchDevice()) return;
