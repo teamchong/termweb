@@ -156,7 +156,18 @@ export class FileTransferHandler {
       transfer.currentFileIndex = 0;
       transfer.bytesTransferred = 0;
       transfer.state = 'transferring';
+
+      // If this is a download, start requesting files
+      if (transfer.direction === 'download') {
+        this.requestNextFile(transferId);
+      }
     }
+  }
+
+  // For downloads, the server pushes FILE_REQUEST messages
+  // This is called after we've fully received a file
+  private requestNextFile(_transferId: number): void {
+    // No-op - server pushes FILE_REQUEST messages
   }
 
   private async handleFileRequest(data: ArrayBuffer): Promise<void> {
@@ -175,18 +186,26 @@ export class FileTransferHandler {
 
     try {
       const fileData = await this.decompress(compressedData);
-      const file = transfer.files[fileIndex];
 
-      if (!transfer.receivedFiles) transfer.receivedFiles = new Map();
-      if (!transfer.receivedFiles.has(fileIndex)) {
-        transfer.receivedFiles.set(fileIndex, []);
+      // Re-check transfer state after async operation
+      const currentTransfer = this.activeTransfers.get(transferId);
+      if (!currentTransfer || currentTransfer.state === 'complete' || currentTransfer.state === 'error') {
+        return;
       }
-      transfer.receivedFiles.get(fileIndex)!.push({ offset: chunkOffset, data: fileData });
 
-      transfer.bytesTransferred += fileData.length;
+      const file = currentTransfer.files![fileIndex];
+      if (!file) return;
 
-      if (transfer.bytesTransferred >= file.size) {
-        const chunks = transfer.receivedFiles.get(fileIndex)!;
+      if (!currentTransfer.receivedFiles) currentTransfer.receivedFiles = new Map();
+      if (!currentTransfer.receivedFiles.has(fileIndex)) {
+        currentTransfer.receivedFiles.set(fileIndex, []);
+      }
+      currentTransfer.receivedFiles.get(fileIndex)!.push({ offset: chunkOffset, data: fileData });
+
+      currentTransfer.bytesTransferred += fileData.length;
+
+      if (currentTransfer.bytesTransferred >= file.size) {
+        const chunks = currentTransfer.receivedFiles.get(fileIndex)!;
         chunks.sort((a, b) => a.offset - b.offset);
         const fullData = new Uint8Array(file.size);
         let writeOffset = 0;
@@ -196,8 +215,8 @@ export class FileTransferHandler {
         }
 
         this.saveFile(file.path, fullData);
-        transfer.receivedFiles.delete(fileIndex);
-        transfer.currentFileIndex++;
+        currentTransfer.receivedFiles.delete(fileIndex);
+        currentTransfer.currentFileIndex++;
       }
     } catch (err) {
       console.error('Decompression failed:', err);

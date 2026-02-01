@@ -33,6 +33,8 @@ pub fn build(b: *std.Build) !void {
     server.linkFramework("MetalKit");
     server.linkFramework("Carbon");
     server.linkFramework("AppKit");
+    server.linkFramework("VideoToolbox");
+    server.linkFramework("CoreMedia");
     server.linkLibCpp();
 
     // Add termweb's websocket vendor

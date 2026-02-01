@@ -19,20 +19,22 @@ export interface PanelInstance {
   id: string;
   serverId: number | null;
   container: HTMLElement;
-  canvas: HTMLCanvasElement;
+  video: HTMLVideoElement;
+  canvas: HTMLVideoElement; // Alias for backwards compatibility
   ws: WebSocket | null;
   width: number;
   height: number;
-  pwd: string | null;
+  pwd: string;
 
   connect(host: string, port: number): void;
-  disconnect(): void;
-  resize(): void;
+  destroy(): void;
   focus(): void;
-  sendKeyInput(keyCode: number, action: number, mods: number, text?: string): void;
-  sendMouseInput(x: number, y: number, button: number, action: number, mods: number): void;
+  show(): void;
+  hide(): void;
+  sendKeyInput(e: KeyboardEvent, action: number): void;
   sendTextInput(text: string): void;
-  requestKeyframe(): void;
+  toggleInspector(visible?: boolean): void;
+  handleInspectorState(state: unknown): void;
 }
 
 import type { SplitContainer } from './split-container';
@@ -119,4 +121,24 @@ export interface AppConfig {
   controlWsPort: number;
   fileWsPort: number;
   colors?: Record<string, string>;
+}
+
+// Layout data for restoration
+export interface LayoutNode {
+  type: 'leaf' | 'split';
+  panelId?: number;
+  direction?: 'horizontal' | 'vertical';
+  ratio?: number;
+  first?: LayoutNode;
+  second?: LayoutNode;
+}
+
+export interface LayoutTab {
+  id: number;
+  root: LayoutNode;
+}
+
+export interface LayoutData {
+  tabs: LayoutTab[];
+  activeTabId?: number;
 }

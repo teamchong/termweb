@@ -10,6 +10,7 @@ export const ClientMsg = {
   REQUEST_KEYFRAME: 0x11,
   PAUSE_STREAM: 0x12,
   RESUME_STREAM: 0x13,
+  BUFFER_STATS: 0x14, // Client reports buffer health for adaptive bitrate
   CONNECT_PANEL: 0x20,
   CREATE_PANEL: 0x21,
 } as const;
@@ -17,7 +18,6 @@ export const ClientMsg = {
 export const FrameType = {
   KEYFRAME: 0x01,
   DELTA: 0x02,
-  PARTIAL_DELTA: 0x04,
 } as const;
 
 // Binary control message types (client -> server)

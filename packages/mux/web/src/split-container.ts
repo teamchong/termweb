@@ -13,6 +13,7 @@ export class SplitContainer {
   element: HTMLElement;
   divider: HTMLElement | null = null;
   private isDragging = false;
+  private dividerMouseDownHandler: ((e: MouseEvent) => void) | null = null;
 
   constructor(parent: SplitContainer | null = null) {
     this.parent = parent;
@@ -77,10 +78,12 @@ export class SplitContainer {
     }
   }
 
-  private setupDividerDrag(): void {
+  setupDividerDrag(): void {
     let startPos = 0;
     let startRatio = 0;
     let containerSize = 0;
+    let moveHandler: ((e: MouseEvent) => void) | null = null;
+    let upHandler: (() => void) | null = null;
 
     const onMouseDown = (e: MouseEvent) => {
       e.preventDefault();
@@ -97,8 +100,10 @@ export class SplitContainer {
       }
       startRatio = this.ratio;
 
-      document.addEventListener('mousemove', onMouseMove);
-      document.addEventListener('mouseup', onMouseUp);
+      moveHandler = onMouseMove;
+      upHandler = onMouseUp;
+      document.addEventListener('mousemove', moveHandler);
+      document.addEventListener('mouseup', upHandler);
     };
 
     const onMouseMove = (e: MouseEvent) => {
@@ -121,11 +126,14 @@ export class SplitContainer {
 
     const onMouseUp = () => {
       this.isDragging = false;
-      this.divider!.classList.remove('dragging');
-      document.removeEventListener('mousemove', onMouseMove);
-      document.removeEventListener('mouseup', onMouseUp);
+      this.divider?.classList.remove('dragging');
+      if (moveHandler) document.removeEventListener('mousemove', moveHandler);
+      if (upHandler) document.removeEventListener('mouseup', upHandler);
+      moveHandler = null;
+      upHandler = null;
     };
 
+    this.dividerMouseDownHandler = onMouseDown;
     this.divider!.addEventListener('mousedown', onMouseDown);
   }
 
@@ -228,6 +236,12 @@ export class SplitContainer {
   }
 
   destroy(): void {
+    // Clean up divider event listener
+    if (this.divider && this.dividerMouseDownHandler) {
+      this.divider.removeEventListener('mousedown', this.dividerMouseDownHandler);
+      this.dividerMouseDownHandler = null;
+    }
+
     if (this.panel) {
       this.panel.destroy();
     }

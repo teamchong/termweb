@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👻</text></svg>">
   <title>termweb-mux</title>
   <style>
     :root {
@@ -347,13 +348,21 @@
       background: var(--bg);
     }
     .panel.active { display: flex; }
-    .panel canvas {
+    .panel canvas,
+    .panel video,
+    .panel .panel-video {
       flex: 1;
       min-height: 0;
       width: 100%;
+      height: 100%;
       object-fit: contain;
       object-position: top left;
-      image-rendering: pixelated;
+      background: var(--bg);
+    }
+    .panel-content {
+      flex: 1;
+      display: flex;
+      min-height: 0;
     }
     .panel-inspector {
       display: none;
