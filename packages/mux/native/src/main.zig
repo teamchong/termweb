@@ -816,7 +816,7 @@ const Panel = struct {
     inspector_tab: [16]u8,
     inspector_tab_len: u8,
 
-    const KEYFRAME_INTERVAL_MS = 2000;
+    const KEYFRAME_INTERVAL_MS = 60000; // 60 seconds
 
     fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64) !*Panel {
         const panel = try allocator.create(Panel);
