@@ -103,7 +103,7 @@ Then open `http://localhost:8080` in a browser with WebCodecs support (Chrome 94
 - Toggle Full Screen (⌘⇧F) - Hide title/tab bar
 - Show Previous/Next Tab (⌃⇧Tab, ⌃Tab)
 - Zoom Split (⌘⇧↵) - Maximize active panel
-- Select Previous/Next Split (⌘⇧[, ⌘⇧])
+- Select Previous/Next Split (⌘[, ⌘])
 - Select Split (⌘⇧↑↓←→)
 - Resize Split (equalize, move dividers)
 - Tab list (⌘1-9)

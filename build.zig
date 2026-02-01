@@ -253,6 +253,7 @@ pub fn build(b: *std.Build) void {
         mux.linkFramework("AppKit");
         mux.linkFramework("VideoToolbox");
         mux.linkFramework("CoreMedia");
+        mux.linkFramework("Accelerate");
         mux.linkLibCpp();
 
         // Websocket module
