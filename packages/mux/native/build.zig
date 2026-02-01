@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) !void {
     server.linkFramework("AppKit");
     server.linkFramework("VideoToolbox");
     server.linkFramework("CoreMedia");
+    server.linkFramework("Accelerate");
     server.linkLibCpp();
 
     // Add termweb's websocket vendor

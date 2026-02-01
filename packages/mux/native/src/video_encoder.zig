@@ -8,6 +8,7 @@ const c = @cImport({
     @cInclude("VideoToolbox/VideoToolbox.h");
     @cInclude("CoreMedia/CoreMedia.h");
     @cInclude("CoreVideo/CoreVideo.h");
+    @cInclude("Accelerate/Accelerate.h");
 });
 
 pub const VideoEncoder = struct {
@@ -301,34 +302,31 @@ pub const VideoEncoder = struct {
         try self.configureSession();
     }
 
-    // Fast bilinear-ish downscale (point sample with offset for speed)
+    // Fast downscale using Accelerate vImage (hardware optimized)
     fn scaleDown(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
-        const x_ratio: u32 = (src_w << 16) / dst_w;
-        const y_ratio: u32 = (src_h << 16) / dst_h;
+        var src_buffer = c.vImage_Buffer{
+            .data = @constCast(@ptrCast(src.ptr)),
+            .height = src_h,
+            .width = src_w,
+            .rowBytes = src_w * 4,
+        };
 
-        var dst_offset: usize = 0;
-        var y: u32 = 0;
-        while (y < dst_h) : (y += 1) {
-            const src_y = (y * y_ratio) >> 16;
-            const src_row_offset = src_y * src_w * 4;
+        var dst_buffer = c.vImage_Buffer{
+            .data = @ptrCast(dst.ptr),
+            .height = dst_h,
+            .width = dst_w,
+            .rowBytes = dst_w * 4,
+        };
 
-            var x: u32 = 0;
-            while (x < dst_w) : (x += 1) {
-                const src_x = (x * x_ratio) >> 16;
-                const src_offset = src_row_offset + src_x * 4;
-
-                // Copy BGRA pixel
-                dst[dst_offset] = src[src_offset];
-                dst[dst_offset + 1] = src[src_offset + 1];
-                dst[dst_offset + 2] = src[src_offset + 2];
-                dst[dst_offset + 3] = src[src_offset + 3];
-                dst_offset += 4;
-            }
-        }
+        // Use vImageScale for fast hardware-accelerated scaling
+        // kvImageHighQualityResampling for better quality, kvImageNoFlags for speed
+        _ = c.vImageScale_ARGB8888(&src_buffer, &dst_buffer, null, c.kvImageNoFlags);
     }
 
     // Encode a BGRA frame, returns encoded H.264 data
     pub fn encode(self: *VideoEncoder, bgra_data: []const u8, force_keyframe: bool) !?struct { data: []const u8, is_keyframe: bool } {
+        const t0 = std.time.nanoTimestamp();
+
         // Reset output
         self.output_len = 0;
         self.is_keyframe = false;
@@ -342,6 +340,8 @@ pub const VideoEncoder = struct {
             scaleDown(bgra_data, self.source_width, self.source_height, scale_buf, self.width, self.height);
             break :blk scale_buf;
         } else bgra_data;
+
+        const t1 = std.time.nanoTimestamp();
 
         // Create CVPixelBuffer from BGRA data
         var pixel_buffer: c.CVPixelBufferRef = null;
@@ -365,6 +365,8 @@ pub const VideoEncoder = struct {
         }
         defer c.CVPixelBufferRelease(pixel_buffer);
 
+        const t2 = std.time.nanoTimestamp();
+
         // Create presentation timestamp
         const pts = c.CMTimeMake(self.frame_count, 30); // 30 fps timebase
         self.frame_count += 1;
@@ -385,10 +387,25 @@ pub const VideoEncoder = struct {
             return error.EncodeFailed;
         }
 
+        const t3 = std.time.nanoTimestamp();
+
         // Force completion (synchronous output)
         _ = c.VTCompressionSessionCompleteFrames(self.session, c.kCMTimeInvalid);
 
+        const t4 = std.time.nanoTimestamp();
+
         self.encode_pending = false;
+
+        // Debug timing (only every 30 frames to reduce spam)
+        if (@mod(self.frame_count, 30) == 0) {
+            const scale_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+            const pixbuf_ms = @as(f64, @floatFromInt(t2 - t1)) / 1_000_000.0;
+            const submit_ms = @as(f64, @floatFromInt(t3 - t2)) / 1_000_000.0;
+            const complete_ms = @as(f64, @floatFromInt(t4 - t3)) / 1_000_000.0;
+            std.debug.print("ENCODE: scale={d:.1}ms pixbuf={d:.1}ms submit={d:.1}ms complete={d:.1}ms\n", .{
+                scale_ms, pixbuf_ms, submit_ms, complete_ms,
+            });
+        }
 
         if (self.output_len == 0) {
             return null;

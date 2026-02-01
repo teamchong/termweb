@@ -3182,9 +3182,9 @@ const Server = struct {
 
                     if (panel.getIOSurface()) |iosurface| {
                         const t1 = std.time.nanoTimestamp();
-                        const changed = panel.captureFromIOSurface(iosurface) catch continue;
+                        // Always capture - video encoder handles redundant frames efficiently
+                        _ = panel.captureFromIOSurface(iosurface) catch continue;
                         const capture_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t1)) / 1_000_000.0;
-                        if (!changed) continue;
 
                         const t2 = std.time.nanoTimestamp();
                         if (panel.prepareFrame() catch null) |result| {
