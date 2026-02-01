@@ -255,4 +255,100 @@ export class SplitContainer {
       this.element.remove();
     }
   }
+
+  // Equalize all split ratios to 50/50
+  equalize(): void {
+    if (this.direction !== null) {
+      this.ratio = 0.5;
+      this.applyRatio();
+      this.first?.equalize();
+      this.second?.equalize();
+    }
+  }
+
+  // Resize split by moving divider in the given direction
+  resizeSplit(direction: 'up' | 'down' | 'left' | 'right', amount: number): void {
+    // Find the appropriate divider to move based on direction
+    const isVerticalMove = direction === 'up' || direction === 'down';
+    const isNegative = direction === 'up' || direction === 'left';
+
+    // Find a container with matching direction
+    const targetDirection: SplitDirection = isVerticalMove ? 'vertical' : 'horizontal';
+    const container = this.findContainerWithDirection(targetDirection);
+
+    if (container) {
+      const rect = container.element.getBoundingClientRect();
+      const containerSize = isVerticalMove ? rect.height : rect.width;
+      const deltaRatio = (isNegative ? -amount : amount) / containerSize;
+      container.ratio = Math.max(0.1, Math.min(0.9, container.ratio + deltaRatio));
+      container.applyRatio();
+    }
+  }
+
+  private findContainerWithDirection(targetDirection: SplitDirection): SplitContainer | null {
+    // Walk up the tree to find a container with the matching direction
+    let current: SplitContainer | null = this;
+    while (current) {
+      if (current.direction === targetDirection) {
+        return current;
+      }
+      current = current.parent;
+    }
+    return null;
+  }
+
+  // Select split in the given direction from the panel with panelId
+  selectSplitInDirection(direction: 'up' | 'down' | 'left' | 'right', panelId: number | undefined): Panel | null {
+    if (!panelId) return null;
+
+    // Get all panels with their bounding rects
+    const panels = this.getAllPanels();
+    const currentPanel = panels.find(p => p.id === panelId);
+    if (!currentPanel) return null;
+
+    const currentRect = currentPanel.canvas.getBoundingClientRect();
+    const currentCenterX = currentRect.left + currentRect.width / 2;
+    const currentCenterY = currentRect.top + currentRect.height / 2;
+
+    let bestPanel: Panel | null = null;
+    let bestDistance = Infinity;
+
+    for (const panel of panels) {
+      if (panel.id === panelId) continue;
+
+      const rect = panel.canvas.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+
+      // Check if panel is in the correct direction
+      let inDirection = false;
+      let distance = 0;
+
+      switch (direction) {
+        case 'up':
+          inDirection = centerY < currentCenterY;
+          distance = currentCenterY - centerY + Math.abs(centerX - currentCenterX) * 0.5;
+          break;
+        case 'down':
+          inDirection = centerY > currentCenterY;
+          distance = centerY - currentCenterY + Math.abs(centerX - currentCenterX) * 0.5;
+          break;
+        case 'left':
+          inDirection = centerX < currentCenterX;
+          distance = currentCenterX - centerX + Math.abs(centerY - currentCenterY) * 0.5;
+          break;
+        case 'right':
+          inDirection = centerX > currentCenterX;
+          distance = centerX - currentCenterX + Math.abs(centerY - currentCenterY) * 0.5;
+          break;
+      }
+
+      if (inDirection && distance < bestDistance) {
+        bestDistance = distance;
+        bestPanel = panel;
+      }
+    }
+
+    return bestPanel;
+  }
 }

@@ -2490,24 +2490,28 @@ class App {
   }
 
   private selectSplitDirection(direction: 'up' | 'down' | 'left' | 'right'): void {
-    if (this.activeTab) {
-      const tab = this.tabs.get(this.activeTab);
-      tab?.root?.selectSplitInDirection?.(direction, this.activePanel?.id);
+    if (!this.activeTab) return;
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab?.root) return;
+    const panel = tab.root.selectSplitInDirection(direction, this.activePanel?.id);
+    if (panel) {
+      this.setActivePanel(panel);
     }
   }
 
   private equalizeSplits(): void {
-    if (this.activeTab) {
-      const tab = this.tabs.get(this.activeTab);
-      tab?.root?.equalize?.();
-    }
+    if (!this.activeTab) return;
+    const tab = this.tabs.get(this.activeTab);
+    tab?.root?.equalize();
   }
 
   private resizeSplit(direction: 'up' | 'down' | 'left' | 'right'): void {
-    if (this.activeTab) {
-      const tab = this.tabs.get(this.activeTab);
-      tab?.root?.resizeSplit?.(direction, 50); // Move by 50px
-    }
+    if (!this.activeTab || !this.activePanel) return;
+    const tab = this.tabs.get(this.activeTab);
+    if (!tab?.root) return;
+    // Find the container for the active panel and resize from there
+    const container = tab.root.findContainer(this.activePanel);
+    container?.resizeSplit(direction, 50);
   }
   // ============================================================================
   // iOS Accessory Bar
