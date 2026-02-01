@@ -2140,10 +2140,46 @@ class App {
   // ============================================================================
 
   private setupMenus(): void {
+    const isMobile = () => window.innerWidth < 768;
+
+    // Mobile: click to toggle menu dropdown
+    document.querySelectorAll('.menu-label').forEach(label => {
+      label.addEventListener('click', (e) => {
+        if (!isMobile()) return;
+        e.stopPropagation();
+        const menu = label.parentElement;
+        const wasOpen = menu?.classList.contains('open');
+        // Close all menus
+        document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+        // Toggle this one
+        if (!wasOpen) menu?.classList.add('open');
+      });
+    });
+
+    // Close menus when clicking outside
+    document.addEventListener('click', () => {
+      document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+      document.getElementById('menubar')?.classList.remove('open');
+    });
+
+    // Hamburger menu toggle
+    const hamburger = document.getElementById('hamburger');
+    if (hamburger) {
+      hamburger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        document.getElementById('menubar')?.classList.toggle('open');
+      });
+    }
+
+    // Menu item actions
     document.querySelectorAll('.menu-item').forEach(item => {
       item.addEventListener('click', () => {
         const action = (item as HTMLElement).dataset.action;
         if (!action) return;
+
+        // Close menu after action
+        document.querySelectorAll('.menu').forEach(m => m.classList.remove('open'));
+        document.getElementById('menubar')?.classList.remove('open');
 
         switch (action) {
           case 'new-tab':
