@@ -301,14 +301,15 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void
     // Move cursor to row 2
     try writer.writeAll("\x1b[2;1H");
 
-    // Use fixed image_id for content - Kitty replaces in-place (no delete needed)
+    // Use fixed image_id AND placement_id for content - Kitty replaces in-place (no accumulation)
     // In hint mode, use negative z-index so text hints appear on top
     const z_index: i32 = if (viewer.mode == .hint_mode) -1 else 0;
     const display_opts = kitty_mod.DisplayOptions{
         .rows = content_rows,
         .columns = display_cols,
         .y_offset = @intCast(y_offset),
-        .image_id = 100, // Fixed ID for content
+        .image_id = 100, // Fixed ID for content image data
+        .placement_id = 100, // Fixed placement ID to replace (not accumulate)
         .z = z_index,
         // Explicit dimensions for PNG (required for some terminals over SSH)
         .width = frame_width,
