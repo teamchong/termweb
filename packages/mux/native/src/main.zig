@@ -3734,12 +3734,27 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 }
 
 
+fn handleSigint(_: c_int) callconv(.c) void {
+    if (Server.global_server) |server| {
+        server.running.store(false, .release);
+        std.debug.print("\nShutting down...\n", .{});
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const args = try parseArgs(allocator);
+
+    // Setup SIGINT handler for graceful shutdown
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleSigint },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
     std.debug.print("termweb-mux server starting...\n", .{});
 
