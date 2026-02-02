@@ -397,7 +397,7 @@ fn printHelp() void {
         \\
         \\Other commands:
         \\  termweb version       Show version
-        \\  termweb mux           Start terminal multiplexer server (macOS)
+        \\  termweb mux           Start terminal multiplexer server
         \\  termweb help          Show this help
         \\
         \\Examples:
@@ -413,22 +413,22 @@ fn printHelp() void {
 }
 
 fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    // Find termweb-mux binary in same directory as termweb
+    // Find hidden mux binary in same directory as termweb
     var self_path_buf: [4096]u8 = undefined;
     const self_path = std.fs.selfExePath(&self_path_buf) catch |err| {
         std.debug.print("Error getting self path: {}\n", .{err});
         std.process.exit(1);
     };
 
-    // Replace "termweb" with "termweb-mux" in path
+    // Look for .termweb-mux (hidden binary)
     var mux_path_buf: [4096]u8 = undefined;
     const dir_end = std.mem.lastIndexOf(u8, self_path, "/") orelse 0;
-    const mux_path = std.fmt.bufPrint(&mux_path_buf, "{s}/termweb-mux", .{self_path[0..dir_end]}) catch {
+    const mux_path = std.fmt.bufPrint(&mux_path_buf, "{s}/.termweb-mux", .{self_path[0..dir_end]}) catch {
         std.debug.print("Path too long\n", .{});
         std.process.exit(1);
     };
 
-    // Build argv: termweb-mux + remaining args (skip "termweb" and "mux")
+    // Build argv: .termweb-mux + remaining args (skip "termweb" and "mux")
     var argv: std.ArrayListUnmanaged([]const u8) = .{};
     defer argv.deinit(allocator);
     try argv.append(allocator, mux_path);
@@ -438,9 +438,9 @@ fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    // Execute termweb-mux (doesn't return on success)
+    // Execute mux binary (doesn't return on success)
     const err = std.process.execv(allocator, argv.items);
-    std.debug.print("Failed to exec termweb-mux: {}\n", .{err});
-    std.debug.print("Make sure termweb-mux is installed alongside termweb\n", .{});
+    std.debug.print("Failed to start mux server: {}\n", .{err});
+    std.debug.print("Run 'make' to build the mux component\n", .{});
     std.process.exit(1);
 }

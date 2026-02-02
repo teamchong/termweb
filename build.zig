@@ -229,7 +229,7 @@ pub fn build(b: *std.Build) void {
     // =========================================================================
     if (target.result.os.tag == .macos or target.result.os.tag == .linux) {
         const mux = b.addExecutable(.{
-            .name = "termweb-mux",
+            .name = ".termweb-mux", // Hidden binary, accessed via "termweb mux"
             .root_module = b.createModule(.{
                 .root_source_file = b.path("packages/mux/native/src/main.zig"),
                 .target = target,
