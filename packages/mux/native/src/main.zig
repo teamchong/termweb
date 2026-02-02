@@ -1407,8 +1407,9 @@ const PanelSplitRequest = struct {
 };
 
 const Server = struct {
-    app: c.ghostty_app_t,
-    config: c.ghostty_config_t,
+    // Ghostty app/config - lazy initialized on first panel, freed when last panel closes
+    app: ?c.ghostty_app_t,
+    config: ?c.ghostty_config_t,
     panels: std.AutoHashMap(u32, *Panel),
     panel_connections: std.AutoHashMap(*ws.Connection, *Panel),
     control_connections: std.ArrayList(*ws.Connection),
@@ -1445,34 +1446,10 @@ const Server = struct {
         const server = try allocator.create(Server);
         errdefer allocator.destroy(server);
 
-        // Initialize ghostty
-        const init_result = c.ghostty_init(0, null);
-        if (init_result != c.GHOSTTY_SUCCESS) return error.GhosttyInitFailed;
+        // Ghostty is lazy-initialized on first panel creation (scale to zero)
 
-        // Load user's ghostty config (~/.config/ghostty/config)
-        const config = c.ghostty_config_new();
-        c.ghostty_config_load_default_files(config);
-        c.ghostty_config_finalize(config);
-
-        const runtime_config = c.ghostty_runtime_config_s{
-            .userdata = null,
-            .supports_selection_clipboard = true,
-            .wakeup_cb = wakeupCallback,
-            .action_cb = actionCallback,
-            .read_clipboard_cb = readClipboardCallback,
-            .confirm_read_clipboard_cb = confirmReadClipboardCallback,
-            .write_clipboard_cb = writeClipboardCallback,
-            .close_surface_cb = closeSurfaceCallback,
-        };
-
-        const app = c.ghostty_app_new(&runtime_config, config);
-        if (app == null) {
-            c.ghostty_config_free(config);
-            return error.AppCreationFailed;
-        }
-
-        // Create HTTP server for static files
-        const http_srv = try http.HttpServer.init(allocator, "0.0.0.0", http_port, config);
+        // Create HTTP server for static files (no ghostty config needed initially)
+        const http_srv = try http.HttpServer.init(allocator, "0.0.0.0", http_port, null);
 
         // Create control WebSocket server (for tab list, layout, etc.)
         const control_ws = try ws.Server.init(allocator, "0.0.0.0", control_port);
@@ -1490,8 +1467,8 @@ const Server = struct {
         const auth_state = try auth.AuthState.init(allocator);
 
         server.* = .{
-            .app = app,
-            .config = config,
+            .app = null, // Lazy init on first panel
+            .config = null,
             .panels = std.AutoHashMap(u32, *Panel).init(allocator),
             .panel_connections = std.AutoHashMap(*ws.Connection, *Panel).init(allocator),
             .control_connections = .{},
@@ -1518,6 +1495,52 @@ const Server = struct {
 
         global_server = server;
         return server;
+    }
+
+    // Lazy initialize ghostty when first panel is created
+    fn ensureGhosttyInit(self: *Server) !void {
+        if (self.app != null) return; // Already initialized
+
+        const init_result = c.ghostty_init(0, null);
+        if (init_result != c.GHOSTTY_SUCCESS) return error.GhosttyInitFailed;
+
+        // Load user's ghostty config (~/.config/ghostty/config)
+        const config = c.ghostty_config_new();
+        c.ghostty_config_load_default_files(config);
+        c.ghostty_config_finalize(config);
+
+        const runtime_config = c.ghostty_runtime_config_s{
+            .userdata = null,
+            .supports_selection_clipboard = true,
+            .wakeup_cb = wakeupCallback,
+            .action_cb = actionCallback,
+            .read_clipboard_cb = readClipboardCallback,
+            .confirm_read_clipboard_cb = confirmReadClipboardCallback,
+            .write_clipboard_cb = writeClipboardCallback,
+            .close_surface_cb = closeSurfaceCallback,
+        };
+
+        const app = c.ghostty_app_new(&runtime_config, config);
+        if (app == null) {
+            c.ghostty_config_free(config);
+            return error.AppCreationFailed;
+        }
+
+        self.app = app;
+        self.config = config;
+        std.debug.print("Ghostty initialized (first panel created)\n", .{});
+    }
+
+    // Free ghostty when last panel is closed (scale to zero)
+    fn freeGhosttyIfEmpty(self: *Server) void {
+        if (self.panels.count() > 0) return; // Still have panels
+        if (self.app == null) return; // Already freed
+
+        if (self.app) |app| c.ghostty_app_free(app);
+        if (self.config) |cfg| c.ghostty_config_free(cfg);
+        self.app = null;
+        self.config = null;
+        std.debug.print("Ghostty freed (all panels closed)\n", .{});
     }
 
     fn deinit(self: *Server) void {
@@ -1552,19 +1575,23 @@ const Server = struct {
         self.file_connections.deinit(self.allocator);
         self.connection_roles.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
-        c.ghostty_app_free(self.app);
-        c.ghostty_config_free(self.config);
+        // Only free ghostty if it was initialized
+        if (self.app) |app| c.ghostty_app_free(app);
+        if (self.config) |cfg| c.ghostty_config_free(cfg);
         self.allocator.destroy(self);
     }
 
     fn createPanel(self: *Server, width: u32, height: u32, scale: f64) !*Panel {
+        // Lazy init ghostty on first panel (scale to zero)
+        try self.ensureGhosttyInit();
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const id = self.next_panel_id;
         self.next_panel_id += 1;
 
-        const panel = try Panel.init(self.allocator, self.app, id, width, height, scale);
+        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale);
         try self.panels.put(id, panel);
 
         // Add to layout as a new tab (default behavior for new panels)
@@ -1575,13 +1602,16 @@ const Server = struct {
 
     // Create a panel as a split of an existing panel (doesn't create a new tab)
     fn createPanelAsSplit(self: *Server, width: u32, height: u32, scale: f64, parent_panel_id: u32, direction: SplitDirection) !*Panel {
+        // Lazy init ghostty on first panel (scale to zero)
+        try self.ensureGhosttyInit();
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const id = self.next_panel_id;
         self.next_panel_id += 1;
 
-        const panel = try Panel.init(self.allocator, self.app, id, width, height, scale);
+        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale);
         try self.panels.put(id, panel);
 
         // Add to layout as a split of the parent panel
@@ -1601,6 +1631,9 @@ const Server = struct {
         if (self.panels.fetchRemove(id)) |entry| {
             entry.value.deinit();
         }
+
+        // Free ghostty if no panels left (scale to zero)
+        self.freeGhosttyIfEmpty();
     }
 
     fn getPanel(self: *Server, id: u32) ?*Panel {
@@ -1610,7 +1643,8 @@ const Server = struct {
     }
 
     fn tick(self: *Server) void {
-        c.ghostty_app_tick(self.app);
+        // Only tick if ghostty is initialized
+        if (self.app) |app| c.ghostty_app_tick(app);
     }
 
     // ========== Control WebSocket callbacks ==========
@@ -3526,6 +3560,9 @@ const Server = struct {
         }
 
         self.allocator.free(pending);
+
+        // Free ghostty if no panels left (scale to zero)
+        self.freeGhosttyIfEmpty();
     }
 
     fn processPendingResizes(self: *Server) void {

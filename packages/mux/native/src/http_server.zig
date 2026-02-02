@@ -1,10 +1,22 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const net = std.net;
 const Allocator = std.mem.Allocator;
 
-const c = @cImport({
+// Platform detection
+const is_macos = builtin.os.tag == .macos;
+
+// Platform-specific ghostty import
+const c = if (is_macos) @cImport({
     @cInclude("ghostty.h");
-});
+}) else struct {
+    // Stub for Linux
+    const ghostty_stub = @import("ghostty_stub.zig");
+    pub const ghostty_config_t = ghostty_stub.ghostty_config_t;
+    pub fn ghostty_config_get(_: ghostty_config_t, _: anytype, _: [*:0]const u8, _: usize) c_int {
+        return -1; // Not found
+    }
+};
 
 // Embedded web assets (~140KB total) - from web_assets module
 const web_assets = @import("web_assets");
@@ -18,7 +30,10 @@ const Color = extern struct {
     b: u8,
 };
 
-// Simple HTTP server for embedded static files + config endpoint
+// WebSocket upgrade callback type
+pub const WsUpgradeCallback = *const fn (stream: net.Stream, request: []const u8, user_data: ?*anyopaque) void;
+
+// Simple HTTP server for embedded static files + config endpoint + WebSocket upgrades
 pub const HttpServer = struct {
     listener: net.Server,
     allocator: Allocator,
@@ -26,9 +41,14 @@ pub const HttpServer = struct {
     panel_ws_port: u16,
     control_ws_port: u16,
     file_ws_port: u16,
-    ghostty_config: c.ghostty_config_t,
+    ghostty_config: ?c.ghostty_config_t,
+    // WebSocket upgrade callbacks
+    panel_ws_callback: ?WsUpgradeCallback = null,
+    control_ws_callback: ?WsUpgradeCallback = null,
+    file_ws_callback: ?WsUpgradeCallback = null,
+    ws_user_data: ?*anyopaque = null,
 
-    pub fn init(allocator: Allocator, address: []const u8, port: u16, ghostty_config: c.ghostty_config_t) !*HttpServer {
+    pub fn init(allocator: Allocator, address: []const u8, port: u16, ghostty_config: ?c.ghostty_config_t) !*HttpServer {
         const server = try allocator.create(HttpServer);
         errdefer allocator.destroy(server);
 
@@ -41,6 +61,10 @@ pub const HttpServer = struct {
             .control_ws_port = 0,
             .file_ws_port = 0,
             .ghostty_config = ghostty_config,
+            .panel_ws_callback = null,
+            .control_ws_callback = null,
+            .file_ws_callback = null,
+            .ws_user_data = null,
         };
 
         return server;
@@ -50,6 +74,19 @@ pub const HttpServer = struct {
         self.panel_ws_port = panel_port;
         self.control_ws_port = control_port;
         self.file_ws_port = file_port;
+    }
+
+    pub fn setWsCallbacks(
+        self: *HttpServer,
+        panel_cb: ?WsUpgradeCallback,
+        control_cb: ?WsUpgradeCallback,
+        file_cb: ?WsUpgradeCallback,
+        user_data: ?*anyopaque,
+    ) void {
+        self.panel_ws_callback = panel_cb;
+        self.control_ws_callback = control_cb;
+        self.file_ws_callback = file_cb;
+        self.ws_user_data = user_data;
     }
 
     pub fn deinit(self: *HttpServer) void {
@@ -84,29 +121,84 @@ pub const HttpServer = struct {
     }
 
     fn handleConnection(self: *HttpServer, stream: net.Stream) void {
-        defer stream.close();
-
         var buf: [4096]u8 = undefined;
-        const n = stream.read(&buf) catch return;
-        if (n == 0) return;
+        const n = stream.read(&buf) catch {
+            stream.close();
+            return;
+        };
+        if (n == 0) {
+            stream.close();
+            return;
+        }
 
         const request = buf[0..n];
 
         // Parse request line
-        const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return;
+        const line_end = std.mem.indexOf(u8, request, "\r\n") orelse {
+            stream.close();
+            return;
+        };
         const request_line = request[0..line_end];
 
         // Parse method and path
         var parts = std.mem.splitScalar(u8, request_line, ' ');
-        const method = parts.next() orelse return;
-        const path = parts.next() orelse return;
+        const method = parts.next() orelse {
+            stream.close();
+            return;
+        };
+        const full_path = parts.next() orelse {
+            stream.close();
+            return;
+        };
+
+        // Split path from query string
+        const path = if (std.mem.indexOf(u8, full_path, "?")) |idx| full_path[0..idx] else full_path;
 
         if (!std.mem.eql(u8, method, "GET")) {
             self.sendError(stream, 405, "Method Not Allowed");
+            stream.close();
             return;
         }
 
-        // Handle /config endpoint - returns WebSocket ports
+        // Debug: print request for /ws paths
+        if (std.mem.startsWith(u8, path, "/ws/")) {
+            std.debug.print("=== Request for {s} ===\n", .{path});
+            // Print first 500 chars of request
+            const preview_len = @min(request.len, 500);
+            std.debug.print("{s}\n", .{request[0..preview_len]});
+            std.debug.print("=== End request ===\n", .{});
+        }
+
+        // Check for WebSocket upgrade
+        if (self.isWebSocketUpgrade(request)) {
+            std.debug.print("WebSocket upgrade detected for path: {s}\n", .{path});
+            // Route WebSocket by path - don't close stream, callback owns it
+            if (std.mem.eql(u8, path, "/ws/panel")) {
+                if (self.panel_ws_callback) |cb| {
+                    cb(stream, request, self.ws_user_data);
+                    return; // Callback owns the stream
+                }
+            } else if (std.mem.eql(u8, path, "/ws/control")) {
+                if (self.control_ws_callback) |cb| {
+                    cb(stream, request, self.ws_user_data);
+                    return;
+                }
+            } else if (std.mem.eql(u8, path, "/ws/file")) {
+                if (self.file_ws_callback) |cb| {
+                    cb(stream, request, self.ws_user_data);
+                    return;
+                }
+            }
+            // Unknown WebSocket path or no callback
+            self.sendError(stream, 404, "WebSocket endpoint not found");
+            stream.close();
+            return;
+        }
+
+        // Regular HTTP - close stream when done
+        defer stream.close();
+
+        // Handle /config endpoint - returns WebSocket info
         if (std.mem.eql(u8, path, "/config")) {
             self.sendConfig(stream);
             return;
@@ -141,6 +233,36 @@ pub const HttpServer = struct {
         _ = stream.write(content) catch return;
     }
 
+    fn isWebSocketUpgrade(self: *HttpServer, request: []const u8) bool {
+        _ = self;
+        // Check for "Upgrade: websocket" header (case-insensitive)
+        var i: usize = 0;
+        while (i < request.len) {
+            // Find next line
+            const line_start = i;
+            while (i < request.len and request[i] != '\r') : (i += 1) {}
+            const line = request[line_start..i];
+
+            // Skip \r\n
+            if (i + 1 < request.len and request[i] == '\r' and request[i + 1] == '\n') {
+                i += 2;
+            } else {
+                break;
+            }
+
+            // Check for Upgrade header
+            if (line.len >= 18) { // "Upgrade: websocket"
+                if (std.ascii.eqlIgnoreCase(line[0..8], "Upgrade:")) {
+                    const value = std.mem.trim(u8, line[8..], " \t");
+                    if (std.ascii.eqlIgnoreCase(value, "websocket")) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     fn sendError(self: *HttpServer, stream: net.Stream, code: u16, message: []const u8) void {
         _ = self;
         var buf: [256]u8 = undefined;
@@ -158,13 +280,11 @@ pub const HttpServer = struct {
             _ = c.ghostty_config_get(cfg, &fg, "foreground", 10);
         }
 
+        // Return config - client uses path-based WebSocket on same port
         var body_buf: [512]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf,
-            \\{{"panelWsPort":{},"controlWsPort":{},"fileWsPort":{},"colors":{{"background":"#{x:0>2}{x:0>2}{x:0>2}","foreground":"#{x:0>2}{x:0>2}{x:0>2}"}}}}
+            \\{{"wsPath":true,"colors":{{"background":"#{x:0>2}{x:0>2}{x:0>2}","foreground":"#{x:0>2}{x:0>2}{x:0>2}"}}}}
         , .{
-            self.panel_ws_port,
-            self.control_ws_port,
-            self.file_ws_port,
             bg.r, bg.g, bg.b,
             fg.r, fg.g, fg.b,
         }) catch return;

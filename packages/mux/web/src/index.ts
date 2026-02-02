@@ -525,11 +525,6 @@ class App {
 
     if (allPanels.length <= 1) {
       // Last panel in tab - close the whole tab
-      // But first create a new tab if this is the last tab
-      if (this.tabs.size === 1) {
-        this.createTab();
-      }
-
       tab.root.destroy();
       tab.element.remove();
       this.tabs.delete(containingTabId);
@@ -575,9 +570,26 @@ class App {
     }
   }
 
-  private handleLayoutUpdate(_layout: unknown): void {
-    // Layout updates from server are ignored - client is source of truth
-    // Server sends these for multi-client sync but we don't support that yet
+  private handleLayoutUpdate(layout: unknown): void {
+    // Check if server has no tabs (scale to zero) - clear client UI
+    const layoutData = layout as LayoutData | null;
+    if (!layoutData || !layoutData.tabs || layoutData.tabs.length === 0) {
+      // Server has no panels - clear all tabs
+      for (const [tabId, tab] of this.tabs) {
+        tab.root.destroy();
+        tab.element.remove();
+        this.removeTabUI(tabId);
+      }
+      this.tabs.clear();
+      this.panels.clear();
+      this.activeTab = null;
+      this.activePanel = null;
+
+      // Reset title to ghost emoji (empty state)
+      const appTitle = document.getElementById('app-title');
+      if (appTitle) appTitle.textContent = '👻';
+    }
+    // Non-empty layouts are ignored - client manages its own state
   }
 
   private restoreLayoutFromServer(layout: LayoutData): void {
@@ -981,11 +993,6 @@ class App {
     const tab = this.tabs.get(tabId);
     if (!tab) return;
 
-    // If last tab, create new one first
-    if (this.tabs.size === 1) {
-      this.createTab();
-    }
-
     // Get all panels in tab
     const tabPanels = tab.root.getAllPanels();
 
@@ -1030,7 +1037,14 @@ class App {
       const remaining = this.tabs.keys().next();
       if (!remaining.done) {
         this.switchToTab(remaining.value);
+        return;
       }
+    }
+
+    // No tabs left - reset to empty state
+    if (this.tabs.size === 0) {
+      const appTitle = document.getElementById('app-title');
+      if (appTitle) appTitle.textContent = '👻';
     }
   }
 
@@ -1084,10 +1098,7 @@ class App {
     const tabIds = Array.from(this.tabs.keys());
     if (tabIds.length === 0) return;
 
-    // Create new tab first
-    this.createTab();
-
-    // Close old tabs
+    // Close all tabs - frontend will be empty (scale to zero)
     for (const tabId of tabIds) {
       this.closeTab(tabId);
     }
