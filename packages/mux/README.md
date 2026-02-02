@@ -1,4 +1,4 @@
-# termweb-mux
+# termweb mux
 
 A high-performance terminal multiplexer for the web, powered by [Ghostty](https://ghostty.org)'s libghostty rendering engine with H.264 video streaming.
 
@@ -74,7 +74,7 @@ pnpm build
 ## Running
 
 ```bash
-./zig-out/bin/termweb-mux
+./zig-out/bin/termweb mux
 ```
 
 Then open `http://localhost:8080` in a browser with WebCodecs support (Chrome 94+, Edge 94+).
