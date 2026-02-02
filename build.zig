@@ -223,9 +223,11 @@ pub fn build(b: *std.Build) void {
     }
 
     // =========================================================================
-    // Mux server (macOS only - requires ghostty, VideoToolbox)
+    // Mux server (cross-platform with libghostty)
+    // - macOS: libghostty + VideoToolbox + IOSurface
+    // - Linux: libghostty + VA-API/software encoding
     // =========================================================================
-    if (target.result.os.tag == .macos) {
+    if (target.result.os.tag == .macos or target.result.os.tag == .linux) {
         const mux = b.addExecutable(.{
             .name = "termweb-mux",
             .root_module = b.createModule(.{
@@ -235,31 +237,57 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
-        // Link pre-built libghostty
-        mux.addObjectFile(b.path("packages/mux/vendor/ghostty/zig-out/lib/libghostty.a"));
-        mux.addIncludePath(b.path("packages/mux/vendor/ghostty/include"));
+        // Link pre-built libghostty (both platforms)
+        mux.addObjectFile(b.path("vendor/libs/libghostty.a"));
+        mux.addIncludePath(b.path("vendor/ghostty/include"));
 
-        // macOS frameworks required by libghostty and VideoToolbox
-        mux.linkFramework("Foundation");
-        mux.linkFramework("CoreFoundation");
-        mux.linkFramework("CoreGraphics");
-        mux.linkFramework("CoreText");
-        mux.linkFramework("CoreVideo");
-        mux.linkFramework("QuartzCore");
-        mux.linkFramework("IOSurface");
-        mux.linkFramework("Metal");
-        mux.linkFramework("MetalKit");
-        mux.linkFramework("Carbon");
-        mux.linkFramework("AppKit");
-        mux.linkFramework("VideoToolbox");
-        mux.linkFramework("CoreMedia");
-        mux.linkFramework("Accelerate");
-        mux.linkLibCpp();
+        // Platform-specific dependencies
+        if (target.result.os.tag == .macos) {
+            // macOS frameworks required by libghostty and VideoToolbox
+            mux.linkFramework("Foundation");
+            mux.linkFramework("CoreFoundation");
+            mux.linkFramework("CoreGraphics");
+            mux.linkFramework("CoreText");
+            mux.linkFramework("CoreVideo");
+            mux.linkFramework("QuartzCore");
+            mux.linkFramework("IOSurface");
+            mux.linkFramework("Metal");
+            mux.linkFramework("MetalKit");
+            mux.linkFramework("Carbon");
+            mux.linkFramework("AppKit");
+            mux.linkFramework("VideoToolbox");
+            mux.linkFramework("CoreMedia");
+            mux.linkFramework("Accelerate");
+            mux.linkLibCpp();
+        } else {
+            // Linux: link vendored static libraries (built from Ghostty)
+            mux.addObjectFile(b.path("vendor/libs/libsimdutf.a"));
+            mux.addObjectFile(b.path("vendor/libs/libglslang.a"));
+            mux.addObjectFile(b.path("vendor/libs/libspirv_cross.a"));
+            mux.addObjectFile(b.path("vendor/libs/libhighway.a"));
+            mux.addObjectFile(b.path("vendor/libs/liboniguruma.a"));
+            mux.addObjectFile(b.path("vendor/libs/libharfbuzz.a"));
+            mux.addObjectFile(b.path("vendor/libs/libfreetype.a"));
+            mux.addObjectFile(b.path("vendor/libs/libfontconfig.a"));
+            mux.addObjectFile(b.path("vendor/libs/libutfcpp.a"));
+            mux.addObjectFile(b.path("vendor/libs/libpng.a"));
+            mux.addObjectFile(b.path("vendor/libs/libz.a"));
+            mux.addObjectFile(b.path("vendor/libs/libdcimgui.a"));
+            mux.addObjectFile(b.path("vendor/libs/libxml2.a"));
+            // Compile glad for OpenGL function loading
+            mux.addCSourceFile(.{
+                .file = b.path("vendor/ghostty/vendor/glad/src/gl.c"),
+                .flags = &.{"-O2"},
+            });
+            mux.addIncludePath(b.path("vendor/ghostty/vendor/glad/include"));
+            // EGL and GL are loaded dynamically at runtime by egl_headless.zig
+            mux.linkLibCpp();
+        }
 
-        // Websocket module
+        // Websocket module (cross-platform)
         mux.root_module.addImport("websocket", websocket_mod);
 
-        // SIMD mask module
+        // SIMD mask module (cross-platform)
         const mux_simd_mod = b.createModule(.{
             .root_source_file = b.path("src/simd/mask.zig"),
             .target = target,
@@ -267,18 +295,37 @@ pub fn build(b: *std.Build) void {
         });
         mux.root_module.addImport("simd_mask", mux_simd_mod);
 
-        // libdeflate
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_compress.c"), .flags = &.{"-O2"} });
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_decompress.c"), .flags = &.{"-O2"} });
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_compress.c"), .flags = &.{"-O2"} });
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_decompress.c"), .flags = &.{"-O2"} });
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = &.{"-O2"} });
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/crc32.c"), .flags = &.{"-O2"} });
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/utils.c"), .flags = &.{"-O2"} });
-        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/arm/cpu_features.c"), .flags = &.{"-O2"} });
+        // Shared memory module (for Linux IPC)
+        const mux_shm_mod = b.createModule(.{
+            .root_source_file = b.path("src/simd/shared_memory.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mux.root_module.addImport("shared_memory", mux_shm_mod);
+
+        // libdeflate (cross-platform)
+        const libdeflate_flags = if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64)
+            &[_][]const u8{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" }
+        else
+            &[_][]const u8{"-O2"};
+
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_compress.c"), .flags = libdeflate_flags });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_decompress.c"), .flags = libdeflate_flags });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_compress.c"), .flags = libdeflate_flags });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_decompress.c"), .flags = libdeflate_flags });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = libdeflate_flags });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/crc32.c"), .flags = libdeflate_flags });
+        mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/utils.c"), .flags = libdeflate_flags });
+
+        // CPU features (platform-specific)
+        if (target.result.os.tag == .macos or target.result.cpu.arch == .aarch64) {
+            mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/arm/cpu_features.c"), .flags = &.{"-O2"} });
+        } else {
+            mux.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"), .flags = libdeflate_flags });
+        }
         mux.addIncludePath(b.path("vendor/libdeflate"));
 
-        // xxHash
+        // xxHash (cross-platform)
         mux.addIncludePath(b.path("vendor/xxhash"));
         mux.addCSourceFile(.{ .file = b.path("vendor/xxhash/xxhash.c"), .flags = &.{"-O2"} });
 

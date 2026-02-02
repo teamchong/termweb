@@ -1,12 +1,12 @@
 # Termweb Makefile
 
-.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean
+.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean vendor-reset vendor-patch vendor-sync vendor-build-ghostty
 
 # Default: build everything (JS must be bundled before Zig embeds it)
 all: build-all
 
 # Build main termweb CLI (requires mux-web first for embedding)
-build: mux-web
+build: vendor-sync mux-web
 	zig build
 
 # Run main termweb CLI
@@ -71,6 +71,37 @@ mux-clean:
 	rm -rf packages/mux/native/zig-out packages/mux/native/zig-cache
 
 # =============================================================================
+# Vendor Management (submodules + patches)
+# =============================================================================
+
+# Reset all submodules to pinned commits
+vendor-reset:
+	@echo "Resetting vendor submodules..."
+	git submodule update --init --recursive
+	cd vendor/ghostty && git reset --hard HEAD && git clean -fd
+
+# Apply patches to vendor submodules
+vendor-patch:
+	@echo "Applying patches to vendor/ghostty..."
+	@for patch in patches/ghostty/*.patch; do \
+		if [ -f "$$patch" ]; then \
+			echo "Applying $$patch..."; \
+			cd vendor/ghostty && git apply "../../$$patch" && cd ../..; \
+		fi \
+	done
+	@echo "Patches applied."
+
+# Full vendor sync: reset + patch
+vendor-sync: vendor-reset vendor-patch
+	@echo "Vendor sync complete."
+
+# Build libghostty from patched source (Linux)
+vendor-build-ghostty:
+	@echo "Building libghostty..."
+	cd vendor/ghostty && zig build -Doptimize=ReleaseFast -Dapp-runtime=none
+	@echo "libghostty built."
+
+# =============================================================================
 # UI Asset Generation
 # =============================================================================
 
@@ -123,6 +154,12 @@ help:
 	@echo "  make mux-native   - Build mux native binary (macOS only)"
 	@echo "  make mux-run      - Run mux server"
 	@echo "  make mux-clean    - Clean mux build artifacts"
+	@echo ""
+	@echo "Vendor management:"
+	@echo "  make vendor-sync  - Reset submodules and apply patches"
+	@echo "  make vendor-reset - Reset submodules to pinned commits"
+	@echo "  make vendor-patch - Apply patches to submodules"
+	@echo "  make vendor-build-ghostty - Build libghostty from source"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make gen-ui       - Generate UI assets from templates"
