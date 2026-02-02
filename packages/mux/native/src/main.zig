@@ -521,6 +521,7 @@ const Panel = struct {
     last_iosurface_seed: u32, // For detecting IOSurface/SharedMemory changes
     last_frame_time: i64, // For FPS control
     last_tick_time: i128, // For rate limiting panel.tick()
+    ticks_since_connect: u32, // Track frames since connection (for initial render delay)
 
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
@@ -614,6 +615,7 @@ const Panel = struct {
             .last_iosurface_seed = 0,
             .last_frame_time = 0,
             .last_tick_time = 0,
+            .ticks_since_connect = 0,
         };
 
         return panel;
@@ -636,6 +638,7 @@ const Panel = struct {
         if (conn != null) {
             self.streaming.store(true, .release);
             self.force_keyframe = true;
+            self.ticks_since_connect = 0; // Reset so ghostty can render before we read pixels
         } else {
             self.streaming.store(false, .release);
         }
@@ -898,6 +901,10 @@ const Panel = struct {
 
     fn tick(self: *Panel) void {
         c.ghostty_surface_draw(self.surface);
+        // Track ticks for initial render delay (capped to avoid overflow)
+        if (self.ticks_since_connect < 100) {
+            self.ticks_since_connect += 1;
+        }
     }
 
     fn getPixelWidth(self: *const Panel) u32 {
@@ -3690,6 +3697,10 @@ const Server = struct {
                                 panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch continue;
                             }
                         }
+
+                        // Wait a few frames for ghostty to render initial content
+                        // This prevents blank frames on first connection
+                        if (panel.ticks_since_connect < 3) continue;
 
                         // Read pixels from OpenGL framebuffer (RGBA from glReadPixels)
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
