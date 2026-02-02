@@ -29,12 +29,37 @@ index 3d3973084..6152c6b7d 100644
  typedef enum {
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..3956fad38
+index 000000000..578fb800b
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,291 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
++const posix = std.posix;
++
++// GBM types and functions
++const gbm = struct {
++    const Device = ?*anyopaque;
++    const CreateDeviceFn = *const fn (c_int) callconv(.c) Device;
++    const DestroyDeviceFn = *const fn (Device) callconv(.c) void;
++
++    var lib: ?std.DynLib = null;
++    var gbm_create_device: ?CreateDeviceFn = null;
++    var gbm_device_destroy: ?DestroyDeviceFn = null;
++
++    fn load() void {
++        if (lib != null) return;
++        lib = std.DynLib.open("libgbm.so.1") catch std.DynLib.open("libgbm.so") catch return;
++        gbm_create_device = lib.?.lookup(CreateDeviceFn, "gbm_create_device");
++        gbm_device_destroy = lib.?.lookup(DestroyDeviceFn, "gbm_device_destroy");
++    }
++
++    fn createDevice(fd: c_int) Device {
++        load();
++        if (gbm_create_device) |func| return func(fd);
++        return null;
++    }
++};
 +
 +const c = struct {
 +    pub const EGL_DEFAULT_DISPLAY: ?*anyopaque = null;
@@ -47,6 +72,8 @@ index 000000000..3956fad38
 +    pub const EGL_PBUFFER_BIT: c_int = 0x0001;
 +    pub const EGL_RENDERABLE_TYPE: c_int = 0x3040;
 +    pub const EGL_OPENGL_BIT: c_int = 0x0008;
++    pub const EGL_OPENGL_ES2_BIT: c_int = 0x0004;
++    pub const EGL_OPENGL_ES3_BIT: c_int = 0x0040;
 +    pub const EGL_RED_SIZE: c_int = 0x3024;
 +    pub const EGL_GREEN_SIZE: c_int = 0x3025;
 +    pub const EGL_BLUE_SIZE: c_int = 0x3026;
@@ -59,6 +86,13 @@ index 000000000..3956fad38
 +    pub const EGL_CONTEXT_OPENGL_PROFILE_MASK: c_int = 0x30FD;
 +    pub const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: c_int = 0x00000001;
 +    pub const EGL_OPENGL_API: c_int = 0x30A2;
++    pub const EGL_OPENGL_ES_API: c_int = 0x30A0;
++    // EGL_EXT_platform_device
++    pub const EGL_PLATFORM_DEVICE_EXT: c_int = 0x313F;
++    // EGL_MESA_platform_surfaceless
++    pub const EGL_PLATFORM_SURFACELESS_MESA: c_int = 0x31DD;
++    // EGL_MESA_platform_gbm
++    pub const EGL_PLATFORM_GBM_MESA: c_int = 0x31D7;
 +
 +    pub const EGLDisplay = ?*anyopaque;
 +    pub const EGLConfig = ?*anyopaque;
@@ -81,6 +115,9 @@ index 000000000..3956fad38
 +    pub var eglSwapBuffers: *const fn (EGLDisplay, EGLSurface) callconv(.c) c_int = undefined;
 +    pub var eglGetError: *const fn () callconv(.c) EGLint = undefined;
 +    pub var eglGetProcAddress: *const fn ([*:0]const u8) callconv(.c) ?*const fn () callconv(.c) void = undefined;
++    // EGL_EXT_device_enumeration / EGL_EXT_platform_device
++    pub var eglQueryDevicesEXT: ?*const fn (c_int, [*]?*anyopaque, *c_int) callconv(.c) c_int = null;
++    pub var eglGetPlatformDisplayEXT: ?*const fn (c_int, ?*anyopaque, [*]const c_int) callconv(.c) EGLDisplay = null;
 +
 +    pub fn loadEgl() !void {
 +        if (lib != null) return;
@@ -100,6 +137,13 @@ index 000000000..3956fad38
 +        eglSwapBuffers = lib.?.lookup(@TypeOf(eglSwapBuffers), "eglSwapBuffers") orelse return error.EglSymbolNotFound;
 +        eglGetError = lib.?.lookup(@TypeOf(eglGetError), "eglGetError") orelse return error.EglSymbolNotFound;
 +        eglGetProcAddress = lib.?.lookup(@TypeOf(eglGetProcAddress), "eglGetProcAddress") orelse return error.EglSymbolNotFound;
++        // Optional extensions for headless - must use eglGetProcAddress
++        if (eglGetProcAddress("eglQueryDevicesEXT")) |ptr| {
++            eglQueryDevicesEXT = @ptrCast(ptr);
++        }
++        if (eglGetProcAddress("eglGetPlatformDisplayEXT")) |ptr| {
++            eglGetPlatformDisplayEXT = @ptrCast(ptr);
++        }
 +    }
 +};
 +
@@ -109,74 +153,121 @@ index 000000000..3956fad38
 +    display: c.EGLDisplay,
 +    context: c.EGLContext,
 +    surface: c.EGLSurface,
++    use_gles: bool,
++
++    var drm_fd: ?posix.fd_t = null;
++    var gbm_device: gbm.Device = null;
 +
 +    pub fn init() !EglHeadless {
-+        std.debug.print("[EGL] Initializing...\n", .{});
 +        try c.loadEgl();
 +
-+        const display = c.eglGetDisplay(c.EGL_DEFAULT_DISPLAY);
-+        if (display == c.EGL_NO_DISPLAY) {
-+            std.debug.print("[EGL] eglGetDisplay failed\n", .{});
-+            return error.EglDisplayFailed;
++        // Try GBM first (hardware GPU), then surfaceless, then default
++        // GBM requires DRM render node access
++        var try_gbm = false;
++        if (c.eglGetPlatformDisplayEXT != null) {
++            if (drm_fd == null) {
++                drm_fd = posix.open("/dev/dri/renderD128", .{ .ACCMODE = .RDWR }, 0) catch null;
++                if (drm_fd != null) {
++                    gbm_device = gbm.createDevice(@intCast(drm_fd.?));
++                    if (gbm_device == null) {
++                        posix.close(drm_fd.?);
++                        drm_fd = null;
++                    } else {
++                        try_gbm = true;
++                    }
++                }
++            } else if (gbm_device != null) {
++                try_gbm = true;
++            }
 +        }
 +
-+        var major: c.EGLint = 0;
-+        var minor: c.EGLint = 0;
-+        if (c.eglInitialize(display, &major, &minor) == c.EGL_FALSE) {
-+            std.debug.print("[EGL] eglInitialize failed: 0x{x}\n", .{c.eglGetError()});
-+            return error.EglInitFailed;
-+        }
-+        std.debug.print("[EGL] Version {}.{}\n", .{ major, minor });
-+
-+        const config_attribs = [_]c.EGLint{
-+            c.EGL_SURFACE_TYPE,    c.EGL_PBUFFER_BIT,
-+            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_BIT,
-+            c.EGL_RED_SIZE,        8,
-+            c.EGL_GREEN_SIZE,      8,
-+            c.EGL_BLUE_SIZE,       8,
-+            c.EGL_ALPHA_SIZE,      8,
-+            c.EGL_NONE,
++        const platforms = [_]struct { name: []const u8, platform: ?c_int, native: ?*anyopaque }{
++            .{ .name = "gbm", .platform = c.EGL_PLATFORM_GBM_MESA, .native = gbm_device },
++            .{ .name = "surfaceless", .platform = c.EGL_PLATFORM_SURFACELESS_MESA, .native = c.EGL_DEFAULT_DISPLAY },
++            .{ .name = "default", .platform = null, .native = c.EGL_DEFAULT_DISPLAY },
 +        };
 +
-+        var config: c.EGLConfig = null;
-+        var num_configs: c.EGLint = 0;
-+        if (c.eglChooseConfig(display, &config_attribs, &config, 1, &num_configs) == c.EGL_FALSE or num_configs == 0) {
-+            std.debug.print("[EGL] eglChooseConfig failed: 0x{x}\n", .{c.eglGetError()});
++        for (platforms) |plat| {
++            // Skip GBM if we couldn't open the device
++            if (std.mem.eql(u8, plat.name, "gbm") and !try_gbm) continue;
++
++            var display: c.EGLDisplay = c.EGL_NO_DISPLAY;
++
++            if (plat.platform) |platform| {
++                if (c.eglGetPlatformDisplayEXT) |getPlatformDisplay| {
++                    const attribs = [_]c.EGLint{c.EGL_NONE};
++                    display = getPlatformDisplay(platform, plat.native, &attribs);
++                } else {
++                    continue;
++                }
++            } else {
++                display = c.eglGetDisplay(plat.native);
++            }
++
++            const is_surfaceless = std.mem.eql(u8, plat.name, "surfaceless");
++
++            if (display == c.EGL_NO_DISPLAY) continue;
++
++            var major: c.EGLint = 0;
++            var minor: c.EGLint = 0;
++            if (c.eglInitialize(display, &major, &minor) == c.EGL_FALSE) continue;
++
++            // Try desktop OpenGL first, then OpenGL ES
++            const api_configs = [_]struct { api: c_int, renderable: c_int, maj: c_int, min: c_int, name: []const u8, use_profile: bool }{
++                .{ .api = c.EGL_OPENGL_API, .renderable = c.EGL_OPENGL_BIT, .maj = 4, .min = 3, .name = "OpenGL 4.3", .use_profile = true },
++                .{ .api = c.EGL_OPENGL_API, .renderable = c.EGL_OPENGL_BIT, .maj = 3, .min = 3, .name = "OpenGL 3.3", .use_profile = true },
++                .{ .api = c.EGL_OPENGL_ES_API, .renderable = c.EGL_OPENGL_ES3_BIT, .maj = 3, .min = 2, .name = "OpenGL ES 3.2", .use_profile = false },
++                .{ .api = c.EGL_OPENGL_ES_API, .renderable = c.EGL_OPENGL_ES3_BIT, .maj = 3, .min = 1, .name = "OpenGL ES 3.1", .use_profile = false },
++                .{ .api = c.EGL_OPENGL_ES_API, .renderable = c.EGL_OPENGL_ES3_BIT, .maj = 3, .min = 0, .name = "OpenGL ES 3.0", .use_profile = false },
++            };
++
++            for (api_configs) |api_cfg| {
++                if (c.eglBindAPI(api_cfg.api) == c.EGL_FALSE) continue;
++
++                // Try different config attribute combinations
++                const config_variants = [_]struct { name: []const u8, attribs: []const c.EGLint }{
++                    .{ .name = "pbuffer", .attribs = &[_]c.EGLint{ c.EGL_SURFACE_TYPE, c.EGL_PBUFFER_BIT, c.EGL_RENDERABLE_TYPE, api_cfg.renderable, c.EGL_RED_SIZE, 8, c.EGL_GREEN_SIZE, 8, c.EGL_BLUE_SIZE, 8, c.EGL_ALPHA_SIZE, 8, c.EGL_NONE } },
++                    .{ .name = "surfaceless", .attribs = &[_]c.EGLint{ c.EGL_SURFACE_TYPE, 0, c.EGL_RENDERABLE_TYPE, api_cfg.renderable, c.EGL_RED_SIZE, 8, c.EGL_GREEN_SIZE, 8, c.EGL_BLUE_SIZE, 8, c.EGL_ALPHA_SIZE, 8, c.EGL_NONE } },
++                    .{ .name = "minimal", .attribs = &[_]c.EGLint{ c.EGL_RENDERABLE_TYPE, api_cfg.renderable, c.EGL_NONE } },
++                };
++
++                for (config_variants) |cfg_var| {
++                    var config: c.EGLConfig = null;
++                    var num_configs: c.EGLint = 0;
++                    const result = c.eglChooseConfig(display, cfg_var.attribs.ptr, &config, 1, &num_configs);
++                    if (result == c.EGL_FALSE or num_configs == 0) continue;
++
++                    // Surfaceless platform uses no surface, others try pbuffer
++                    var surface: c.EGLSurface = c.EGL_NO_SURFACE;
++                    if (!is_surfaceless) {
++                        const pbuffer_attribs = [_]c.EGLint{ c.EGL_WIDTH, 1, c.EGL_HEIGHT, 1, c.EGL_NONE };
++                        surface = c.eglCreatePbufferSurface(display, config, &pbuffer_attribs);
++                        // pbuffer is optional, continue even if it fails
++                    }
++
++                    var context_attribs: [7]c.EGLint = undefined;
++                    if (api_cfg.use_profile) {
++                        context_attribs = [_]c.EGLint{ c.EGL_CONTEXT_MAJOR_VERSION, api_cfg.maj, c.EGL_CONTEXT_MINOR_VERSION, api_cfg.min, c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, c.EGL_NONE };
++                    } else {
++                        context_attribs = [_]c.EGLint{ c.EGL_CONTEXT_MAJOR_VERSION, api_cfg.maj, c.EGL_CONTEXT_MINOR_VERSION, api_cfg.min, c.EGL_NONE, 0, 0 };
++                    }
++
++                    const context = c.eglCreateContext(display, config, c.EGL_NO_CONTEXT, &context_attribs);
++                    if (context == c.EGL_NO_CONTEXT) {
++                        if (surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(display, surface);
++                        continue;
++                    }
++
++                    log.info("EGL context created: {s} via {s} platform", .{ api_cfg.name, plat.name });
++                    return .{ .display = display, .context = context, .surface = surface, .use_gles = api_cfg.api == c.EGL_OPENGL_ES_API };
++                }
++            }
++
 +            _ = c.eglTerminate(display);
-+            return error.EglConfigFailed;
 +        }
 +
-+        if (c.eglBindAPI(c.EGL_OPENGL_API) == c.EGL_FALSE) {
-+            std.debug.print("[EGL] eglBindAPI failed: 0x{x}\n", .{c.eglGetError()});
-+            _ = c.eglTerminate(display);
-+            return error.EglBindApiFailed;
-+        }
-+
-+        const pbuffer_attribs = [_]c.EGLint{ c.EGL_WIDTH, 1, c.EGL_HEIGHT, 1, c.EGL_NONE };
-+        const surface = c.eglCreatePbufferSurface(display, config, &pbuffer_attribs);
-+        if (surface == c.EGL_NO_SURFACE) {
-+            std.debug.print("[EGL] eglCreatePbufferSurface failed: 0x{x}\n", .{c.eglGetError()});
-+            _ = c.eglTerminate(display);
-+            return error.EglSurfaceFailed;
-+        }
-+
-+        const context_attribs = [_]c.EGLint{
-+            c.EGL_CONTEXT_MAJOR_VERSION,       4,
-+            c.EGL_CONTEXT_MINOR_VERSION,       3,
-+            c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-+            c.EGL_NONE,
-+        };
-+
-+        const context = c.eglCreateContext(display, config, c.EGL_NO_CONTEXT, &context_attribs);
-+        if (context == c.EGL_NO_CONTEXT) {
-+            std.debug.print("[EGL] eglCreateContext failed (GL 4.3): 0x{x}\n", .{c.eglGetError()});
-+            _ = c.eglDestroySurface(display, surface);
-+            _ = c.eglTerminate(display);
-+            return error.EglContextFailed;
-+        }
-+
-+        std.debug.print("[EGL] Context created successfully\n", .{});
-+        return .{ .display = display, .context = context, .surface = surface };
++        log.err("failed to create any valid EGL context", .{});
++        return error.EglContextFailed;
 +    }
 +
 +    pub fn deinit(self: *EglHeadless) void {
@@ -202,12 +293,10 @@ index 000000000..3956fad38
 +    if (global_egl_context) |*ctx| return ctx;
 +    global_egl_context = try EglHeadless.init();
 +    if (!global_egl_context.?.makeCurrent()) {
-+        std.debug.print("[EGL] makeCurrent failed\n", .{});
 +        global_egl_context.?.deinit();
 +        global_egl_context = null;
 +        return error.EglMakeCurrentFailed;
 +    }
-+    std.debug.print("[EGL] Global context ready\n", .{});
 +    return &global_egl_context.?;
 +}
 +
@@ -222,11 +311,34 @@ index 000000000..3956fad38
 +pub fn isGlInitialized() bool {
 +    return gl_initialized;
 +}
++
++pub fn makeCurrentOnThread() bool {
++    if (global_egl_context) |*ctx| {
++        return ctx.makeCurrent();
++    }
++    return false;
++}
++
++pub fn releaseContext() void {
++    if (global_egl_context) |*ctx| {
++        _ = c.eglMakeCurrent(ctx.display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
++    }
++}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..325bff1c4 100644
+index dcf8a6357..c5d27f010 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
-@@ -342,6 +342,7 @@ pub const App = struct {
+@@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
+ pub const resourcesDir = internal_os.resourcesDir;
+ 
+ pub const App = struct {
++    /// For embedded Linux with OpenGL, drawing must be done from the app thread
++    /// because EGL contexts can only be current on one thread at a time.
++    pub const must_draw_from_app_thread = if (builtin.target.os.tag == .linux) true else false;
+     /// Because we only expect the embedding API to be used in embedded
+     /// environments, the options are extern so that we can expose it
+     /// directly to a C callconv and not pay for any translation costs.
+@@ -342,6 +345,7 @@ pub const App = struct {
  pub const Platform = union(PlatformTag) {
      macos: MacOS,
      ios: IOS,
@@ -234,7 +346,7 @@ index dcf8a6357..325bff1c4 100644
  
      // If our build target for libghostty is not darwin then we do
      // not include macos support at all.
-@@ -355,6 +356,12 @@ pub const Platform = union(PlatformTag) {
+@@ -355,6 +359,12 @@ pub const Platform = union(PlatformTag) {
          uiview: objc.Object,
      } else void;
  
@@ -247,7 +359,7 @@ index dcf8a6357..325bff1c4 100644
      // The C ABI compatible version of this union. The tag is expected
      // to be stored elsewhere.
      pub const C = extern union {
-@@ -365,6 +372,12 @@ pub const Platform = union(PlatformTag) {
+@@ -365,6 +375,12 @@ pub const Platform = union(PlatformTag) {
          ios: extern struct {
              uiview: ?*anyopaque,
          },
@@ -260,7 +372,7 @@ index dcf8a6357..325bff1c4 100644
      };
  
      /// Initialize a Platform a tag and configuration from the C ABI.
-@@ -384,6 +397,12 @@ pub const Platform = union(PlatformTag) {
+@@ -384,6 +400,12 @@ pub const Platform = union(PlatformTag) {
                      break :ios error.UIViewMustBeSet);
                  break :ios .{ .ios = .{ .uiview = uiview } };
              } else error.UnsupportedPlatform,
@@ -273,7 +385,7 @@ index dcf8a6357..325bff1c4 100644
          };
      }
  };
-@@ -394,6 +413,7 @@ pub const PlatformTag = enum(c_int) {
+@@ -394,6 +416,7 @@ pub const PlatformTag = enum(c_int) {
  
      macos = 1,
      ios = 2,
@@ -282,10 +394,10 @@ index dcf8a6357..325bff1c4 100644
  
  pub const EnvVar = extern struct {
 diff --git a/src/renderer/OpenGL.zig b/src/renderer/OpenGL.zig
-index 4b01da0c5..2c29efff5 100644
+index 4b01da0c5..8d5edd8f4 100644
 --- a/src/renderer/OpenGL.zig
 +++ b/src/renderer/OpenGL.zig
-@@ -170,9 +170,22 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
+@@ -170,9 +170,16 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
          => try prepareContext(null),
  
          apprt.embedded => {
@@ -293,21 +405,37 @@ index 4b01da0c5..2c29efff5 100644
 -            // to compile for OpenGL targets but libghostty is strictly
 -            // broken for rendering on this platforms.
 +            if (comptime builtin.target.os.tag == .linux) {
-+                std.debug.print("[OpenGL] surfaceInit for embedded Linux\n", .{});
++                // Initialize headless EGL for Linux embedded rendering
 +                const egl_headless = @import("../apprt/egl_headless.zig");
 +                if (!egl_headless.isGlInitialized()) {
-+                    _ = egl_headless.initGlobalContext() catch |err| {
-+                        std.debug.print("[OpenGL] EGL init failed: {}\n", .{err});
-+                        return err;
-+                    };
-+                    prepareContext(egl_headless.EglHeadless.getProcAddress()) catch |err| {
-+                        std.debug.print("[OpenGL] prepareContext failed: {}\n", .{err});
-+                        return err;
-+                    };
++                    _ = try egl_headless.initGlobalContext();
++                    try prepareContext(egl_headless.EglHeadless.getProcAddress());
 +                    egl_headless.setGlInitialized();
-+                    std.debug.print("[OpenGL] Initialized via EGL\n", .{});
++                    log.info("OpenGL initialized via headless EGL", .{});
 +                }
 +            }
          },
      }
  
+@@ -191,6 +198,8 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
+ pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
+     _ = self;
+     _ = surface;
++    // For embedded Linux, we keep the EGL context on the main thread.
++    // Drawing is done from the app thread (must_draw_from_app_thread = true).
+ }
+ 
+ /// Callback called by renderer.Thread when it begins.
+@@ -209,9 +218,9 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
+         },
+ 
+         apprt.embedded => {
+-            // TODO(mitchellh): this does nothing today to allow libghostty
+-            // to compile for OpenGL targets but libghostty is strictly
+-            // broken for rendering on this platforms.
++            // For embedded Linux with OpenGL, all drawing happens on the app
++            // thread (must_draw_from_app_thread = true), so the renderer thread
++            // doesn't need to set up an OpenGL context.
+         },
+     }
+ }
