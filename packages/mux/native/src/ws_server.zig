@@ -384,6 +384,7 @@ pub const Server = struct {
     listener: net.Server,
     allocator: Allocator,
     running: std.atomic.Value(bool),
+    active_connections: std.atomic.Value(u32), // Track active connection threads
     enable_deflate: bool,
     on_connect: ?*const fn (*Connection) void,
     on_message: ?*const fn (*Connection, []u8, bool) void, // conn, data, is_binary
@@ -406,6 +407,7 @@ pub const Server = struct {
             .listener = try addr.listen(.{ .reuse_address = true, .force_nonblocking = true }),
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
+            .active_connections = std.atomic.Value(u32).init(0),
             .enable_deflate = enable_deflate,
             .on_connect = null,
             .on_message = null,
@@ -417,6 +419,14 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.stop();
+        // Wait for all active connection threads to finish
+        var wait_count: u32 = 0;
+        while (self.active_connections.load(.acquire) > 0) {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            wait_count += 1;
+            // Timeout after 2 seconds to avoid hanging forever
+            if (wait_count > 200) break;
+        }
         self.listener.deinit();
         self.allocator.destroy(self);
     }
@@ -511,6 +521,8 @@ pub const Server = struct {
     }
 
     fn handleConnectionThread(self: *Server, conn: *Connection) void {
+        _ = self.active_connections.fetchAdd(1, .acq_rel);
+        defer _ = self.active_connections.fetchSub(1, .acq_rel);
         self.handleConnection(conn);
     }
 
@@ -533,10 +545,11 @@ pub const Server = struct {
         if (self.on_connect) |cb| cb(conn);
 
         // Spawn a new thread to handle this connection
-        _ = std.Thread.spawn(.{}, handleConnectionThread, .{ self, conn }) catch {
+        const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ self, conn }) catch {
             conn.deinit();
             self.allocator.destroy(conn);
             return;
         };
+        thread.detach();
     }
 };

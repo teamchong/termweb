@@ -939,125 +939,247 @@ const Panel = struct {
         return @intCast(mods);
     }
 
-    // Map JS e.code to macOS virtual keycode (ghostty expects macOS keycodes, not its own enum)
+    // Map JS e.code to native keycode (platform-specific)
+    // macOS uses virtual keycodes, Linux uses XKB keycodes
     fn mapKeyCode(code: []const u8) u32 {
-        // Use comptime string map for efficient lookup - values are macOS virtual keycodes
-        const map = std.StaticStringMap(u32).initComptime(.{
-            // Writing System Keys
-            .{ "Backquote", 0x32 },
-            .{ "Backslash", 0x2a },
-            .{ "BracketLeft", 0x21 },
-            .{ "BracketRight", 0x1e },
-            .{ "Comma", 0x2b },
-            .{ "Digit0", 0x1d },
-            .{ "Digit1", 0x12 },
-            .{ "Digit2", 0x13 },
-            .{ "Digit3", 0x14 },
-            .{ "Digit4", 0x15 },
-            .{ "Digit5", 0x17 },
-            .{ "Digit6", 0x16 },
-            .{ "Digit7", 0x1a },
-            .{ "Digit8", 0x1c },
-            .{ "Digit9", 0x19 },
-            .{ "Equal", 0x18 },
-            .{ "IntlBackslash", 0x0a },
-            .{ "KeyA", 0x00 },
-            .{ "KeyB", 0x0b },
-            .{ "KeyC", 0x08 },
-            .{ "KeyD", 0x02 },
-            .{ "KeyE", 0x0e },
-            .{ "KeyF", 0x03 },
-            .{ "KeyG", 0x05 },
-            .{ "KeyH", 0x04 },
-            .{ "KeyI", 0x22 },
-            .{ "KeyJ", 0x26 },
-            .{ "KeyK", 0x28 },
-            .{ "KeyL", 0x25 },
-            .{ "KeyM", 0x2e },
-            .{ "KeyN", 0x2d },
-            .{ "KeyO", 0x1f },
-            .{ "KeyP", 0x23 },
-            .{ "KeyQ", 0x0c },
-            .{ "KeyR", 0x0f },
-            .{ "KeyS", 0x01 },
-            .{ "KeyT", 0x11 },
-            .{ "KeyU", 0x20 },
-            .{ "KeyV", 0x09 },
-            .{ "KeyW", 0x0d },
-            .{ "KeyX", 0x07 },
-            .{ "KeyY", 0x10 },
-            .{ "KeyZ", 0x06 },
-            .{ "Minus", 0x1b },
-            .{ "Period", 0x2f },
-            .{ "Quote", 0x27 },
-            .{ "Semicolon", 0x29 },
-            .{ "Slash", 0x2c },
-            // Modifier Keys
-            .{ "AltLeft", 0x3a },
-            .{ "AltRight", 0x3d },
-            .{ "ControlLeft", 0x3b },
-            .{ "ControlRight", 0x3e },
-            .{ "MetaLeft", 0x37 },
-            .{ "MetaRight", 0x36 },
-            .{ "ShiftLeft", 0x38 },
-            .{ "ShiftRight", 0x3c },
-            // Functional Keys
-            .{ "Backspace", 0x33 },
-            .{ "CapsLock", 0x39 },
-            .{ "ContextMenu", 0x6e },
-            .{ "Enter", 0x24 },
-            .{ "Space", 0x31 },
-            .{ "Tab", 0x30 },
-            // Control Pad
-            .{ "Delete", 0x75 },
-            .{ "End", 0x77 },
-            .{ "Home", 0x73 },
-            .{ "Insert", 0x72 },
-            .{ "PageDown", 0x79 },
-            .{ "PageUp", 0x74 },
-            // Arrow Keys
-            .{ "ArrowDown", 0x7d },
-            .{ "ArrowLeft", 0x7b },
-            .{ "ArrowRight", 0x7c },
-            .{ "ArrowUp", 0x7e },
-            // Numpad
-            .{ "NumLock", 0x47 },
-            .{ "Numpad0", 0x52 },
-            .{ "Numpad1", 0x53 },
-            .{ "Numpad2", 0x54 },
-            .{ "Numpad3", 0x55 },
-            .{ "Numpad4", 0x56 },
-            .{ "Numpad5", 0x57 },
-            .{ "Numpad6", 0x58 },
-            .{ "Numpad7", 0x59 },
-            .{ "Numpad8", 0x5b },
-            .{ "Numpad9", 0x5c },
-            .{ "NumpadAdd", 0x45 },
-            .{ "NumpadDecimal", 0x41 },
-            .{ "NumpadDivide", 0x4b },
-            .{ "NumpadEnter", 0x4c },
-            .{ "NumpadEqual", 0x51 },
-            .{ "NumpadMultiply", 0x43 },
-            .{ "NumpadSubtract", 0x4e },
-            // Function Keys
-            .{ "Escape", 0x35 },
-            .{ "F1", 0x7a },
-            .{ "F2", 0x78 },
-            .{ "F3", 0x63 },
-            .{ "F4", 0x76 },
-            .{ "F5", 0x60 },
-            .{ "F6", 0x61 },
-            .{ "F7", 0x62 },
-            .{ "F8", 0x64 },
-            .{ "F9", 0x65 },
-            .{ "F10", 0x6d },
-            .{ "F11", 0x67 },
-            .{ "F12", 0x6f },
-            // Media/Browser Keys
-            .{ "PrintScreen", 0x69 },
-            .{ "ScrollLock", 0x6b },
-            .{ "Pause", 0x71 },
-        });
+        // Use comptime string map for efficient lookup
+        // Values from Chromium's dom_code_data.inc via ghostty/src/input/keycodes.zig
+        const map = if (comptime is_linux)
+            // Linux XKB keycodes
+            std.StaticStringMap(u32).initComptime(.{
+                // Writing System Keys
+                .{ "Backquote", 0x0031 },
+                .{ "Backslash", 0x0033 },
+                .{ "BracketLeft", 0x0022 },
+                .{ "BracketRight", 0x0023 },
+                .{ "Comma", 0x003b },
+                .{ "Digit0", 0x0013 },
+                .{ "Digit1", 0x000a },
+                .{ "Digit2", 0x000b },
+                .{ "Digit3", 0x000c },
+                .{ "Digit4", 0x000d },
+                .{ "Digit5", 0x000e },
+                .{ "Digit6", 0x000f },
+                .{ "Digit7", 0x0010 },
+                .{ "Digit8", 0x0011 },
+                .{ "Digit9", 0x0012 },
+                .{ "Equal", 0x0015 },
+                .{ "IntlBackslash", 0x005e },
+                .{ "KeyA", 0x0026 },
+                .{ "KeyB", 0x0038 },
+                .{ "KeyC", 0x0036 },
+                .{ "KeyD", 0x0028 },
+                .{ "KeyE", 0x001a },
+                .{ "KeyF", 0x0029 },
+                .{ "KeyG", 0x002a },
+                .{ "KeyH", 0x002b },
+                .{ "KeyI", 0x001f },
+                .{ "KeyJ", 0x002c },
+                .{ "KeyK", 0x002d },
+                .{ "KeyL", 0x002e },
+                .{ "KeyM", 0x003a },
+                .{ "KeyN", 0x0039 },
+                .{ "KeyO", 0x0020 },
+                .{ "KeyP", 0x0021 },
+                .{ "KeyQ", 0x0018 },
+                .{ "KeyR", 0x001b },
+                .{ "KeyS", 0x0027 },
+                .{ "KeyT", 0x001c },
+                .{ "KeyU", 0x001e },
+                .{ "KeyV", 0x0037 },
+                .{ "KeyW", 0x0019 },
+                .{ "KeyX", 0x0035 },
+                .{ "KeyY", 0x001d },
+                .{ "KeyZ", 0x0034 },
+                .{ "Minus", 0x0014 },
+                .{ "Period", 0x003c },
+                .{ "Quote", 0x0030 },
+                .{ "Semicolon", 0x002f },
+                .{ "Slash", 0x003d },
+                // Modifier Keys
+                .{ "AltLeft", 0x0040 },
+                .{ "AltRight", 0x006c },
+                .{ "ControlLeft", 0x0025 },
+                .{ "ControlRight", 0x0069 },
+                .{ "MetaLeft", 0x0085 },
+                .{ "MetaRight", 0x0086 },
+                .{ "ShiftLeft", 0x0032 },
+                .{ "ShiftRight", 0x003e },
+                // Functional Keys
+                .{ "Backspace", 0x0016 },
+                .{ "CapsLock", 0x0042 },
+                .{ "ContextMenu", 0x0087 },
+                .{ "Enter", 0x0024 },
+                .{ "Space", 0x0041 },
+                .{ "Tab", 0x0017 },
+                // Control Pad
+                .{ "Delete", 0x0077 },
+                .{ "End", 0x0073 },
+                .{ "Home", 0x006e },
+                .{ "Insert", 0x0076 },
+                .{ "PageDown", 0x0075 },
+                .{ "PageUp", 0x0070 },
+                // Arrow Keys
+                .{ "ArrowDown", 0x0074 },
+                .{ "ArrowLeft", 0x0071 },
+                .{ "ArrowRight", 0x0072 },
+                .{ "ArrowUp", 0x006f },
+                // Numpad
+                .{ "NumLock", 0x004d },
+                .{ "Numpad0", 0x005a },
+                .{ "Numpad1", 0x0057 },
+                .{ "Numpad2", 0x0058 },
+                .{ "Numpad3", 0x0059 },
+                .{ "Numpad4", 0x0053 },
+                .{ "Numpad5", 0x0054 },
+                .{ "Numpad6", 0x0055 },
+                .{ "Numpad7", 0x004f },
+                .{ "Numpad8", 0x0050 },
+                .{ "Numpad9", 0x0051 },
+                .{ "NumpadAdd", 0x0056 },
+                .{ "NumpadDecimal", 0x005b },
+                .{ "NumpadDivide", 0x006a },
+                .{ "NumpadEnter", 0x0068 },
+                .{ "NumpadEqual", 0x007d },
+                .{ "NumpadMultiply", 0x003f },
+                .{ "NumpadSubtract", 0x0052 },
+                // Function Keys
+                .{ "Escape", 0x0009 },
+                .{ "F1", 0x0043 },
+                .{ "F2", 0x0044 },
+                .{ "F3", 0x0045 },
+                .{ "F4", 0x0046 },
+                .{ "F5", 0x0047 },
+                .{ "F6", 0x0048 },
+                .{ "F7", 0x0049 },
+                .{ "F8", 0x004a },
+                .{ "F9", 0x004b },
+                .{ "F10", 0x004c },
+                .{ "F11", 0x005f },
+                .{ "F12", 0x0060 },
+                // Media/Browser Keys
+                .{ "PrintScreen", 0x006b },
+                .{ "ScrollLock", 0x004e },
+                .{ "Pause", 0x007f },
+            })
+        else
+            // macOS virtual keycodes
+            std.StaticStringMap(u32).initComptime(.{
+                // Writing System Keys
+                .{ "Backquote", 0x32 },
+                .{ "Backslash", 0x2a },
+                .{ "BracketLeft", 0x21 },
+                .{ "BracketRight", 0x1e },
+                .{ "Comma", 0x2b },
+                .{ "Digit0", 0x1d },
+                .{ "Digit1", 0x12 },
+                .{ "Digit2", 0x13 },
+                .{ "Digit3", 0x14 },
+                .{ "Digit4", 0x15 },
+                .{ "Digit5", 0x17 },
+                .{ "Digit6", 0x16 },
+                .{ "Digit7", 0x1a },
+                .{ "Digit8", 0x1c },
+                .{ "Digit9", 0x19 },
+                .{ "Equal", 0x18 },
+                .{ "IntlBackslash", 0x0a },
+                .{ "KeyA", 0x00 },
+                .{ "KeyB", 0x0b },
+                .{ "KeyC", 0x08 },
+                .{ "KeyD", 0x02 },
+                .{ "KeyE", 0x0e },
+                .{ "KeyF", 0x03 },
+                .{ "KeyG", 0x05 },
+                .{ "KeyH", 0x04 },
+                .{ "KeyI", 0x22 },
+                .{ "KeyJ", 0x26 },
+                .{ "KeyK", 0x28 },
+                .{ "KeyL", 0x25 },
+                .{ "KeyM", 0x2e },
+                .{ "KeyN", 0x2d },
+                .{ "KeyO", 0x1f },
+                .{ "KeyP", 0x23 },
+                .{ "KeyQ", 0x0c },
+                .{ "KeyR", 0x0f },
+                .{ "KeyS", 0x01 },
+                .{ "KeyT", 0x11 },
+                .{ "KeyU", 0x20 },
+                .{ "KeyV", 0x09 },
+                .{ "KeyW", 0x0d },
+                .{ "KeyX", 0x07 },
+                .{ "KeyY", 0x10 },
+                .{ "KeyZ", 0x06 },
+                .{ "Minus", 0x1b },
+                .{ "Period", 0x2f },
+                .{ "Quote", 0x27 },
+                .{ "Semicolon", 0x29 },
+                .{ "Slash", 0x2c },
+                // Modifier Keys
+                .{ "AltLeft", 0x3a },
+                .{ "AltRight", 0x3d },
+                .{ "ControlLeft", 0x3b },
+                .{ "ControlRight", 0x3e },
+                .{ "MetaLeft", 0x37 },
+                .{ "MetaRight", 0x36 },
+                .{ "ShiftLeft", 0x38 },
+                .{ "ShiftRight", 0x3c },
+                // Functional Keys
+                .{ "Backspace", 0x33 },
+                .{ "CapsLock", 0x39 },
+                .{ "ContextMenu", 0x6e },
+                .{ "Enter", 0x24 },
+                .{ "Space", 0x31 },
+                .{ "Tab", 0x30 },
+                // Control Pad
+                .{ "Delete", 0x75 },
+                .{ "End", 0x77 },
+                .{ "Home", 0x73 },
+                .{ "Insert", 0x72 },
+                .{ "PageDown", 0x79 },
+                .{ "PageUp", 0x74 },
+                // Arrow Keys
+                .{ "ArrowDown", 0x7d },
+                .{ "ArrowLeft", 0x7b },
+                .{ "ArrowRight", 0x7c },
+                .{ "ArrowUp", 0x7e },
+                // Numpad
+                .{ "NumLock", 0x47 },
+                .{ "Numpad0", 0x52 },
+                .{ "Numpad1", 0x53 },
+                .{ "Numpad2", 0x54 },
+                .{ "Numpad3", 0x55 },
+                .{ "Numpad4", 0x56 },
+                .{ "Numpad5", 0x57 },
+                .{ "Numpad6", 0x58 },
+                .{ "Numpad7", 0x59 },
+                .{ "Numpad8", 0x5b },
+                .{ "Numpad9", 0x5c },
+                .{ "NumpadAdd", 0x45 },
+                .{ "NumpadDecimal", 0x41 },
+                .{ "NumpadDivide", 0x4b },
+                .{ "NumpadEnter", 0x4c },
+                .{ "NumpadEqual", 0x51 },
+                .{ "NumpadMultiply", 0x43 },
+                .{ "NumpadSubtract", 0x4e },
+                // Function Keys
+                .{ "Escape", 0x35 },
+                .{ "F1", 0x7a },
+                .{ "F2", 0x78 },
+                .{ "F3", 0x63 },
+                .{ "F4", 0x76 },
+                .{ "F5", 0x60 },
+                .{ "F6", 0x61 },
+                .{ "F7", 0x62 },
+                .{ "F8", 0x64 },
+                .{ "F9", 0x65 },
+                .{ "F10", 0x6d },
+                .{ "F11", 0x67 },
+                .{ "F12", 0x6f },
+                // Media/Browser Keys
+                .{ "PrintScreen", 0x69 },
+                .{ "ScrollLock", 0x6b },
+                .{ "Pause", 0x71 },
+            });
         return map.get(code) orelse 0xFFFF; // Invalid keycode
     }
 
@@ -1394,6 +1516,17 @@ const Server = struct {
     fn deinit(self: *Server) void {
         self.running.store(false, .release);
 
+        // Clear global_server first to prevent callbacks from accessing it during shutdown
+        global_server = null;
+
+        // Shut down WebSocket servers first and wait for all connection threads to finish
+        // This must happen BEFORE destroying panels to avoid use-after-free
+        self.http_server.deinit();
+        self.panel_ws_server.deinit();
+        self.control_ws_server.deinit();
+        self.file_ws_server.deinit();
+
+        // Now safe to destroy panels since all connection threads have finished
         var panel_it = self.panels.valueIterator();
         while (panel_it.next()) |panel| {
             panel.*.deinit();
@@ -1407,17 +1540,12 @@ const Server = struct {
         self.pending_resizes.deinit(self.allocator);
         self.pending_splits.deinit(self.allocator);
 
-        self.http_server.deinit();
-        self.panel_ws_server.deinit();
-        self.control_ws_server.deinit();
-        self.file_ws_server.deinit();
         self.auth_state.deinit();
         self.transfer_manager.deinit();
         self.file_connections.deinit(self.allocator);
         self.connection_roles.deinit();
         c.ghostty_app_free(self.app);
         c.ghostty_config_free(self.config);
-        global_server = null;
         self.allocator.destroy(self);
     }
 
