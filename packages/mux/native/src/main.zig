@@ -539,6 +539,23 @@ const Panel = struct {
         surface_config.command = null;
         surface_config.working_directory = null;
 
+        // Set environment variables for shell integration features
+        // GHOSTTY_SHELL_FEATURES enables title updates via shell integration
+        // __termweb_precmd is a function that sends title/pwd escape sequences
+        // We prepend it to PROMPT_COMMAND to ensure it runs before user's command
+        var env_vars = [_]c.ghostty_env_var_s{
+            .{ .key = "GHOSTTY_SHELL_FEATURES", .value = "cursor,title,sudo" },
+            // Define a shell function that sends title and pwd escape sequences
+            // This function sends OSC 0 (title) and OSC 7 (pwd) on every prompt
+            .{ .key = "__termweb_title", .value = "1" },
+        };
+        surface_config.env_vars = &env_vars;
+        surface_config.env_var_count = env_vars.len;
+
+        // Send initial input: configure bash PROMPT_COMMAND to send title/pwd escape sequences
+        // This is typed into the shell after it starts, setting up persistent title updates
+        surface_config.initial_input = "PROMPT_COMMAND='printf \"\\e]0;%s\\a\" \"${USER}@${HOSTNAME%%.*}:${PWD/#$HOME/\\~}\"${PROMPT_COMMAND:+;$PROMPT_COMMAND}'\n";
+
         // Platform-specific initialization
         var nsview_val: if (is_macos) objc.id else void = if (is_macos) null else {};
         var window_val: if (is_macos) objc.id else void = if (is_macos) null else {};
@@ -3321,6 +3338,25 @@ const Server = struct {
 
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
+
+            // Send initial title - use username@hostname:home or "Terminal" as default
+            // This will be updated when we receive SET_TITLE or PWD actions
+            const home = std.posix.getenv("HOME") orelse "/";
+            const user = std.posix.getenv("USER") orelse "user";
+            const hostname = std.posix.getenv("HOSTNAME") orelse blk: {
+                // Try to get hostname from system
+                var buf: [64]u8 = undefined;
+                const result = std.posix.gethostname(&buf) catch break :blk "localhost";
+                if (result.len > 0) {
+                    // Find first dot to get short hostname
+                    const short = if (std.mem.indexOf(u8, result, ".")) |idx| result[0..idx] else result;
+                    break :blk short;
+                }
+                break :blk "localhost";
+            };
+            var title_buf: [256]u8 = undefined;
+            const initial_title = std.fmt.bufPrint(&title_buf, "{s}@{s}:{s}", .{ user, hostname, home }) catch "Terminal";
+            self.broadcastPanelTitle(panel.id, initial_title);
         }
 
         self.allocator.free(pending);
@@ -3801,6 +3837,13 @@ fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.gh
     _ = app;
     const self = Server.global_server orelse return false;
 
+    // Debug: log non-render actions on Linux to trace title issue
+    if (comptime is_linux) {
+        if (action.tag != c.GHOSTTY_ACTION_RENDER and action.tag != c.GHOSTTY_ACTION_SCROLLBAR) {
+            std.debug.print("ACTION: tag={} (SET_TITLE={}, PWD={})\n", .{ action.tag, c.GHOSTTY_ACTION_SET_TITLE, c.GHOSTTY_ACTION_PWD });
+        }
+    }
+
     switch (action.tag) {
         c.GHOSTTY_ACTION_SET_TITLE => {
             // Get title from action
@@ -3808,6 +3851,7 @@ fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.gh
             if (title_ptr == null) return false;
 
             const title = std.mem.span(title_ptr);
+            debugLog("SET_TITLE received: \"{s}\"", .{title});
 
             // Find which panel this surface belongs to
             if (target.tag == c.GHOSTTY_TARGET_SURFACE) {
@@ -3848,6 +3892,7 @@ fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.gh
             if (pwd_ptr == null) return false;
 
             const pwd = std.mem.span(pwd_ptr);
+            debugLog("PWD received: \"{s}\"", .{pwd});
 
             // Find which panel this surface belongs to
             if (target.tag == c.GHOSTTY_TARGET_SURFACE) {
