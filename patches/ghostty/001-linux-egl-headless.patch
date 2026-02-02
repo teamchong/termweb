@@ -1,5 +1,30 @@
+From d066bcc50c591a4d1ec5fdd5829212ae44e51126 Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Mon, 2 Feb 2026 06:49:49 -0500
+Subject: [PATCH] feat(linux): add headless EGL rendering support for embedded
+ platform
+
+Add headless OpenGL rendering via EGL for Linux embedded platform:
+
+- Create egl_headless.zig module that dynamically loads libEGL and libgbm
+- Support multiple platforms: GBM (hardware GPU), surfaceless, default
+- Support multiple OpenGL versions: 4.3, 3.3, ES 3.2, 3.1, 3.0
+- Add must_draw_from_app_thread for Linux to handle threadlocal glad context
+- Initialize EGL context in surfaceInit for embedded Linux
+- Add ghostty_surface_read_pixels for video frame capture
+
+This enables headless GPU rendering on Linux servers without a display,
+using DRM render nodes (/dev/dri/renderD128) for hardware acceleration.
+---
+ include/ghostty.h          |  13 ++
+ src/apprt/egl_headless.zig | 327 +++++++++++++++++++++++++++++++++++++
+ src/apprt/embedded.zig     |  43 +++++
+ src/renderer/OpenGL.zig    |  21 ++-
+ 4 files changed, 398 insertions(+), 6 deletions(-)
+ create mode 100644 src/apprt/egl_headless.zig
+
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 3d3973084..6152c6b7d 100644
+index 3d3973084..e04c2fabe 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
 @@ -38,6 +38,7 @@ typedef enum {
@@ -27,15 +52,28 @@ index 3d3973084..6152c6b7d 100644
  } ghostty_platform_u;
  
  typedef enum {
+@@ -1146,6 +1154,11 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
+ bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
+ #endif
+ 
++#ifdef __linux__
++// Read pixels from the OpenGL framebuffer (for video encoding)
++bool ghostty_surface_read_pixels(ghostty_surface_t, uint8_t*, size_t);
++#endif
++
+ // APIs I'd like to get rid of eventually but are still needed for now.
+ // Don't use these unless you know what you're doing.
+ void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..578fb800b
+index 000000000..ea96e753b
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,327 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
++const gl = @import("../renderer/opengl/main.zig");
 +
 +// GBM types and functions
 +const gbm = struct {
@@ -324,8 +362,43 @@ index 000000000..578fb800b
 +        _ = c.eglMakeCurrent(ctx.display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
 +    }
 +}
++
++/// Read pixels from the current OpenGL framebuffer (RGBA format)
++/// Used for video encoding on Linux (equivalent to IOSurface on macOS)
++pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) bool {
++    if (gl.glReadPixels == null) return false;
++
++    const expected_size = @as(usize, width) * @as(usize, height) * 4;
++    if (buffer_len < expected_size) return false;
++
++    // Ensure we're reading from the right buffer
++    if (gl.glReadBuffer) |readBuf| {
++        readBuf(gl.c.GL_BACK);
++    }
++
++    // Read pixels (OpenGL origin is bottom-left)
++    gl.glReadPixels.?(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, buffer);
++
++    // Flip image vertically (OpenGL has origin at bottom-left, we need top-left)
++    const row_size = width * 4;
++    var temp_row: [4096 * 4]u8 = undefined; // Support up to 4K width
++    if (row_size <= temp_row.len) {
++        var y: u32 = 0;
++        while (y < height / 2) : (y += 1) {
++            const top_offset = y * row_size;
++            const bottom_offset = (height - 1 - y) * row_size;
++
++            // Swap rows
++            @memcpy(temp_row[0..row_size], buffer[top_offset..][0..row_size]);
++            @memcpy(buffer[top_offset..][0..row_size], buffer[bottom_offset..][0..row_size]);
++            @memcpy(buffer[bottom_offset..][0..row_size], temp_row[0..row_size]);
++        }
++    }
++
++    return true;
++}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..c5d27f010 100644
+index dcf8a6357..d0bb18d11 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -393,6 +466,31 @@ index dcf8a6357..c5d27f010 100644
  };
  
  pub const EnvVar = extern struct {
+@@ -2204,4 +2227,24 @@ pub const CAPI = struct {
+             }
+         }
+     };
++
++    // Linux-only C APIs
++    const Linux = struct {
++        /// Read pixels from the OpenGL framebuffer for video encoding
++        export fn ghostty_surface_read_pixels(ptr: *Surface, buffer: [*]u8, buffer_len: usize) bool {
++            const surface = &ptr.core_surface;
++            const size = surface.screen_size orelse return false;
++
++            if (comptime builtin.target.os.tag == .linux) {
++                const egl_headless = @import("egl_headless.zig");
++                return egl_headless.readPixels(buffer, buffer_len, size.width, size.height);
++            }
++            return false;
++        }
++    };
++    comptime {
++        if (builtin.target.os.tag == .linux) {
++            _ = Linux;
++        }
++    }
+ };
 diff --git a/src/renderer/OpenGL.zig b/src/renderer/OpenGL.zig
 index 4b01da0c5..8d5edd8f4 100644
 --- a/src/renderer/OpenGL.zig
@@ -439,3 +537,6 @@ index 4b01da0c5..8d5edd8f4 100644
          },
      }
  }
+-- 
+2.43.0
+

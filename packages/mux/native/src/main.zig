@@ -1,21 +1,56 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
 const auth = @import("auth.zig");
 const zip = @import("zip.zig");
-const video = @import("video_encoder.zig");
 
-const c = @cImport({
+// Debug logging to stderr
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt ++ "\n", args);
+}
+
+// Platform detection
+const is_macos = builtin.os.tag == .macos;
+const is_linux = builtin.os.tag == .linux;
+
+// Cross-platform video encoder (uses comptime to select implementation)
+const video = @import("video.zig");
+
+// Ghostty stub for Linux (comptime selected)
+const ghostty_stub = @import("ghostty_stub.zig");
+
+// Platform-specific C imports + ghostty
+const c = if (is_macos) @cImport({
     @cInclude("libdeflate.h");
     @cInclude("ghostty.h");
     @cInclude("IOSurface/IOSurfaceRef.h");
+}) else @cImport({
+    // Linux: libghostty + libdeflate (no IOSurface)
+    @cInclude("libdeflate.h");
+    @cInclude("ghostty.h");
 });
 
-const objc = @cImport({
+// IOSurface types/stubs for cross-platform code (actual calls guarded by is_macos)
+const IOSurfacePtr = if (is_macos) *c.struct___IOSurface else *anyopaque;
+
+// Objective-C runtime (macOS only, stub on Linux)
+const objc = if (is_macos) @cImport({
     @cInclude("objc/runtime.h");
     @cInclude("objc/message.h");
-});
+}) else struct {
+    pub const id = ?*anyopaque;
+    pub const SEL = ?*anyopaque;
+    pub const Class = ?*anyopaque;
+    pub fn sel_registerName(_: [*:0]const u8) SEL { return null; }
+    pub fn objc_getClass(_: [*:0]const u8) Class { return null; }
+    pub fn class_getInstanceMethod(_: Class, _: SEL) ?*anyopaque { return null; }
+    pub fn method_getImplementation(_: ?*anyopaque) ?*anyopaque { return null; }
+
+    // Stub for objc_msgSend - returns null function pointer
+    pub fn objc_msgSend() callconv(.c) ?*anyopaque { return null; }
+};
 
 // ============================================================================
 // Frame Protocol (same as termweb)
@@ -435,8 +470,6 @@ pub const Layout = struct {
     }
 };
 
-const IOSurfacePtr = *c.struct___IOSurface;
-
 // ============================================================================
 // Input Event Queue (for thread-safe input to ghostty)
 // ============================================================================
@@ -458,13 +491,18 @@ const InputEvent = union(enum) {
 // Panel - One ghostty surface + streamer + websocket connection
 // ============================================================================
 
+// Import SharedMemory for Linux IPC
+const SharedMemory = @import("shared_memory").SharedMemory;
+
 const Panel = struct {
     id: u32,
     surface: c.ghostty_surface_t,
-    nsview: objc.id,
-    window: objc.id,
+    // Platform-specific fields (comptime selected)
+    nsview: if (is_macos) objc.id else void,
+    window: if (is_macos) objc.id else void,
+    shm: if (is_linux) ?SharedMemory else void, // Linux shared memory
     video_encoder: ?*video.VideoEncoder, // Lazy init on first frame
-    bgra_buffer: ?[]u8, // For IOSurface capture - lazy init
+    bgra_buffer: ?[]u8, // For IOSurface/SharedMemory capture - lazy init
     sequence: u32,
     width: u32,
     height: u32,
@@ -480,7 +518,7 @@ const Panel = struct {
     inspector_subscribed: bool,
     inspector_tab: [16]u8,
     inspector_tab_len: u8,
-    last_iosurface_seed: u32, // For detecting IOSurface changes without copying
+    last_iosurface_seed: u32, // For detecting IOSurface/SharedMemory changes
     last_frame_time: i64, // For FPS control
     last_tick_time: i128, // For rate limiting panel.tick()
 
@@ -491,23 +529,44 @@ const Panel = struct {
         const panel = try allocator.create(Panel);
         errdefer allocator.destroy(panel);
 
-        // Create window at point dimensions (CSS pixels from browser)
-        // The layer's contentsScale handles retina rendering
-        const window_view = createHiddenWindow(width, height) orelse return error.WindowCreationFailed;
-
-        // Make view layer-backed for Metal rendering and set contentsScale for retina
-        makeViewLayerBacked(window_view.view, scale);
+        // Frame buffer is at pixel dimensions (width * scale, height * scale)
+        const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
+        const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * scale);
 
         var surface_config = c.ghostty_surface_config_new();
-        surface_config.platform_tag = c.GHOSTTY_PLATFORM_MACOS;
-        surface_config.platform.macos.nsview = @ptrCast(window_view.view);
-        // Use actual scale factor - ghostty will render at retina resolution
         surface_config.scale_factor = scale;
-        // Set userdata to panel pointer for clipboard callbacks
         surface_config.userdata = panel;
-        // Use default shell (null = user's shell from /etc/passwd)
         surface_config.command = null;
         surface_config.working_directory = null;
+
+        // Platform-specific initialization
+        var nsview_val: if (is_macos) objc.id else void = if (is_macos) null else {};
+        var window_val: if (is_macos) objc.id else void = if (is_macos) null else {};
+        var shm_val: if (is_linux) ?SharedMemory else void = if (is_linux) null else {};
+
+        if (comptime is_macos) {
+            // macOS: Create hidden window with NSView for Metal rendering
+            const window_view = createHiddenWindow(width, height) orelse return error.WindowCreationFailed;
+            makeViewLayerBacked(window_view.view, scale);
+
+            surface_config.platform_tag = c.GHOSTTY_PLATFORM_MACOS;
+            surface_config.platform.macos.nsview = @ptrCast(window_view.view);
+
+            nsview_val = window_view.view;
+            window_val = window_view.window;
+        } else if (comptime is_linux) {
+            // Linux: Create SharedMemory for pixel output
+            const shm_size = @as(usize, pixel_width) * @as(usize, pixel_height) * 4; // BGRA
+            var shm = SharedMemory.create("ghostty_panel", shm_size) catch return error.SharedMemoryFailed;
+            errdefer shm.deinit();
+
+            surface_config.platform_tag = c.GHOSTTY_PLATFORM_LINUX;
+            surface_config.platform.linux_shm.shm_fd = @intCast(shm.fd);
+            surface_config.platform.linux_shm.shm_ptr = @ptrCast(shm.mapped.ptr);
+            surface_config.platform.linux_shm.shm_size = shm.size;
+
+            shm_val = shm;
+        }
 
         const surface = c.ghostty_surface_new(app, &surface_config);
         if (surface == null) return error.SurfaceCreationFailed;
@@ -518,28 +577,22 @@ const Panel = struct {
         // Tell ghostty the surface is visible (not occluded) so it renders properly
         c.ghostty_surface_set_occlusion(surface, true);
 
-        // Frame buffer is at pixel dimensions (width * scale, height * scale)
-        const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
-        const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * scale);
-
-        // Set size in pixels - ghostty creates IOSurface at this size
+        // Set size in pixels
         c.ghostty_surface_set_size(surface, pixel_width, pixel_height);
-
-        // Video encoder and BGRA buffer are lazily initialized on first frame
-        // This speeds up panel creation significantly
 
         panel.* = .{
             .id = id,
             .surface = surface,
-            .nsview = window_view.view,
-            .window = window_view.window,
+            .nsview = nsview_val,
+            .window = window_val,
+            .shm = shm_val,
             .video_encoder = null,
             .bgra_buffer = null,
             .sequence = 0,
-            .width = width,       // Store point dimensions
-            .height = height,     // Store point dimensions
+            .width = width,
+            .height = height,
             .scale = scale,
-            .streaming = std.atomic.Value(bool).init(false), // Start paused until connected
+            .streaming = std.atomic.Value(bool).init(false),
             .force_keyframe = true,
             .connection = null,
             .allocator = allocator,
@@ -589,8 +642,10 @@ const Panel = struct {
         self.width = width;
         self.height = height;
 
-        // Resize the NSWindow and NSView at point dimensions
-        resizeWindow(self.window, width, height);
+        // Resize the NSWindow and NSView at point dimensions (macOS only)
+        if (comptime is_macos) {
+            resizeWindow(self.window, width, height);
+        }
 
         // Set ghostty size in pixels
         const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * self.scale);
@@ -616,7 +671,10 @@ const Panel = struct {
     }
 
     // Returns true if frame changed, false if identical to previous
-    fn captureFromIOSurface(self: *Panel, iosurface: IOSurfacePtr) !bool {
+    // macOS only - uses IOSurface for pixel capture (guarded at call site)
+    const captureFromIOSurface = if (is_macos) captureFromIOSurfaceMacOS else void;
+
+    fn captureFromIOSurfaceMacOS(self: *Panel, iosurface: IOSurfacePtr) !bool {
         // Check IOSurface seed - if unchanged, surface wasn't modified, skip copy entirely
         const seed = c.IOSurfaceGetSeed(iosurface);
         if (seed == self.last_iosurface_seed and !self.force_keyframe) {
@@ -834,7 +892,18 @@ const Panel = struct {
         c.ghostty_surface_draw(self.surface);
     }
 
-    fn getIOSurface(self: *Panel) ?IOSurfacePtr {
+    fn getPixelWidth(self: *const Panel) u32 {
+        return @intFromFloat(@as(f64, @floatFromInt(self.width)) * self.scale);
+    }
+
+    fn getPixelHeight(self: *const Panel) u32 {
+        return @intFromFloat(@as(f64, @floatFromInt(self.height)) * self.scale);
+    }
+
+    // macOS only - get IOSurface from NSView (guarded at call site)
+    const getIOSurface = if (is_macos) getIOSurfaceMacOS else void;
+
+    fn getIOSurfaceMacOS(self: *Panel) ?IOSurfacePtr {
         return getIOSurfaceFromView(self.nsview);
     }
 
@@ -846,7 +915,9 @@ const Panel = struct {
         if (self.connection) |conn| {
             if (conn.is_open) {
                 try conn.sendBinary(data);
+            } else {
             }
+        } else {
         }
     }
 
@@ -1468,7 +1539,11 @@ const Server = struct {
     }
 
     fn onPanelMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        const self = global_server orelse return;
+        std.debug.print("onPanelMessage called: binary={}, len={}\n", .{ is_binary, data.len });
+        const self = global_server orelse {
+            std.debug.print("ERROR: global_server is null!\n", .{});
+            return;
+        };
 
         // Handle JSON text messages (inspector commands)
         if (!is_binary and data.len > 0 and data[0] == '{') {
@@ -3229,9 +3304,11 @@ const Server = struct {
         };
         self.mutex.unlock();
 
+        if (pending.len > 0) {
+        }
+
         for (pending) |req| {
-            const panel = self.createPanel(req.width, req.height, req.scale) catch |err| {
-                std.debug.print("Failed to create panel: {}\n", .{err});
+            const panel = self.createPanel(req.width, req.height, req.scale) catch {
                 continue;
             };
 
@@ -3364,10 +3441,12 @@ const Server = struct {
         var frame_blocks: u32 = 0;
         var fps_timer: i128 = std.time.nanoTimestamp();
 
+        std.debug.print("Render loop started, running={}\n", .{self.running.load(.acquire)});
+
         while (self.running.load(.acquire)) {
-            // Create autorelease pool for this iteration (prevents ObjC object accumulation)
-            const pool = objc_autoreleasePoolPush();
-            defer objc_autoreleasePoolPop(pool);
+            // Create autorelease pool for this iteration (macOS only - prevents ObjC object accumulation)
+            const pool = if (comptime is_macos) objc_autoreleasePoolPush() else null;
+            defer if (comptime is_macos) objc_autoreleasePoolPop(pool);
 
             // Process pending panel creations/destructions/resizes/splits (NSWindow/ghostty must be on main thread)
             self.processPendingPanels();
@@ -3418,21 +3497,63 @@ const Server = struct {
 
                     frames_attempted += 1;
 
-                    // Scoped autorelease pool for ALL ObjC/Metal objects created during this panel's frame
-                    const draw_pool = objc_autoreleasePoolPush();
-                    defer objc_autoreleasePoolPop(draw_pool);
+                    // Scoped autorelease pool for ALL ObjC/Metal objects created during this panel's frame (macOS only)
+                    const draw_pool = if (comptime is_macos) objc_autoreleasePoolPush() else null;
+                    defer if (comptime is_macos) objc_autoreleasePoolPop(draw_pool);
 
                     // Render panel content to IOSurface
                     panel.tick();
 
-                    if (panel.getIOSurface()) |iosurface| {
-                        // BGRA copy path - faster than direct IOSurface encoding
-                        // (VideoToolbox has overhead reading from GPU memory)
-                        _ = panel.captureFromIOSurface(iosurface) catch continue;
+                    // Platform-specific frame capture
+                    if (comptime is_macos) {
+                        if (panel.getIOSurface()) |iosurface| {
+                            // BGRA copy path - faster than direct IOSurface encoding
+                            // (VideoToolbox has overhead reading from GPU memory)
+                            _ = panel.captureFromIOSurface(iosurface) catch continue;
 
-                        if (panel.prepareFrame() catch null) |result| {
-                            panel.sendFrame(result.data) catch {};
-                            frames_sent += 1;
+                            if (panel.prepareFrame() catch null) |result| {
+                                panel.sendFrame(result.data) catch {};
+                                frames_sent += 1;
+                            }
+                        }
+                    } else if (comptime is_linux) {
+                        // Linux: Capture from OpenGL framebuffer via ghostty
+                        const pixel_width = panel.getPixelWidth();
+                        const pixel_height = panel.getPixelHeight();
+                        const buffer_size = @as(usize, pixel_width) * @as(usize, pixel_height) * 4;
+
+                        // Lazy init video encoder and BGRA buffer for Linux
+                        if (panel.video_encoder == null) {
+                            panel.video_encoder = video.VideoEncoder.init(panel.allocator, pixel_width, pixel_height) catch null;
+                            if (panel.video_encoder != null) {
+                                panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch {
+                                    panel.video_encoder.?.deinit();
+                                    panel.video_encoder = null;
+                                    continue;
+                                };
+                            }
+                        }
+
+                        if (panel.video_encoder == null or panel.bgra_buffer == null) continue;
+
+                        // Resize encoder if dimensions changed
+                        if (pixel_width != panel.video_encoder.?.source_width or pixel_height != panel.video_encoder.?.source_height) {
+                            panel.video_encoder.?.resize(pixel_width, pixel_height) catch continue;
+                            if (panel.bgra_buffer.?.len != buffer_size) {
+                                panel.allocator.free(panel.bgra_buffer.?);
+                                panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch continue;
+                            }
+                        }
+
+                        // Read pixels from OpenGL framebuffer (RGBA from glReadPixels)
+                        const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
+                        if (read_ok) {
+                            // Encode RGBA to H.264 (VA-API on Linux, VideoToolbox on macOS)
+                            if (panel.video_encoder.?.encode(panel.bgra_buffer.?, panel.force_keyframe) catch null) |result| {
+                                panel.sendFrame(result.data) catch {};
+                                panel.force_keyframe = false;
+                                frames_sent += 1;
+                            }
                         }
                     }
                 }
@@ -3479,21 +3600,17 @@ const Server = struct {
     fn run(self: *Server) !void {
         self.running.store(true, .release);
 
-        // Start HTTP server in background
+        // Set running flag for WebSocket servers (they don't call run() but need this for handleConnection)
+        self.panel_ws_server.running.store(true, .release);
+        self.control_ws_server.running.store(true, .release);
+        self.file_ws_server.running.store(true, .release);
+
+        // Start HTTP server in background (handles all WebSocket via path-based routing)
         const http_thread = try std.Thread.spawn(.{}, runHttpServer, .{self});
         defer http_thread.join();
 
-        // Start control WebSocket server in background
-        const control_thread = try std.Thread.spawn(.{}, runControlWebSocket, .{self});
-        defer control_thread.join();
-
-        // Start panel WebSocket server in background
-        const panel_thread = try std.Thread.spawn(.{}, runPanelWebSocket, .{self});
-        defer panel_thread.join();
-
-        // Start file WebSocket server in background
-        const file_thread = try std.Thread.spawn(.{}, runFileWebSocket, .{self});
-        defer file_thread.join();
+        // Note: WebSocket servers are NOT started with run() - they only handle
+        // upgrades from HTTP server via handleUpgrade(). No separate ports needed.
 
         // Run render loop in main thread
         self.runRenderLoop();
@@ -3891,8 +4008,29 @@ fn handleSigint(_: c_int) callconv(.c) void {
     // First Ctrl+C - graceful shutdown
     if (Server.global_server) |server| {
         server.running.store(false, .release);
+        // Also stop child servers so their connection handlers exit
+        server.http_server.stop();
+        server.panel_ws_server.stop();
+        server.control_ws_server.stop();
+        server.file_ws_server.stop();
     }
     std.debug.print("\nShutting down...\n", .{});
+}
+
+// WebSocket upgrade callbacks for HTTP server
+fn onPanelWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
+    const server: *Server = @ptrCast(@alignCast(user_data orelse return));
+    server.panel_ws_server.handleUpgrade(stream, request);
+}
+
+fn onControlWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
+    const server: *Server = @ptrCast(@alignCast(user_data orelse return));
+    server.control_ws_server.handleUpgrade(stream, request);
+}
+
+fn onFileWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
+    const server: *Server = @ptrCast(@alignCast(user_data orelse return));
+    server.file_ws_server.handleUpgrade(stream, request);
 }
 
 /// Run mux server - can be called from CLI or standalone
@@ -3911,17 +4049,16 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16) !void {
     const server = try Server.init(allocator, http_port, 0, 0);
     defer server.deinit();
 
-    const panel_port = server.panel_ws_server.listener.listen_address.getPort();
-    const control_port = server.control_ws_server.listener.listen_address.getPort();
-    const file_port = server.file_ws_server.listener.listen_address.getPort();
+    // Set up WebSocket upgrade callbacks on HTTP server
+    // All WebSocket connections go through the HTTP port via path-based routing
+    server.http_server.setWsCallbacks(
+        onPanelWsUpgrade,
+        onControlWsUpgrade,
+        onFileWsUpgrade,
+        server,
+    );
 
-    // Tell HTTP server about the WS ports so it can serve /config
-    server.http_server.setWsPorts(panel_port, control_port, file_port);
-
-    std.debug.print("  HTTP:              http://localhost:{}\n", .{http_port});
-    std.debug.print("  Panel WebSocket:   ws://localhost:{}\n", .{panel_port});
-    std.debug.print("  Control WebSocket: ws://localhost:{}\n", .{control_port});
-    std.debug.print("  File WebSocket:    ws://localhost:{}\n", .{file_port});
+    std.debug.print("  HTTP + WebSocket:  http://localhost:{}\n", .{http_port});
     std.debug.print("  Web assets:        embedded (~140KB)\n", .{});
     std.debug.print("\nServer initialized, waiting for connections...\n", .{});
 
