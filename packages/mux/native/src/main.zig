@@ -3330,18 +3330,19 @@ const Server = struct {
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
 
-            // Send initial title - use username@hostname:~ or "Terminal" as default
-            // This will be updated when we receive SET_TITLE or PWD actions
-            const user = std.posix.getenv("USER") orelse "user";
-            var host_buf: [64]u8 = undefined;
-            const hostname: []const u8 = if (std.posix.getenv("HOSTNAME")) |h| h else blk: {
-                const result = std.posix.gethostname(&host_buf) catch break :blk "localhost";
-                // Find first dot to get short hostname
-                break :blk if (std.mem.indexOf(u8, result, ".")) |idx| result[0..idx] else result;
-            };
-            var title_buf: [256]u8 = undefined;
-            const initial_title = std.fmt.bufPrint(&title_buf, "{s}@{s}:~", .{ user, hostname }) catch "Terminal";
-            self.broadcastPanelTitle(panel.id, initial_title);
+            // Linux only: Send initial title since shell integration may not be configured
+            // macOS works fine without this as ghostty auto-injects shell integration
+            if (comptime is_linux) {
+                const user = std.posix.getenv("USER") orelse "user";
+                var host_buf: [64]u8 = undefined;
+                const hostname: []const u8 = if (std.posix.getenv("HOSTNAME")) |h| h else blk: {
+                    const result = std.posix.gethostname(&host_buf) catch break :blk "localhost";
+                    break :blk if (std.mem.indexOf(u8, result, ".")) |idx| result[0..idx] else result;
+                };
+                var title_buf: [256]u8 = undefined;
+                const initial_title = std.fmt.bufPrint(&title_buf, "{s}@{s}:~", .{ user, hostname }) catch "Terminal";
+                self.broadcastPanelTitle(panel.id, initial_title);
+            }
         }
 
         self.allocator.free(pending);
