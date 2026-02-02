@@ -366,6 +366,7 @@ pub const Connection = struct {
 
     // Send close frame
     pub fn sendClose(self: *Connection) !void {
+        if (!self.is_open) return; // Already closed
         try self.writeFrame(.close, &[_]u8{});
         self.is_open = false;
     }
