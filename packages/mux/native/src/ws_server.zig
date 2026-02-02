@@ -19,6 +19,45 @@ fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
+// Find HTTP header value case-insensitively (proxies may lowercase headers)
+fn findHeaderValue(request: []const u8, header_name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < request.len) {
+        // Find line start
+        const line_start = i;
+        // Find end of line
+        while (i < request.len and request[i] != '\r') : (i += 1) {}
+        const line = request[line_start..i];
+
+        // Skip \r\n
+        if (i + 1 < request.len and request[i] == '\r' and request[i + 1] == '\n') {
+            i += 2;
+        } else {
+            break;
+        }
+
+        // Check if line starts with header name (case-insensitive)
+        if (line.len > header_name.len + 1) { // +1 for ':'
+            var matches = true;
+            for (0..header_name.len) |j| {
+                if (std.ascii.toLower(line[j]) != std.ascii.toLower(header_name[j])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches and line[header_name.len] == ':') {
+                // Found header, extract value (skip ': ' prefix)
+                var value_start = header_name.len + 1;
+                while (value_start < line.len and (line[value_start] == ' ' or line[value_start] == '\t')) {
+                    value_start += 1;
+                }
+                return line[value_start..];
+            }
+        }
+    }
+    return null;
+}
+
 // ============================================================================
 // WebSocket Protocol
 // ============================================================================
@@ -101,12 +140,53 @@ pub const Connection = struct {
             }
         }
 
-        // Find Sec-WebSocket-Key header
-        const key_header = "Sec-WebSocket-Key: ";
-        const key_start = std.mem.indexOf(u8, request, key_header) orelse return error.InvalidHandshake;
-        const key_value_start = key_start + key_header.len;
-        const key_end = std.mem.indexOfPos(u8, request, key_value_start, "\r\n") orelse return error.InvalidHandshake;
-        const ws_key = request[key_value_start..key_end];
+        // Find Sec-WebSocket-Key header (case-insensitive - proxies may lowercase)
+        const ws_key = findHeaderValue(request, "sec-websocket-key") orelse return error.InvalidHandshake;
+
+        // Generate accept key: base64(sha1(key + magic))
+        const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        var hasher = std.crypto.hash.Sha1.init(.{});
+        hasher.update(ws_key);
+        hasher.update(magic);
+        const hash = hasher.finalResult();
+
+        var accept_key: [28]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&accept_key, &hash);
+
+        // Check for permessage-deflate extension (only if enabled for this connection)
+        const has_deflate = enable_deflate and std.mem.indexOf(u8, request, "permessage-deflate") != null;
+
+        // Send handshake response
+        const response = "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: ";
+        _ = try self.stream.write(response);
+        _ = try self.stream.write(&accept_key);
+
+        // Enable permessage-deflate if client supports it
+        if (has_deflate) {
+            _ = try self.stream.write("\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover");
+            self.deflate_enabled = true;
+            self.compressor = c.libdeflate_alloc_compressor(6);
+            self.decompressor = c.libdeflate_alloc_decompressor();
+        }
+
+        _ = try self.stream.write("\r\n\r\n");
+    }
+
+    // Accept handshake with pre-read request (for HTTP server upgrade)
+    pub fn acceptHandshakeFromRequest(self: *Connection, request: []const u8, enable_deflate: bool) !void {
+        // Extract request URI from first line (e.g., "GET /ws/panel?token=xyz HTTP/1.1")
+        if (std.mem.indexOf(u8, request, " ")) |method_end| {
+            const uri_start = method_end + 1;
+            if (std.mem.indexOfPos(u8, request, uri_start, " ")) |uri_end| {
+                self.request_uri = self.allocator.dupe(u8, request[uri_start..uri_end]) catch null;
+            }
+        }
+
+        // Find Sec-WebSocket-Key header (case-insensitive - proxies may lowercase)
+        const ws_key = findHeaderValue(request, "sec-websocket-key") orelse return error.InvalidHandshake;
 
         // Generate accept key: base64(sha1(key + magic))
         const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -377,10 +457,7 @@ pub const Server = struct {
     // Handle connection messages in a loop
     pub fn handleConnection(self: *Server, conn: *Connection) void {
         while (conn.is_open and self.running.load(.acquire)) {
-            const frame = conn.readFrame() catch |err| {
-                std.debug.print("Read error: {}\n", .{err});
-                break;
-            };
+            const frame = conn.readFrame() catch break;
 
             // readFrame returns null on timeout - just continue to check running flag
             if (frame == null) continue;
@@ -413,7 +490,6 @@ pub const Server = struct {
     // Run server loop (blocking)
     pub fn run(self: *Server) !void {
         self.running.store(true, .release);
-        std.debug.print("WebSocket server listening on port {}\n", .{self.listener.listen_address.getPort()});
 
         while (self.running.load(.acquire)) {
             const conn = self.acceptOne() catch |err| {
@@ -421,7 +497,6 @@ pub const Server = struct {
                     std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
                 }
-                std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
 
@@ -437,5 +512,31 @@ pub const Server = struct {
 
     fn handleConnectionThread(self: *Server, conn: *Connection) void {
         self.handleConnection(conn);
+    }
+
+    // Handle a WebSocket upgrade from an HTTP server
+    // The stream and pre-read request are passed from the HTTP handler
+    pub fn handleUpgrade(self: *Server, stream: net.Stream, request: []const u8) void {
+        const conn = self.allocator.create(Connection) catch return;
+        conn.* = Connection.init(stream, self.allocator);
+
+        // Set socket read timeout for blocking I/O
+        setReadTimeout(stream.handle, 100);
+
+        // Complete WebSocket handshake with pre-read request
+        conn.acceptHandshakeFromRequest(request, self.enable_deflate) catch {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            return;
+        };
+
+        if (self.on_connect) |cb| cb(conn);
+
+        // Spawn a new thread to handle this connection
+        _ = std.Thread.spawn(.{}, handleConnectionThread, .{ self, conn }) catch {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            return;
+        };
     }
 };

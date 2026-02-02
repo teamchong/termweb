@@ -1547,11 +1547,7 @@ const Server = struct {
     }
 
     fn onPanelMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        std.debug.print("onPanelMessage called: binary={}, len={}\n", .{ is_binary, data.len });
-        const self = global_server orelse {
-            std.debug.print("ERROR: global_server is null!\n", .{});
-            return;
-        };
+        const self = global_server orelse return;
 
         // Handle JSON text messages (inspector commands)
         if (!is_binary and data.len > 0 and data[0] == '{') {
