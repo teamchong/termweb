@@ -4,7 +4,8 @@ A high-performance terminal multiplexer for the web, powered by [Ghostty](https:
 
 ## Features
 
-- **H.264 Video Streaming**: libghostty renders to IOSurface (GPU), VideoToolbox encodes to H.264, WebCodecs decodes in browser
+- **Cross-Platform**: macOS (VideoToolbox) and Linux (VA-API hardware H.264)
+- **H.264 Video Streaming**: libghostty renders to GPU surface, encoded to H.264, WebCodecs decodes in browser
 - **Low Latency**: Direct WebCodecs decoding to canvas (no MSE buffering)
 - **Tab Management**: Multiple tabs with LRU (last recently used) switching on close
 - **Split Panes**: Horizontal/vertical splits with draggable dividers, zoom split to maximize active panel
@@ -38,7 +39,8 @@ A high-performance terminal multiplexer for the web, powered by [Ghostty](https:
 ┌─────────────────────────────────────────────────────────────┐
 │                    Server (main.zig)                        │
 │                                                             │
-│    libghostty → IOSurface (GPU) → VideoToolbox (H.264)      │
+│  macOS:  libghostty → IOSurface → VideoToolbox (H.264)      │
+│  Linux:  libghostty → EGL → VA-API (H.264)                  │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -47,7 +49,7 @@ A high-performance terminal multiplexer for the web, powered by [Ghostty](https:
 
 ### Server (Zig)
 
-Requires Zig 0.14.0+:
+Requires Zig 0.14.0+ (0.15.0 recommended):
 
 ```bash
 cd packages/mux/native
@@ -166,10 +168,41 @@ Add `#debug` or `?debug=1` to URL to show FPS/latency overlay in bottom-right co
 
 ## Dependencies
 
+### All Platforms
 - [Ghostty](https://github.com/ghostty-org/ghostty) - Terminal emulation core (vendored)
-- Zig 0.14.0+ - Server and native code
-- VideoToolbox (macOS) - H.264 encoding
+- Zig 0.14.0+ (0.15.0 recommended) - Server and native code
 - Bun - TypeScript bundling
+
+### macOS
+- VideoToolbox - H.264 hardware encoding
+- IOSurface - GPU buffer for rendering
+- Metal - GPU rendering
+
+### Linux (Ubuntu/Debian)
+
+**Required system packages:**
+
+```bash
+# VA-API for hardware H.264 encoding (Intel/AMD GPUs)
+sudo apt-get install libva-dev
+
+# Intel GPU driver (if using Intel graphics)
+sudo apt-get install intel-media-va-driver
+```
+
+The vendored static libraries in `vendor/libs/` include:
+- fontconfig, freetype, harfbuzz (font rendering)
+- oniguruma (regex for highlighting)
+- glslang, spirv-cross (shader compilation)
+- simdutf, highway (SIMD acceleration)
+- dcimgui (inspector UI)
+- libpng, libz, libxml2 (supporting libraries)
+
+Build with Zig:
+
+```bash
+zig build
+```
 
 ## License
 

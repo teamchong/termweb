@@ -117,9 +117,7 @@ export interface CommandAction {
 
 // App configuration from server
 export interface AppConfig {
-  panelWsPort: number;
-  controlWsPort: number;
-  fileWsPort: number;
+  wsPath?: boolean; // True if using path-based WebSocket on same port
   colors?: Record<string, string>;
 }
 

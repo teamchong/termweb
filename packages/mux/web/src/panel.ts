@@ -5,6 +5,13 @@
 
 import { ClientMsg, BinaryCtrlMsg } from './protocol';
 
+// WebSocket URL builder - auto-detects ws/wss based on page protocol
+function getWsUrl(path: string): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.host; // includes port if non-standard
+  return `${protocol}//${host}${path}`;
+}
+
 export interface PanelCallbacks {
   onResize?: (panelId: number, width: number, height: number) => void;
   onViewAction?: (action: string, data?: unknown) => void;
@@ -238,6 +245,11 @@ export class Panel {
     this.ctx.fillText('Connecting...', this.canvas.width / 2, this.canvas.height / 2);
   }
 
+  private hideLoading(): void {
+    // Loading screen is automatically hidden when the first frame is drawn
+    // This method exists for compatibility
+  }
+
   private initDecoder(): void {
     this.decoder = new VideoDecoder({
       output: (frame) => this.onFrame(frame),
@@ -373,12 +385,12 @@ export class Panel {
     this.resizeObserver.observe(this.element);
   }
 
-  connect(host: string, port: number): void {
+  connect(): void {
     if (this.ws) {
       this.ws.close();
     }
 
-    const wsUrl = `ws://${host}:${port}`;
+    const wsUrl = getWsUrl('/ws/panel');
     this.ws = new WebSocket(wsUrl);
     this.ws.binaryType = 'arraybuffer';
 
@@ -473,11 +485,15 @@ export class Panel {
   }
 
   private handleFrame(data: ArrayBuffer): void {
-    if (this.destroyed || !this.decoder) return;
+    if (this.destroyed) return;
 
     this.frameTimestamps.push(performance.now());
-    const nalData = new Uint8Array(data);
-    const nalUnits = this.parseNalUnits(nalData);
+    const frameData = new Uint8Array(data);
+
+    // Handle H.264 frame
+    if (!this.decoder) return;
+
+    const nalUnits = this.parseNalUnits(frameData);
 
     let isKeyframe = false;
     let sps: Uint8Array | null = null;
@@ -528,7 +544,7 @@ export class Panel {
       console.log('Got first keyframe, starting decode');
     }
 
-    this.decodeFrame(nalData, isKeyframe);
+    this.decodeFrame(frameData, isKeyframe);
     this.checkBufferHealth();
   }
 

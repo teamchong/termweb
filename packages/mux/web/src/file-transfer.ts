@@ -1,5 +1,12 @@
 // File transfer protocol and handlers
 
+// WebSocket URL builder - auto-detects ws/wss based on page protocol
+function getWsUrl(path: string): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.host; // includes port if non-standard
+  return `${protocol}//${host}${path}`;
+}
+
 export const TransferMsgType = {
   // Client -> Server
   TRANSFER_INIT: 0x20,
@@ -64,8 +71,8 @@ export class FileTransferHandler {
   onTransferError?: (transferId: number, error: string) => void;
   onDryRunReport?: (transferId: number, report: DryRunReport) => void;
 
-  connect(host: string, port: number): void {
-    this.ws = new WebSocket(`ws://${host}:${port}`);
+  connect(): void {
+    this.ws = new WebSocket(getWsUrl('/ws/file'));
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {

@@ -89,11 +89,9 @@ export const Role = {
 
 export type RoleType = typeof Role[keyof typeof Role];
 
-// WebSocket port configuration
-export interface PortConfig {
-  panelWsPort: number;
-  controlWsPort: number;
-  fileWsPort: number;
+// Server configuration (path-based WebSocket)
+export interface ServerConfig {
+  wsPath?: boolean; // True if using path-based WebSocket on same port
   colors?: Record<string, string>;
 }
 
