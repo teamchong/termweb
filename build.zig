@@ -274,6 +274,9 @@ pub fn build(b: *std.Build) void {
             mux.addObjectFile(b.path("vendor/libs/libz.a"));
             mux.addObjectFile(b.path("vendor/libs/libdcimgui.a"));
             mux.addObjectFile(b.path("vendor/libs/libxml2.a"));
+            // VA-API for hardware H.264 encoding (Intel/AMD/NVIDIA GPUs)
+            mux.linkSystemLibrary("va");
+            mux.linkSystemLibrary("va-drm");
             // Compile glad for OpenGL function loading
             mux.addCSourceFile(.{
                 .file = b.path("vendor/ghostty/vendor/glad/src/gl.c"),
@@ -303,6 +306,7 @@ pub fn build(b: *std.Build) void {
         });
         mux.root_module.addImport("shared_memory", mux_shm_mod);
 
+
         // libdeflate (cross-platform)
         const libdeflate_flags = if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64)
             &[_][]const u8{ "-O2", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI=1", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ=1" }
@@ -329,20 +333,12 @@ pub fn build(b: *std.Build) void {
         mux.addIncludePath(b.path("vendor/xxhash"));
         mux.addCSourceFile(.{ .file = b.path("vendor/xxhash/xxhash.c"), .flags = &.{"-O2"} });
 
-        // Build web client (bun build) before embedding
-        const build_web = b.addSystemCommand(&.{
-            "bun", "build", "src/index.ts", "--outfile=client.js", "--format=iife",
-        });
-        build_web.setCwd(b.path("packages/mux/web"));
-
-        // Web assets module (~140KB embedded)
+        // Web assets module - client.js is built by Makefile's mux-web target
+        // (Makefile touches assets.zig to force zig to re-embed on changes)
         const web_assets = b.createModule(.{
             .root_source_file = b.path("packages/mux/web/assets.zig"),
         });
         mux.root_module.addImport("web_assets", web_assets);
-
-        // Ensure web is built before mux compiles
-        mux.step.dependOn(&build_web.step);
 
         mux.linkLibC();
         b.installArtifact(mux);

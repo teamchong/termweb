@@ -38,6 +38,8 @@ mux-deps:
 mux-web: mux-deps
 	@echo "Building mux web client..."
 	cd packages/mux/web && bun run build
+	@# Touch assets.zig to force zig to re-embed (zig doesn't detect @embedFile changes)
+	@touch packages/mux/web/assets.zig
 	@echo "Web client built: packages/mux/web/client.js"
 
 # Build mux web client in dev mode (unminified, with sourcemaps)
@@ -77,8 +79,8 @@ mux-clean:
 # Reset all submodules to pinned commits
 vendor-reset:
 	@echo "Resetting vendor submodules..."
-	git submodule update --init --recursive
-	cd vendor/ghostty && git reset --hard HEAD && git clean -fd
+	git submodule update --init --recursive --force
+	cd vendor/ghostty && git clean -fd
 
 # Apply patches to vendor submodules
 vendor-patch:
@@ -86,7 +88,7 @@ vendor-patch:
 	@for patch in patches/ghostty/*.patch; do \
 		if [ -f "$$patch" ]; then \
 			echo "Applying $$patch..."; \
-			cd vendor/ghostty && git apply "../../$$patch" && cd ../..; \
+			cd vendor/ghostty && git am --3way "../../$$patch" && cd ../..; \
 		fi \
 	done
 	@echo "Patches applied."

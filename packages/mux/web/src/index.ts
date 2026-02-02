@@ -19,10 +19,12 @@ export { Panel } from './panel';
 export { SplitContainer } from './split-container';
 export { FileTransferHandler } from './file-transfer';
 
-// WebSocket ports (fetched from /config endpoint)
-let PANEL_PORT = 0;
-let CONTROL_PORT = 0;
-let FILE_PORT = 0;
+// WebSocket URL builder - auto-detects ws/wss based on page protocol
+function getWsUrl(path: string): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.host; // includes port if non-standard
+  return `${protocol}//${host}${path}`;
+}
 
 // ============================================================================
 // App - main application controller
@@ -92,19 +94,14 @@ class App {
 
     // Fetch config
     const config = await this.fetchConfig();
-    PANEL_PORT = config.panelWsPort;
-    CONTROL_PORT = config.controlWsPort;
-    FILE_PORT = config.fileWsPort;
 
     if (config.colors) {
       applyColors(config.colors);
     }
 
-    // Connect WebSockets
+    // Connect WebSockets (path-based on same port)
     this.connectControl();
-    if (FILE_PORT) {
-      this.fileTransfer.connect(this.host, FILE_PORT);
-    }
+    this.fileTransfer.connect();
 
     // Wait for panel_list from server to decide whether to create or connect
     // createTab() will be called in handleJsonMessage if no panels exist
@@ -173,7 +170,7 @@ class App {
   private connectControl(): void {
     if (this.destroyed) return;
 
-    const wsUrl = `ws://${this.host}:${CONTROL_PORT}`;
+    const wsUrl = getWsUrl('/ws/control');
     this.controlWs = new WebSocket(wsUrl);
     this.controlWs.binaryType = 'arraybuffer';
 
@@ -209,12 +206,12 @@ class App {
 
     switch (type) {
       case 'panel_list':
+        // Server is authoritative - restore whatever state it sends
+        // If empty, frontend stays empty (user can create tab with hotkey)
         if (msg.layout && typeof msg.layout === 'object') {
           this.restoreLayoutFromServer(msg.layout as LayoutData);
         } else if (Array.isArray(msg.panels) && msg.panels.length > 0) {
           this.reconnectPanelsAsSplits(msg.panels as Array<{ panel_id: number; title: string }>);
-        } else {
-          this.createTab();
         }
         break;
       case 'panel_created':
@@ -412,20 +409,20 @@ class App {
   }
 
   private handlePanelList(panels: Array<{ panel_id: number; title: string }>, layout: unknown): void {
+    // Server is authoritative - restore whatever state it sends
+    // If empty, frontend stays empty (user can create tab with hotkey)
     if (layout && typeof layout === 'object' && (layout as LayoutData).tabs?.length > 0) {
       this.restoreLayoutFromServer(layout as LayoutData);
     } else if (panels.length > 0) {
       this.reconnectPanelsAsSplits(panels);
-    } else {
-      this.createTab();
     }
+    // No else - empty state is valid, user creates tab manually
   }
 
   private reconnectPanelsAsSplits(panels: Array<{ panel_id: number; title: string }>): void {
     // Put all panels in one tab with horizontal splits
     if (panels.length === 0) {
-      this.createTab();
-      return;
+      return; // Empty state - user creates tab manually
     }
 
     // Create first panel as tab
@@ -896,7 +893,7 @@ class App {
     });
 
     this.panels.set(id, panel);
-    panel.connect(this.host, PANEL_PORT);
+    panel.connect();
 
     // Add click handler to focus this panel
     panel.element.addEventListener('mousedown', () => {

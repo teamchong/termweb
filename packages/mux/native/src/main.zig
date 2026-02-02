@@ -1551,6 +1551,7 @@ const Server = struct {
         self.transfer_manager.deinit();
         self.file_connections.deinit(self.allocator);
         self.connection_roles.deinit();
+        if (self.selection_clipboard) |clip| self.allocator.free(clip);
         c.ghostty_app_free(self.app);
         c.ghostty_config_free(self.config);
         self.allocator.destroy(self);
