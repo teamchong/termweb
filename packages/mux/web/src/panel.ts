@@ -40,7 +40,6 @@ export class Panel {
 
   private lastReportedWidth = 0;
   private lastReportedHeight = 0;
-  private resizeTimeout: ReturnType<typeof setTimeout> | null = null;
   resizeObserver: ResizeObserver | null = null;
 
   // Adaptive bitrate - buffer monitoring
@@ -85,6 +84,7 @@ export class Panel {
     this.element.innerHTML = `
       <div class="panel-content">
         <canvas class="panel-canvas"></canvas>
+        <div class="panel-loading">Connecting...</div>
       </div>
     `;
     container.appendChild(this.element);
@@ -97,8 +97,6 @@ export class Panel {
     this.setupResizeObserver();
     this.initDecoder();
     this.setupStatsOverlay();
-    // Delay showLoading to ensure DOM layout is complete
-    requestAnimationFrame(() => this.showLoading());
   }
 
   private createInspectorElement(): void {
@@ -236,28 +234,9 @@ export class Panel {
     });
   }
 
-  private showLoading(): void {
-    if (!this.ctx) return;
-    const rect = this.element.getBoundingClientRect();
-    // Skip if element not yet laid out
-    if (rect.width === 0 || rect.height === 0) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    this.canvas.width = rect.width * dpr;
-    this.canvas.height = rect.height * dpr;
-
-    // Dark background with loading text
-    this.ctx.fillStyle = '#1a1a1a';
-    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx.fillStyle = '#666';
-    this.ctx.font = `${14 * dpr}px system-ui`;
-    this.ctx.textAlign = 'center';
-    this.ctx.fillText('Connecting...', this.canvas.width / 2, this.canvas.height / 2);
-  }
-
   private hideLoading(): void {
-    // Loading screen is automatically hidden when the first frame is drawn
-    // This method exists for compatibility
+    const loading = this.element.querySelector('.panel-loading');
+    if (loading) loading.remove();
   }
 
   private initDecoder(): void {
@@ -350,6 +329,9 @@ export class Panel {
     this.ctx.drawImage(frame, 0, 0);
     frame.close();
 
+    // Hide loading overlay on first frame
+    this.hideLoading();
+
     // Update stats
     this.renderedFrames++;
     this.updateStatsOverlay();
@@ -375,26 +357,23 @@ export class Panel {
 
   private setupResizeObserver(): void {
     this.resizeObserver = new ResizeObserver(() => {
-      if (this.resizeTimeout) clearTimeout(this.resizeTimeout);
-      // Use requestAnimationFrame + setTimeout to ensure layout is complete
-      // This prevents incorrect sizes during split operations
-      this.resizeTimeout = setTimeout(() => {
-        requestAnimationFrame(() => {
-          const rect = this.element.getBoundingClientRect();
-          const width = Math.floor(rect.width);
-          const height = Math.floor(rect.height);
+      // Use rAF to ensure layout is complete, no debounce needed
+      // Dimension check below prevents duplicate calls
+      requestAnimationFrame(() => {
+        const rect = this.element.getBoundingClientRect();
+        const width = Math.floor(rect.width);
+        const height = Math.floor(rect.height);
 
-          if (width === 0 || height === 0) return;
-          if (width === this.lastReportedWidth && height === this.lastReportedHeight) return;
+        if (width === 0 || height === 0) return;
+        if (width === this.lastReportedWidth && height === this.lastReportedHeight) return;
 
-          this.lastReportedWidth = width;
-          this.lastReportedHeight = height;
+        this.lastReportedWidth = width;
+        this.lastReportedHeight = height;
 
-          if (this.serverId !== null && this.callbacks.onResize) {
-            this.callbacks.onResize(this.serverId, width, height);
-          }
-        });
-      }, 50);
+        if (this.serverId !== null && this.callbacks.onResize) {
+          this.callbacks.onResize(this.serverId, width, height);
+        }
+      });
     });
     this.resizeObserver.observe(this.element);
   }
@@ -875,11 +854,6 @@ export class Panel {
 
   destroy(): void {
     this.destroyed = true;
-
-    if (this.resizeTimeout) {
-      clearTimeout(this.resizeTimeout);
-      this.resizeTimeout = null;
-    }
 
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
