@@ -1499,6 +1499,9 @@ const Server = struct {
 
     // Lazy initialize ghostty when first panel is created
     fn ensureGhosttyInit(self: *Server) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.app != null) return; // Already initialized
 
         const init_result = c.ghostty_init(0, null);
@@ -1532,14 +1535,29 @@ const Server = struct {
     }
 
     // Free ghostty when last panel is closed (scale to zero)
+    // Note: caller should NOT hold mutex when calling this (we acquire it internally)
     fn freeGhosttyIfEmpty(self: *Server) void {
-        if (self.panels.count() > 0) return; // Still have panels
-        if (self.app == null) return; // Already freed
+        self.mutex.lock();
 
-        if (self.app) |app| c.ghostty_app_free(app);
-        if (self.config) |cfg| c.ghostty_config_free(cfg);
+        if (self.panels.count() > 0) {
+            self.mutex.unlock();
+            return; // Still have panels
+        }
+        if (self.app == null) {
+            self.mutex.unlock();
+            return; // Already freed
+        }
+
+        // Take ownership of app/config while holding mutex
+        const app = self.app.?;
+        const cfg = self.config.?;
         self.app = null;
         self.config = null;
+        self.mutex.unlock();
+
+        // Free outside mutex to avoid blocking panel creation
+        c.ghostty_app_free(app);
+        c.ghostty_config_free(cfg);
         std.debug.print("Ghostty freed (all panels closed)\n", .{});
     }
 
@@ -1583,10 +1601,15 @@ const Server = struct {
 
     fn createPanel(self: *Server, width: u32, height: u32, scale: f64) !*Panel {
         // Lazy init ghostty on first panel (scale to zero)
+        // ensureGhosttyInit handles its own mutex
         try self.ensureGhosttyInit();
 
+        // Now lock for panel creation - app is guaranteed valid after ensureGhosttyInit
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Double-check app is still valid (in case of rapid close/reopen race)
+        if (self.app == null) return error.GhosttyNotInitialized;
 
         const id = self.next_panel_id;
         self.next_panel_id += 1;
@@ -1603,10 +1626,15 @@ const Server = struct {
     // Create a panel as a split of an existing panel (doesn't create a new tab)
     fn createPanelAsSplit(self: *Server, width: u32, height: u32, scale: f64, parent_panel_id: u32, direction: SplitDirection) !*Panel {
         // Lazy init ghostty on first panel (scale to zero)
+        // ensureGhosttyInit handles its own mutex
         try self.ensureGhosttyInit();
 
+        // Now lock for panel creation
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Double-check app is still valid (in case of rapid close/reopen race)
+        if (self.app == null) return error.GhosttyNotInitialized;
 
         const id = self.next_panel_id;
         self.next_panel_id += 1;
@@ -1625,11 +1653,20 @@ const Server = struct {
     }
 
     fn destroyPanel(self: *Server, id: u32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        var panel_to_deinit: ?*Panel = null;
 
-        if (self.panels.fetchRemove(id)) |entry| {
-            entry.value.deinit();
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.panels.fetchRemove(id)) |entry| {
+                panel_to_deinit = entry.value;
+            }
+        }
+
+        // Deinit panel outside mutex
+        if (panel_to_deinit) |panel| {
+            panel.deinit();
         }
 
         // Free ghostty if no panels left (scale to zero)
