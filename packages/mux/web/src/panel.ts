@@ -97,7 +97,8 @@ export class Panel {
     this.setupResizeObserver();
     this.initDecoder();
     this.setupStatsOverlay();
-    this.showLoading();
+    // Delay showLoading to ensure DOM layout is complete
+    requestAnimationFrame(() => this.showLoading());
   }
 
   private createInspectorElement(): void {
@@ -237,15 +238,19 @@ export class Panel {
 
   private showLoading(): void {
     if (!this.ctx) return;
-    const rect = this.container.getBoundingClientRect();
-    this.canvas.width = rect.width * (window.devicePixelRatio || 1);
-    this.canvas.height = rect.height * (window.devicePixelRatio || 1);
+    const rect = this.element.getBoundingClientRect();
+    // Skip if element not yet laid out
+    if (rect.width === 0 || rect.height === 0) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = rect.width * dpr;
+    this.canvas.height = rect.height * dpr;
 
     // Dark background with loading text
     this.ctx.fillStyle = '#1a1a1a';
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     this.ctx.fillStyle = '#666';
-    this.ctx.font = `${14 * (window.devicePixelRatio || 1)}px system-ui`;
+    this.ctx.font = `${14 * dpr}px system-ui`;
     this.ctx.textAlign = 'center';
     this.ctx.fillText('Connecting...', this.canvas.width / 2, this.canvas.height / 2);
   }
