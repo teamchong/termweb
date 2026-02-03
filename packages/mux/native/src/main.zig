@@ -1398,6 +1398,7 @@ const PanelRequest = struct {
     height: u32,
     scale: f64,
     inherit_cwd_from: u32, // Panel ID to inherit CWD from, 0 = use initial_cwd
+    is_quick_terminal: bool, // Don't add to layout if true
 };
 
 // Panel destruction request (to be processed on main thread)
@@ -1652,6 +1653,10 @@ const Server = struct {
     }
 
     fn createPanelWithCwd(self: *Server, width: u32, height: u32, scale: f64, working_directory: ?[]const u8) !*Panel {
+        return self.createPanelWithCwdAndLayout(width, height, scale, working_directory, true);
+    }
+
+    fn createPanelWithCwdAndLayout(self: *Server, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, add_to_layout: bool) !*Panel {
         // Lazy init ghostty on first panel (scale to zero)
         // ensureGhosttyInit handles its own mutex
         try self.ensureGhosttyInit();
@@ -1669,8 +1674,10 @@ const Server = struct {
         const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory);
         try self.panels.put(id, panel);
 
-        // Add to layout as a new tab (default behavior for new panels)
-        _ = self.layout.createTab(id) catch {};
+        // Add to layout as a new tab (unless it's a special panel like quick terminal)
+        if (add_to_layout) {
+            _ = self.layout.createTab(id) catch {};
+        }
 
         return panel;
     }
@@ -1852,11 +1859,13 @@ const Server = struct {
                     }
                 },
                 .create_panel => {
-                    // Create new panel: [msg_type:u8][width:u16][height:u16][scale:f32][inherit_panel_id:u32]?
+                    // Create new panel: [msg_type:u8][width:u16][height:u16][scale:f32][inherit_panel_id:u32][flags:u8]?
+                    // flags: bit 0 = is_quick_terminal (don't add to layout)
                     var width: u32 = 800;
                     var height: u32 = 600;
                     var scale: f64 = 2.0;
                     var inherit_cwd_from: u32 = 0;
+                    var is_quick_terminal: bool = false;
                     if (data.len >= 5) {
                         width = std.mem.readInt(u16, data[1..3], .little);
                         height = std.mem.readInt(u16, data[3..5], .little);
@@ -1868,6 +1877,9 @@ const Server = struct {
                     if (data.len >= 13) {
                         inherit_cwd_from = std.mem.readInt(u32, data[9..13], .little);
                     }
+                    if (data.len >= 14) {
+                        is_quick_terminal = (data[13] & 1) != 0;
+                    }
                     self.mutex.lock();
                     self.pending_panels.append(self.allocator, .{
                         .conn = conn,
@@ -1875,6 +1887,7 @@ const Server = struct {
                         .height = height,
                         .scale = scale,
                         .inherit_cwd_from = inherit_cwd_from,
+                        .is_quick_terminal = is_quick_terminal,
                     }) catch {};
                     self.mutex.unlock();
                 },
@@ -3730,7 +3743,9 @@ const Server = struct {
                 break :blk self.initial_cwd;
             } else self.initial_cwd;
 
-            const panel = self.createPanelWithCwd(req.width, req.height, req.scale, working_dir) catch {
+            // Quick terminal panels don't get added to layout
+            const add_to_layout = !req.is_quick_terminal;
+            const panel = self.createPanelWithCwdAndLayout(req.width, req.height, req.scale, working_dir, add_to_layout) catch {
                 continue;
             };
 
@@ -3742,7 +3757,10 @@ const Server = struct {
             self.mutex.unlock();
 
             self.broadcastPanelCreated(panel.id);
-            self.broadcastLayoutUpdate();
+            // Only broadcast layout update if we modified the layout
+            if (add_to_layout) {
+                self.broadcastLayoutUpdate();
+            }
 
             // Linux only: Send initial title since shell integration may not be configured
             // macOS works fine without this as ghostty auto-injects shell integration

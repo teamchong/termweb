@@ -67,6 +67,7 @@ export class Panel {
 
   private initialSize: { width: number; height: number } | null = null;
   private splitInfo: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' } | null = null;
+  private isQuickTerminal = false;
 
   constructor(
     id: string,
@@ -75,7 +76,8 @@ export class Panel {
     callbacks: PanelCallbacks = {},
     inheritCwdFrom: number | null = null,
     initialSize?: { width: number; height: number },
-    splitInfo?: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' }
+    splitInfo?: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' },
+    isQuickTerminal = false
   ) {
     this.id = id;
     this.serverId = serverId;
@@ -84,6 +86,7 @@ export class Panel {
     this.inheritCwdFrom = inheritCwdFrom;
     this.initialSize = initialSize ?? null;
     this.splitInfo = splitInfo ?? null;
+    this.isQuickTerminal = isQuickTerminal;
 
     // Create panel element with canvas
     this.element = document.createElement('div');
@@ -482,14 +485,16 @@ export class Panel {
     this.lastReportedWidth = width;
     this.lastReportedHeight = height;
 
-    // [msg_type:u8][width:u16][height:u16][scale:f32][inherit_cwd_from:u32]
-    const buf = new ArrayBuffer(13);
+    // [msg_type:u8][width:u16][height:u16][scale:f32][inherit_cwd_from:u32][flags:u8]
+    // flags: bit 0 = isQuickTerminal (don't add to layout)
+    const buf = new ArrayBuffer(14);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.CREATE_PANEL);
     view.setUint16(1, width, true);
     view.setUint16(3, height, true);
     view.setFloat32(5, scale, true);
     view.setUint32(9, this.inheritCwdFrom ?? 0, true);
+    view.setUint8(13, this.isQuickTerminal ? 1 : 0);
     this.ws.send(buf);
   }
 

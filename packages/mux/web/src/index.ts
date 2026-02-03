@@ -956,13 +956,14 @@ class App {
     serverId: number | null = null,
     inheritCwdFrom: number | null = null,
     initialSize?: { width: number; height: number },
-    splitInfo?: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' }
+    splitInfo?: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' },
+    isQuickTerminal = false
   ): Panel {
     const id = generateId();
-    console.log(`Creating panel id=${id}, serverId=${serverId}, container=${container.className || container.id}, initialSize=${initialSize ? `${initialSize.width}x${initialSize.height}` : 'auto'}, split=${splitInfo ? `parent=${splitInfo.parentPanelId},dir=${splitInfo.direction}` : 'none'}`);
+    console.log(`Creating panel id=${id}, serverId=${serverId}, container=${container.className || container.id}, initialSize=${initialSize ? `${initialSize.width}x${initialSize.height}` : 'auto'}, split=${splitInfo ? `parent=${splitInfo.parentPanelId},dir=${splitInfo.direction}` : 'none'}, quickTerminal=${isQuickTerminal}`);
     const panel = new Panel(id, container, serverId, {
       onViewAction: (action, data) => this.handleViewAction(panel, action, data),
-    }, inheritCwdFrom, initialSize, splitInfo);
+    }, inheritCwdFrom, initialSize, splitInfo, isQuickTerminal);
 
     this.panels.set(id, panel);
     panel.connect();
@@ -2423,7 +2424,7 @@ class App {
             width: window.innerWidth,
             height: quickTerminalHeight
           };
-          this.quickTerminalPanel = this.createPanel(content as HTMLElement, null, inheritCwdFrom, initialSize);
+          this.quickTerminalPanel = this.createPanel(content as HTMLElement, null, inheritCwdFrom, initialSize, undefined, true);
         }
       }
 
