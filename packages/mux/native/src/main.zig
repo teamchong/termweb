@@ -3899,6 +3899,7 @@ const Server = struct {
         std.debug.print("Render loop started, running={}\n", .{self.running.load(.acquire)});
 
         while (self.running.load(.acquire)) {
+
             // Create autorelease pool for this iteration (macOS only - prevents ObjC object accumulation)
             const pool = if (comptime is_macos) objc_autoreleasePoolPush() else null;
             defer if (comptime is_macos) objc_autoreleasePoolPop(pool);

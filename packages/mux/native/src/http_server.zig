@@ -180,18 +180,8 @@ pub const HttpServer = struct {
             return;
         }
 
-        // Debug: print request for /ws paths
-        if (std.mem.startsWith(u8, path, "/ws/")) {
-            std.debug.print("=== Request for {s} ===\n", .{path});
-            // Print first 500 chars of request
-            const preview_len = @min(request.len, 500);
-            std.debug.print("{s}\n", .{request[0..preview_len]});
-            std.debug.print("=== End request ===\n", .{});
-        }
-
         // Check for WebSocket upgrade
         if (self.isWebSocketUpgrade(request)) {
-            std.debug.print("WebSocket upgrade detected for path: {s}\n", .{path});
             // Route WebSocket by path - don't close stream, callback owns it
             if (std.mem.eql(u8, path, "/ws/panel")) {
                 if (self.panel_ws_callback) |cb| {
