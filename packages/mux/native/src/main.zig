@@ -508,7 +508,6 @@ const Panel = struct {
     height: u32,
     scale: f64,
     streaming: std.atomic.Value(bool),
-    awaiting_resize: bool, // For split panels: wait for resize before streaming
     force_keyframe: bool,
     connection: ?*ws.Connection,
     allocator: std.mem.Allocator,
@@ -610,7 +609,6 @@ const Panel = struct {
             .height = height,
             .scale = scale,
             .streaming = std.atomic.Value(bool).init(false),
-            .awaiting_resize = false,
             .force_keyframe = true,
             .connection = null,
             .allocator = allocator,
@@ -645,10 +643,7 @@ const Panel = struct {
         defer self.mutex.unlock();
         self.connection = conn;
         if (conn != null) {
-            // Don't start streaming if awaiting resize (split panels wait for correct dimensions)
-            if (!self.awaiting_resize) {
-                self.streaming.store(true, .release);
-            }
+            self.streaming.store(true, .release);
             self.force_keyframe = true;
             self.ticks_since_connect = 0; // Reset so ghostty can render before we read pixels
         } else {
@@ -659,15 +654,6 @@ const Panel = struct {
     // Internal resize - called from main thread only (via processInputQueue)
     // width/height are in CSS pixels (points)
     fn resizeInternal(self: *Panel, width: u32, height: u32) !void {
-        // If awaiting resize (split panel), clear flag and start streaming
-        const was_awaiting = self.awaiting_resize;
-        if (was_awaiting) {
-            self.awaiting_resize = false;
-            if (self.connection != null) {
-                self.streaming.store(true, .release);
-            }
-        }
-
         // Skip resize if size hasn't changed to avoid unnecessary terminal reflow
         if (self.width == width and self.height == height) return;
 
@@ -1686,8 +1672,6 @@ const Server = struct {
         self.next_panel_id += 1;
 
         const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory);
-        // Split panels wait for resize before streaming (client does DOM split first)
-        panel.awaiting_resize = true;
         try self.panels.put(id, panel);
 
         // Add to layout as a split of the parent panel
@@ -3700,21 +3684,8 @@ const Server = struct {
         self.mutex.unlock();
 
         for (pending) |req| {
-            // Pause the parent panel until it receives resize (its container size changes during split)
-            if (self.panels.get(req.parent_panel_id)) |parent| {
-                parent.awaiting_resize = true;
-                parent.streaming.store(false, .release);
-            }
-
             const panel = self.createPanelAsSplit(req.width, req.height, req.scale, req.parent_panel_id, req.direction) catch |err| {
                 std.debug.print("Failed to create split panel: {}\n", .{err});
-                // Re-enable parent if split failed
-                if (self.panels.get(req.parent_panel_id)) |parent| {
-                    parent.awaiting_resize = false;
-                    if (parent.connection != null) {
-                        parent.streaming.store(true, .release);
-                    }
-                }
                 continue;
             };
 

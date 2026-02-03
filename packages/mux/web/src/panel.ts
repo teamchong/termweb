@@ -64,6 +64,7 @@ export class Panel {
   private inspectorActiveTab = 'screen';
   private inspectorState: Record<string, number> | null = null;
   private inspectorEl: HTMLElement | null = null;
+  private documentClickHandler: (() => void) | null = null;
 
   constructor(
     id: string,
@@ -191,11 +192,12 @@ export class Panel {
     });
 
     // Hide menu when clicking elsewhere
-    document.addEventListener('click', () => {
+    this.documentClickHandler = () => {
       this.inspectorEl?.querySelectorAll('.inspector-dock-menu.visible').forEach(m => {
         m.classList.remove('visible');
       });
-    });
+    };
+    document.addEventListener('click', this.documentClickHandler);
 
     // Menu item click - hide header
     const menuItems = this.inspectorEl.querySelectorAll('.inspector-dock-menu-item');
@@ -402,11 +404,14 @@ export class Panel {
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
-      if (this.serverId !== null) {
-        this.sendConnectPanel(this.serverId);
-      } else {
-        this.sendCreatePanel();
-      }
+      // Delay slightly to ensure DOM layout is complete before measuring
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (this.serverId !== null) {
+          this.sendConnectPanel(this.serverId);
+        } else {
+          this.sendCreatePanel();
+        }
+      }));
     };
 
     this.ws.onmessage = (event) => {
@@ -451,7 +456,8 @@ export class Panel {
   private sendCreatePanel(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const rect = this.container.getBoundingClientRect();
+    // Use element (not container) for consistent sizing
+    const rect = this.element.getBoundingClientRect();
     const width = Math.floor(rect.width) || 800;
     const height = Math.floor(rect.height) || 600;
     const scale = window.devicePixelRatio || 1;
@@ -873,6 +879,11 @@ export class Panel {
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
+    }
+
+    if (this.documentClickHandler) {
+      document.removeEventListener('click', this.documentClickHandler);
+      this.documentClickHandler = null;
     }
 
     if (this.ws) {

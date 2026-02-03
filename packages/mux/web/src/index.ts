@@ -40,7 +40,6 @@ class App {
   private activeTab: string | null = null;
   private host: string;
   private nextTabId = 1;
-  private pendingSplit: { parentPanelId: number; direction: string; container: SplitContainer } | null = null;
   private pendingDownload: DownloadOptions | null = null;
   private quickTerminalPanel: Panel | null = null;
   private previousActivePanel: Panel | null = null;
@@ -441,15 +440,11 @@ class App {
   }
 
   private handlePanelCreated(panelId: number): void {
-    if (this.pendingSplit) {
-      this.completePendingSplit(panelId);
-    } else {
-      // New panel created on server - update local panel's serverId
-      for (const [, panel] of this.panels) {
-        if (panel.serverId === null) {
-          panel.serverId = panelId;
-          break;
-        }
+    // New panel created on server - update local panel's serverId
+    for (const [, panel] of this.panels) {
+      if (panel.serverId === null) {
+        panel.serverId = panelId;
+        break;
       }
     }
   }
@@ -1127,57 +1122,19 @@ class App {
     const container = tab.root.findContainer(this.activePanel);
     if (!container) return;
 
-    if (!this.activePanel.serverId) return;
+    // Get parent panel's serverId for CWD inheritance
+    const inheritCwdFrom = this.activePanel.serverId;
 
-    // Request new panel from server with correct dimensions for split direction
-    const rect = this.activePanel.canvas.getBoundingClientRect();
-    const isHorizontal = direction === 'right' || direction === 'left';
-    // Horizontal split: half width, full height. Vertical split: full width, half height.
-    const width = isHorizontal ? Math.floor(rect.width / 2) : Math.floor(rect.width);
-    const height = isHorizontal ? Math.floor(rect.height) : Math.floor(rect.height / 2);
+    // INSTANT: Do DOM split immediately
+    // New panel created with serverId=null, will get ID when server responds
+    const newPanel = this.createPanel(tab.element, null, inheritCwdFrom);
+    container.split(direction, newPanel);
 
-    this.pendingSplit = {
-      parentPanelId: this.activePanel.serverId,
-      direction,
-      container,
-    };
-
-    this.sendSplitPanel(this.activePanel.serverId, direction, width, height);
-  }
-
-  private completePendingSplit(newPanelId: number): void {
-    if (!this.pendingSplit || !this.activeTab) return;
-
-    const { direction, container } = this.pendingSplit;
-    const tab = this.tabs.get(this.activeTab);
-    if (!tab) return;
-
-    // Get reference to old panel before split
-    const oldPanel = container.panel;
-
-    const newPanel = this.createPanel(tab.element, newPanelId);
-    container.split(direction as 'right' | 'down' | 'left' | 'up', newPanel);
-
-    // Trigger immediate resize for both panels after DOM layout is complete
-    requestAnimationFrame(() => {
-      // Resize old panel (its container size changed)
-      if (oldPanel?.serverId !== null && oldPanel?.serverId !== undefined) {
-        const oldRect = oldPanel.element.getBoundingClientRect();
-        if (oldRect.width > 0 && oldRect.height > 0) {
-          this.sendResizePanel(oldPanel.serverId, Math.floor(oldRect.width), Math.floor(oldRect.height));
-        }
-      }
-      // Resize new panel (it may have connected before DOM split)
-      if (newPanel.serverId !== null) {
-        const newRect = newPanel.element.getBoundingClientRect();
-        if (newRect.width > 0 && newRect.height > 0) {
-          this.sendResizePanel(newPanel.serverId, Math.floor(newRect.width), Math.floor(newRect.height));
-        }
-      }
-    });
-
+    // Focus new panel immediately
     this.setActivePanel(newPanel);
-    this.pendingSplit = null;
+
+    // ResizeObserver will measure correct size after layout
+    // Panel.connect() sends CREATE_PANEL with measured dimensions
   }
 
   // ============================================================================
@@ -1711,19 +1668,6 @@ class App {
       this.controlWs.send(JSON.stringify({
         type: 'close_panel',
         panel_id: serverId
-      }));
-    }
-  }
-
-  private sendSplitPanel(parentPanelId: number, direction: string, width: number, height: number): void {
-    if (this.controlWs?.readyState === WebSocket.OPEN) {
-      this.controlWs.send(JSON.stringify({
-        type: 'split_panel',
-        panel_id: parentPanelId,
-        direction,
-        width,
-        height,
-        scale: window.devicePixelRatio || 1
       }));
     }
   }
