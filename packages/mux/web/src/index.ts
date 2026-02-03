@@ -1440,6 +1440,7 @@ class App {
     for (const [tabId, tab] of this.tabs) {
       const preview = document.createElement('div');
       preview.className = 'tab-preview';
+      preview.style.cssText = `width: ${scaledWidth}px; height: ${scaledHeight + 44}px;`;
       if (tabId === this.activeTab) {
         preview.classList.add('active');
       }
