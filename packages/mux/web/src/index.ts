@@ -442,14 +442,12 @@ class App {
 
   private handlePanelCreated(panelId: number): void {
     if (this.pendingSplit) {
-      console.log(`Completing pending split with new panel ${panelId}`);
       this.completePendingSplit(panelId);
     } else {
       // New panel created on server - update local panel's serverId
       for (const [, panel] of this.panels) {
         if (panel.serverId === null) {
           panel.serverId = panelId;
-          console.log(`Local panel ${panel.id} assigned server ID ${panelId}`);
           break;
         }
       }
@@ -886,7 +884,9 @@ class App {
 
     this.panelsEl?.appendChild(container);
 
-    const panel = this.createPanel(container, serverId);
+    // When creating a new panel (serverId is null), inherit CWD from active panel
+    const inheritCwdFrom = serverId === null ? this.activePanel?.serverId ?? null : null;
+    const panel = this.createPanel(container, serverId, inheritCwdFrom);
     const root = SplitContainer.createLeaf(panel);
     container.appendChild(root.element);
 
@@ -903,12 +903,12 @@ class App {
     return tabId;
   }
 
-  private createPanel(container: HTMLElement, serverId: number | null = null): Panel {
+  private createPanel(container: HTMLElement, serverId: number | null = null, inheritCwdFrom: number | null = null): Panel {
     const id = generateId();
     const panel = new Panel(id, container, serverId, {
       onResize: (panelId, width, height) => this.sendResizePanel(panelId, width, height),
       onViewAction: (action, data) => this.handleViewAction(panel, action, data),
-    });
+    }, inheritCwdFrom);
 
     this.panels.set(id, panel);
     panel.connect();
@@ -1127,18 +1127,22 @@ class App {
     const container = tab.root.findContainer(this.activePanel);
     if (!container) return;
 
-    // Request new panel from server
+    if (!this.activePanel.serverId) return;
+
+    // Request new panel from server with correct dimensions for split direction
     const rect = this.activePanel.canvas.getBoundingClientRect();
-    const width = Math.floor(rect.width / 2);
-    const height = Math.floor(rect.height / 2);
+    const isHorizontal = direction === 'right' || direction === 'left';
+    // Horizontal split: half width, full height. Vertical split: full width, half height.
+    const width = isHorizontal ? Math.floor(rect.width / 2) : Math.floor(rect.width);
+    const height = isHorizontal ? Math.floor(rect.height) : Math.floor(rect.height / 2);
 
     this.pendingSplit = {
-      parentPanelId: this.activePanel.serverId!,
+      parentPanelId: this.activePanel.serverId,
       direction,
       container,
     };
 
-    this.sendSplitPanel(this.activePanel.serverId!, direction, width, height);
+    this.sendSplitPanel(this.activePanel.serverId, direction, width, height);
   }
 
   private completePendingSplit(newPanelId: number): void {
@@ -1148,8 +1152,29 @@ class App {
     const tab = this.tabs.get(this.activeTab);
     if (!tab) return;
 
+    // Get reference to old panel before split
+    const oldPanel = container.panel;
+
     const newPanel = this.createPanel(tab.element, newPanelId);
     container.split(direction as 'right' | 'down' | 'left' | 'up', newPanel);
+
+    // Trigger immediate resize for both panels after DOM layout is complete
+    requestAnimationFrame(() => {
+      // Resize old panel (its container size changed)
+      if (oldPanel?.serverId !== null && oldPanel?.serverId !== undefined) {
+        const oldRect = oldPanel.element.getBoundingClientRect();
+        if (oldRect.width > 0 && oldRect.height > 0) {
+          this.sendResizePanel(oldPanel.serverId, Math.floor(oldRect.width), Math.floor(oldRect.height));
+        }
+      }
+      // Resize new panel (it may have connected before DOM split)
+      if (newPanel.serverId !== null) {
+        const newRect = newPanel.element.getBoundingClientRect();
+        if (newRect.width > 0 && newRect.height > 0) {
+          this.sendResizePanel(newPanel.serverId, Math.floor(newRect.width), Math.floor(newRect.height));
+        }
+      }
+    });
 
     this.setActivePanel(newPanel);
     this.pendingSplit = null;
@@ -2180,7 +2205,9 @@ class App {
         const content = container.querySelector('.quick-terminal-content');
         if (content) {
           content.innerHTML = '';
-          this.quickTerminalPanel = this.createPanel(content as HTMLElement, null);
+          // Inherit CWD from the previously active panel
+          const inheritCwdFrom = this.previousActivePanel?.serverId ?? null;
+          this.quickTerminalPanel = this.createPanel(content as HTMLElement, null, inheritCwdFrom);
         }
       }
       if (this.quickTerminalPanel) {

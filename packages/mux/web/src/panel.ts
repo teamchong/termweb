@@ -24,6 +24,7 @@ export class Panel {
   readonly canvas: HTMLCanvasElement;
   readonly element: HTMLElement;
   pwd: string = '';
+  private inheritCwdFrom: number | null = null;
 
   private ws: WebSocket | null = null;
   private callbacks: PanelCallbacks;
@@ -68,12 +69,14 @@ export class Panel {
     id: string,
     container: HTMLElement,
     serverId: number | null,
-    callbacks: PanelCallbacks = {}
+    callbacks: PanelCallbacks = {},
+    inheritCwdFrom: number | null = null
   ) {
     this.id = id;
     this.serverId = serverId;
     this.container = container;
     this.callbacks = callbacks;
+    this.inheritCwdFrom = inheritCwdFrom;
 
     // Create panel element with canvas
     this.element = document.createElement('div');
@@ -366,21 +369,25 @@ export class Panel {
   private setupResizeObserver(): void {
     this.resizeObserver = new ResizeObserver(() => {
       if (this.resizeTimeout) clearTimeout(this.resizeTimeout);
+      // Use requestAnimationFrame + setTimeout to ensure layout is complete
+      // This prevents incorrect sizes during split operations
       this.resizeTimeout = setTimeout(() => {
-        const rect = this.container.getBoundingClientRect();
-        const width = Math.floor(rect.width);
-        const height = Math.floor(rect.height);
+        requestAnimationFrame(() => {
+          const rect = this.element.getBoundingClientRect();
+          const width = Math.floor(rect.width);
+          const height = Math.floor(rect.height);
 
-        if (width === 0 || height === 0) return;
-        if (width === this.lastReportedWidth && height === this.lastReportedHeight) return;
+          if (width === 0 || height === 0) return;
+          if (width === this.lastReportedWidth && height === this.lastReportedHeight) return;
 
-        this.lastReportedWidth = width;
-        this.lastReportedHeight = height;
+          this.lastReportedWidth = width;
+          this.lastReportedHeight = height;
 
-        if (this.serverId !== null && this.callbacks.onResize) {
-          this.callbacks.onResize(this.serverId, width, height);
-        }
-      }, 16);
+          if (this.serverId !== null && this.callbacks.onResize) {
+            this.callbacks.onResize(this.serverId, width, height);
+          }
+        });
+      }, 50);
     });
     this.resizeObserver.observe(this.element);
   }
@@ -425,6 +432,20 @@ export class Panel {
     view.setUint8(0, ClientMsg.CONNECT_PANEL);
     view.setUint32(1, panelId, true);
     this.ws.send(buf);
+
+    // Send resize after a short delay to ensure correct dimensions after layout
+    setTimeout(() => {
+      requestAnimationFrame(() => {
+        const rect = this.element.getBoundingClientRect();
+        const width = Math.floor(rect.width);
+        const height = Math.floor(rect.height);
+        if (width > 0 && height > 0 && this.serverId !== null && this.callbacks.onResize) {
+          this.lastReportedWidth = width;
+          this.lastReportedHeight = height;
+          this.callbacks.onResize(this.serverId, width, height);
+        }
+      });
+    }, 100);
   }
 
   private sendCreatePanel(): void {
@@ -438,12 +459,14 @@ export class Panel {
     this.lastReportedWidth = width;
     this.lastReportedHeight = height;
 
-    const buf = new ArrayBuffer(9);
+    // [msg_type:u8][width:u16][height:u16][scale:f32][inherit_cwd_from:u32]
+    const buf = new ArrayBuffer(13);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.CREATE_PANEL);
     view.setUint16(1, width, true);
     view.setUint16(3, height, true);
     view.setFloat32(5, scale, true);
+    view.setUint32(9, this.inheritCwdFrom ?? 0, true);
     this.ws.send(buf);
   }
 

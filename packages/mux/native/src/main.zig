@@ -508,6 +508,7 @@ const Panel = struct {
     height: u32,
     scale: f64,
     streaming: std.atomic.Value(bool),
+    awaiting_resize: bool, // For split panels: wait for resize before streaming
     force_keyframe: bool,
     connection: ?*ws.Connection,
     allocator: std.mem.Allocator,
@@ -526,7 +527,7 @@ const Panel = struct {
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
 
-    fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64) !*Panel {
+    fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64, working_directory: ?[]const u8) !*Panel {
         const panel = try allocator.create(Panel);
         errdefer allocator.destroy(panel);
 
@@ -538,7 +539,14 @@ const Panel = struct {
         surface_config.scale_factor = scale;
         surface_config.userdata = panel;
         surface_config.command = null;
-        surface_config.working_directory = null;
+
+        // Set working directory for new shell
+        const cwd_z: ?[:0]const u8 = if (working_directory) |wd|
+            allocator.dupeZ(u8, wd) catch null
+        else
+            null;
+        defer if (cwd_z) |z| allocator.free(z);
+        surface_config.working_directory = if (cwd_z) |z| z.ptr else null;
 
         // Set environment variables for shell integration features
         // GHOSTTY_SHELL_FEATURES enables title updates if user has sourced ghostty shell integration
@@ -602,6 +610,7 @@ const Panel = struct {
             .height = height,
             .scale = scale,
             .streaming = std.atomic.Value(bool).init(false),
+            .awaiting_resize = false,
             .force_keyframe = true,
             .connection = null,
             .allocator = allocator,
@@ -636,7 +645,10 @@ const Panel = struct {
         defer self.mutex.unlock();
         self.connection = conn;
         if (conn != null) {
-            self.streaming.store(true, .release);
+            // Don't start streaming if awaiting resize (split panels wait for correct dimensions)
+            if (!self.awaiting_resize) {
+                self.streaming.store(true, .release);
+            }
             self.force_keyframe = true;
             self.ticks_since_connect = 0; // Reset so ghostty can render before we read pixels
         } else {
@@ -647,7 +659,16 @@ const Panel = struct {
     // Internal resize - called from main thread only (via processInputQueue)
     // width/height are in CSS pixels (points)
     fn resizeInternal(self: *Panel, width: u32, height: u32) !void {
-        // Skip if size hasn't changed to avoid unnecessary terminal reflow
+        // If awaiting resize (split panel), clear flag and start streaming
+        const was_awaiting = self.awaiting_resize;
+        if (was_awaiting) {
+            self.awaiting_resize = false;
+            if (self.connection != null) {
+                self.streaming.store(true, .release);
+            }
+        }
+
+        // Skip resize if size hasn't changed to avoid unnecessary terminal reflow
         if (self.width == width and self.height == height) return;
 
         self.width = width;
@@ -1383,6 +1404,7 @@ const PanelRequest = struct {
     width: u32,
     height: u32,
     scale: f64,
+    inherit_cwd_from: u32, // Panel ID to inherit CWD from, 0 = use initial_cwd
 };
 
 // Panel destruction request (to be processed on main thread)
@@ -1432,6 +1454,8 @@ const Server = struct {
     mutex: std.Thread.Mutex,
     selection_clipboard: ?[]u8,  // Selection clipboard buffer
     inspector_subscriptions: std.ArrayList(InspectorSubscription),
+    initial_cwd: []const u8,  // CWD where termweb was started
+    initial_cwd_allocated: bool,  // Whether initial_cwd was allocated (vs static "/")
 
     const InspectorSubscription = struct {
         conn: *ws.Connection,
@@ -1491,7 +1515,18 @@ const Server = struct {
             .mutex = .{},
             .selection_clipboard = null,
             .inspector_subscriptions = .{},
+            .initial_cwd = undefined,
+            .initial_cwd_allocated = false,
         };
+
+        // Get current working directory (fallback to "/" if unavailable)
+        if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd| {
+            server.initial_cwd = cwd;
+            server.initial_cwd_allocated = true;
+        } else |_| {
+            server.initial_cwd = "/";
+            server.initial_cwd_allocated = false;
+        }
 
         global_server = server;
         return server;
@@ -1593,6 +1628,7 @@ const Server = struct {
         self.file_connections.deinit(self.allocator);
         self.connection_roles.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
+        if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
         // Only free ghostty if it was initialized
         if (self.app) |app| c.ghostty_app_free(app);
         if (self.config) |cfg| c.ghostty_config_free(cfg);
@@ -1600,6 +1636,10 @@ const Server = struct {
     }
 
     fn createPanel(self: *Server, width: u32, height: u32, scale: f64) !*Panel {
+        return self.createPanelWithCwd(width, height, scale, self.initial_cwd);
+    }
+
+    fn createPanelWithCwd(self: *Server, width: u32, height: u32, scale: f64, working_directory: ?[]const u8) !*Panel {
         // Lazy init ghostty on first panel (scale to zero)
         // ensureGhosttyInit handles its own mutex
         try self.ensureGhosttyInit();
@@ -1614,7 +1654,7 @@ const Server = struct {
         const id = self.next_panel_id;
         self.next_panel_id += 1;
 
-        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale);
+        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory);
         try self.panels.put(id, panel);
 
         // Add to layout as a new tab (default behavior for new panels)
@@ -1636,10 +1676,18 @@ const Server = struct {
         // Double-check app is still valid (in case of rapid close/reopen race)
         if (self.app == null) return error.GhosttyNotInitialized;
 
+        // Get parent panel's pwd for inheritance
+        const working_directory: ?[]const u8 = if (self.panels.get(parent_panel_id)) |parent|
+            if (parent.pwd.len > 0) parent.pwd else self.initial_cwd
+        else
+            self.initial_cwd;
+
         const id = self.next_panel_id;
         self.next_panel_id += 1;
 
-        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale);
+        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory);
+        // Split panels wait for resize before streaming (client does DOM split first)
+        panel.awaiting_resize = true;
         try self.panels.put(id, panel);
 
         // Add to layout as a split of the parent panel
@@ -1789,10 +1837,11 @@ const Server = struct {
                     }
                 },
                 .create_panel => {
-                    // Create new panel: [msg_type:u8][width:u16][height:u16][scale:f32]
+                    // Create new panel: [msg_type:u8][width:u16][height:u16][scale:f32][inherit_panel_id:u32]?
                     var width: u32 = 800;
                     var height: u32 = 600;
                     var scale: f64 = 2.0;
+                    var inherit_cwd_from: u32 = 0;
                     if (data.len >= 5) {
                         width = std.mem.readInt(u16, data[1..3], .little);
                         height = std.mem.readInt(u16, data[3..5], .little);
@@ -1801,12 +1850,16 @@ const Server = struct {
                         const scale_f32: f32 = @bitCast(std.mem.readInt(u32, data[5..9], .little));
                         scale = @floatCast(scale_f32);
                     }
+                    if (data.len >= 13) {
+                        inherit_cwd_from = std.mem.readInt(u32, data[9..13], .little);
+                    }
                     self.mutex.lock();
                     self.pending_panels.append(self.allocator, .{
                         .conn = conn,
                         .width = width,
                         .height = height,
                         .scale = scale,
+                        .inherit_cwd_from = inherit_cwd_from,
                     }) catch {};
                     self.mutex.unlock();
                 },
@@ -3515,11 +3568,16 @@ const Server = struct {
         };
         self.mutex.unlock();
 
-        if (pending.len > 0) {
-        }
-
         for (pending) |req| {
-            const panel = self.createPanel(req.width, req.height, req.scale) catch {
+            // Determine CWD: inherit from specified panel, or use initial_cwd
+            const working_dir: []const u8 = if (req.inherit_cwd_from != 0) blk: {
+                if (self.panels.get(req.inherit_cwd_from)) |parent_panel| {
+                    if (parent_panel.pwd.len > 0) break :blk parent_panel.pwd;
+                }
+                break :blk self.initial_cwd;
+            } else self.initial_cwd;
+
+            const panel = self.createPanelWithCwd(req.width, req.height, req.scale, working_dir) catch {
                 continue;
             };
 
@@ -3642,8 +3700,21 @@ const Server = struct {
         self.mutex.unlock();
 
         for (pending) |req| {
+            // Pause the parent panel until it receives resize (its container size changes during split)
+            if (self.panels.get(req.parent_panel_id)) |parent| {
+                parent.awaiting_resize = true;
+                parent.streaming.store(false, .release);
+            }
+
             const panel = self.createPanelAsSplit(req.width, req.height, req.scale, req.parent_panel_id, req.direction) catch |err| {
                 std.debug.print("Failed to create split panel: {}\n", .{err});
+                // Re-enable parent if split failed
+                if (self.panels.get(req.parent_panel_id)) |parent| {
+                    parent.awaiting_resize = false;
+                    if (parent.connection != null) {
+                        parent.streaming.store(true, .release);
+                    }
+                }
                 continue;
             };
 
