@@ -1581,8 +1581,17 @@ class App {
     if (this.previewWs) return;
 
     const wsUrl = getWsUrl('/ws/preview');
+    console.log('Preview WS: connecting to', wsUrl);
     this.previewWs = new WebSocket(wsUrl);
     this.previewWs.binaryType = 'arraybuffer';
+
+    this.previewWs.onopen = () => {
+      console.log('Preview WS: connected');
+    };
+
+    this.previewWs.onclose = (e) => {
+      console.log('Preview WS: closed', e.code, e.reason);
+    };
 
     this.previewWs.onmessage = (event) => {
       if (!(event.data instanceof ArrayBuffer) || event.data.byteLength < 5) return;

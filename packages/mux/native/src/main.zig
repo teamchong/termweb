@@ -1433,6 +1433,7 @@ const Server = struct {
     file_ws_server: *ws.Server,
     preview_ws_server: *ws.Server,
     preview_connections: std.ArrayList(*ws.Connection),
+    preview_needs_immediate_frame: bool, // Send preview frames immediately after connect
     http_server: *http.HttpServer,
     auth_state: *auth.AuthState,  // Session and access control
     transfer_manager: transfer.TransferManager,
@@ -1501,6 +1502,7 @@ const Server = struct {
             .file_ws_server = file_ws,
             .preview_ws_server = preview_ws,
             .preview_connections = .{},
+            .preview_needs_immediate_frame = false,
             .auth_state = auth_state,
             .transfer_manager = transfer.TransferManager.init(allocator),
             .file_connections = .{},
@@ -3345,6 +3347,9 @@ const Server = struct {
             panel_ptr.*.force_keyframe = true; // Ensure first preview frame has SPS/PPS
         }
 
+        // Request immediate preview frames
+        self.preview_needs_immediate_frame = true;
+
         std.debug.print("Preview client connected, pausing panel streams\n", .{});
     }
 
@@ -3836,10 +3841,14 @@ const Server = struct {
                 // Check if we have preview clients (overview mode)
                 self.mutex.lock();
                 const has_preview_clients = self.preview_connections.items.len > 0;
+                const needs_immediate = self.preview_needs_immediate_frame;
+                if (needs_immediate) {
+                    self.preview_needs_immediate_frame = false;
+                }
                 self.mutex.unlock();
 
-                // Send preview every 6th frame (5fps at 30fps base)
-                const send_preview = has_preview_clients and (frame_blocks % 6 == 0);
+                // Send preview every 6th frame (5fps at 30fps base), or immediately after connect
+                const send_preview = has_preview_clients and (needs_immediate or frame_blocks % 6 == 0);
 
                 // Tick ghostty to render content to IOSurface
                 self.tick();
