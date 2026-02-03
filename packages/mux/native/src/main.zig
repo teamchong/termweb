@@ -1459,8 +1459,8 @@ const Server = struct {
         const panel_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
         panel_ws.setCallbacks(onPanelConnect, onPanelMessage, onPanelDisconnect);
 
-        // Create file WebSocket server (for file transfers - no deflate, we compress manually)
-        const file_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", 0);
+        // Create file WebSocket server (for file transfers - uses zstd compression)
+        const file_ws = try ws.Server.init(allocator, "0.0.0.0", 0);
         file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
 
         // Initialize auth state

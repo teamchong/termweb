@@ -361,6 +361,7 @@ pub fn build(b: *std.Build) void {
         exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_lazy.c"), .flags = zstd_flags });
         exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_ldm.c"), .flags = zstd_flags });
         exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_opt.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_preSplit.c"), .flags = zstd_flags });
         exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstdmt_compress.c"), .flags = zstd_flags });
         // Decompress sources
         exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/decompress/huf_decompress.c"), .flags = zstd_flags });
