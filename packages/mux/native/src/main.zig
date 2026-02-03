@@ -1602,6 +1602,7 @@ const Server = struct {
         self.panel_ws_server.deinit();
         self.control_ws_server.deinit();
         self.file_ws_server.deinit();
+        self.preview_ws_server.deinit();
 
         // Now safe to destroy panels since all connection threads have finished
         var panel_it = self.panels.valueIterator();
@@ -1620,6 +1621,7 @@ const Server = struct {
         self.auth_state.deinit();
         self.transfer_manager.deinit();
         self.file_connections.deinit(self.allocator);
+        self.preview_connections.deinit(self.allocator);
         self.connection_roles.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
         if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
