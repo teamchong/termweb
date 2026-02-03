@@ -955,13 +955,14 @@ class App {
     container: HTMLElement,
     serverId: number | null = null,
     inheritCwdFrom: number | null = null,
-    initialSize?: { width: number; height: number }
+    initialSize?: { width: number; height: number },
+    splitInfo?: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' }
   ): Panel {
     const id = generateId();
-    console.log(`Creating panel id=${id}, serverId=${serverId}, container=${container.className || container.id}, initialSize=${initialSize ? `${initialSize.width}x${initialSize.height}` : 'auto'}`);
+    console.log(`Creating panel id=${id}, serverId=${serverId}, container=${container.className || container.id}, initialSize=${initialSize ? `${initialSize.width}x${initialSize.height}` : 'auto'}, split=${splitInfo ? `parent=${splitInfo.parentPanelId},dir=${splitInfo.direction}` : 'none'}`);
     const panel = new Panel(id, container, serverId, {
       onViewAction: (action, data) => this.handleViewAction(panel, action, data),
-    }, inheritCwdFrom, initialSize);
+    }, inheritCwdFrom, initialSize, splitInfo);
 
     this.panels.set(id, panel);
     panel.connect();
@@ -1181,19 +1182,25 @@ class App {
     const container = tab.root.findContainer(this.activePanel);
     if (!container) return;
 
-    // Get parent panel's serverId for CWD inheritance
-    const inheritCwdFrom = this.activePanel.serverId;
+    // Get parent panel's serverId for CWD inheritance and split info
+    const parentPanelId = this.activePanel.serverId;
+
+    // Build split info if parent has a server ID
+    const splitInfo = parentPanelId !== null
+      ? { parentPanelId, direction }
+      : undefined;
 
     // INSTANT: Do DOM split immediately
     // New panel created with serverId=null, will get ID when server responds
-    const newPanel = this.createPanel(tab.element, null, inheritCwdFrom);
+    // If parent has serverId, send SPLIT_PANEL to server so it tracks the split layout
+    const newPanel = this.createPanel(tab.element, null, parentPanelId, undefined, splitInfo);
     container.split(direction, newPanel);
 
     // Focus new panel immediately
     this.setActivePanel(newPanel);
 
     // ResizeObserver will measure correct size after layout
-    // Panel.connect() sends CREATE_PANEL with measured dimensions
+    // Panel.connect() sends SPLIT_PANEL (if split) or CREATE_PANEL with measured dimensions
   }
 
   // ============================================================================

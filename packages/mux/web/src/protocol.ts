@@ -13,6 +13,7 @@ export const ClientMsg = {
   BUFFER_STATS: 0x14, // Client reports buffer health for adaptive bitrate
   CONNECT_PANEL: 0x20,
   CREATE_PANEL: 0x21,
+  SPLIT_PANEL: 0x22, // Create panel as split of existing panel (panel WebSocket)
 } as const;
 
 export const FrameType = {

@@ -84,6 +84,7 @@ pub const ClientMsg = enum(u8) {
     buffer_stats = 0x14,   // Client reports buffer health for adaptive bitrate
     connect_panel = 0x20,  // Connect to existing panel by ID
     create_panel = 0x21,   // Request new panel creation
+    split_panel = 0x22,    // Create panel as split of existing panel
 };
 
 // Key input message format (from browser)
@@ -1362,7 +1363,7 @@ const Panel = struct {
             .resume_stream => self.resumeStream(),
             .buffer_stats => self.handleBufferStats(payload),
             // Connection-level commands - handled in Server.onPanelMessage before reaching panel
-            .connect_panel, .create_panel => {},
+            .connect_panel, .create_panel, .split_panel => {},
         }
     }
 
@@ -1413,6 +1414,7 @@ const PanelResizeRequest = struct {
 
 // Panel split request (to be processed on main thread)
 const PanelSplitRequest = struct {
+    conn: *ws.Connection,
     parent_panel_id: u32,
     direction: SplitDirection,
     width: u32,
@@ -1876,6 +1878,28 @@ const Server = struct {
                     }) catch {};
                     self.mutex.unlock();
                 },
+                .split_panel => {
+                    // Split existing panel: [msg_type:u8][parent_id:u32][dir_byte:u8][width:u16][height:u16][scale_x100:u16]
+                    if (data.len < 12) return;
+                    const parent_id = std.mem.readInt(u32, data[1..5], .little);
+                    const dir_byte = data[5];
+                    const width = std.mem.readInt(u16, data[6..8], .little);
+                    const height = std.mem.readInt(u16, data[8..10], .little);
+                    const scale_x100 = std.mem.readInt(u16, data[10..12], .little);
+                    const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
+                    const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
+
+                    self.mutex.lock();
+                    self.pending_splits.append(self.allocator, .{
+                        .conn = conn,
+                        .parent_panel_id = parent_id,
+                        .direction = direction,
+                        .width = width,
+                        .height = height,
+                        .scale = scale,
+                    }) catch {};
+                    self.mutex.unlock();
+                },
                 else => {},
             }
         }
@@ -1977,27 +2001,6 @@ const Server = struct {
             self.mutex.lock();
             self.pending_resizes.append(self.allocator, .{ .id = id, .width = width, .height = height }) catch {};
             self.mutex.unlock();
-        } else if (std.mem.indexOf(u8, data, "\"split_panel\"")) |_| {
-            // Split an existing panel
-            // {"type":"split_panel","panel_id":1,"direction":"horizontal","width":800,"height":600,"scale":2.0}
-            const parent_id = self.parseJsonInt(data, "panel_id") orelse return;
-            const width = self.parseJsonInt(data, "width") orelse 800;
-            const height = self.parseJsonInt(data, "height") orelse 600;
-            const scale = self.parseJsonFloat(data, "scale") orelse 2.0;
-
-            const dir_str = self.parseJsonString(data, "direction") orelse "right";
-            // "down" or "up" = vertical split, "right" or "left" = horizontal split
-            const direction: SplitDirection = if (std.mem.eql(u8, dir_str, "down") or std.mem.eql(u8, dir_str, "up")) .vertical else .horizontal;
-
-            self.mutex.lock();
-            self.pending_splits.append(self.allocator, .{
-                .parent_panel_id = parent_id,
-                .direction = direction,
-                .width = width,
-                .height = height,
-                .scale = scale,
-            }) catch {};
-            self.mutex.unlock();
         } else if (std.mem.indexOf(u8, data, "\"focus_panel\"")) |_| {
             // Client focused a panel - update active tab and active panel within tab
             // {"type":"focus_panel","panel_id":1}
@@ -2060,25 +2063,6 @@ const Server = struct {
             if (self.layout.findTabByPanel(panel_id)) |tab| {
                 self.layout.active_tab_id = tab.id;
             }
-            self.mutex.unlock();
-        } else if (msg_type == 0x84) { // split_panel
-            if (data.len < 12) return;
-            const parent_id = std.mem.readInt(u32, data[1..5], .little);
-            const dir_byte = data[5];
-            const width = std.mem.readInt(u16, data[6..8], .little);
-            const height = std.mem.readInt(u16, data[8..10], .little);
-            const scale_x100 = std.mem.readInt(u16, data[10..12], .little);
-            const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
-            const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
-
-            self.mutex.lock();
-            self.pending_splits.append(self.allocator, .{
-                .parent_panel_id = parent_id,
-                .direction = direction,
-                .width = width,
-                .height = height,
-                .scale = scale,
-            }) catch {};
             self.mutex.unlock();
         } else if (msg_type == 0x85) { // inspector_subscribe
             if (data.len < 6) return;
@@ -3874,7 +3858,14 @@ const Server = struct {
                 continue;
             };
 
-            // Panel connection will be established when client connects via panel WS with CONNECT_PANEL
+            // Associate the WebSocket connection with the new panel (same as processPendingPanels)
+            panel.setConnection(req.conn);
+            req.conn.user_data = panel;
+
+            self.mutex.lock();
+            self.panel_connections.put(req.conn, panel) catch {};
+            self.mutex.unlock();
+
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
         }
@@ -4094,13 +4085,15 @@ const Server = struct {
 
         // Start HTTP server in background (handles all WebSocket via path-based routing)
         const http_thread = try std.Thread.spawn(.{}, runHttpServer, .{self});
-        defer http_thread.join();
 
         // Note: WebSocket servers are NOT started with run() - they only handle
         // upgrades from HTTP server via handleUpgrade(). No separate ports needed.
 
         // Run render loop in main thread
         self.runRenderLoop();
+
+        // Wait for HTTP thread to finish
+        http_thread.join();
     }
 };
 

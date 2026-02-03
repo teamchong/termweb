@@ -33,6 +33,7 @@ export class Panel {
   // WebCodecs decoder
   private decoder: VideoDecoder | null = null;
   private decoderConfigured = false;
+  private lastCodec: string | null = null; // Track codec to detect resolution changes
   private gotFirstKeyframe = false; // Must receive keyframe before decoding
   private frameCount = 0;
   private ctx: CanvasRenderingContext2D | null = null;
@@ -65,6 +66,7 @@ export class Panel {
   private documentClickHandler: (() => void) | null = null;
 
   private initialSize: { width: number; height: number } | null = null;
+  private splitInfo: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' } | null = null;
 
   constructor(
     id: string,
@@ -72,7 +74,8 @@ export class Panel {
     serverId: number | null,
     callbacks: PanelCallbacks = {},
     inheritCwdFrom: number | null = null,
-    initialSize?: { width: number; height: number }
+    initialSize?: { width: number; height: number },
+    splitInfo?: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' }
   ) {
     this.id = id;
     this.serverId = serverId;
@@ -80,6 +83,7 @@ export class Panel {
     this.callbacks = callbacks;
     this.inheritCwdFrom = inheritCwdFrom;
     this.initialSize = initialSize ?? null;
+    this.splitInfo = splitInfo ?? null;
 
     // Create panel element with canvas
     this.element = document.createElement('div');
@@ -412,6 +416,8 @@ export class Panel {
       requestAnimationFrame(() => requestAnimationFrame(() => {
         if (this.serverId !== null) {
           this.sendConnectPanel(this.serverId);
+        } else if (this.splitInfo) {
+          this.sendSplitPanel();
         } else {
           this.sendCreatePanel();
         }
@@ -487,6 +493,42 @@ export class Panel {
     this.ws.send(buf);
   }
 
+  private sendSplitPanel(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.splitInfo) return;
+
+    // Use pre-calculated size if provided, otherwise measure element
+    let width: number, height: number;
+    if (this.initialSize) {
+      width = this.initialSize.width;
+      height = this.initialSize.height;
+      this.initialSize = null;
+    } else {
+      const rect = this.element.getBoundingClientRect();
+      width = Math.floor(rect.width) || 800;
+      height = Math.floor(rect.height) || 600;
+    }
+    const scale = window.devicePixelRatio || 1;
+
+    this.lastReportedWidth = width;
+    this.lastReportedHeight = height;
+
+    // Map direction to horizontal/vertical: right/left = horizontal, down/up = vertical
+    const isVertical = this.splitInfo.direction === 'down' || this.splitInfo.direction === 'up';
+    const dirByte = isVertical ? 1 : 0;
+
+    // Binary: [msg_type:u8][parent_id:u32][dir_byte:u8][width:u16][height:u16][scale_x100:u16]
+    const buf = new ArrayBuffer(12);
+    const view = new DataView(buf);
+    view.setUint8(0, ClientMsg.SPLIT_PANEL);
+    view.setUint32(1, this.splitInfo.parentPanelId, true);
+    view.setUint8(5, dirByte);
+    view.setUint16(6, width, true);
+    view.setUint16(8, height, true);
+    view.setUint16(10, Math.round(scale * 100), true);
+    this.ws.send(buf);
+    this.splitInfo = null; // Clear after use
+  }
+
   // Parse NAL units from Annex B format (00 00 00 01 start codes)
   private parseNalUnits(data: Uint8Array): Uint8Array[] {
     const units: Uint8Array[] = [];
@@ -553,20 +595,32 @@ export class Panel {
       }
     }
 
-    // Configure decoder on first SPS
-    if (sps && !this.decoderConfigured) {
+    // Configure or reconfigure decoder when SPS is received
+    // SPS contains resolution info - must reconfigure when it changes (e.g., after resize)
+    if (sps) {
       const codec = this.getCodecFromSps(sps);
 
-      try {
-        this.decoder.configure({
-          codec: codec,
-          optimizeForLatency: true,
-        });
-        this.decoderConfigured = true;
-        console.log('Decoder configured:', codec);
-      } catch (e) {
-        console.error('Failed to configure decoder:', e);
-        return;
+      // Check if we need to reconfigure (first time or codec changed)
+      if (!this.decoderConfigured || codec !== this.lastCodec) {
+        try {
+          // Reset decoder if reconfiguring
+          if (this.decoderConfigured) {
+            console.log('Reconfiguring decoder:', this.lastCodec, '->', codec);
+            this.decoder.reset();
+            this.gotFirstKeyframe = false;
+          }
+
+          this.decoder.configure({
+            codec: codec,
+            optimizeForLatency: true,
+          });
+          this.decoderConfigured = true;
+          this.lastCodec = codec;
+          console.log('Decoder configured:', codec);
+        } catch (e) {
+          console.error('Failed to configure decoder:', e);
+          return;
+        }
       }
     }
 
