@@ -1644,29 +1644,35 @@ class App {
 
   private sendFocusPanel(serverId: number): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      this.controlWs.send(JSON.stringify({
-        type: 'focus_panel',
-        panel_id: serverId
-      }));
+      const buf = new ArrayBuffer(5);
+      const view = new DataView(buf);
+      view.setUint8(0, 0x83); // focus_panel
+      view.setUint32(1, serverId, true);
+      this.controlWs.send(buf);
     }
   }
 
   private sendClosePanel(serverId: number): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      this.controlWs.send(JSON.stringify({
-        type: 'close_panel',
-        panel_id: serverId
-      }));
+      const buf = new ArrayBuffer(5);
+      const view = new DataView(buf);
+      view.setUint8(0, 0x81); // close_panel
+      view.setUint32(1, serverId, true);
+      this.controlWs.send(buf);
     }
   }
 
   private sendViewAction(serverId: number, action: string): void {
     if (this.controlWs?.readyState === WebSocket.OPEN) {
-      this.controlWs.send(JSON.stringify({
-        type: 'view_action',
-        panel_id: serverId,
-        action
-      }));
+      // View actions: [0x88, panel_id (u32), action_len (u8), action_string]
+      const actionBytes = new TextEncoder().encode(action);
+      const buf = new ArrayBuffer(6 + actionBytes.length);
+      const view = new DataView(buf);
+      view.setUint8(0, 0x88); // view_action
+      view.setUint32(1, serverId, true);
+      view.setUint8(5, actionBytes.length);
+      new Uint8Array(buf, 6).set(actionBytes);
+      this.controlWs.send(buf);
     }
   }
 
