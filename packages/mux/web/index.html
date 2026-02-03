@@ -403,10 +403,67 @@
       position: absolute;
       inset: 0;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
+      gap: 12px;
       color: #666;
       font: 14px system-ui, sans-serif;
+    }
+    #panels-loading .spinner {
+      width: 24px;
+      height: 24px;
+      border: 2px solid #333;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    #panels-empty {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 24px;
+      color: #888;
+      font: 14px system-ui, sans-serif;
+    }
+    #panels-empty.visible {
+      display: flex;
+    }
+    #panels-empty h2 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 500;
+      color: #aaa;
+    }
+    #panels-empty .shortcuts {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      text-align: left;
+    }
+    #panels-empty .shortcut {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    #panels-empty .shortcut kbd {
+      background: #333;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      color: #ccc;
+      min-width: 60px;
+      text-align: center;
+    }
+    #panels-empty .shortcut span {
+      color: #888;
     }
     .panel {
       position: absolute;
@@ -1480,7 +1537,20 @@
     </div>
   </div>
   <div id="panels">
-    <div id="panels-loading">Connecting...</div>
+    <div id="panels-loading">
+      <div class="spinner"></div>
+      <span>Connecting...</span>
+    </div>
+    <div id="panels-empty">
+      <h2>No Open Tabs</h2>
+      <div class="shortcuts">
+        <div class="shortcut"><kbd>⌘ /</kbd><span>New Tab</span></div>
+        <div class="shortcut"><kbd>⌘ D</kbd><span>Split Right</span></div>
+        <div class="shortcut"><kbd>⌘ ⇧ D</kbd><span>Split Down</span></div>
+        <div class="shortcut"><kbd>⌘ `</kbd><span>Quick Terminal</span></div>
+        <div class="shortcut"><kbd>⌘ ⇧ P</kbd><span>Command Palette</span></div>
+      </div>
+    </div>
   </div>
   <div id="tab-overview">
     <div id="tab-overview-title">All Tabs</div>

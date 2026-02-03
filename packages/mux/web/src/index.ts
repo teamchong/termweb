@@ -177,7 +177,18 @@ class App {
 
   private hidePanelsLoading(): void {
     const loading = document.getElementById('panels-loading');
+    console.log('hidePanelsLoading: element found =', !!loading);
     if (loading) loading.remove();
+  }
+
+  private updateEmptyState(): void {
+    const emptyEl = document.getElementById('panels-empty');
+    if (!emptyEl) return;
+    if (this.tabs.size === 0) {
+      emptyEl.classList.add('visible');
+    } else {
+      emptyEl.classList.remove('visible');
+    }
   }
 
   private connectControl(): void {
@@ -219,7 +230,7 @@ class App {
 
     switch (type) {
       case 'panel_list':
-        // Hide loading indicator - we have server state now
+        // Note: panel_list is now sent as binary (0x01), this JSON handler is legacy
         this.hidePanelsLoading();
         // Server is authoritative - restore whatever state it sends
         // If empty, frontend stays empty (user can create tab with hotkey)
@@ -293,6 +304,9 @@ class App {
         const layoutJson = decoder.decode(bytes.slice(offset, offset + layoutLen));
         let layout = null;
         try { layout = JSON.parse(layoutJson); } catch { /* ignore */ }
+        console.log(`panel_list (binary): ${count} panels, layout=${!!layout}`);
+        // Hide loading indicator - we have server state now
+        this.hidePanelsLoading();
         this.handlePanelList(panels, layout);
         break;
       }
@@ -449,7 +463,8 @@ class App {
     } else if (panels.length > 0) {
       this.reconnectPanelsAsSplits(panels);
     }
-    // No else - empty state is valid, user creates tab manually
+    // Update empty state (show welcome screen if no tabs)
+    this.updateEmptyState();
   }
 
   private reconnectPanelsAsSplits(panels: Array<{ panel_id: number; title: string }>): void {
@@ -595,6 +610,7 @@ class App {
         this.setActivePanel(otherPanel);
       }
     }
+    this.updateEmptyState();
   }
 
   private handleLayoutUpdate(layout: unknown): void {
@@ -617,6 +633,7 @@ class App {
       if (appTitle) appTitle.textContent = '👻';
 
       this.updateMenuState();
+      this.updateEmptyState();
     }
     // Non-empty layouts are ignored - client manages its own state
   }
@@ -929,11 +946,13 @@ class App {
     this.addTabUI(tabId, tabTitle);
     this.switchToTab(tabId);
     this.updateMenuState();
+    this.updateEmptyState();
     return tabId;
   }
 
   private createPanel(container: HTMLElement, serverId: number | null = null, inheritCwdFrom: number | null = null): Panel {
     const id = generateId();
+    console.log(`Creating panel id=${id}, serverId=${serverId}, container=${container.className || container.id}`);
     const panel = new Panel(id, container, serverId, {
       onViewAction: (action, data) => this.handleViewAction(panel, action, data),
     }, inheritCwdFrom);
@@ -1084,6 +1103,7 @@ class App {
     }
 
     this.updateMenuState();
+    this.updateEmptyState();
   }
 
   closeActivePanel(): void {
@@ -1815,6 +1835,7 @@ class App {
   }
 
   private handleQuickTerminalState(isOpen: boolean): void {
+    console.log(`handleQuickTerminalState: isOpen=${isOpen}, activePanel=${this.activePanel?.id}, tabs=${this.tabs.size}`);
     const container = document.getElementById('quick-terminal');
     const isCurrentlyOpen = container?.classList.contains('visible') ?? false;
     if (isOpen === isCurrentlyOpen) return;

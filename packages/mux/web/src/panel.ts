@@ -314,8 +314,14 @@ export class Panel {
     }
 
     if (this.destroyed || !this.ctx) {
+      console.warn(`Panel ${this.id}: onFrame skipped - destroyed=${this.destroyed}, ctx=${!!this.ctx}`);
       frame.close();
       return;
+    }
+
+    // Log first frame
+    if (this.renderedFrames === 0) {
+      console.log(`Panel ${this.id}: First frame rendered, size=${frame.displayWidth}x${frame.displayHeight}`);
     }
 
     // Resize canvas to match frame if needed
