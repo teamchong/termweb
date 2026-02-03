@@ -399,6 +399,15 @@
       position: relative;
       background: var(--bg);
     }
+    #panels-loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #666;
+      font: 14px system-ui, sans-serif;
+    }
     .panel {
       position: absolute;
       top: 0;
@@ -491,7 +500,8 @@
       overflow: hidden;
       position: relative;
     }
-    .split-container > .split-pane > .panel {
+    .split-container > .split-pane > .panel,
+    .tab-content > .split-pane > .panel {
       position: absolute;
       top: 0;
       left: 0;
@@ -500,10 +510,12 @@
       display: flex;
     }
     /* Dim non-focused panels in split view */
-    .split-container > .split-pane > .panel:not(.focused) {
+    .split-container > .split-pane > .panel:not(.focused),
+    .tab-content > .split-pane > .panel:not(.focused) {
       opacity: 0.6;
     }
-    .split-container > .split-pane > .panel.focused {
+    .split-container > .split-pane > .panel.focused,
+    .tab-content > .split-pane > .panel.focused {
       opacity: 1;
     }
     .split-divider {
@@ -1467,7 +1479,9 @@
       <button id="new-tab" title="New Tab (⌘/)">+</button>
     </div>
   </div>
-  <div id="panels"></div>
+  <div id="panels">
+    <div id="panels-loading">Connecting...</div>
+  </div>
   <div id="tab-overview">
     <div id="tab-overview-title">All Tabs</div>
     <div id="tab-overview-grid"></div>

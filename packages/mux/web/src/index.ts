@@ -175,6 +175,11 @@ class App {
     }
   }
 
+  private hidePanelsLoading(): void {
+    const loading = document.getElementById('panels-loading');
+    if (loading) loading.remove();
+  }
+
   private connectControl(): void {
     if (this.destroyed) return;
 
@@ -214,6 +219,8 @@ class App {
 
     switch (type) {
       case 'panel_list':
+        // Hide loading indicator - we have server state now
+        this.hidePanelsLoading();
         // Server is authoritative - restore whatever state it sends
         // If empty, frontend stays empty (user can create tab with hotkey)
         if (msg.layout && typeof msg.layout === 'object') {
@@ -882,6 +889,9 @@ class App {
   // ============================================================================
 
   createTab(serverIdOrTitle?: number | string, title?: string): string {
+    // Hide loading indicator when creating tabs
+    this.hidePanelsLoading();
+
     // Handle overloaded signatures:
     // createTab() - new panel with empty title (shows 👻)
     // createTab("Title") - new panel with custom title
