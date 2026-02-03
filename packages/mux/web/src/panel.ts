@@ -64,18 +64,22 @@ export class Panel {
   private inspectorEl: HTMLElement | null = null;
   private documentClickHandler: (() => void) | null = null;
 
+  private initialSize: { width: number; height: number } | null = null;
+
   constructor(
     id: string,
     container: HTMLElement,
     serverId: number | null,
     callbacks: PanelCallbacks = {},
-    inheritCwdFrom: number | null = null
+    inheritCwdFrom: number | null = null,
+    initialSize?: { width: number; height: number }
   ) {
     this.id = id;
     this.serverId = serverId;
     this.container = container;
     this.callbacks = callbacks;
     this.inheritCwdFrom = inheritCwdFrom;
+    this.initialSize = initialSize ?? null;
 
     // Create panel element with canvas
     this.element = document.createElement('div');
@@ -456,10 +460,17 @@ export class Panel {
   private sendCreatePanel(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // Use element (not container) for consistent sizing
-    const rect = this.element.getBoundingClientRect();
-    const width = Math.floor(rect.width) || 800;
-    const height = Math.floor(rect.height) || 600;
+    // Use pre-calculated size if provided, otherwise measure element
+    let width: number, height: number;
+    if (this.initialSize) {
+      width = this.initialSize.width;
+      height = this.initialSize.height;
+      this.initialSize = null; // Clear after use
+    } else {
+      const rect = this.element.getBoundingClientRect();
+      width = Math.floor(rect.width) || 800;
+      height = Math.floor(rect.height) || 600;
+    }
     const scale = window.devicePixelRatio || 1;
 
     this.lastReportedWidth = width;

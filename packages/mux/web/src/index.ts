@@ -951,12 +951,17 @@ class App {
     return tabId;
   }
 
-  private createPanel(container: HTMLElement, serverId: number | null = null, inheritCwdFrom: number | null = null): Panel {
+  private createPanel(
+    container: HTMLElement,
+    serverId: number | null = null,
+    inheritCwdFrom: number | null = null,
+    initialSize?: { width: number; height: number }
+  ): Panel {
     const id = generateId();
-    console.log(`Creating panel id=${id}, serverId=${serverId}, container=${container.className || container.id}`);
+    console.log(`Creating panel id=${id}, serverId=${serverId}, container=${container.className || container.id}, initialSize=${initialSize ? `${initialSize.width}x${initialSize.height}` : 'auto'}`);
     const panel = new Panel(id, container, serverId, {
       onViewAction: (action, data) => this.handleViewAction(panel, action, data),
-    }, inheritCwdFrom);
+    }, inheritCwdFrom, initialSize);
 
     this.panels.set(id, panel);
     panel.connect();
@@ -2397,18 +2402,25 @@ class App {
         this.activePanel.element.classList.remove('focused');
       }
 
-      // Quick terminal runs in parallel with active panel - don't pause it
+      // Create panel immediately with pre-calculated dimensions
+      // Quick terminal has fixed height (400px) and full viewport width
       if (!this.quickTerminalPanel) {
         const content = container.querySelector('.quick-terminal-content');
         if (content) {
           content.innerHTML = '';
-          // Inherit CWD from the previously active panel
           const inheritCwdFrom = this.previousActivePanel?.serverId ?? null;
-          this.quickTerminalPanel = this.createPanel(content as HTMLElement, null, inheritCwdFrom);
+          // Quick terminal: width=viewport, height=400px container - calculate content height
+          // Container is 400px with flex column, content is flex:1
+          const quickTerminalHeight = 400; // Fixed in CSS
+          const initialSize = {
+            width: window.innerWidth,
+            height: quickTerminalHeight
+          };
+          this.quickTerminalPanel = this.createPanel(content as HTMLElement, null, inheritCwdFrom, initialSize);
         }
       }
 
-      // Focus quick terminal without hiding previous panel
+      // Focus quick terminal
       if (this.quickTerminalPanel) {
         this.quickTerminalPanel.element.classList.add('active', 'focused');
         this.quickTerminalPanel.focus();
