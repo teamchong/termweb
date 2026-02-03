@@ -16,6 +16,15 @@ fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
+// Set socket write timeout to prevent blocking on slow/unresponsive clients
+fn setWriteTimeout(fd: posix.socket_t, timeout_ms: u32) void {
+    const tv = posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
 // Find HTTP header value case-insensitively (proxies may lowercase headers)
 fn findHeaderValue(request: []const u8, header_name: []const u8) ?[]const u8 {
     var i: usize = 0;
@@ -490,8 +499,9 @@ pub const Server = struct {
         const conn = try self.allocator.create(Connection);
         conn.* = Connection.init(stream.stream, self.allocator);
 
-        // Set socket read timeout for blocking I/O (100ms wakeup for shutdown check)
-        setReadTimeout(stream.stream.handle, 100);
+        // Set socket timeouts for blocking I/O
+        setReadTimeout(stream.stream.handle, 100); // 100ms wakeup for shutdown check
+        setWriteTimeout(stream.stream.handle, 1000); // 1s write timeout to prevent blocking
 
         // Perform handshake (with or without zstd based on server config)
         try conn.acceptHandshakeWithOptions(self.enable_zstd);
@@ -569,8 +579,9 @@ pub const Server = struct {
         const conn = self.allocator.create(Connection) catch return;
         conn.* = Connection.init(stream, self.allocator);
 
-        // Set socket read timeout for blocking I/O
-        setReadTimeout(stream.handle, 100);
+        // Set socket timeouts for blocking I/O
+        setReadTimeout(stream.handle, 100); // 100ms wakeup for shutdown check
+        setWriteTimeout(stream.handle, 1000); // 1s write timeout to prevent blocking
 
         // Complete WebSocket handshake with pre-read request
         conn.acceptHandshakeFromRequest(request, self.enable_zstd) catch {

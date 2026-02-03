@@ -70,6 +70,7 @@ class App {
   private overviewStateFromServer = false; // Flag to prevent feedback loop
   private quickTerminalStateFromServer = false; // Flag to prevent feedback loop
   private inspectorStateFromServer = false; // Flag to prevent feedback loop
+  private quickTerminalWasOpenBeforeOverview = false; // Track QT state when overview opens
 
   // Cleanup state
   private destroyed = false;
@@ -1456,6 +1457,20 @@ class App {
     const grid = document.getElementById('tab-overview-grid');
     if (!overlay || !grid || !this.panelsEl) return;
 
+    // Track and hide quick terminal if open
+    const quickTerminalContainer = document.getElementById('quick-terminal');
+    this.quickTerminalWasOpenBeforeOverview = quickTerminalContainer?.classList.contains('visible') ?? false;
+    if (this.quickTerminalWasOpenBeforeOverview && quickTerminalContainer) {
+      quickTerminalContainer.classList.remove('visible');
+    }
+
+    // Pause all panels (stop receiving video frames) to save bandwidth
+    for (const [, panel] of this.panels) {
+      panel.hide();
+    }
+    // Also pause quick terminal panel if it exists
+    this.quickTerminalPanel?.hide();
+
     grid.innerHTML = '';
     this.tabOverviewTabs = [];
 
@@ -1623,6 +1638,22 @@ class App {
         overlay.removeEventListener('click', this.tabOverviewCloseHandler);
         this.tabOverviewCloseHandler = null;
       }
+    }
+
+    // Resume all panels (restart receiving video frames)
+    for (const [, panel] of this.panels) {
+      panel.show();
+    }
+    // Also resume quick terminal panel if it exists
+    this.quickTerminalPanel?.show();
+
+    // Restore quick terminal if it was open before overview
+    if (this.quickTerminalWasOpenBeforeOverview) {
+      const quickTerminalContainer = document.getElementById('quick-terminal');
+      if (quickTerminalContainer) {
+        quickTerminalContainer.classList.add('visible');
+      }
+      this.quickTerminalWasOpenBeforeOverview = false;
     }
 
     if (this.activeTab !== null) {
