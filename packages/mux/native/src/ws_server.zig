@@ -104,10 +104,19 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        // Free zstd resources
-        if (self.compressor) |*comp| comp.deinit();
-        if (self.decompressor) |*decomp| decomp.deinit();
-        if (self.request_uri) |uri| self.allocator.free(uri);
+        // Free zstd resources - null out after freeing to prevent double-free
+        if (self.compressor) |*comp| {
+            comp.deinit();
+            self.compressor = null;
+        }
+        if (self.decompressor) |*decomp| {
+            decomp.deinit();
+            self.decompressor = null;
+        }
+        if (self.request_uri) |uri| {
+            self.allocator.free(uri);
+            self.request_uri = null;
+        }
         self.stream.close();
         self.is_open = false;
     }
@@ -304,53 +313,58 @@ pub const Connection = struct {
     // For binary frames with zstd enabled: [compression_flag:u8][data...]
     // compression_flag: 0x00 = uncompressed, 0x01 = zstd compressed
     pub fn writeFrame(self: *Connection, opcode: Opcode, payload: []const u8) !void {
-        // For binary frames with zstd enabled, compress the payload
+        // For binary frames with zstd enabled, add compression flag prefix
         var final_payload: []const u8 = payload;
         var compressed_buf: ?[]u8 = null;
         defer if (compressed_buf) |buf| self.allocator.free(buf);
 
-        if (opcode == .binary and self.zstd_enabled and payload.len > 64) {
-            // Only compress if we have a compressor and payload is worth compressing
-            if (self.compressor) |*comp| {
-                if (comp.compress(payload)) |compressed| {
-                    // Only use compression if it actually reduces size
-                    if (compressed.len + 1 < payload.len) {
-                        // Build compressed payload: [0x01][compressed_data]
-                        const with_flag = self.allocator.alloc(u8, compressed.len + 1) catch {
+        if (opcode == .binary and self.zstd_enabled) {
+            // Only try compression for payloads > 64 bytes
+            if (payload.len > 64) {
+                if (self.compressor) |*comp| {
+                    if (comp.compress(payload)) |compressed| {
+                        // Only use compression if it actually reduces size
+                        if (compressed.len + 1 < payload.len) {
+                            // Build compressed payload: [0x01][compressed_data]
+                            const with_flag = self.allocator.alloc(u8, compressed.len + 1) catch {
+                                self.allocator.free(compressed);
+                                // Fall through to send uncompressed with flag
+                                return self.sendUncompressedWithFlag(payload);
+                            };
+                            with_flag[0] = 0x01; // zstd compressed flag
+                            @memcpy(with_flag[1..], compressed);
                             self.allocator.free(compressed);
-                            // Fall through to send uncompressed
-                            return self.writeFrameRaw(opcode, payload, false);
-                        };
-                        with_flag[0] = 0x01; // zstd compressed flag
-                        @memcpy(with_flag[1..], compressed);
-                        self.allocator.free(compressed);
-                        compressed_buf = with_flag;
-                        final_payload = with_flag;
-                    } else {
-                        self.allocator.free(compressed);
-                        // Build uncompressed payload: [0x00][data]
-                        const with_flag = self.allocator.alloc(u8, payload.len + 1) catch {
-                            return self.writeFrameRaw(opcode, payload, false);
-                        };
-                        with_flag[0] = 0x00; // uncompressed flag
-                        @memcpy(with_flag[1..], payload);
-                        compressed_buf = with_flag;
-                        final_payload = with_flag;
+                            compressed_buf = with_flag;
+                            final_payload = with_flag;
+                        } else {
+                            self.allocator.free(compressed);
+                            // Compression didn't help, send uncompressed with flag
+                            return self.sendUncompressedWithFlag(payload);
+                        }
+                    } else |_| {
+                        // Compression failed, send uncompressed with flag
+                        return self.sendUncompressedWithFlag(payload);
                     }
-                } else |_| {
-                    // Compression failed, send uncompressed with flag
-                    const with_flag = self.allocator.alloc(u8, payload.len + 1) catch {
-                        return self.writeFrameRaw(opcode, payload, false);
-                    };
-                    with_flag[0] = 0x00;
-                    @memcpy(with_flag[1..], payload);
-                    compressed_buf = with_flag;
-                    final_payload = with_flag;
+                } else {
+                    // No compressor, send uncompressed with flag
+                    return self.sendUncompressedWithFlag(payload);
                 }
+            } else {
+                // Small payload, skip compression but still add flag byte
+                return self.sendUncompressedWithFlag(payload);
             }
         }
 
         try self.writeFrameRaw(opcode, final_payload, false);
+    }
+
+    // Helper: send binary data with uncompressed flag prefix
+    fn sendUncompressedWithFlag(self: *Connection, payload: []const u8) !void {
+        const with_flag = try self.allocator.alloc(u8, payload.len + 1);
+        defer self.allocator.free(with_flag);
+        with_flag[0] = 0x00; // uncompressed flag
+        @memcpy(with_flag[1..], payload);
+        try self.writeFrameRaw(.binary, with_flag, false);
     }
 
     // Write raw WebSocket frame without compression processing

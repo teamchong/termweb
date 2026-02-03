@@ -82,13 +82,26 @@ pub const Compressor = struct {
     /// Compress data into a newly allocated buffer
     pub fn compress(self: *Compressor, src: []const u8) ![]u8 {
         const max_size = compressBound(src.len);
-        var dst = try self.allocator.alloc(u8, max_size);
+        const dst = try self.allocator.alloc(u8, max_size);
         errdefer self.allocator.free(dst);
 
         const actual_size = try self.compressInto(src, dst);
 
-        // Resize to actual size
-        return self.allocator.realloc(dst, actual_size) catch dst[0..actual_size];
+        // Try to shrink the allocation to the actual size.
+        // Note: We must use realloc to get proper allocation tracking.
+        // Returning a smaller slice of a larger allocation would cause
+        // memory corruption when freed (wrong size passed to allocator).
+        return self.allocator.realloc(dst, actual_size) catch {
+            // Realloc failed - allocate exact size, copy, and free original
+            const exact = self.allocator.alloc(u8, actual_size) catch {
+                // Even that failed, return full original buffer
+                // (caller will free full max_size allocation, which is safe)
+                return dst;
+            };
+            @memcpy(exact, dst[0..actual_size]);
+            self.allocator.free(dst);
+            return exact;
+        };
     }
 
     /// Compress data into a provided buffer, returns actual compressed size
@@ -142,13 +155,25 @@ pub const Decompressor = struct {
         const expected_size = getFrameContentSize(src) orelse max_size;
         const alloc_size = @min(expected_size, max_size);
 
-        var dst = try self.allocator.alloc(u8, alloc_size);
+        const dst = try self.allocator.alloc(u8, alloc_size);
         errdefer self.allocator.free(dst);
 
         const actual_size = try self.decompressInto(src, dst);
 
-        // Resize to actual size
-        return self.allocator.realloc(dst, actual_size) catch dst[0..actual_size];
+        // Try to shrink the allocation to the actual size.
+        // Note: We must use realloc to get proper allocation tracking.
+        // Returning a smaller slice of a larger allocation would cause
+        // memory corruption when freed (wrong size passed to allocator).
+        return self.allocator.realloc(dst, actual_size) catch {
+            // Realloc failed - allocate exact size, copy, and free original
+            const exact = self.allocator.alloc(u8, actual_size) catch {
+                // Even that failed, return full original buffer
+                return dst;
+            };
+            @memcpy(exact, dst[0..actual_size]);
+            self.allocator.free(dst);
+            return exact;
+        };
     }
 
     /// Decompress data into a provided buffer, returns actual decompressed size
@@ -171,13 +196,18 @@ pub const Decompressor = struct {
 /// Simple one-shot compression
 pub fn compressSimple(allocator: Allocator, src: []const u8, level: c_int) ![]u8 {
     const max_size = Compressor.compressBound(src.len);
-    var dst = try allocator.alloc(u8, max_size);
+    const dst = try allocator.alloc(u8, max_size);
     errdefer allocator.free(dst);
 
     const result = ZSTD_compress(dst.ptr, dst.len, src.ptr, src.len, level);
     const actual_size = try checkError(result);
 
-    return allocator.realloc(dst, actual_size) catch dst[0..actual_size];
+    return allocator.realloc(dst, actual_size) catch {
+        const exact = allocator.alloc(u8, actual_size) catch return dst;
+        @memcpy(exact, dst[0..actual_size]);
+        allocator.free(dst);
+        return exact;
+    };
 }
 
 /// Simple one-shot decompression
@@ -185,13 +215,18 @@ pub fn decompressSimple(allocator: Allocator, src: []const u8, max_size: usize) 
     const expected_size = Decompressor.getFrameContentSize(src) orelse max_size;
     const alloc_size = @min(expected_size, max_size);
 
-    var dst = try allocator.alloc(u8, alloc_size);
+    const dst = try allocator.alloc(u8, alloc_size);
     errdefer allocator.free(dst);
 
     const result = ZSTD_decompress(dst.ptr, dst.len, src.ptr, src.len);
     const actual_size = try checkError(result);
 
-    return allocator.realloc(dst, actual_size) catch dst[0..actual_size];
+    return allocator.realloc(dst, actual_size) catch {
+        const exact = allocator.alloc(u8, actual_size) catch return dst;
+        @memcpy(exact, dst[0..actual_size]);
+        allocator.free(dst);
+        return exact;
+    };
 }
 
 // ============================================================================

@@ -644,8 +644,15 @@ pub const TransferSession = struct {
         }
         self.files.deinit(self.allocator);
 
-        if (self.compressor) |*comp| comp.deinit();
-        if (self.decompressor) |*decomp| decomp.deinit();
+        // Free zstd resources - null out after freeing to prevent double-free
+        if (self.compressor) |*comp| {
+            comp.deinit();
+            self.compressor = null;
+        }
+        if (self.decompressor) |*decomp| {
+            decomp.deinit();
+            self.decompressor = null;
+        }
 
         self.allocator.destroy(self);
     }
