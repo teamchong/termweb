@@ -336,6 +336,41 @@ pub fn build(b: *std.Build) void {
         exe.addIncludePath(b.path("vendor/xxhash"));
         exe.addCSourceFile(.{ .file = b.path("vendor/xxhash/xxhash.c"), .flags = &.{"-O2"} });
 
+        // zstd for WebSocket compression (faster than deflate)
+        const zstd_flags = &[_][]const u8{ "-O2", "-DZSTD_DISABLE_ASM" };
+        // Common sources (including xxhash which is part of zstd)
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/debug.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/entropy_common.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/error_private.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/fse_decompress.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/pool.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/threading.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/zstd_common.c"), .flags = zstd_flags });
+        // zstd uses its own xxhash implementation with ZSTD_ prefix
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/common/xxhash.c"), .flags = zstd_flags });
+        // Compress sources
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/fse_compress.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/hist.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/huf_compress.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_compress.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_compress_literals.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_compress_sequences.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_compress_superblock.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_double_fast.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_fast.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_lazy.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_ldm.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstd_opt.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/compress/zstdmt_compress.c"), .flags = zstd_flags });
+        // Decompress sources
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/decompress/huf_decompress.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/decompress/zstd_ddict.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/decompress/zstd_decompress.c"), .flags = zstd_flags });
+        exe.addCSourceFile(.{ .file = b.path("vendor/zstd/lib/decompress/zstd_decompress_block.c"), .flags = zstd_flags });
+        // Include path for zstd
+        exe.addIncludePath(b.path("vendor/zstd/lib"));
+        mux_mod.addIncludePath(b.path("vendor/zstd/lib"));
+
     }
 
     // Run step

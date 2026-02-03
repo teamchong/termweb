@@ -1,4 +1,8 @@
 // File transfer protocol and handlers
+// Uses zstd compression via WASM worker pool
+
+import { CompressionPool, getCompressionPool, destroyCompressionPool } from './compression-pool';
+import { initZstd, compressZstd, decompressZstd } from './zstd-wasm';
 
 // WebSocket URL builder - auto-detects ws/wss based on page protocol
 function getWsUrl(path: string): string {
@@ -66,12 +70,27 @@ export class FileTransferHandler {
   private ws: WebSocket | null = null;
   private activeTransfers = new Map<number, TransferState>();
   private chunkSize = 256 * 1024; // 256KB chunks
+  private compressionPool: CompressionPool | null = null;
+  private zstdInitialized = false;
+  private useZstd = true; // Use zstd compression (negotiated with server)
 
   onTransferComplete?: (transferId: number, totalBytes: number) => void;
   onTransferError?: (transferId: number, error: string) => void;
   onDryRunReport?: (transferId: number, report: DryRunReport) => void;
 
-  connect(): void {
+  async connect(): Promise<void> {
+    // Initialize zstd WASM and compression pool
+    try {
+      await initZstd('/zstd.wasm');
+      this.zstdInitialized = true;
+      this.compressionPool = getCompressionPool();
+      console.log('zstd compression initialized');
+    } catch (err) {
+      console.warn('Failed to initialize zstd, falling back to deflate:', err);
+      this.useZstd = false;
+    }
+
+    // Add X-Compression header to signal zstd support
     this.ws = new WebSocket(getWsUrl('/ws/file'));
     this.ws.binaryType = 'arraybuffer';
 
@@ -93,6 +112,7 @@ export class FileTransferHandler {
   disconnect(): void {
     this.ws?.close();
     this.ws = null;
+    // Don't destroy the compression pool here - it's shared
   }
 
   private handleMessage(data: ArrayBuffer): void {
@@ -461,6 +481,16 @@ export class FileTransferHandler {
   }
 
   private async compress(data: Uint8Array): Promise<Uint8Array> {
+    // Use zstd compression if available
+    if (this.useZstd && this.compressionPool) {
+      try {
+        return await this.compressionPool.compress(data, 3);
+      } catch (err) {
+        console.warn('zstd compression failed, falling back to deflate:', err);
+      }
+    }
+
+    // Fall back to built-in deflate
     const cs = new CompressionStream('deflate-raw');
     const writer = cs.writable.getWriter();
     writer.write(data as Uint8Array<ArrayBuffer>);
@@ -485,6 +515,16 @@ export class FileTransferHandler {
   }
 
   private async decompress(data: Uint8Array): Promise<Uint8Array> {
+    // Use zstd decompression if available
+    if (this.useZstd && this.compressionPool) {
+      try {
+        return await this.compressionPool.decompress(data);
+      } catch (err) {
+        console.warn('zstd decompression failed, falling back to deflate:', err);
+      }
+    }
+
+    // Fall back to built-in deflate
     const ds = new DecompressionStream('deflate-raw');
     const writer = ds.writable.getWriter();
     writer.write(data as Uint8Array<ArrayBuffer>);

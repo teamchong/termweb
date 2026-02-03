@@ -23,6 +23,10 @@ const web_assets = @import("web_assets");
 const embedded_index_html = web_assets.index_html;
 const embedded_client_js = web_assets.client_js;
 
+// COOP/COEP headers for SharedArrayBuffer support (required for Web Workers with shared memory)
+const cross_origin_headers = "Cross-Origin-Opener-Policy: same-origin\r\n" ++
+    "Cross-Origin-Embedder-Policy: require-corp\r\n";
+
 // Color struct matching ghostty_config_color_s
 const Color = extern struct {
     r: u8,
@@ -206,7 +210,7 @@ pub const HttpServer = struct {
 
         // Handle /favicon.ico - return 204 No Content (we use inline SVG)
         if (std.mem.eql(u8, path, "/favicon.ico")) {
-            stream.writeAll("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n") catch return;
+            stream.writeAll("HTTP/1.1 204 No Content\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n") catch return;
             return;
         }
 
@@ -225,9 +229,9 @@ pub const HttpServer = struct {
         // Determine content type
         const content_type = getContentType(clean_path);
 
-        // Send response
-        var header_buf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ content_type, content.len }) catch return;
+        // Send response with COOP/COEP headers for SharedArrayBuffer support
+        var header_buf: [768]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{ content_type, content.len }) catch return;
 
         _ = stream.write(header) catch return;
         _ = stream.write(content) catch return;
@@ -265,8 +269,8 @@ pub const HttpServer = struct {
 
     fn sendError(self: *HttpServer, stream: net.Stream, code: u16, message: []const u8) void {
         _ = self;
-        var buf: [256]u8 = undefined;
-        const response = std.fmt.bufPrint(&buf, "HTTP/1.1 {} {s}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}", .{ code, message, message.len, message }) catch return;
+        var buf: [512]u8 = undefined;
+        const response = std.fmt.bufPrint(&buf, "HTTP/1.1 {} {s}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n{s}", .{ code, message, message.len, message }) catch return;
         _ = stream.write(response) catch {};
     }
 
@@ -289,8 +293,8 @@ pub const HttpServer = struct {
             fg.r, fg.g, fg.b,
         }) catch return;
 
-        var header_buf: [256]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{body.len}) catch return;
+        var header_buf: [512]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{body.len}) catch return;
 
         _ = stream.write(header) catch return;
         _ = stream.write(body) catch return;

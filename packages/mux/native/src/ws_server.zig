@@ -4,10 +4,7 @@ const posix = std.posix;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
-const c = @cImport({
-    @cInclude("libdeflate.h");
-});
-
+const zstd = @import("zstd.zig");
 const simd_mask = @import("simd_mask");
 
 // Set socket read timeout for blocking I/O with periodic wakeup
@@ -88,10 +85,10 @@ pub const Connection = struct {
     is_open: bool,
     user_data: ?*anyopaque,
     request_uri: ?[]const u8 = null,  // Request URI for auth token extraction
-    // permessage-deflate fields
-    deflate_enabled: bool = false,
-    compressor: ?*c.libdeflate_compressor = null,
-    decompressor: ?*c.libdeflate_decompressor = null,
+    // App-level zstd compression (replaces permessage-deflate)
+    zstd_enabled: bool = false,
+    compressor: ?zstd.Compressor = null,
+    decompressor: ?zstd.Decompressor = null,
 
     pub fn init(stream: net.Stream, allocator: Allocator) Connection {
         return .{
@@ -100,23 +97,23 @@ pub const Connection = struct {
             .is_open = true,
             .user_data = null,
             .request_uri = null,
-            .deflate_enabled = false,
+            .zstd_enabled = false,
             .compressor = null,
             .decompressor = null,
         };
     }
 
     pub fn deinit(self: *Connection) void {
-        // Free deflate resources
-        if (self.compressor) |comp| c.libdeflate_free_compressor(comp);
-        if (self.decompressor) |decomp| c.libdeflate_free_decompressor(decomp);
+        // Free zstd resources
+        if (self.compressor) |*comp| comp.deinit();
+        if (self.decompressor) |*decomp| decomp.deinit();
         if (self.request_uri) |uri| self.allocator.free(uri);
         self.stream.close();
         self.is_open = false;
     }
 
     // Perform WebSocket handshake (server side)
-    // Set enable_deflate=false for connections that carry pre-compressed data (like video frames)
+    // Set enable_zstd=false for connections that carry pre-compressed data (like video frames)
     pub fn acceptHandshake(self: *Connection) !void {
         return self.acceptHandshakeWithOptions(true);
     }
@@ -125,7 +122,7 @@ pub const Connection = struct {
         return self.acceptHandshakeWithOptions(false);
     }
 
-    fn acceptHandshakeWithOptions(self: *Connection, enable_deflate: bool) !void {
+    fn acceptHandshakeWithOptions(self: *Connection, enable_zstd: bool) !void {
         var buf: [4096]u8 = undefined;
         const n = try self.stream.read(&buf);
         if (n == 0) return error.ConnectionClosed;
@@ -153,10 +150,10 @@ pub const Connection = struct {
         var accept_key: [28]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&accept_key, &hash);
 
-        // Check for permessage-deflate extension (only if enabled for this connection)
-        const has_deflate = enable_deflate and std.mem.indexOf(u8, request, "permessage-deflate") != null;
+        // Check for X-Compression: zstd header (app-level compression)
+        const has_zstd = enable_zstd and findHeaderValue(request, "x-compression") != null;
 
-        // Send handshake response
+        // Send handshake response (no permessage-deflate - we use app-level zstd)
         const response = "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
@@ -164,19 +161,19 @@ pub const Connection = struct {
         _ = try self.stream.write(response);
         _ = try self.stream.write(&accept_key);
 
-        // Enable permessage-deflate if client supports it
-        if (has_deflate) {
-            _ = try self.stream.write("\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover");
-            self.deflate_enabled = true;
-            self.compressor = c.libdeflate_alloc_compressor(6);
-            self.decompressor = c.libdeflate_alloc_decompressor();
+        // Enable zstd if client supports it (indicated by X-Compression header)
+        if (has_zstd) {
+            _ = try self.stream.write("\r\nX-Compression: zstd");
+            self.zstd_enabled = true;
+            self.compressor = zstd.Compressor.init(self.allocator, 3) catch null;
+            self.decompressor = zstd.Decompressor.init(self.allocator) catch null;
         }
 
         _ = try self.stream.write("\r\n\r\n");
     }
 
     // Accept handshake with pre-read request (for HTTP server upgrade)
-    pub fn acceptHandshakeFromRequest(self: *Connection, request: []const u8, enable_deflate: bool) !void {
+    pub fn acceptHandshakeFromRequest(self: *Connection, request: []const u8, enable_zstd: bool) !void {
         // Extract request URI from first line (e.g., "GET /ws/panel?token=xyz HTTP/1.1")
         if (std.mem.indexOf(u8, request, " ")) |method_end| {
             const uri_start = method_end + 1;
@@ -198,10 +195,10 @@ pub const Connection = struct {
         var accept_key: [28]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&accept_key, &hash);
 
-        // Check for permessage-deflate extension (only if enabled for this connection)
-        const has_deflate = enable_deflate and std.mem.indexOf(u8, request, "permessage-deflate") != null;
+        // Check for X-Compression: zstd header (app-level compression)
+        const has_zstd = enable_zstd and findHeaderValue(request, "x-compression") != null;
 
-        // Send handshake response
+        // Send handshake response (no permessage-deflate - we use app-level zstd)
         const response = "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
@@ -209,25 +206,25 @@ pub const Connection = struct {
         _ = try self.stream.write(response);
         _ = try self.stream.write(&accept_key);
 
-        // Enable permessage-deflate if client supports it
-        if (has_deflate) {
-            _ = try self.stream.write("\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover");
-            self.deflate_enabled = true;
-            self.compressor = c.libdeflate_alloc_compressor(6);
-            self.decompressor = c.libdeflate_alloc_decompressor();
+        // Enable zstd if client supports it
+        if (has_zstd) {
+            _ = try self.stream.write("\r\nX-Compression: zstd");
+            self.zstd_enabled = true;
+            self.compressor = zstd.Compressor.init(self.allocator, 3) catch null;
+            self.decompressor = zstd.Decompressor.init(self.allocator) catch null;
         }
 
         _ = try self.stream.write("\r\n\r\n");
     }
 
     // Read a WebSocket frame
+    // App-level zstd: first byte of binary payload is compression flag (0x01 = zstd compressed)
     pub fn readFrame(self: *Connection) !?Frame {
         var header: [2]u8 = undefined;
         const header_read = self.stream.read(&header) catch return null;
         if (header_read < 2) return null;
 
         const fin = (header[0] & 0x80) != 0;
-        const rsv1 = (header[0] & 0x40) != 0; // Compression flag per RFC 7692
         const opcode: Opcode = @enumFromInt(@as(u4, @truncate(header[0] & 0x0F)));
         const masked = (header[1] & 0x80) != 0;
         var payload_len: u64 = header[1] & 0x7F;
@@ -266,59 +263,34 @@ pub const Connection = struct {
             simd_mask.xorMask(payload, mask);
         }
 
-        // Decompress if RSV1 is set and deflate is enabled (per RFC 7692)
-        if (rsv1 and self.deflate_enabled) {
-            if (self.decompressor) |decomp| {
-                // Per RFC 7692, sender removed trailing 0x00 0x00 0xFF 0xFF from deflate output.
-                // We add it back, then append a final empty stored block with BFINAL=1.
-                // libdeflate requires BFINAL=1 to know the stream is complete.
-                const input = try self.allocator.alloc(u8, payload.len + 4 + 5);
-                defer self.allocator.free(input);
-                @memcpy(input[0..payload.len], payload);
-                // Complete original empty stored block (BFINAL=0)
-                input[payload.len..][0..4].* = .{ 0x00, 0x00, 0xFF, 0xFF };
-                // Add final empty stored block (BFINAL=1)
-                input[payload.len + 4 ..][0..5].* = .{ 0x01, 0x00, 0x00, 0xFF, 0xFF };
+        // App-level zstd decompression for binary frames
+        // Format: [compression_flag:u8][data...]
+        // compression_flag: 0x00 = uncompressed, 0x01 = zstd compressed
+        if (opcode == .binary and self.zstd_enabled and payload.len > 1) {
+            const compression_flag = payload[0];
+            if (compression_flag == 0x01) {
+                // zstd compressed
+                if (self.decompressor) |*decomp| {
+                    const compressed_data = payload[1..];
+                    const max_decompressed = 16 * 1024 * 1024; // 16MB max
 
-                // Allocate decompression buffer (start with 10x, retry with larger if needed)
-                var decompress_buf = try self.allocator.alloc(u8, payload.len * 10 + 4096);
+                    const decompressed = decomp.decompress(compressed_data, max_decompressed) catch {
+                        return error.DecompressionFailed;
+                    };
 
-                var actual_size: usize = 0;
-                var result = c.libdeflate_deflate_decompress(
-                    decomp,
-                    input.ptr,
-                    input.len,
-                    decompress_buf.ptr,
-                    decompress_buf.len,
-                    &actual_size,
-                );
-
-                // If buffer too small, try with larger buffer
-                if (result == c.LIBDEFLATE_INSUFFICIENT_SPACE) {
-                    self.allocator.free(decompress_buf);
-                    decompress_buf = try self.allocator.alloc(u8, payload.len * 100 + 65536);
-                    result = c.libdeflate_deflate_decompress(
-                        decomp,
-                        input.ptr,
-                        input.len,
-                        decompress_buf.ptr,
-                        decompress_buf.len,
-                        &actual_size,
-                    );
+                    // Replace payload with decompressed data (no compression flag prefix)
+                    self.allocator.free(payload);
+                    payload = decompressed;
                 }
-
-                if (result != c.LIBDEFLATE_SUCCESS) {
-                    self.allocator.free(decompress_buf);
-                    return error.DecompressionFailed;
-                }
-
-                // Replace payload with decompressed data
+            } else if (compression_flag == 0x00) {
+                // Uncompressed - strip the flag byte
+                const data = payload[1..];
+                const new_payload = try self.allocator.alloc(u8, data.len);
+                @memcpy(new_payload, data);
                 self.allocator.free(payload);
-                const final_payload = try self.allocator.alloc(u8, actual_size);
-                @memcpy(final_payload, decompress_buf[0..actual_size]);
-                self.allocator.free(decompress_buf);
-                payload = final_payload;
+                payload = new_payload;
             }
+            // Unknown flags are passed through as-is
         }
 
         return .{
@@ -328,15 +300,65 @@ pub const Connection = struct {
         };
     }
 
-    // Write a WebSocket frame
-    // Note: Server-side compression disabled because libdeflate produces complete
-    // deflate streams with BFINAL=1, not Z_SYNC_FLUSH format that browsers expect.
-    // Client->server decompression still works.
+    // Write a WebSocket frame with optional zstd compression
+    // For binary frames with zstd enabled: [compression_flag:u8][data...]
+    // compression_flag: 0x00 = uncompressed, 0x01 = zstd compressed
     pub fn writeFrame(self: *Connection, opcode: Opcode, payload: []const u8) !void {
+        // For binary frames with zstd enabled, compress the payload
+        var final_payload: []const u8 = payload;
+        var compressed_buf: ?[]u8 = null;
+        defer if (compressed_buf) |buf| self.allocator.free(buf);
+
+        if (opcode == .binary and self.zstd_enabled and payload.len > 64) {
+            // Only compress if we have a compressor and payload is worth compressing
+            if (self.compressor) |*comp| {
+                if (comp.compress(payload)) |compressed| {
+                    // Only use compression if it actually reduces size
+                    if (compressed.len + 1 < payload.len) {
+                        // Build compressed payload: [0x01][compressed_data]
+                        const with_flag = self.allocator.alloc(u8, compressed.len + 1) catch {
+                            self.allocator.free(compressed);
+                            // Fall through to send uncompressed
+                            return self.writeFrameRaw(opcode, payload, false);
+                        };
+                        with_flag[0] = 0x01; // zstd compressed flag
+                        @memcpy(with_flag[1..], compressed);
+                        self.allocator.free(compressed);
+                        compressed_buf = with_flag;
+                        final_payload = with_flag;
+                    } else {
+                        self.allocator.free(compressed);
+                        // Build uncompressed payload: [0x00][data]
+                        const with_flag = self.allocator.alloc(u8, payload.len + 1) catch {
+                            return self.writeFrameRaw(opcode, payload, false);
+                        };
+                        with_flag[0] = 0x00; // uncompressed flag
+                        @memcpy(with_flag[1..], payload);
+                        compressed_buf = with_flag;
+                        final_payload = with_flag;
+                    }
+                } else |_| {
+                    // Compression failed, send uncompressed with flag
+                    const with_flag = self.allocator.alloc(u8, payload.len + 1) catch {
+                        return self.writeFrameRaw(opcode, payload, false);
+                    };
+                    with_flag[0] = 0x00;
+                    @memcpy(with_flag[1..], payload);
+                    compressed_buf = with_flag;
+                    final_payload = with_flag;
+                }
+            }
+        }
+
+        try self.writeFrameRaw(opcode, final_payload, false);
+    }
+
+    // Write raw WebSocket frame without compression processing
+    fn writeFrameRaw(self: *Connection, opcode: Opcode, payload: []const u8, _: bool) !void {
         var header: [10]u8 = undefined;
         var header_len: usize = 2;
 
-        header[0] = 0x80 | @as(u8, @intFromEnum(opcode)); // FIN + opcode, no compression
+        header[0] = 0x80 | @as(u8, @intFromEnum(opcode)); // FIN + opcode
 
         if (payload.len < 126) {
             header[1] = @intCast(payload.len);
@@ -386,7 +408,7 @@ pub const Server = struct {
     allocator: Allocator,
     running: std.atomic.Value(bool),
     active_connections: std.atomic.Value(u32), // Track active connection threads
-    enable_deflate: bool,
+    enable_zstd: bool,
     on_connect: ?*const fn (*Connection) void,
     on_message: ?*const fn (*Connection, []u8, bool) void, // conn, data, is_binary
     on_disconnect: ?*const fn (*Connection) void,
@@ -399,7 +421,7 @@ pub const Server = struct {
         return initWithOptions(allocator, address, port, false);
     }
 
-    fn initWithOptions(allocator: Allocator, address: []const u8, port: u16, enable_deflate: bool) !*Server {
+    fn initWithOptions(allocator: Allocator, address: []const u8, port: u16, enable_zstd: bool) !*Server {
         const server = try allocator.create(Server);
         errdefer allocator.destroy(server);
 
@@ -409,7 +431,7 @@ pub const Server = struct {
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(u32).init(0),
-            .enable_deflate = enable_deflate,
+            .enable_zstd = enable_zstd,
             .on_connect = null,
             .on_message = null,
             .on_disconnect = null,
@@ -457,8 +479,8 @@ pub const Server = struct {
         // Set socket read timeout for blocking I/O (100ms wakeup for shutdown check)
         setReadTimeout(stream.stream.handle, 100);
 
-        // Perform handshake (with or without deflate based on server config)
-        try conn.acceptHandshakeWithOptions(self.enable_deflate);
+        // Perform handshake (with or without zstd based on server config)
+        try conn.acceptHandshakeWithOptions(self.enable_zstd);
 
         if (self.on_connect) |cb| cb(conn);
 
@@ -537,7 +559,7 @@ pub const Server = struct {
         setReadTimeout(stream.handle, 100);
 
         // Complete WebSocket handshake with pre-read request
-        conn.acceptHandshakeFromRequest(request, self.enable_deflate) catch {
+        conn.acceptHandshakeFromRequest(request, self.enable_zstd) catch {
             conn.deinit();
             self.allocator.destroy(conn);
             return;

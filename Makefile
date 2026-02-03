@@ -35,6 +35,7 @@ mux-deps:
 
 # Build mux web client (TypeScript -> bundled JS)
 # Requires: bun (https://bun.sh)
+# Note: Uses fzstd (pure JS) for zstd decompression in browser
 mux-web: mux-deps
 	@echo "Building mux web client..."
 	cd packages/mux/web && bun run build
@@ -153,7 +154,7 @@ help:
 	@echo "  make mux-web      - Build mux web client only"
 	@echo "  make mux-web-dev  - Build mux web client (dev mode)"
 	@echo "  make mux-web-watch- Watch mux web client for changes"
-	@echo "  make mux-native   - Build mux native binary (macOS only)"
+	@echo "  make mux-native   - Build mux native binary"
 	@echo "  make mux-run      - Run mux server"
 	@echo "  make mux-clean    - Clean mux build artifacts"
 	@echo ""

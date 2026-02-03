@@ -4,10 +4,8 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
-// Compression library
-const c = @cImport({
-    @cInclude("libdeflate.h");
-});
+// zstd compression
+const zstd = @import("zstd.zig");
 
 // XXH3 SIMD-accelerated hashing
 // Use extern declaration directly to avoid cImport macro expansion issues
@@ -335,44 +333,16 @@ pub const ParallelCompressor = struct {
                 const end = @min(start + CHUNK_SIZE, data.len);
                 const chunk = data[start..end];
 
-                const comp = c.libdeflate_alloc_compressor(compression_level);
-                if (comp == null) {
-                    // Free all allocated chunks
+                // Use zstd for compression
+                const compressed = zstd.compressSimple(allocator, chunk, compression_level) catch {
                     for (results[0..i]) |result| {
                         allocator.free(result);
                     }
                     allocator.free(results);
                     return error.CompressionFailed;
-                }
-                defer c.libdeflate_free_compressor(comp);
-
-                const max_size = c.libdeflate_deflate_compress_bound(comp, chunk.len);
-                var output = allocator.alloc(u8, max_size) catch {
-                    for (results[0..i]) |result| {
-                        allocator.free(result);
-                    }
-                    allocator.free(results);
-                    return error.OutOfMemory;
                 };
 
-                const actual_size = c.libdeflate_deflate_compress(
-                    comp,
-                    chunk.ptr,
-                    chunk.len,
-                    output.ptr,
-                    output.len,
-                );
-
-                if (actual_size == 0) {
-                    allocator.free(output);
-                    for (results[0..i]) |result| {
-                        allocator.free(result);
-                    }
-                    allocator.free(results);
-                    return error.CompressionFailed;
-                }
-
-                results[i] = allocator.realloc(output, actual_size) catch output[0..actual_size];
+                results[i] = compressed;
             }
         }
 
@@ -394,35 +364,13 @@ pub const ParallelCompressor = struct {
             const end = @min(start + CHUNK_SIZE, ctx.data.len);
             const chunk = ctx.data[start..end];
 
-            // Each thread needs its own compressor
-            const comp = c.libdeflate_alloc_compressor(ctx.level);
-            if (comp == null) {
-                ctx.errors[idx] = true;
-                return;
-            }
-            defer c.libdeflate_free_compressor(comp);
-
-            const max_size = c.libdeflate_deflate_compress_bound(comp, chunk.len);
-            var output = ctx.alloc.alloc(u8, max_size) catch {
+            // Use zstd for compression
+            const compressed = zstd.compressSimple(ctx.alloc, chunk, ctx.level) catch {
                 ctx.errors[idx] = true;
                 return;
             };
 
-            const actual_size = c.libdeflate_deflate_compress(
-                comp,
-                chunk.ptr,
-                chunk.len,
-                output.ptr,
-                output.len,
-            );
-
-            if (actual_size == 0) {
-                ctx.alloc.free(output);
-                ctx.errors[idx] = true;
-                return;
-            }
-
-            ctx.results[idx] = ctx.alloc.realloc(output, actual_size) catch output[0..actual_size];
+            ctx.results[idx] = compressed;
         }
     }
 
@@ -649,9 +597,9 @@ pub const TransferSession = struct {
     is_active: bool,
     allocator: Allocator,
 
-    // Compression
-    compressor: ?*c.libdeflate_compressor,
-    decompressor: ?*c.libdeflate_decompressor,
+    // Compression (zstd)
+    compressor: ?zstd.Compressor,
+    decompressor: ?zstd.Decompressor,
 
     // Currently mapped file for streaming downloads
     current_mapped_file: ?MappedFile,
@@ -671,8 +619,8 @@ pub const TransferSession = struct {
             .bytes_transferred = 0,
             .is_active = true,
             .allocator = allocator,
-            .compressor = c.libdeflate_alloc_compressor(6),
-            .decompressor = c.libdeflate_alloc_decompressor(),
+            .compressor = zstd.Compressor.init(allocator, 3) catch null,
+            .decompressor = zstd.Decompressor.init(allocator) catch null,
             .current_mapped_file = null,
         };
         return session;
@@ -696,8 +644,8 @@ pub const TransferSession = struct {
         }
         self.files.deinit(self.allocator);
 
-        if (self.compressor) |comp| c.libdeflate_free_compressor(comp);
-        if (self.decompressor) |decomp| c.libdeflate_free_decompressor(decomp);
+        if (self.compressor) |*comp| comp.deinit();
+        if (self.decompressor) |*decomp| decomp.deinit();
 
         self.allocator.destroy(self);
     }
@@ -838,29 +786,12 @@ pub const TransferSession = struct {
         }
     }
 
-    // Compress data using libdeflate
+    // Compress data using zstd
     pub fn compress(self: *TransferSession, input: []const u8) ![]u8 {
-        const comp = self.compressor orelse return error.NoCompressor;
-
-        // Allocate output buffer (worst case: slightly larger than input)
-        const max_size = c.libdeflate_deflate_compress_bound(comp, input.len);
-        var output = try self.allocator.alloc(u8, max_size);
-
-        const actual_size = c.libdeflate_deflate_compress(
-            comp,
-            input.ptr,
-            input.len,
-            output.ptr,
-            output.len,
-        );
-
-        if (actual_size == 0) {
-            self.allocator.free(output);
-            return error.CompressionFailed;
+        if (self.compressor) |*comp| {
+            return comp.compress(input);
         }
-
-        // Resize to actual size
-        return self.allocator.realloc(output, actual_size) catch output[0..actual_size];
+        return error.NoCompressor;
     }
 
     // Compress directly from mapped memory (zero-copy input)
@@ -869,28 +800,12 @@ pub const TransferSession = struct {
         return self.compress(chunk);
     }
 
-    // Decompress data using libdeflate
+    // Decompress data using zstd
     pub fn decompress(self: *TransferSession, input: []const u8, expected_size: usize) ![]u8 {
-        const decomp = self.decompressor orelse return error.NoDecompressor;
-
-        var output = try self.allocator.alloc(u8, expected_size);
-        var actual_size: usize = 0;
-
-        const result = c.libdeflate_deflate_decompress(
-            decomp,
-            input.ptr,
-            input.len,
-            output.ptr,
-            output.len,
-            &actual_size,
-        );
-
-        if (result != c.LIBDEFLATE_SUCCESS) {
-            self.allocator.free(output);
-            return error.DecompressionFailed;
+        if (self.decompressor) |*decomp| {
+            return decomp.decompress(input, expected_size);
         }
-
-        return output[0..actual_size];
+        return error.NoDecompressor;
     }
 
     // Persist session state for resume
@@ -992,8 +907,8 @@ pub const TransferSession = struct {
             .bytes_transferred = bytes_transferred,
             .is_active = true,
             .allocator = allocator,
-            .compressor = c.libdeflate_alloc_compressor(6),
-            .decompressor = c.libdeflate_alloc_decompressor(),
+            .compressor = zstd.Compressor.init(allocator, 3) catch null,
+            .decompressor = zstd.Decompressor.init(allocator) catch null,
             .current_mapped_file = null,
         };
 
