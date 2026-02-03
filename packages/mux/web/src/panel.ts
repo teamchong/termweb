@@ -13,7 +13,6 @@ function getWsUrl(path: string): string {
 }
 
 export interface PanelCallbacks {
-  onResize?: (panelId: number, width: number, height: number) => void;
   onViewAction?: (action: string, data?: unknown) => void;
 }
 
@@ -226,10 +225,10 @@ export class Panel {
       const rect = this.canvas.getBoundingClientRect();
       const width = Math.floor(rect.width);
       const height = Math.floor(rect.height);
-      if (width > 0 && height > 0 && this.serverId !== null && this.callbacks.onResize) {
+      if (width > 0 && height > 0) {
         this.lastReportedWidth = width;
         this.lastReportedHeight = height;
-        this.callbacks.onResize(this.serverId, width, height);
+        this.sendResizeBinary(width, height);
       }
     });
   }
@@ -370,12 +369,23 @@ export class Panel {
         this.lastReportedWidth = width;
         this.lastReportedHeight = height;
 
-        if (this.serverId !== null && this.callbacks.onResize) {
-          this.callbacks.onResize(this.serverId, width, height);
-        }
+        // Send resize directly as binary on panel WebSocket (faster than JSON on control WS)
+        this.sendResizeBinary(width, height);
       });
     });
     this.resizeObserver.observe(this.element);
+  }
+
+  private sendResizeBinary(width: number, height: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    // Binary format: [0x10, width_lo, width_hi, height_lo, height_hi]
+    const buffer = new ArrayBuffer(5);
+    const view = new DataView(buffer);
+    view.setUint8(0, 0x10); // resize message type
+    view.setUint16(1, width, true); // little endian
+    view.setUint16(3, height, true);
+    this.ws.send(buffer);
   }
 
   connect(): void {
@@ -428,10 +438,10 @@ export class Panel {
         const rect = this.element.getBoundingClientRect();
         const width = Math.floor(rect.width);
         const height = Math.floor(rect.height);
-        if (width > 0 && height > 0 && this.serverId !== null && this.callbacks.onResize) {
+        if (width > 0 && height > 0) {
           this.lastReportedWidth = width;
           this.lastReportedHeight = height;
-          this.callbacks.onResize(this.serverId, width, height);
+          this.sendResizeBinary(width, height);
         }
       });
     }, 100);

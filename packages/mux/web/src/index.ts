@@ -901,7 +901,6 @@ class App {
   private createPanel(container: HTMLElement, serverId: number | null = null, inheritCwdFrom: number | null = null): Panel {
     const id = generateId();
     const panel = new Panel(id, container, serverId, {
-      onResize: (panelId, width, height) => this.sendResizePanel(panelId, width, height),
       onViewAction: (action, data) => this.handleViewAction(panel, action, data),
     }, inheritCwdFrom);
 
@@ -1648,17 +1647,6 @@ class App {
       this.controlWs.send(JSON.stringify({
         type: 'focus_panel',
         panel_id: serverId
-      }));
-    }
-  }
-
-  private sendResizePanel(serverId: number, width: number, height: number): void {
-    if (this.controlWs?.readyState === WebSocket.OPEN) {
-      this.controlWs.send(JSON.stringify({
-        type: 'resize_panel',
-        panel_id: serverId,
-        width,
-        height
       }));
     }
   }
