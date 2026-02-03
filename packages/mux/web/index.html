@@ -444,26 +444,30 @@
     #panels-empty .shortcuts {
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      text-align: left;
+      gap: 6px;
+      min-width: 200px;
     }
     #panels-empty .shortcut {
       display: flex;
       align-items: center;
-      gap: 12px;
+      justify-content: space-between;
+      padding: 6px 12px;
+      border-radius: 4px;
+    }
+    #panels-empty .shortcut:hover {
+      background: rgba(255,255,255,0.05);
+    }
+    #panels-empty .shortcut span {
+      color: #aaa;
     }
     #panels-empty .shortcut kbd {
       background: #333;
-      padding: 4px 8px;
-      border-radius: 4px;
+      padding: 3px 6px;
+      border-radius: 3px;
       font-family: ui-monospace, monospace;
-      font-size: 12px;
-      color: #ccc;
-      min-width: 60px;
-      text-align: center;
-    }
-    #panels-empty .shortcut span {
+      font-size: 11px;
       color: #888;
+      margin-left: 24px;
     }
     .panel {
       position: absolute;
@@ -1544,11 +1548,11 @@
     <div id="panels-empty">
       <h2>No Open Tabs</h2>
       <div class="shortcuts">
-        <div class="shortcut"><kbd>⌘ /</kbd><span>New Tab</span></div>
-        <div class="shortcut"><kbd>⌘ D</kbd><span>Split Right</span></div>
-        <div class="shortcut"><kbd>⌘ ⇧ D</kbd><span>Split Down</span></div>
-        <div class="shortcut"><kbd>⌘ `</kbd><span>Quick Terminal</span></div>
-        <div class="shortcut"><kbd>⌘ ⇧ P</kbd><span>Command Palette</span></div>
+        <div class="shortcut"><span>New Tab</span><kbd>⌘/</kbd></div>
+        <div class="shortcut"><span>Split Right</span><kbd>⌘D</kbd></div>
+        <div class="shortcut"><span>Split Down</span><kbd>⌘⇧D</kbd></div>
+        <div class="shortcut"><span>Quick Terminal</span><kbd>⌘`</kbd></div>
+        <div class="shortcut"><span>Command Palette</span><kbd>⌘⇧P</kbd></div>
       </div>
     </div>
   </div>
