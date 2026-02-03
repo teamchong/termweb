@@ -882,9 +882,13 @@
       justify-content: space-between;
       align-items: center;
     }
-    .command-item:hover,
-    .command-item.selected {
+    .command-item:hover:not(.disabled),
+    .command-item.selected:not(.disabled) {
       background: var(--tab-hover);
+    }
+    .command-item.disabled {
+      opacity: 0.4;
+      cursor: default;
     }
     .command-item-title {
       color: var(--text);

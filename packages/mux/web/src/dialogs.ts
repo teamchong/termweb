@@ -7,62 +7,64 @@ export interface Command {
   action: string;
   description: string;
   shortcut?: string;
+  requiresPanel?: boolean;  // Disabled when no active panel
+  requiresTab?: boolean;    // Disabled when no tabs
 }
 
 export function getCommands(): Command[] {
   const commands: Command[] = [
-    // Text Operations
-    { title: 'Copy to Clipboard', action: 'copy_to_clipboard', description: 'Copy selected text' },
-    { title: 'Paste from Clipboard', action: 'paste_from_clipboard', description: 'Paste contents of clipboard' },
-    { title: 'Paste from Selection', action: 'paste_from_selection', description: 'Paste from selection clipboard' },
-    { title: 'Select All', action: 'select_all', description: 'Select all text' },
+    // Text Operations (require active panel)
+    { title: 'Copy to Clipboard', action: 'copy_to_clipboard', description: 'Copy selected text', requiresPanel: true },
+    { title: 'Paste from Clipboard', action: 'paste_from_clipboard', description: 'Paste contents of clipboard', requiresPanel: true },
+    { title: 'Paste from Selection', action: 'paste_from_selection', description: 'Paste from selection clipboard', requiresPanel: true },
+    { title: 'Select All', action: 'select_all', description: 'Select all text', requiresPanel: true },
 
-    // Font Control
-    { title: 'Increase Font Size', action: 'increase_font_size:1', description: 'Make text larger', shortcut: '⌘=' },
-    { title: 'Decrease Font Size', action: 'decrease_font_size:1', description: 'Make text smaller', shortcut: '⌘-' },
-    { title: 'Reset Font Size', action: 'reset_font_size', description: 'Reset to default size', shortcut: '⌘0' },
+    // Font Control (require active panel)
+    { title: 'Increase Font Size', action: 'increase_font_size:1', description: 'Make text larger', shortcut: '⌘=', requiresPanel: true },
+    { title: 'Decrease Font Size', action: 'decrease_font_size:1', description: 'Make text smaller', shortcut: '⌘-', requiresPanel: true },
+    { title: 'Reset Font Size', action: 'reset_font_size', description: 'Reset to default size', shortcut: '⌘0', requiresPanel: true },
 
-    // Screen Operations
-    { title: 'Clear Screen', action: 'clear_screen', description: 'Clear screen and scrollback' },
-    { title: 'Scroll to Top', action: 'scroll_to_top', description: 'Scroll to top of buffer' },
-    { title: 'Scroll to Bottom', action: 'scroll_to_bottom', description: 'Scroll to bottom of buffer' },
-    { title: 'Scroll Page Up', action: 'scroll_page_up', description: 'Scroll up one page' },
-    { title: 'Scroll Page Down', action: 'scroll_page_down', description: 'Scroll down one page' },
+    // Screen Operations (require active panel)
+    { title: 'Clear Screen', action: 'clear_screen', description: 'Clear screen and scrollback', requiresPanel: true },
+    { title: 'Scroll to Top', action: 'scroll_to_top', description: 'Scroll to top of buffer', requiresPanel: true },
+    { title: 'Scroll to Bottom', action: 'scroll_to_bottom', description: 'Scroll to bottom of buffer', requiresPanel: true },
+    { title: 'Scroll Page Up', action: 'scroll_page_up', description: 'Scroll up one page', requiresPanel: true },
+    { title: 'Scroll Page Down', action: 'scroll_page_down', description: 'Scroll down one page', requiresPanel: true },
 
     // Tab Management
     { title: 'New Tab', action: '_new_tab', description: 'Open a new tab', shortcut: '⌘/' },
-    { title: 'Close Tab', action: '_close_tab', description: 'Close current tab', shortcut: '⌘.' },
-    { title: 'Show All Tabs', action: '_show_all_tabs', description: 'Show tab overview', shortcut: '⌘⇧A' },
+    { title: 'Close Tab', action: '_close_tab', description: 'Close current tab', shortcut: '⌘.', requiresTab: true },
+    { title: 'Show All Tabs', action: '_show_all_tabs', description: 'Show tab overview', shortcut: '⌘⇧A', requiresTab: true },
 
-    // Split Management
-    { title: 'Split Right', action: '_split_right', description: 'Split pane to the right', shortcut: '⌘D' },
-    { title: 'Split Down', action: '_split_down', description: 'Split pane downward', shortcut: '⌘⇧D' },
-    { title: 'Split Left', action: '_split_left', description: 'Split pane to the left' },
-    { title: 'Split Up', action: '_split_up', description: 'Split pane upward' },
+    // Split Management (require active panel)
+    { title: 'Split Right', action: '_split_right', description: 'Split pane to the right', shortcut: '⌘D', requiresPanel: true },
+    { title: 'Split Down', action: '_split_down', description: 'Split pane downward', shortcut: '⌘⇧D', requiresPanel: true },
+    { title: 'Split Left', action: '_split_left', description: 'Split pane to the left', requiresPanel: true },
+    { title: 'Split Up', action: '_split_up', description: 'Split pane upward', requiresPanel: true },
 
-    // Navigation
-    { title: 'Focus Split: Left', action: 'goto_split:left', description: 'Focus left split' },
-    { title: 'Focus Split: Right', action: 'goto_split:right', description: 'Focus right split' },
-    { title: 'Focus Split: Up', action: 'goto_split:up', description: 'Focus split above' },
-    { title: 'Focus Split: Down', action: 'goto_split:down', description: 'Focus split below' },
-    { title: 'Focus Split: Previous', action: 'goto_split:previous', description: 'Focus previous split' },
-    { title: 'Focus Split: Next', action: 'goto_split:next', description: 'Focus next split' },
-    { title: 'Toggle Split Zoom', action: 'toggle_split_zoom', description: 'Toggle zoom on current split' },
-    { title: 'Equalize Splits', action: 'equalize_splits', description: 'Make all splits equal size' },
+    // Navigation (require active panel)
+    { title: 'Focus Split: Left', action: 'goto_split:left', description: 'Focus left split', requiresPanel: true },
+    { title: 'Focus Split: Right', action: 'goto_split:right', description: 'Focus right split', requiresPanel: true },
+    { title: 'Focus Split: Up', action: 'goto_split:up', description: 'Focus split above', requiresPanel: true },
+    { title: 'Focus Split: Down', action: 'goto_split:down', description: 'Focus split below', requiresPanel: true },
+    { title: 'Focus Split: Previous', action: 'goto_split:previous', description: 'Focus previous split', requiresPanel: true },
+    { title: 'Focus Split: Next', action: 'goto_split:next', description: 'Focus next split', requiresPanel: true },
+    { title: 'Toggle Split Zoom', action: 'toggle_split_zoom', description: 'Toggle zoom on current split', requiresPanel: true },
+    { title: 'Equalize Splits', action: 'equalize_splits', description: 'Make all splits equal size', requiresPanel: true },
 
-    // Terminal Control
-    { title: 'Reset Terminal', action: 'reset', description: 'Reset terminal state' },
-    { title: 'Toggle Read-Only Mode', action: 'toggle_readonly', description: 'Toggle read-only mode' },
+    // Terminal Control (require active panel)
+    { title: 'Reset Terminal', action: 'reset', description: 'Reset terminal state', requiresPanel: true },
+    { title: 'Toggle Read-Only Mode', action: 'toggle_readonly', description: 'Toggle read-only mode', requiresPanel: true },
 
     // Config
     { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration' },
-    { title: 'Toggle Inspector', action: '_toggle_inspector', description: 'Toggle terminal inspector', shortcut: '⌥⌘I' },
+    { title: 'Toggle Inspector', action: '_toggle_inspector', description: 'Toggle terminal inspector', shortcut: '⌥⌘I', requiresPanel: true },
 
-    // Title
-    { title: 'Change Title...', action: '_change_title', description: 'Change the terminal title' },
+    // Title (require tab)
+    { title: 'Change Title...', action: '_change_title', description: 'Change the terminal title', requiresTab: true },
 
-    // Fun
-    { title: 'Ghostty', action: 'text:👻', description: 'Add a little ghost to your terminal' },
+    // Fun (require active panel)
+    { title: 'Ghostty', action: 'text:👻', description: 'Add a little ghost to your terminal', requiresPanel: true },
   ];
 
   return commands.sort((a, b) => a.title.localeCompare(b.title));
@@ -76,18 +78,23 @@ export class CommandPalette {
   private filteredCommands: Command[] = [];
   private selectedIndex = 0;
   private onExecute?: (action: string) => void;
+  private hasTabs = false;
+  private hasActivePanel = false;
 
   constructor(onExecute: (action: string) => void) {
     this.onExecute = onExecute;
     this.commands = getCommands();
   }
 
-  show(): void {
+  show(hasTabs = false, hasActivePanel = false): void {
+    this.hasTabs = hasTabs;
+    this.hasActivePanel = hasActivePanel;
+
     this.overlay = document.getElementById('command-palette');
     if (!this.overlay) return;
 
-    this.input = this.overlay.querySelector('.command-input');
-    this.list = this.overlay.querySelector('.command-list');
+    this.input = document.getElementById('command-palette-input') as HTMLInputElement;
+    this.list = document.getElementById('command-palette-list');
 
     if (this.input) {
       this.input.value = '';
@@ -97,6 +104,8 @@ export class CommandPalette {
 
     this.selectedIndex = 0;
     this.renderList('');
+    // Select first enabled item
+    this.selectNextEnabled(0);
     this.overlay.classList.add('visible');
     this.input?.focus();
 
@@ -107,6 +116,29 @@ export class CommandPalette {
 
   hide(): void {
     this.overlay?.classList.remove('visible');
+  }
+
+  private isCommandDisabled(cmd: Command): boolean {
+    if (cmd.requiresPanel && !this.hasActivePanel) return true;
+    if (cmd.requiresTab && !this.hasTabs) return true;
+    return false;
+  }
+
+  private selectNextEnabled(startIndex: number, direction: 1 | -1 = 1): void {
+    const len = this.filteredCommands.length;
+    if (len === 0) return;
+
+    let index = startIndex;
+    for (let i = 0; i < len; i++) {
+      if (!this.isCommandDisabled(this.filteredCommands[index])) {
+        this.selectedIndex = index;
+        this.updateSelection();
+        return;
+      }
+      index = (index + direction + len) % len;
+    }
+    // All disabled, just select the start
+    this.selectedIndex = startIndex;
   }
 
   private renderList(filter: string): void {
@@ -120,19 +152,26 @@ export class CommandPalette {
 
     this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredCommands.length - 1));
 
-    this.list.innerHTML = this.filteredCommands.map((cmd, i) => `
-      <div class="command-item ${i === this.selectedIndex ? 'selected' : ''}" data-index="${i}">
+    this.list.innerHTML = this.filteredCommands.map((cmd, i) => {
+      const disabled = this.isCommandDisabled(cmd);
+      return `
+      <div class="command-item ${i === this.selectedIndex ? 'selected' : ''} ${disabled ? 'disabled' : ''}" data-index="${i}">
         <div class="command-title">${cmd.title}</div>
         <div class="command-desc">${cmd.description}</div>
         ${cmd.shortcut ? `<div class="command-shortcut">${cmd.shortcut}</div>` : ''}
       </div>
-    `).join('');
+    `;
+    }).join('');
 
     this.list.querySelectorAll('.command-item').forEach((el, i) => {
-      el.addEventListener('click', () => this.executeIndex(i));
+      if (!this.isCommandDisabled(this.filteredCommands[i])) {
+        el.addEventListener('click', () => this.executeIndex(i));
+      }
       el.addEventListener('mouseenter', () => {
-        this.selectedIndex = i;
-        this.updateSelection();
+        if (!this.isCommandDisabled(this.filteredCommands[i])) {
+          this.selectedIndex = i;
+          this.updateSelection();
+        }
       });
     });
   }
@@ -148,17 +187,21 @@ export class CommandPalette {
     switch (e.key) {
       case 'ArrowDown':
         e.preventDefault();
-        this.selectedIndex = Math.min(this.selectedIndex + 1, this.filteredCommands.length - 1);
-        this.updateSelection();
+        if (this.selectedIndex < this.filteredCommands.length - 1) {
+          this.selectNextEnabled(this.selectedIndex + 1, 1);
+        }
         break;
       case 'ArrowUp':
         e.preventDefault();
-        this.selectedIndex = Math.max(this.selectedIndex - 1, 0);
-        this.updateSelection();
+        if (this.selectedIndex > 0) {
+          this.selectNextEnabled(this.selectedIndex - 1, -1);
+        }
         break;
       case 'Enter':
         e.preventDefault();
-        this.executeIndex(this.selectedIndex);
+        if (!this.isCommandDisabled(this.filteredCommands[this.selectedIndex])) {
+          this.executeIndex(this.selectedIndex);
+        }
         break;
       case 'Escape':
         e.preventDefault();

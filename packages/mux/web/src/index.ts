@@ -1900,7 +1900,7 @@ class App {
   }
 
   showCommandPalette(): void {
-    this.commandPalette.show();
+    this.commandPalette.show(this.tabs.size > 0, this.activePanel !== null);
   }
 
   showUploadDialog(): void {
