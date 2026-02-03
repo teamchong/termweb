@@ -799,6 +799,7 @@ export class Panel {
 
   // Decode a preview frame received via preview WebSocket
   decodePreviewFrame(frameData: Uint8Array): void {
+    console.log(`Panel ${this.serverId}: decodePreviewFrame, decoder configured=${this.decoderConfigured}, gotFirstKeyframe=${this.gotFirstKeyframe}`);
     this.handleFrame(frameData.buffer.slice(frameData.byteOffset, frameData.byteOffset + frameData.byteLength));
   }
 

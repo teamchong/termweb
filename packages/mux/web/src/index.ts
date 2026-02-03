@@ -1592,11 +1592,16 @@ class App {
       const frameData = new Uint8Array(event.data, 4);
 
       // Find the panel and decode frame to its canvas
+      let found = false;
       for (const [, panel] of this.panels) {
         if (panel.serverId === panelId) {
           panel.decodePreviewFrame(frameData);
+          found = true;
           break;
         }
+      }
+      if (!found) {
+        console.log(`Preview: no panel found for id ${panelId}, panels:`, Array.from(this.panels.values()).map(p => p.serverId));
       }
     };
 

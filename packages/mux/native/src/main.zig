@@ -3336,10 +3336,11 @@ const Server = struct {
 
         self.preview_connections.append(self.allocator, conn) catch {};
 
-        // Pause all panel streams when preview client connects (overview is open)
+        // Pause all panel streams and force keyframes for preview
         var panel_it = self.panels.valueIterator();
         while (panel_it.next()) |panel_ptr| {
             panel_ptr.*.streaming.store(false, .release);
+            panel_ptr.*.force_keyframe = true; // Ensure first preview frame has SPS/PPS
         }
 
         std.debug.print("Preview client connected, pausing panel streams\n", .{});
@@ -3379,6 +3380,8 @@ const Server = struct {
     // Send frame to all preview clients with panel_id prefix
     fn sendPreviewFrame(self: *Server, panel_id: u32, frame_data: []const u8) void {
         if (self.preview_connections.items.len == 0) return;
+
+        std.debug.print("Preview: sending frame for panel {} ({} bytes)\n", .{ panel_id, frame_data.len });
 
         // Build message: [panel_id (u32 LE), frame_data...]
         const msg_len = 4 + frame_data.len;
