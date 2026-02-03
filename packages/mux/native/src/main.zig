@@ -140,6 +140,9 @@ pub const BinaryCtrlMsg = enum(u8) {
     clipboard = 0x08,
     inspector_state = 0x09,
     panel_notification = 0x0D,
+    overview_state = 0x0E,  // Overview open/closed state
+    quick_terminal_state = 0x0F,  // Quick terminal open/closed state
+    inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
 
     // Auth/Session Server → Client (0x0A-0x0F)
     auth_state = 0x0A,      // Current auth state (role, sessions, tokens)
@@ -155,6 +158,9 @@ pub const BinaryCtrlMsg = enum(u8) {
     inspector_unsubscribe = 0x86,
     inspector_tab = 0x87,
     view_action = 0x88,
+    set_overview = 0x89,  // Set overview open/closed state
+    set_quick_terminal = 0x8A,  // Set quick terminal open/closed state
+    set_inspector = 0x8B,  // Set inspector open/closed state
 
     // Auth/Session Client → Server (0x90-0x9F)
     get_auth_state = 0x90,       // Request auth state
@@ -1445,6 +1451,9 @@ const Server = struct {
     inspector_subscriptions: std.ArrayList(InspectorSubscription),
     initial_cwd: []const u8,  // CWD where termweb was started
     initial_cwd_allocated: bool,  // Whether initial_cwd was allocated (vs static "/")
+    overview_open: bool,  // Whether tab overview is currently open
+    quick_terminal_open: bool,  // Whether quick terminal is open
+    inspector_open: bool,  // Whether inspector is open
 
     const InspectorSubscription = struct {
         conn: *ws.Connection,
@@ -1513,6 +1522,9 @@ const Server = struct {
             .inspector_subscriptions = .{},
             .initial_cwd = undefined,
             .initial_cwd_allocated = false,
+            .overview_open = false,
+            .quick_terminal_open = false,
+            .inspector_open = false,
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -1742,6 +1754,11 @@ const Server = struct {
 
         // Send current panel list
         self.sendPanelList(conn);
+
+        // Send UI states (for persistence across page reloads and shared sessions)
+        self.sendOverviewState(conn);
+        self.sendQuickTerminalState(conn);
+        self.sendInspectorOpenState(conn);
     }
 
     fn onControlMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
@@ -2094,6 +2111,25 @@ const Server = struct {
             } else {
                 self.mutex.unlock();
             }
+        } else if (msg_type == 0x89) { // set_overview
+            if (data.len < 2) return;
+            self.mutex.lock();
+            self.overview_open = data[1] != 0;
+            self.mutex.unlock();
+            // Broadcast to all control connections so other clients can sync
+            self.broadcastOverviewState();
+        } else if (msg_type == 0x8A) { // set_quick_terminal
+            if (data.len < 2) return;
+            self.mutex.lock();
+            self.quick_terminal_open = data[1] != 0;
+            self.mutex.unlock();
+            self.broadcastQuickTerminalState();
+        } else if (msg_type == 0x8B) { // set_inspector
+            if (data.len < 2) return;
+            self.mutex.lock();
+            self.inspector_open = data[1] != 0;
+            self.mutex.unlock();
+            self.broadcastInspectorOpenState();
         } else {
             std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type});
         }
@@ -2431,7 +2467,7 @@ const Server = struct {
             0x17 => self.handleBinaryFilePreview(conn, data[1..]),
             0x18 => self.handleBinaryFolderPreview(conn, data[1..]),
             // Client control messages
-            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88 => {
+            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B => {
                 self.handleBinaryControlMessageFromClient(conn, data);
             },
             else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
@@ -3216,6 +3252,78 @@ const Server = struct {
         self.mutex.unlock();
     }
 
+    fn broadcastOverviewState(self: *Server) void {
+        // Binary: [type:u8][open:u8] = 2 bytes
+        var buf: [2]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.overview_state);
+        buf[1] = if (self.overview_open) 1 else 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.control_connections.items) |conn| {
+            conn.sendBinary(&buf) catch {};
+        }
+    }
+
+    fn sendOverviewState(self: *Server, conn: *ws.Connection) void {
+        // Binary: [type:u8][open:u8] = 2 bytes
+        var buf: [2]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.overview_state);
+        self.mutex.lock();
+        buf[1] = if (self.overview_open) 1 else 0;
+        self.mutex.unlock();
+        conn.sendBinary(&buf) catch {};
+    }
+
+    fn broadcastQuickTerminalState(self: *Server) void {
+        // Binary: [type:u8][open:u8] = 2 bytes
+        var buf: [2]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.quick_terminal_state);
+        buf[1] = if (self.quick_terminal_open) 1 else 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.control_connections.items) |conn| {
+            conn.sendBinary(&buf) catch {};
+        }
+    }
+
+    fn sendQuickTerminalState(self: *Server, conn: *ws.Connection) void {
+        // Binary: [type:u8][open:u8] = 2 bytes
+        var buf: [2]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.quick_terminal_state);
+        self.mutex.lock();
+        buf[1] = if (self.quick_terminal_open) 1 else 0;
+        self.mutex.unlock();
+        conn.sendBinary(&buf) catch {};
+    }
+
+    fn broadcastInspectorOpenState(self: *Server) void {
+        // Binary: [type:u8][open:u8] = 2 bytes
+        var buf: [2]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state_open);
+        buf[1] = if (self.inspector_open) 1 else 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.control_connections.items) |conn| {
+            conn.sendBinary(&buf) catch {};
+        }
+    }
+
+    fn sendInspectorOpenState(self: *Server, conn: *ws.Connection) void {
+        // Binary: [type:u8][open:u8] = 2 bytes
+        var buf: [2]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state_open);
+        self.mutex.lock();
+        buf[1] = if (self.inspector_open) 1 else 0;
+        self.mutex.unlock();
+        conn.sendBinary(&buf) catch {};
+    }
+
     fn broadcastClipboard(self: *Server, text: []const u8) void {
         // Binary: [type:u8][data_len:u32][data...] = 5 + text.len bytes (raw UTF-8, no base64)
         const data_len: u32 = @intCast(@min(text.len, 16 * 1024 * 1024)); // Max 16MB
@@ -3340,17 +3448,20 @@ const Server = struct {
 
         self.preview_connections.append(self.allocator, conn) catch {};
 
-        // Pause all panel streams and force keyframes for preview
+        // Force keyframes for all panels for preview
+        // Don't pause panels - let them continue streaming (render loop handles both)
         var panel_it = self.panels.valueIterator();
         while (panel_it.next()) |panel_ptr| {
-            panel_ptr.*.streaming.store(false, .release);
-            panel_ptr.*.force_keyframe = true; // Ensure first preview frame has SPS/PPS
+            const panel = panel_ptr.*;
+            panel.force_keyframe = true; // Ensure first preview frame has SPS/PPS
+            // Skip the initial render delay for panels that have already been running
+            panel.ticks_since_connect = 100;
         }
 
         // Request immediate preview frames
         self.preview_needs_immediate_frame = true;
 
-        std.debug.print("Preview client connected, pausing panel streams\n", .{});
+        std.debug.print("Preview client connected\n", .{});
     }
 
     fn onPreviewMessage(_: *ws.Connection, _: []u8, _: bool) void {
@@ -3371,24 +3482,12 @@ const Server = struct {
             }
         }
 
-        // Resume panel streams if no more preview clients
-        if (self.preview_connections.items.len == 0) {
-            var panel_it = self.panels.valueIterator();
-            while (panel_it.next()) |panel_ptr| {
-                if (panel_ptr.*.connection != null) {
-                    panel_ptr.*.streaming.store(true, .release);
-                    panel_ptr.*.force_keyframe = true;
-                }
-            }
-            std.debug.print("Preview client disconnected, resuming panel streams\n", .{});
-        }
+        std.debug.print("Preview client disconnected\n", .{});
     }
 
     // Send frame to all preview clients with panel_id prefix
     fn sendPreviewFrame(self: *Server, panel_id: u32, frame_data: []const u8) void {
         if (self.preview_connections.items.len == 0) return;
-
-        std.debug.print("Preview: sending frame for panel {} ({} bytes)\n", .{ panel_id, frame_data.len });
 
         // Build message: [panel_id (u32 LE), frame_data...]
         const msg_len = 4 + frame_data.len;
@@ -3842,8 +3941,10 @@ const Server = struct {
                 self.mutex.lock();
                 const has_preview_clients = self.preview_connections.items.len > 0;
                 const needs_immediate = self.preview_needs_immediate_frame;
+                const num_panels = self.panels.count();
                 if (needs_immediate) {
                     self.preview_needs_immediate_frame = false;
+                    std.debug.print("Preview: needs_immediate triggered, has_clients={}, num_panels={}\n", .{ has_preview_clients, num_panels });
                 }
                 self.mutex.unlock();
 

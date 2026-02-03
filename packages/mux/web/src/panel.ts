@@ -754,6 +754,10 @@ export class Panel {
     }
   }
 
+  isInspectorOpen(): boolean {
+    return this.inspectorVisible;
+  }
+
   private showInspector(): void {
     this.inspectorVisible = true;
     if (this.inspectorEl) {

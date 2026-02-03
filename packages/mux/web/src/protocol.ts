@@ -33,6 +33,9 @@ export const BinaryCtrlMsg = {
   INSPECTOR_UNSUBSCRIBE: 0x86,
   INSPECTOR_TAB: 0x87,
   VIEW_ACTION: 0x88,
+  SET_OVERVIEW: 0x89,  // Set overview open/closed state
+  SET_QUICK_TERMINAL: 0x8A,  // Set quick terminal open/closed state
+  SET_INSPECTOR: 0x8B,  // Set inspector open/closed state
   // Auth messages
   GET_AUTH_STATE: 0x90,
   SET_PASSWORD: 0x91,
@@ -59,6 +62,13 @@ export const AuthResponseType = {
   AUTH_STATE: 0x0A,
   SESSION_LIST: 0x0B,
   SHARE_LINKS: 0x0C,
+} as const;
+
+// Server -> client control message types
+export const ServerCtrlMsg = {
+  OVERVIEW_STATE: 0x0E,  // Overview open/closed state
+  QUICK_TERMINAL_STATE: 0x0F,  // Quick terminal open/closed state
+  INSPECTOR_OPEN_STATE: 0x1E,  // Inspector open/closed state
 } as const;
 
 // Transfer protocol message types

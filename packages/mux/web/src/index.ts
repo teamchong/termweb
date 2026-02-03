@@ -67,6 +67,9 @@ class App {
   private previewWs: WebSocket | null = null;
   private previewDecoders: Map<number, VideoDecoder> = new Map();
   private previewCanvases: Map<number, HTMLCanvasElement> = new Map();
+  private overviewStateFromServer = false; // Flag to prevent feedback loop
+  private quickTerminalStateFromServer = false; // Flag to prevent feedback loop
+  private inspectorStateFromServer = false; // Flag to prevent feedback loop
 
   // Cleanup state
   private destroyed = false;
@@ -393,6 +396,24 @@ class App {
         const bodyLen = view.getUint16(6 + titleLen, true);
         const body = decoder.decode(bytes.slice(8 + titleLen, 8 + titleLen + bodyLen));
         this.handleNotification(panelId, title, body);
+        break;
+      }
+      case 0x0E: { // overview_state
+        // Format: [type:u8][open:u8]
+        const isOpen = view.getUint8(1) !== 0;
+        this.handleOverviewState(isOpen);
+        break;
+      }
+      case 0x0F: { // quick_terminal_state
+        // Format: [type:u8][open:u8]
+        const isOpen = view.getUint8(1) !== 0;
+        this.handleQuickTerminalState(isOpen);
+        break;
+      }
+      case 0x1E: { // inspector_open_state
+        // Format: [type:u8][open:u8]
+        const isOpen = view.getUint8(1) !== 0;
+        this.handleInspectorOpenState(isOpen);
         break;
       }
       case 0x12: // FILE_DATA (single file download response)
@@ -1507,6 +1528,11 @@ class App {
 
     overlay.classList.add('visible');
 
+    // Notify server of overview state (unless triggered by server)
+    if (!this.overviewStateFromServer) {
+      this.sendOverviewState(true);
+    }
+
     // Connect preview WebSocket for live thumbnails
     this.connectPreviewWs();
 
@@ -1546,6 +1572,11 @@ class App {
   }
 
   hideTabOverview(): void {
+    // Notify server of overview state (unless triggered by server)
+    if (!this.overviewStateFromServer) {
+      this.sendOverviewState(false);
+    }
+
     // Disconnect preview WebSocket
     this.disconnectPreviewWs();
 
@@ -1731,6 +1762,85 @@ class App {
       view.setUint8(5, actionBytes.length);
       new Uint8Array(buf, 6).set(actionBytes);
       this.controlWs.send(buf);
+    }
+  }
+
+  private sendOverviewState(isOpen: boolean): void {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const buf = new ArrayBuffer(2);
+      const view = new DataView(buf);
+      view.setUint8(0, 0x89); // set_overview
+      view.setUint8(1, isOpen ? 1 : 0);
+      this.controlWs.send(buf);
+    }
+  }
+
+  private handleOverviewState(isOpen: boolean): void {
+    // Check if the overview is already in the correct state
+    const overlay = document.getElementById('tab-overview');
+    const isCurrentlyOpen = overlay?.classList.contains('visible') ?? false;
+    if (isOpen === isCurrentlyOpen) return;
+
+    // Set flag to prevent sending state back to server
+    this.overviewStateFromServer = true;
+    try {
+      if (isOpen) {
+        this.showTabOverview();
+      } else {
+        this.hideTabOverview();
+      }
+    } finally {
+      this.overviewStateFromServer = false;
+    }
+  }
+
+  private sendQuickTerminalState(isOpen: boolean): void {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const buf = new ArrayBuffer(2);
+      const view = new DataView(buf);
+      view.setUint8(0, 0x8A); // set_quick_terminal
+      view.setUint8(1, isOpen ? 1 : 0);
+      this.controlWs.send(buf);
+    }
+  }
+
+  private handleQuickTerminalState(isOpen: boolean): void {
+    const container = document.getElementById('quick-terminal');
+    const isCurrentlyOpen = container?.classList.contains('visible') ?? false;
+    if (isOpen === isCurrentlyOpen) return;
+
+    // Set flag to prevent sending state back to server
+    this.quickTerminalStateFromServer = true;
+    try {
+      this.toggleQuickTerminal();
+    } finally {
+      this.quickTerminalStateFromServer = false;
+    }
+  }
+
+  private sendInspectorState(isOpen: boolean): void {
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      const buf = new ArrayBuffer(2);
+      const view = new DataView(buf);
+      view.setUint8(0, 0x8B); // set_inspector
+      view.setUint8(1, isOpen ? 1 : 0);
+      this.controlWs.send(buf);
+    }
+  }
+
+  private handleInspectorOpenState(isOpen: boolean): void {
+    // Toggle inspector on active panel
+    if (!this.activePanel) return;
+
+    const isCurrentlyOpen = this.activePanel.isInspectorOpen();
+    if (isOpen === isCurrentlyOpen) return;
+
+    // Set flag to prevent sending state back to server
+    this.inspectorStateFromServer = true;
+    try {
+      this.activePanel.toggleInspector();
+    } finally {
+      this.inspectorStateFromServer = false;
     }
   }
 
@@ -2182,11 +2292,17 @@ class App {
 
   private toggleInspector(): void {
     this.activePanel?.toggleInspector();
+    // Notify server of inspector state (unless triggered by server)
+    if (!this.inspectorStateFromServer && this.activePanel) {
+      this.sendInspectorState(this.activePanel.isInspectorOpen());
+    }
   }
 
   toggleQuickTerminal(): void {
     const container = document.getElementById('quick-terminal');
     if (!container) return;
+
+    const willBeOpen = !container.classList.contains('visible');
 
     if (container.classList.contains('visible')) {
       container.classList.remove('visible');
@@ -2197,6 +2313,7 @@ class App {
     } else {
       container.classList.add('visible');
       this.previousActivePanel = this.activePanel;
+      // Quick terminal runs in parallel with active panel - don't pause it
       if (!this.quickTerminalPanel) {
         const content = container.querySelector('.quick-terminal-content');
         if (content) {
@@ -2209,6 +2326,11 @@ class App {
       if (this.quickTerminalPanel) {
         this.setActivePanel(this.quickTerminalPanel);
       }
+    }
+
+    // Notify server of quick terminal state (unless triggered by server)
+    if (!this.quickTerminalStateFromServer) {
+      this.sendQuickTerminalState(willBeOpen);
     }
   }
 

@@ -1,7 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const net = std.net;
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
+
+// Set socket read timeout for blocking I/O with periodic wakeup
+fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
+    const tv = posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+}
 
 // Platform detection
 const is_macos = builtin.os.tag == .macos;
@@ -128,6 +138,9 @@ pub const HttpServer = struct {
     }
 
     fn handleConnection(self: *HttpServer, stream: net.Stream) void {
+        // Set read timeout so we don't block forever during shutdown
+        setReadTimeout(stream.handle, 1000); // 1 second timeout
+
         var buf: [4096]u8 = undefined;
         const n = stream.read(&buf) catch {
             stream.close();
