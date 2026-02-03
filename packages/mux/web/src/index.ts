@@ -2305,14 +2305,36 @@ class App {
     const willBeOpen = !container.classList.contains('visible');
 
     if (container.classList.contains('visible')) {
+      // Closing quick terminal
       container.classList.remove('visible');
+
+      // Remove active/focused from quick terminal panel
+      if (this.quickTerminalPanel) {
+        this.quickTerminalPanel.element.classList.remove('active', 'focused');
+      }
+
+      // Restore focus to previous panel (it already has 'active' class)
       if (this.previousActivePanel) {
-        this.setActivePanel(this.previousActivePanel);
+        this.previousActivePanel.element.classList.add('focused');
+        this.previousActivePanel.focus();
+        this.activePanel = this.previousActivePanel;
+        if (this.previousActivePanel.serverId !== null) {
+          this.sendFocusPanel(this.previousActivePanel.serverId);
+        }
+        this.updateTitleForPanel(this.previousActivePanel);
         this.previousActivePanel = null;
       }
+      this.updateMenuState();
     } else {
+      // Opening quick terminal
       container.classList.add('visible');
       this.previousActivePanel = this.activePanel;
+
+      // Keep previous panel visible (keep 'active' class), only remove 'focused'
+      if (this.activePanel) {
+        this.activePanel.element.classList.remove('focused');
+      }
+
       // Quick terminal runs in parallel with active panel - don't pause it
       if (!this.quickTerminalPanel) {
         const content = container.querySelector('.quick-terminal-content');
@@ -2323,9 +2345,18 @@ class App {
           this.quickTerminalPanel = this.createPanel(content as HTMLElement, null, inheritCwdFrom);
         }
       }
+
+      // Focus quick terminal without hiding previous panel
       if (this.quickTerminalPanel) {
-        this.setActivePanel(this.quickTerminalPanel);
+        this.quickTerminalPanel.element.classList.add('active', 'focused');
+        this.quickTerminalPanel.focus();
+        this.activePanel = this.quickTerminalPanel;
+        if (this.quickTerminalPanel.serverId !== null) {
+          this.sendFocusPanel(this.quickTerminalPanel.serverId);
+        }
+        this.updateTitleForPanel(this.quickTerminalPanel);
       }
+      this.updateMenuState();
     }
 
     // Notify server of quick terminal state (unless triggered by server)
