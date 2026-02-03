@@ -797,6 +797,11 @@ export class Panel {
     }
   }
 
+  // Decode a preview frame received via preview WebSocket
+  decodePreviewFrame(frameData: Uint8Array): void {
+    this.handleFrame(frameData.buffer.slice(frameData.byteOffset, frameData.byteOffset + frameData.byteLength));
+  }
+
   handleInspectorState(state: unknown): void {
     if (state && typeof state === 'object') {
       this.inspectorState = state as Record<string, number>;

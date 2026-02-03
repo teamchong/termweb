@@ -50,6 +50,7 @@ pub const HttpServer = struct {
     panel_ws_callback: ?WsUpgradeCallback = null,
     control_ws_callback: ?WsUpgradeCallback = null,
     file_ws_callback: ?WsUpgradeCallback = null,
+    preview_ws_callback: ?WsUpgradeCallback = null,
     ws_user_data: ?*anyopaque = null,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16, ghostty_config: ?c.ghostty_config_t) !*HttpServer {
@@ -85,11 +86,13 @@ pub const HttpServer = struct {
         panel_cb: ?WsUpgradeCallback,
         control_cb: ?WsUpgradeCallback,
         file_cb: ?WsUpgradeCallback,
+        preview_cb: ?WsUpgradeCallback,
         user_data: ?*anyopaque,
     ) void {
         self.panel_ws_callback = panel_cb;
         self.control_ws_callback = control_cb;
         self.file_ws_callback = file_cb;
+        self.preview_ws_callback = preview_cb;
         self.ws_user_data = user_data;
     }
 
@@ -189,6 +192,11 @@ pub const HttpServer = struct {
                 }
             } else if (std.mem.eql(u8, path, "/ws/file")) {
                 if (self.file_ws_callback) |cb| {
+                    cb(stream, request, self.ws_user_data);
+                    return;
+                }
+            } else if (std.mem.eql(u8, path, "/ws/preview")) {
+                if (self.preview_ws_callback) |cb| {
                     cb(stream, request, self.ws_user_data);
                     return;
                 }

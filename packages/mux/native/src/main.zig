@@ -1431,6 +1431,8 @@ const Server = struct {
     panel_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
     file_ws_server: *ws.Server,
+    preview_ws_server: *ws.Server,
+    preview_connections: std.ArrayList(*ws.Connection),
     http_server: *http.HttpServer,
     auth_state: *auth.AuthState,  // Session and access control
     transfer_manager: transfer.TransferManager,
@@ -1473,6 +1475,10 @@ const Server = struct {
         const file_ws = try ws.Server.init(allocator, "0.0.0.0", 0);
         file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
 
+        // Create preview WebSocket server (for tab overview thumbnails - no deflate, video is pre-compressed)
+        const preview_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", 0);
+        preview_ws.setCallbacks(onPreviewConnect, onPreviewMessage, onPreviewDisconnect);
+
         // Initialize auth state
         const auth_state = try auth.AuthState.init(allocator);
 
@@ -1493,6 +1499,8 @@ const Server = struct {
             .panel_ws_server = panel_ws,
             .control_ws_server = control_ws,
             .file_ws_server = file_ws,
+            .preview_ws_server = preview_ws,
+            .preview_connections = .{},
             .auth_state = auth_state,
             .transfer_manager = transfer.TransferManager.init(allocator),
             .file_connections = .{},
@@ -3318,6 +3326,74 @@ const Server = struct {
         std.debug.print("File transfer client disconnected\n", .{});
     }
 
+    // ========== Preview WebSocket callbacks ==========
+
+    fn onPreviewConnect(conn: *ws.Connection) void {
+        const self = global_server orelse return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.preview_connections.append(self.allocator, conn) catch {};
+
+        // Pause all panel streams when preview client connects (overview is open)
+        var panel_it = self.panels.valueIterator();
+        while (panel_it.next()) |panel_ptr| {
+            panel_ptr.*.streaming.store(false, .release);
+        }
+
+        std.debug.print("Preview client connected, pausing panel streams\n", .{});
+    }
+
+    fn onPreviewMessage(_: *ws.Connection, _: []u8, _: bool) void {
+        // Preview is one-way server->client, no messages expected
+    }
+
+    fn onPreviewDisconnect(conn: *ws.Connection) void {
+        const self = global_server orelse return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Remove from preview connections
+        for (self.preview_connections.items, 0..) |pc, i| {
+            if (pc == conn) {
+                _ = self.preview_connections.orderedRemove(i);
+                break;
+            }
+        }
+
+        // Resume panel streams if no more preview clients
+        if (self.preview_connections.items.len == 0) {
+            var panel_it = self.panels.valueIterator();
+            while (panel_it.next()) |panel_ptr| {
+                if (panel_ptr.*.connection != null) {
+                    panel_ptr.*.streaming.store(true, .release);
+                    panel_ptr.*.force_keyframe = true;
+                }
+            }
+            std.debug.print("Preview client disconnected, resuming panel streams\n", .{});
+        }
+    }
+
+    // Send frame to all preview clients with panel_id prefix
+    fn sendPreviewFrame(self: *Server, panel_id: u32, frame_data: []const u8) void {
+        if (self.preview_connections.items.len == 0) return;
+
+        // Build message: [panel_id (u32 LE), frame_data...]
+        const msg_len = 4 + frame_data.len;
+        const msg = self.allocator.alloc(u8, msg_len) catch return;
+        defer self.allocator.free(msg);
+
+        std.mem.writeInt(u32, msg[0..4], panel_id, .little);
+        @memcpy(msg[4..], frame_data);
+
+        // Send to all preview clients
+        for (self.preview_connections.items) |conn| {
+            conn.sendBinary(msg) catch {};
+        }
+    }
+
     // Handle TRANSFER_INIT message
     fn handleTransferInit(self: *Server, conn: *ws.Connection, data: []u8) void {
         var init_data = transfer.parseTransferInit(self.allocator, data) catch |err| {
@@ -3752,6 +3828,14 @@ const Server = struct {
 
                 frame_blocks += 1;
 
+                // Check if we have preview clients (overview mode)
+                self.mutex.lock();
+                const has_preview_clients = self.preview_connections.items.len > 0;
+                self.mutex.unlock();
+
+                // Send preview every 6th frame (5fps at 30fps base)
+                const send_preview = has_preview_clients and (frame_blocks % 6 == 0);
+
                 // Tick ghostty to render content to IOSurface
                 self.tick();
 
@@ -3763,7 +3847,10 @@ const Server = struct {
                 panel_it = self.panels.valueIterator();
                 while (panel_it.next()) |panel_ptr| {
                     const panel = panel_ptr.*;
-                    if (!panel.streaming.load(.acquire)) continue;
+
+                    // Skip if not streaming AND no preview needed
+                    const is_streaming = panel.streaming.load(.acquire);
+                    if (!is_streaming and !send_preview) continue;
 
                     frames_attempted += 1;
 
@@ -3775,15 +3862,15 @@ const Server = struct {
                     panel.tick();
 
                     // Platform-specific frame capture
+                    var frame_data: ?[]const u8 = null;
+
                     if (comptime is_macos) {
                         if (panel.getIOSurface()) |iosurface| {
                             // BGRA copy path - faster than direct IOSurface encoding
-                            // (VideoToolbox has overhead reading from GPU memory)
                             _ = panel.captureFromIOSurface(iosurface) catch continue;
 
                             if (panel.prepareFrame() catch null) |result| {
-                                panel.sendFrame(result.data) catch {};
-                                frames_sent += 1;
+                                frame_data = result.data;
                             }
                         }
                     } else if (comptime is_linux) {
@@ -3816,18 +3903,28 @@ const Server = struct {
                         }
 
                         // Wait a few frames for ghostty to render initial content
-                        // This prevents blank frames on first connection
                         if (panel.ticks_since_connect < 3) continue;
 
-                        // Read pixels from OpenGL framebuffer (RGBA from glReadPixels)
+                        // Read pixels from OpenGL framebuffer
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
                         if (read_ok) {
-                            // Encode RGBA to H.264 (VA-API on Linux, VideoToolbox on macOS)
                             if (panel.video_encoder.?.encode(panel.bgra_buffer.?, panel.force_keyframe) catch null) |result| {
-                                panel.sendFrame(result.data) catch {};
+                                frame_data = result.data;
                                 panel.force_keyframe = false;
-                                frames_sent += 1;
                             }
+                        }
+                    }
+
+                    // Send frame to panel connection (if streaming)
+                    if (frame_data) |data| {
+                        if (is_streaming) {
+                            panel.sendFrame(data) catch {};
+                            frames_sent += 1;
+                        }
+
+                        // Send to preview clients (if any)
+                        if (send_preview) {
+                            self.sendPreviewFrame(panel.id, data);
                         }
                     }
                 }
@@ -4287,6 +4384,7 @@ fn handleSigint(_: c_int) callconv(.c) void {
         server.panel_ws_server.stop();
         server.control_ws_server.stop();
         server.file_ws_server.stop();
+        server.preview_ws_server.stop();
     }
     std.debug.print("\nShutting down...\n", .{});
 }
@@ -4305,6 +4403,11 @@ fn onControlWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*
 fn onFileWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
     const server: *Server = @ptrCast(@alignCast(user_data orelse return));
     server.file_ws_server.handleUpgrade(stream, request);
+}
+
+fn onPreviewWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
+    const server: *Server = @ptrCast(@alignCast(user_data orelse return));
+    server.preview_ws_server.handleUpgrade(stream, request);
 }
 
 /// Run mux server - can be called from CLI or standalone
@@ -4329,6 +4432,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16) !void {
         onPanelWsUpgrade,
         onControlWsUpgrade,
         onFileWsUpgrade,
+        onPreviewWsUpgrade,
         server,
     );
 

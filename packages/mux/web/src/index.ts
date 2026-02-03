@@ -64,6 +64,9 @@ class App {
   // Tab overview state
   private tabOverviewTabs: Array<{ tabId: string; tab: TabInfo; element: HTMLElement }> | null = null;
   private tabOverviewCloseHandler: ((e: KeyboardEvent | MouseEvent) => void) | null = null;
+  private previewWs: WebSocket | null = null;
+  private previewDecoders: Map<number, VideoDecoder> = new Map();
+  private previewCanvases: Map<number, HTMLCanvasElement> = new Map();
 
   // Cleanup state
   private destroyed = false;
@@ -1504,6 +1507,9 @@ class App {
 
     overlay.classList.add('visible');
 
+    // Connect preview WebSocket for live thumbnails
+    this.connectPreviewWs();
+
     // Clean up any existing handlers before adding new ones
     if (this.tabOverviewCloseHandler) {
       document.removeEventListener('keydown', this.tabOverviewCloseHandler);
@@ -1540,6 +1546,9 @@ class App {
   }
 
   hideTabOverview(): void {
+    // Disconnect preview WebSocket
+    this.disconnectPreviewWs();
+
     this.restoreTabsFromOverview();
 
     const overlay = document.getElementById('tab-overview');
@@ -1566,6 +1575,41 @@ class App {
     }
 
     this.activePanel?.focus();
+  }
+
+  private connectPreviewWs(): void {
+    if (this.previewWs) return;
+
+    const wsUrl = getWsUrl('/ws/preview');
+    this.previewWs = new WebSocket(wsUrl);
+    this.previewWs.binaryType = 'arraybuffer';
+
+    this.previewWs.onmessage = (event) => {
+      if (!(event.data instanceof ArrayBuffer) || event.data.byteLength < 5) return;
+
+      const view = new DataView(event.data);
+      const panelId = view.getUint32(0, true);
+      const frameData = new Uint8Array(event.data, 4);
+
+      // Find the panel and decode frame to its canvas
+      for (const [, panel] of this.panels) {
+        if (panel.serverId === panelId) {
+          panel.decodePreviewFrame(frameData);
+          break;
+        }
+      }
+    };
+
+    this.previewWs.onerror = (e) => {
+      console.error('Preview WebSocket error:', e);
+    };
+  }
+
+  private disconnectPreviewWs(): void {
+    if (this.previewWs) {
+      this.previewWs.close();
+      this.previewWs = null;
+    }
   }
 
   // ============================================================================
