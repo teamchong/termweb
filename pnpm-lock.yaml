@@ -1,0 +1,29 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+pnpmfileChecksum: sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+
+importers:
+
+  .: {}
+
+  packages/code:
+    dependencies:
+      termweb:
+        specifier: workspace:*
+        version: link:../..
+
+  packages/json:
+    dependencies:
+      termweb:
+        specifier: workspace:*
+        version: link:../..
+
+  packages/markdown:
+    dependencies:
+      termweb:
+        specifier: workspace:*
+        version: link:../..

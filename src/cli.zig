@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const config = @import("config.zig").Config;
 
@@ -10,6 +11,12 @@ const terminal_mod = @import("terminal/terminal.zig");
 const viewer_mod = @import("viewer.zig");
 const toolbar_mod = @import("ui/toolbar.zig");
 const helpers = @import("viewer/helpers.zig");
+
+// Mux module (only available on macOS/Linux)
+const mux = if (builtin.os.tag == .macos or builtin.os.tag == .linux)
+    @import("mux")
+else
+    @compileError("mux not available on this platform");
 
 /// Version from package.json (single source of truth)
 const VERSION = build_options.version;
@@ -413,34 +420,22 @@ fn printHelp() void {
 }
 
 fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    // Find hidden mux binary in same directory as termweb
-    var self_path_buf: [4096]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_path_buf) catch |err| {
-        std.debug.print("Error getting self path: {}\n", .{err});
-        std.process.exit(1);
-    };
+    // Parse port from args (default 8080)
+    var http_port: u16 = 8080;
 
-    // Look for .termweb-mux (hidden binary)
-    var mux_path_buf: [4096]u8 = undefined;
-    const dir_end = std.mem.lastIndexOf(u8, self_path, "/") orelse 0;
-    const mux_path = std.fmt.bufPrint(&mux_path_buf, "{s}/.termweb-mux", .{self_path[0..dir_end]}) catch {
-        std.debug.print("Path too long\n", .{});
-        std.process.exit(1);
-    };
-
-    // Build argv: .termweb-mux + remaining args (skip "termweb" and "mux")
-    var argv: std.ArrayListUnmanaged([]const u8) = .{};
-    defer argv.deinit(allocator);
-    try argv.append(allocator, mux_path);
-    if (args.len > 2) {
-        for (args[2..]) |arg| {
-            try argv.append(allocator, arg);
+    // Skip "termweb" and "mux" args
+    const mux_args = if (args.len > 2) args[2..] else &[_][]const u8{};
+    var i: usize = 0;
+    while (i < mux_args.len) : (i += 1) {
+        const arg = mux_args[i];
+        if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
+            if (i + 1 < mux_args.len) {
+                http_port = std.fmt.parseInt(u16, mux_args[i + 1], 10) catch 8080;
+                i += 1;
+            }
         }
     }
 
-    // Execute mux binary (doesn't return on success)
-    const err = std.process.execv(allocator, argv.items);
-    std.debug.print("Failed to start mux server: {}\n", .{err});
-    std.debug.print("Run 'make' to build the mux component\n", .{});
-    std.process.exit(1);
+    // Run mux server directly (integrated into termweb binary)
+    try mux.run(allocator, http_port);
 }

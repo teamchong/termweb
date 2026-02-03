@@ -10,7 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const simd = @import("../simd/dispatch.zig");
-const simd_mask = @import("../simd/mask.zig");
+const simd_mask = @import("simd_mask");
 const FramePool = @import("../simd/frame_pool.zig").FramePool;
 const FrameSlot = @import("../simd/frame_pool.zig").FrameSlot;
 
