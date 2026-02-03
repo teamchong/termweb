@@ -112,6 +112,9 @@ class App {
     // Setup menus
     this.setupMenus();
 
+    // Update menu state (disable items that require tabs on initial load)
+    this.updateMenuState();
+
     // Setup iOS accessory bar
     this.setupAccessoryBar();
 
@@ -588,6 +591,8 @@ class App {
       // Reset title to ghost emoji (empty state)
       const appTitle = document.getElementById('app-title');
       if (appTitle) appTitle.textContent = '👻';
+
+      this.updateMenuState();
     }
     // Non-empty layouts are ignored - client manages its own state
   }
@@ -894,6 +899,7 @@ class App {
 
     this.addTabUI(tabId, tabTitle);
     this.switchToTab(tabId);
+    this.updateMenuState();
     return tabId;
   }
 
@@ -940,6 +946,8 @@ class App {
 
       this.updateTitleForPanel(panel);
     }
+
+    this.updateMenuState();
   }
 
   switchToTab(tabId: string): void {
@@ -1046,6 +1054,8 @@ class App {
       const appTitle = document.getElementById('app-title');
       if (appTitle) appTitle.textContent = '👻';
     }
+
+    this.updateMenuState();
   }
 
   closeActivePanel(): void {
@@ -2424,6 +2434,44 @@ class App {
     const hasSplits = panelCount > 1;
     document.querySelectorAll('.split-menu-item').forEach(item => {
       item.classList.toggle('visible', hasSplits);
+    });
+  }
+
+  // Update menu item enabled/disabled state based on current tabs
+  private updateMenuState(): void {
+    const hasTabs = this.tabs.size > 0;
+    const hasActivePanel = this.activePanel !== null;
+
+    // Actions that require at least one tab
+    const requiresTab = [
+      'close-tab', 'close-all-tabs', 'show-all-tabs',
+      'previous-tab', 'next-tab', 'change-title'
+    ];
+
+    // Actions that require an active panel
+    const requiresPanel = [
+      'upload', 'download',
+      'split-right', 'split-down', 'split-left', 'split-up',
+      'copy', 'paste', 'paste-selection', 'select-all',
+      'zoom-in', 'zoom-out', 'zoom-reset',
+      'toggle-inspector',
+      'zoom-split', 'previous-split', 'next-split',
+      'select-split-above', 'select-split-below', 'select-split-left', 'select-split-right',
+      'equalize-splits', 'resize-split-up', 'resize-split-down', 'resize-split-left', 'resize-split-right'
+    ];
+
+    document.querySelectorAll('.menu-item[data-action]').forEach(item => {
+      const action = (item as HTMLElement).dataset.action;
+      if (!action) return;
+
+      let disabled = false;
+      if (requiresTab.includes(action)) {
+        disabled = !hasTabs;
+      } else if (requiresPanel.includes(action)) {
+        disabled = !hasActivePanel;
+      }
+
+      item.classList.toggle('disabled', disabled);
     });
   }
 

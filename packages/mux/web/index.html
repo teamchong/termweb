@@ -260,8 +260,13 @@
     .menu-text {
       flex: 1;
     }
-    .menu-item:hover {
+    .menu-item:hover:not(.disabled) {
       background: var(--tab-hover);
+    }
+    .menu-item.disabled {
+      opacity: 0.4;
+      cursor: default;
+      pointer-events: none;
     }
     .menu-separator {
       height: 1px;
