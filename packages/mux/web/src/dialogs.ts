@@ -49,7 +49,6 @@ const cachedCommands: Command[] = [
   { title: 'Move Tab Left', action: 'move_tab:-1', description: 'Move current tab left', requiresTab: true },
   { title: 'Move Tab Right', action: 'move_tab:1', description: 'Move current tab right', requiresTab: true },
   { title: 'New Tab', action: '_new_tab', description: 'Open a new tab', shortcut: '⌘/' },
-  { title: 'New Window', action: 'new_window', description: 'Open a new window', shortcut: '⌘N' },
   { title: 'Close All Tabs', action: '_close_all_tabs', description: 'Close all tabs', requiresTab: true },
   { title: 'Close Other Tabs', action: '_close_other_tabs', description: 'Close all other tabs', requiresTab: true },
   { title: 'Close Tab', action: '_close_tab', description: 'Close current tab', shortcut: '⌘.', requiresTab: true },
@@ -75,16 +74,12 @@ const cachedCommands: Command[] = [
   { title: 'Redo', action: 'redo', description: 'Redo last action', requiresPanel: true },
   { title: 'Undo', action: 'undo', description: 'Undo last action', requiresPanel: true },
   { title: 'Reset Terminal', action: 'reset', description: 'Reset terminal state', requiresPanel: true },
-  { title: 'Reset Window Size', action: 'reset_window_size', description: 'Reset window to default size' },
-  { title: 'Toggle Float on Top', action: 'toggle_window_float_on_top', description: 'Toggle window float on top' },
   { title: 'Toggle Fullscreen', action: 'toggle_fullscreen', description: 'Toggle fullscreen mode', shortcut: '⌃⌘F' },
-  { title: 'Toggle Maximize', action: 'toggle_maximize', description: 'Toggle window maximize' },
   { title: 'Toggle Secure Input', action: 'toggle_secure_input', description: 'Toggle secure input mode' },
   { title: 'Toggle Read-Only Mode', action: 'toggle_readonly', description: 'Toggle read-only mode', requiresPanel: true },
 
   // Config
   { title: 'Open Config', action: 'open_config', description: 'Open config file in editor', shortcut: '⌘,' },
-  { title: 'Quit', action: 'quit', description: 'Quit application', shortcut: '⌘Q' },
   { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration', shortcut: '⇧⌘,' },
   { title: 'Toggle Inspector', action: '_toggle_inspector', description: 'Toggle terminal inspector', shortcut: '⌥⌘I', requiresPanel: true },
 

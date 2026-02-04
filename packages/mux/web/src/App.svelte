@@ -54,8 +54,11 @@
     { label: 'Close All Tabs', action: '_close_all_tabs', shortcut: '⌘⇧.', icon: '⊠', disabled: !hasTabs },
   ]);
 
-  // Edit menu: Copy, Paste, Select All
+  // Edit menu: Undo/Redo, Copy, Paste, Select All
   let editMenuItems = $derived<MenuItem[]>([
+    { label: 'Undo', action: 'undo', icon: '↩', disabled: !hasTabs },
+    { label: 'Redo', action: 'redo', icon: '↪', disabled: !hasTabs },
+    { separator: true },
     { label: 'Copy', action: 'copy', shortcut: '⌘C', icon: '⧉', disabled: !hasTabs },
     { label: 'Paste', action: 'paste', shortcut: '⌘V', icon: '📋', disabled: !hasTabs },
     { label: 'Paste Selection', action: 'paste-selection', shortcut: '⌘⇧V', icon: '📄', disabled: !hasTabs },
