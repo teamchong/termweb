@@ -41,10 +41,10 @@ index 3d3973084..e04c2fabe 100644
  void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..51043b76b
+index 000000000..143881d86
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,679 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
@@ -234,19 +234,53 @@ index 000000000..51043b76b
 +        const expected_size = @as(usize, width) * @as(usize, height) * 4;
 +        if (dest_len < expected_size) return false;
 +
-+        // Resize PBOs if needed - resize() calls init() which sets is_primed = false
-+        if (self.pbos[0] == 0 or self.width != width or self.height != height) {
-+            if (!self.resize(width, height)) return false;
-+        }
-+
++        const genBuffers = gl.glad.context.GenBuffers orelse return false;
++        const deleteBuffers = gl.glad.context.DeleteBuffers orelse return false;
 +        const bindBuffer = gl.glad.context.BindBuffer orelse return false;
++        const bufferData = gl.glad.context.BufferData orelse return false;
 +        const glReadPixels = gl.glad.context.ReadPixels orelse return false;
 +        const pixelStorei = gl.glad.context.PixelStorei orelse return false;
++
++        // HARD RESET: If dimensions changed, completely destroy and recreate PBOs
++        // This is CRITICAL - reusing wrong-sized PBOs causes stride corruption
++        if (self.width != width or self.height != height or self.pbos[0] == 0) {
++            log.info("PBO hard reset: {}x{} -> {}x{}", .{ self.width, self.height, width, height });
++
++            // 1. Delete old buffers (if any)
++            if (self.pbos[0] != 0) {
++                deleteBuffers(2, &self.pbos);
++                self.pbos = .{ 0, 0 };
++            }
++
++            // 2. Generate new buffers
++            genBuffers(2, &self.pbos);
++
++            // 3. Allocate storage for BOTH ping-pong buffers with new size
++            const new_size: isize = @intCast(width * height * 4);
++            bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[0]);
++            bufferData(GL_PIXEL_PACK_BUFFER, new_size, null, GL_STREAM_READ);
++            bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[1]);
++            bufferData(GL_PIXEL_PACK_BUFFER, new_size, null, GL_STREAM_READ);
++            bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++
++            // 4. Update state
++            self.width = width;
++            self.height = height;
++            self.buffer_size = @intCast(new_size);
++            self.write_index = 0;
++            self.is_primed = false; // CRITICAL: Force sync read for this frame!
++
++            log.info("PBO allocated: 2x {}x{} ({} bytes each)", .{ width, height, new_size });
++
++            // 5. CRITICAL: Return false immediately after reset!
++            // We just allocated new buffers - both are empty/uninitialized.
++            // Force sync fallback for this frame. Next frame we'll write to buffer[0].
++            return false;
++        }
 +
 +        // CRITICAL: Force exact row length to prevent GPU padding
 +        // GL_PACK_ROW_LENGTH tells driver: row length in memory == image width (no padding)
 +        // GL_PACK_ALIGNMENT = 1 ensures no byte alignment padding
-+        // Without these, GPU may add padding causing stride mismatch (vertical stripes)
 +        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(width));
 +        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
 +
@@ -259,7 +293,7 @@ index 000000000..51043b76b
 +        bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[self.write_index]);
 +        glReadPixels(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, null);
 +
-+        // Reset row length to default (0 = use width parameter from glReadPixels)
++        // Reset row length to default
 +        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0);
 +
 +        // If not primed, we just started the first write - cannot read yet
@@ -273,7 +307,16 @@ index 000000000..51043b76b
 +
 +        // Read from the OTHER buffer (the one we wrote to LAST frame)
 +        const read_index: u1 = self.write_index +% 1;
++
++        // CRITICAL: Ensure the async write from last frame is complete before mapping
++        if (gl.glad.context.Finish) |glFinish| {
++            glFinish();
++        }
++
 +        bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[read_index]);
++
++        // Ensure GL_PACK_ROW_LENGTH is set before mapping (some drivers need this)
++        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(self.width));
 +
 +        const mapped_ptr: ?[*]const u8 = blk: {
 +            // Try MapBufferRange first (more control), fall back to MapBuffer
@@ -286,17 +329,23 @@ index 000000000..51043b76b
 +        };
 +
 +        if (mapped_ptr == null) {
++            log.warn("PBO map failed for FBO read", .{});
 +            bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 +            return false;
 +        }
 +
-+        // Copy with vertical flip (OpenGL origin is bottom-left)
-+        const row_size = width * 4;
++        // Simple row-by-row copy with vertical flip
++        // MUST use self.width (the width at write time) for source offsets
++        // and width (current) for destination - but they should match after hard reset
++        const row_bytes = self.width * 4;
++        const src_ptr = mapped_ptr.?;
 +        var y: u32 = 0;
-+        while (y < height) : (y += 1) {
-+            const src_row = (height - 1 - y) * row_size; // Bottom-to-top
-+            const dst_row = y * row_size; // Top-to-bottom
-+            @memcpy(dest_buffer[dst_row..][0..row_size], mapped_ptr.?[src_row..][0..row_size]);
++        while (y < self.height) : (y += 1) {
++            // Source: Read from PBO top-to-bottom
++            const src_offset = y * row_bytes;
++            // Dest: Write flipped (bottom-to-top becomes top-to-bottom)
++            const dst_offset = (self.height - 1 - y) * row_bytes;
++            @memcpy(dest_buffer[dst_offset..][0..row_bytes], src_ptr[src_offset..][0..row_bytes]);
 +        }
 +
 +        // Unmap and unbind
@@ -304,6 +353,9 @@ index 000000000..51043b76b
 +            _ = unmapBuf(GL_PIXEL_PACK_BUFFER);
 +        }
 +        bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++
++        // Reset row length
++        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0);
 +
 +        // Swap write index for next frame
 +        self.write_index +%= 1;
@@ -326,11 +378,27 @@ index 000000000..51043b76b
 +
 +    entries: [MAX_SURFACES]Entry = [_]Entry{.{}} ** MAX_SURFACES,
 +
-+    /// Get or create PBO state for a given FBO ID
-+    pub fn getOrCreate(self: *PboStateManager, fbo_id: c_uint) ?*PboState {
++    /// Get or create PBO state for a given FBO ID and dimensions
++    /// If dimensions changed, the PBO is resized and is_primed is reset
++    pub fn getOrCreate(self: *PboStateManager, fbo_id: c_uint, width: u32, height: u32) ?*PboState {
 +        // First, look for existing entry
 +        for (&self.entries) |*entry| {
 +            if (entry.in_use and entry.fbo_id == fbo_id) {
++                // Check if dimensions changed (resize case)
++                if (entry.pbo_state.width != width or entry.pbo_state.height != height) {
++                    // Dimensions changed - must reallocate PBOs
++                    log.info("PBO resize: FBO {} {}x{} -> {}x{}", .{
++                        fbo_id,
++                        entry.pbo_state.width,
++                        entry.pbo_state.height,
++                        width,
++                        height,
++                    });
++                    // resize() calls deinit() then init() which resets is_primed=false
++                    if (!entry.pbo_state.resize(width, height)) {
++                        return null;
++                    }
++                }
 +                return &entry.pbo_state;
 +            }
 +        }
@@ -586,13 +654,16 @@ index 000000000..51043b76b
 +        viewport(0, 0, @intCast(width), @intCast(height));
 +    }
 +
-+    // Set pixel pack alignment to 1 (tightly packed)
++    // CRITICAL: Force exact row length to prevent GPU padding (stride mismatch)
++    // Must be set BEFORE any glReadPixels call (both async and sync paths)
 +    if (gl.glad.context.PixelStorei) |pixelStorei| {
++        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(width));
 +        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
 +    }
 +
 +    // Use per-FBO PBO state for async readback
-+    if (pbo_manager.getOrCreate(fbo_id)) |pbo_state| {
++    // Pass dimensions so PBO is resized if needed (handles split/resize case)
++    if (pbo_manager.getOrCreate(fbo_id, width, height)) |pbo_state| {
 +        if (pbo_state.readPixelsAsync(buffer, buffer_len, width, height, fbo_id)) {
 +            return true;
 +        }
@@ -611,6 +682,17 @@ index 000000000..51043b76b
 +    const expected_size = @as(usize, width) * @as(usize, height) * 4;
 +    if (buffer_len < expected_size) return false;
 +
++    // CRITICAL: Ensure no PBO is bound, or glReadPixels writes to PBO offset 0 instead of buffer!
++    if (gl.glad.context.BindBuffer) |bindBuf| {
++        bindBuf(0x88EB, 0); // GL_PIXEL_PACK_BUFFER = 0x88EB
++    }
++
++    // CRITICAL: Set GL_PACK_ROW_LENGTH (async path may have reset it to 0)
++    if (gl.glad.context.PixelStorei) |pixelStorei| {
++        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(width));
++        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
++    }
++
 +    // For FBO reading, use GL_COLOR_ATTACHMENT0 (not GL_BACK)
 +    if (gl.glad.context.ReadBuffer) |readBuf| {
 +        readBuf(GL_COLOR_ATTACHMENT0);
@@ -618,6 +700,11 @@ index 000000000..51043b76b
 +
 +    // Read pixels (OpenGL origin is bottom-left)
 +    readPixelsFn(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, buffer);
++
++    // Reset row length
++    if (gl.glad.context.PixelStorei) |pixelStorei| {
++        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0);
++    }
 +
 +    // Flip image vertically (OpenGL has origin at bottom-left, we need top-left)
 +    const row_size = width * 4;
