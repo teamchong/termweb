@@ -721,7 +721,7 @@ export class MuxClient {
     root.element.style.flex = '1';
     tabContent.appendChild(root.element);
 
-    this.buildSplitTree(tabLayout.root, root);
+    this.buildSplitTree(tabLayout.root, root, tabContent);
 
     const tabInfo: InternalTabInfo = {
       id: tabId,
@@ -737,82 +737,86 @@ export class MuxClient {
 
   /**
    * Recursively build the split tree from layout data.
-   * This properly handles nested splits with different directions.
+   * Directly constructs the tree structure instead of using split() method.
    */
-  private buildSplitTree(node: LayoutNode, container: SplitContainer): void {
+  private buildSplitTree(node: LayoutNode, container: SplitContainer, tabElement: HTMLElement): void {
     if (node.type === 'leaf' && node.panelId !== undefined) {
       // Leaf node - create a panel
       const panel = this.createPanel(container.element, node.panelId);
       container.panel = panel;
     } else if (node.type === 'split' && node.first && node.second) {
-      // Split node - recursively build first child, then split and build second
-      // First, build the first child into this container
-      this.buildSplitTree(node.first, container);
+      // Split node - directly construct the tree structure
+      const direction = node.direction === 'horizontal' ? 'horizontal' : 'vertical';
 
-      // Now split the container and build the second child
-      // We need to find the leaf container that was just created to split it
-      const leafToSplit = this.findLeafContainer(container);
-      if (leafToSplit && leafToSplit.panel) {
-        // Create a temporary panel for the second child (will be replaced by recursive call)
-        const secondLeafPanel = this.getFirstLeafPanel(node.second);
-        if (secondLeafPanel !== undefined) {
-          const tempPanel = this.createPanel(container.element, secondLeafPanel);
-          const dir = node.direction === 'horizontal' ? 'right' : 'down';
-          leafToSplit.split(dir, tempPanel);
+      // Create child containers
+      const firstContainer = new SplitContainer(container);
+      firstContainer.element.className = 'split-pane';
+      firstContainer.element.style.flex = '1';
 
-          // If the second child is also a split, recursively build it
-          if (node.second.type === 'split' && leafToSplit.second) {
-            // The second child's first panel is already created, build remaining structure
-            this.buildNestedSplit(node.second, leafToSplit.second);
-          }
-        }
-      }
+      const secondContainer = new SplitContainer(container);
+      secondContainer.element.className = 'split-pane';
+      secondContainer.element.style.flex = '1';
+
+      // Set up the split structure
+      container.panel = null;
+      (container as unknown as { direction: string }).direction = direction;
+      (container as unknown as { first: SplitContainer }).first = firstContainer;
+      (container as unknown as { second: SplitContainer }).second = secondContainer;
+      (container as unknown as { ratio: number }).ratio = node.ratio ?? 0.5;
+
+      // Rebuild DOM for the container
+      this.rebuildContainerDOM(container);
+
+      // Recursively build children
+      this.buildSplitTree(node.first, firstContainer, tabElement);
+      this.buildSplitTree(node.second, secondContainer, tabElement);
     }
-  }
-
-  private getFirstLeafPanel(node: LayoutNode): number | undefined {
-    if (node.type === 'leaf') return node.panelId;
-    if (node.type === 'split' && node.first) return this.getFirstLeafPanel(node.first);
-    return undefined;
   }
 
   /**
-   * Build nested splits recursively, preserving the correct direction at each level.
+   * Rebuild the DOM for a split container (similar to SplitContainer.rebuildDOM)
    */
-  private buildNestedSplit(node: LayoutNode, container: SplitContainer): void {
-    if (node.type !== 'split' || !node.first || !node.second) return;
+  private rebuildContainerDOM(container: SplitContainer): void {
+    const parent = container.element.parentElement;
+    const oldElement = container.element;
+    const direction = (container as unknown as { direction: string }).direction;
+    const first = (container as unknown as { first: SplitContainer }).first;
+    const second = (container as unknown as { second: SplitContainer }).second;
+    const ratio = (container as unknown as { ratio: number }).ratio;
 
-    // The first child's first leaf is already in the container
-    // We need to handle if first child has more nested structure
-    if (node.first.type === 'split') {
-      this.buildNestedSplit(node.first, container);
+    // Create new container element
+    const newElement = document.createElement('div');
+    newElement.className = `split-container ${direction}`;
+    if (oldElement.style.flex) {
+      newElement.style.flex = oldElement.style.flex;
     }
 
-    // Now handle the second child
-    const leafToSplit = this.findLeafContainer(container);
-    if (!leafToSplit || !leafToSplit.panel) return;
+    // Add children and divider
+    newElement.appendChild(first.element);
 
-    const secondLeafPanel = this.getFirstLeafPanel(node.second);
-    if (secondLeafPanel === undefined) return;
+    const divider = document.createElement('div');
+    divider.className = 'split-divider';
+    (container as unknown as { divider: HTMLElement }).divider = divider;
+    newElement.appendChild(divider);
 
-    const panel = this.createPanel(container.element, secondLeafPanel);
-    const dir = node.direction === 'horizontal' ? 'right' : 'down';
-    leafToSplit.split(dir, panel);
+    newElement.appendChild(second.element);
 
-    // Recursively handle second child's nested structure
-    if (node.second.type === 'split' && leafToSplit.second) {
-      this.buildNestedSplit(node.second, leafToSplit.second);
+    // Replace in DOM
+    if (parent) {
+      parent.replaceChild(newElement, oldElement);
     }
-  }
+    (container as unknown as { element: HTMLElement }).element = newElement;
 
-  private findLeafContainer(container: SplitContainer): SplitContainer | null {
-    if (container.panel) return container;
-    if (container.second) {
-      const found = this.findLeafContainer(container.second);
-      if (found) return found;
+    // Apply ratio
+    const firstPercent = (ratio * 100).toFixed(2);
+    const secondPercent = ((1 - ratio) * 100).toFixed(2);
+    first.element.style.flex = `0 0 calc(${firstPercent}% - 2px)`;
+    second.element.style.flex = `0 0 calc(${secondPercent}% - 2px)`;
+
+    // Set up divider drag (call the container's method)
+    if (typeof (container as unknown as { setupDividerDrag: () => void }).setupDividerDrag === 'function') {
+      (container as unknown as { setupDividerDrag: () => void }).setupDividerDrag();
     }
-    if (container.first) return this.findLeafContainer(container.first);
-    return null;
   }
 
   sendControlMessage(type: number, data: Uint8Array): void {

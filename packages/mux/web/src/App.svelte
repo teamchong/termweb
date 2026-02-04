@@ -39,6 +39,9 @@
   // Check if there are tabs
   let hasTabs = $derived($tabs.size > 0);
 
+  // Check if there are multiple tabs (for prev/next tab)
+  let hasMultipleTabs = $derived($tabs.size > 1);
+
   // Show loading while waiting for initial layout from server
   let isLoading = $derived(showLoading || !layoutLoaded);
 
@@ -100,8 +103,8 @@
 
   let windowMenuItems = $derived<MenuItem[]>([
     { label: 'Toggle Full Screen', action: '_toggle_fullscreen', shortcut: '⌘⇧F', icon: '⛶' },
-    { label: 'Show Previous Tab', action: '_previous_tab', icon: '◀', disabled: !hasTabs },
-    { label: 'Show Next Tab', action: '_next_tab', icon: '▶', disabled: !hasTabs },
+    { label: 'Show Previous Tab', action: '_previous_tab', icon: '◀', disabled: !hasMultipleTabs },
+    { label: 'Show Next Tab', action: '_next_tab', icon: '▶', disabled: !hasMultipleTabs },
     { separator: true },
     // Split menu items (split-menu-item class in original - visible only when splits exist)
     { label: 'Zoom Split', action: '_zoom_split', shortcut: '⌘⇧↵', icon: '⤢', disabled: !hasTabs },
@@ -168,6 +171,15 @@
     }
   }
 
+  // UI fullscreen mode - hides titlebar and toolbar
+  let isFullscreen = $state(false);
+
+  function toggleFullscreen() {
+    isFullscreen = !isFullscreen;
+    // Trigger resize for panels to reclaim space
+    window.dispatchEvent(new Event('resize'));
+  }
+
   // Handle command execution from command palette
   function handleCommand(action: string) {
     switch (action) {
@@ -231,11 +243,7 @@
         break;
       }
       case '_toggle_fullscreen':
-        if (document.fullscreenElement) {
-          document.exitFullscreen();
-        } else {
-          document.documentElement.requestFullscreen();
-        }
+        toggleFullscreen();
         break;
       case '_quick_terminal':
         toggleQuickTerminal();
@@ -247,8 +255,22 @@
         }
         break;
       }
-      case '_previous_tab':
-      case '_next_tab':
+      case '_previous_tab': {
+        const tabArray = Array.from($tabs.values());
+        if (tabArray.length < 2 || !$activeTabId) break;
+        const currentIndex = tabArray.findIndex(t => t.id === $activeTabId);
+        const prevIndex = (currentIndex - 1 + tabArray.length) % tabArray.length;
+        muxClient?.selectTab(tabArray[prevIndex].id);
+        break;
+      }
+      case '_next_tab': {
+        const tabArray = Array.from($tabs.values());
+        if (tabArray.length < 2 || !$activeTabId) break;
+        const currentIndex = tabArray.findIndex(t => t.id === $activeTabId);
+        const nextIndex = (currentIndex + 1) % tabArray.length;
+        muxClient?.selectTab(tabArray[nextIndex].id);
+        break;
+      }
       case '_previous_split':
       case '_next_split':
       case '_zoom_split':
@@ -261,7 +283,7 @@
       case '_resize_split_down':
       case '_resize_split_left':
       case '_resize_split_right':
-        // TODO: implement tab/split navigation in muxClient
+        // TODO: implement split navigation in muxClient
         break;
       case '_sessions':
         muxClient?.showSessionsDialog();
@@ -298,9 +320,9 @@
     muxClient?.destroy();
   });
 
-  // Setup keyboard shortcuts
+  // Setup keyboard shortcuts and input forwarding
   function handleKeydown(e: KeyboardEvent) {
-    // Skip if dialog is open
+    // Skip if dialog is open - let them handle their own keyboard events
     if (commandPaletteOpen || tabOverviewOpen) {
       return;
     }
@@ -313,19 +335,24 @@
 
     const key = e.key.toLowerCase();
 
+    // Application shortcuts (Cmd+key combinations)
     if (e.metaKey && e.shiftKey && key === 'p') {
       e.preventDefault();
       commandPaletteOpen = true;
+      return;
     } else if (e.metaKey && key === '/') {
       e.preventDefault();
       handleNewTab();
+      return;
     } else if (e.metaKey && e.shiftKey && key === '.') {
       e.preventDefault();
       handleCommand('_close_all_tabs');
+      return;
     } else if (e.metaKey && key === '.') {
       e.preventDefault();
       const tabId = $activeTabId;
       if (tabId) handleCloseTab(tabId);
+      return;
     } else if (e.metaKey && key === 'd') {
       e.preventDefault();
       if (e.shiftKey) {
@@ -333,60 +360,78 @@
       } else {
         handleCommand('_split_right');
       }
+      return;
     } else if (e.metaKey && e.shiftKey && (key === 'a' || key === '\\')) {
       e.preventDefault();
       handleShowAllTabs();
+      return;
     } else if (e.metaKey && key === 'u') {
       e.preventDefault();
       handleCommand('_upload');
+      return;
     } else if (e.metaKey && e.shiftKey && key === 's') {
       e.preventDefault();
       handleCommand('_download');
+      return;
     } else if (e.metaKey && e.shiftKey && key === 'f') {
       e.preventDefault();
       handleCommand('_toggle_fullscreen');
+      return;
     } else if (e.metaKey && e.shiftKey && key === '[') {
       e.preventDefault();
       handleCommand('_previous_tab');
+      return;
     } else if (e.metaKey && e.shiftKey && key === ']') {
       e.preventDefault();
       handleCommand('_next_tab');
+      return;
     } else if (e.metaKey && key === '[') {
       e.preventDefault();
       handleCommand('_previous_split');
+      return;
     } else if (e.metaKey && key === ']') {
       e.preventDefault();
       handleCommand('_next_split');
+      return;
     } else if (e.metaKey && e.shiftKey && key === 'enter') {
       e.preventDefault();
       handleCommand('_zoom_split');
+      return;
     } else if (e.metaKey && e.shiftKey) {
       // Cmd+Shift+arrow keys for split selection
       if (key === 'arrowup') {
         e.preventDefault();
         handleCommand('_select_split_up');
+        return;
       } else if (key === 'arrowdown') {
         e.preventDefault();
         handleCommand('_select_split_down');
+        return;
       } else if (key === 'arrowleft') {
         e.preventDefault();
         handleCommand('_select_split_left');
+        return;
       } else if (key === 'arrowright') {
         e.preventDefault();
         handleCommand('_select_split_right');
+        return;
       }
     } else if (e.metaKey && e.altKey && key === 'i') {
       e.preventDefault();
       handleCommand('_toggle_inspector');
+      return;
     } else if (e.metaKey && key === '=') {
       e.preventDefault();
       handleCommand('zoom-in');
+      return;
     } else if (e.metaKey && key === '-') {
       e.preventDefault();
       handleCommand('zoom-out');
+      return;
     } else if (e.metaKey && key === '0') {
       e.preventDefault();
       handleCommand('zoom-reset');
+      return;
     } else if (e.metaKey && key >= '1' && key <= '9') {
       // Tab switching with Cmd+1-9
       e.preventDefault();
@@ -395,15 +440,46 @@
       if (tabIndex < tabArray.length) {
         muxClient?.selectTab(tabArray[tabIndex].id);
       }
+      return;
+    }
+
+    // Forward all other keys to active panel
+    const activePanel = muxClient?.getActivePanel();
+    if (activePanel) {
+      e.preventDefault();
+      activePanel.sendKeyInput(e, 1); // 1 = press
+    }
+  }
+
+  function handleKeyup(e: KeyboardEvent) {
+    // Skip if dialog is open
+    if (commandPaletteOpen || tabOverviewOpen) {
+      return;
+    }
+    const downloadDialog = document.getElementById('download-dialog');
+    const uploadDialog = document.getElementById('upload-dialog');
+    if (downloadDialog?.classList.contains('visible') ||
+        uploadDialog?.classList.contains('visible')) {
+      return;
+    }
+
+    // Don't forward Cmd key releases (they're handled by shortcuts)
+    if (e.metaKey) return;
+
+    // Forward keyup to active panel
+    const activePanel = muxClient?.getActivePanel();
+    if (activePanel) {
+      e.preventDefault();
+      activePanel.sendKeyInput(e, 0); // 0 = release
     }
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} onkeyup={handleKeyup} />
 
 <div class="app-container">
   <!-- Titlebar -->
-  <div id="titlebar">
+  <div id="titlebar" class:hidden={isFullscreen}>
     <div id="title-left">
       <span id="app-title">👻</span>
     </div>
@@ -423,7 +499,7 @@
   </div>
 
   <!-- Toolbar with tabs -->
-  <div id="toolbar">
+  <div id="toolbar" class:hidden={isFullscreen}>
     <TabBar
       onNewTab={handleNewTab}
       onSelectTab={handleSelectTab}
@@ -573,6 +649,11 @@
     display: flex;
     align-items: center;
     padding: 5px;
+  }
+
+  #titlebar.hidden,
+  #toolbar.hidden {
+    display: none;
   }
 
   #panels {
