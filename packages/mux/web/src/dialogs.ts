@@ -15,11 +15,22 @@ export interface Command {
 
 // Cached sorted commands (computed once at module load)
 const cachedCommands: Command[] = [
+  // Copy to File Operations (require active panel)
+  { title: 'Copy Screen to Temporary File and Copy Path', action: 'write_screen_file:copy', description: 'Save screen to temp file and copy path', shortcut: '⌃⇧⌘J', requiresPanel: true },
+  { title: 'Copy Screen to Temporary File and Open', action: 'write_screen_file:open', description: 'Save screen to temp file and open it', shortcut: '⌥⇧⌘J', requiresPanel: true },
+  { title: 'Copy Screen to Temporary File and Paste Path', action: 'write_screen_file:paste', description: 'Save screen to temp file and paste path', shortcut: '⇧⌘J', requiresPanel: true },
+  { title: 'Copy Selection to Temporary File and Copy Path', action: 'write_selection_file:copy', description: 'Save selection to temp file and copy path', requiresPanel: true },
+  { title: 'Copy Selection to Temporary File and Open', action: 'write_selection_file:open', description: 'Save selection to temp file and open it', requiresPanel: true },
+  { title: 'Copy Selection to Temporary File and Paste Path', action: 'write_selection_file:paste', description: 'Save selection to temp file and paste path', requiresPanel: true },
+  { title: 'Copy Terminal Title to Clipboard', action: 'copy_title_to_clipboard', description: 'Copy terminal title to clipboard', requiresPanel: true },
+
   // Text Operations (require active panel)
   { title: 'Copy to Clipboard', action: 'copy_to_clipboard', description: 'Copy selected text', requiresPanel: true },
+  { title: 'Copy URL to Clipboard', action: 'copy_url_to_clipboard', description: 'Copy URL under cursor to clipboard', requiresPanel: true },
   { title: 'Paste from Clipboard', action: 'paste_from_clipboard', description: 'Paste contents of clipboard', requiresPanel: true },
   { title: 'Paste from Selection', action: 'paste_from_selection', description: 'Paste from selection clipboard', requiresPanel: true },
-  { title: 'Select All', action: 'select_all', description: 'Select all text', requiresPanel: true },
+  { title: 'Select All', action: 'select_all', description: 'Select all text', shortcut: '⌘A', requiresPanel: true },
+  { title: 'Show On-Screen Keyboard', action: 'show_on_screen_keyboard', description: 'Show on-screen keyboard', requiresPanel: true },
 
   // Font Control (require active panel)
   { title: 'Increase Font Size', action: 'increase_font_size:1', description: 'Make text larger', shortcut: '⌘=', requiresPanel: true },
@@ -28,13 +39,19 @@ const cachedCommands: Command[] = [
 
   // Screen Operations (require active panel)
   { title: 'Clear Screen', action: 'clear_screen', description: 'Clear screen and scrollback', requiresPanel: true },
-  { title: 'Scroll to Top', action: 'scroll_to_top', description: 'Scroll to top of buffer', requiresPanel: true },
-  { title: 'Scroll to Bottom', action: 'scroll_to_bottom', description: 'Scroll to bottom of buffer', requiresPanel: true },
-  { title: 'Scroll Page Up', action: 'scroll_page_up', description: 'Scroll up one page', requiresPanel: true },
-  { title: 'Scroll Page Down', action: 'scroll_page_down', description: 'Scroll down one page', requiresPanel: true },
+  { title: 'Scroll to Top', action: 'scroll_to_top', description: 'Scroll to top of buffer', shortcut: '⇧⌘↑', requiresPanel: true },
+  { title: 'Scroll to Bottom', action: 'scroll_to_bottom', description: 'Scroll to bottom of buffer', shortcut: '⇧⌘↓', requiresPanel: true },
+  { title: 'Scroll to Selection', action: 'scroll_to_selection', description: 'Scroll to selected text', requiresPanel: true },
+  { title: 'Scroll Page Up', action: 'scroll_page_up', description: 'Scroll up one page', shortcut: '⌘↑', requiresPanel: true },
+  { title: 'Scroll Page Down', action: 'scroll_page_down', description: 'Scroll down one page', shortcut: '⌘↓', requiresPanel: true },
 
   // Tab Management
+  { title: 'Move Tab Left', action: 'move_tab:-1', description: 'Move current tab left', requiresTab: true },
+  { title: 'Move Tab Right', action: 'move_tab:1', description: 'Move current tab right', requiresTab: true },
   { title: 'New Tab', action: '_new_tab', description: 'Open a new tab', shortcut: '⌘/' },
+  { title: 'New Window', action: 'new_window', description: 'Open a new window', shortcut: '⌘N' },
+  { title: 'Close All Tabs', action: '_close_all_tabs', description: 'Close all tabs', requiresTab: true },
+  { title: 'Close Other Tabs', action: '_close_other_tabs', description: 'Close all other tabs', requiresTab: true },
   { title: 'Close Tab', action: '_close_tab', description: 'Close current tab', shortcut: '⌘.', requiresTab: true },
   { title: 'Show All Tabs', action: '_show_all_tabs', description: 'Show tab overview', shortcut: '⌘⇧A', requiresTab: true },
 
@@ -45,21 +62,30 @@ const cachedCommands: Command[] = [
   { title: 'Split Up', action: '_split_up', description: 'Split pane upward', requiresPanel: true },
 
   // Navigation (require active panel)
-  { title: 'Focus Split: Left', action: 'goto_split:left', description: 'Focus left split', requiresPanel: true },
-  { title: 'Focus Split: Right', action: 'goto_split:right', description: 'Focus right split', requiresPanel: true },
-  { title: 'Focus Split: Up', action: 'goto_split:up', description: 'Focus split above', requiresPanel: true },
-  { title: 'Focus Split: Down', action: 'goto_split:down', description: 'Focus split below', requiresPanel: true },
+  { title: 'Focus Split: Left', action: 'goto_split:left', description: 'Focus left split', shortcut: '⌥⌘←', requiresPanel: true },
+  { title: 'Focus Split: Right', action: 'goto_split:right', description: 'Focus right split', shortcut: '⌥⌘→', requiresPanel: true },
+  { title: 'Focus Split: Up', action: 'goto_split:up', description: 'Focus split above', shortcut: '⌥⌘↑', requiresPanel: true },
+  { title: 'Focus Split: Down', action: 'goto_split:down', description: 'Focus split below', shortcut: '⌥⌘↓', requiresPanel: true },
   { title: 'Focus Split: Previous', action: 'goto_split:previous', description: 'Focus previous split', requiresPanel: true },
   { title: 'Focus Split: Next', action: 'goto_split:next', description: 'Focus next split', requiresPanel: true },
-  { title: 'Toggle Split Zoom', action: 'toggle_split_zoom', description: 'Toggle zoom on current split', requiresPanel: true },
+  { title: 'Toggle Split Zoom', action: 'toggle_split_zoom', description: 'Toggle zoom on current split', shortcut: '⇧⌘↩', requiresPanel: true },
   { title: 'Equalize Splits', action: 'equalize_splits', description: 'Make all splits equal size', requiresPanel: true },
 
   // Terminal Control (require active panel)
+  { title: 'Redo', action: 'redo', description: 'Redo last action', requiresPanel: true },
+  { title: 'Undo', action: 'undo', description: 'Undo last action', requiresPanel: true },
   { title: 'Reset Terminal', action: 'reset', description: 'Reset terminal state', requiresPanel: true },
+  { title: 'Reset Window Size', action: 'reset_window_size', description: 'Reset window to default size' },
+  { title: 'Toggle Float on Top', action: 'toggle_window_float_on_top', description: 'Toggle window float on top' },
+  { title: 'Toggle Fullscreen', action: 'toggle_fullscreen', description: 'Toggle fullscreen mode', shortcut: '⌃⌘F' },
+  { title: 'Toggle Maximize', action: 'toggle_maximize', description: 'Toggle window maximize' },
+  { title: 'Toggle Secure Input', action: 'toggle_secure_input', description: 'Toggle secure input mode' },
   { title: 'Toggle Read-Only Mode', action: 'toggle_readonly', description: 'Toggle read-only mode', requiresPanel: true },
 
   // Config
-  { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration' },
+  { title: 'Open Config', action: 'open_config', description: 'Open config file in editor', shortcut: '⌘,' },
+  { title: 'Quit', action: 'quit', description: 'Quit application', shortcut: '⌘Q' },
+  { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration', shortcut: '⇧⌘,' },
   { title: 'Toggle Inspector', action: '_toggle_inspector', description: 'Toggle terminal inspector', shortcut: '⌥⌘I', requiresPanel: true },
 
   // Title (require tab)

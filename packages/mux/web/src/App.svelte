@@ -50,6 +50,7 @@
     { label: 'Split Up', action: '_split_up', icon: '▀⬚', disabled: !hasTabs },
     { separator: true },
     { label: 'Close Tab', action: '_close_tab', shortcut: '⌘.', icon: '✕', disabled: !hasTabs },
+    { label: 'Close Other Tabs', action: '_close_other_tabs', icon: '⊟', disabled: !hasTabs },
     { label: 'Close All Tabs', action: '_close_all_tabs', shortcut: '⌘⇧.', icon: '⊠', disabled: !hasTabs },
   ]);
 
@@ -210,6 +211,16 @@
           muxClient?.closeTab(tab.id);
         }
         break;
+      case '_close_other_tabs': {
+        // Close all tabs except the active one
+        const currentTabId = $activeTabId;
+        for (const tab of $tabs.values()) {
+          if (tab.id !== currentTabId) {
+            muxClient?.closeTab(tab.id);
+          }
+        }
+        break;
+      }
       case '_toggle_fullscreen':
         if (document.fullscreenElement) {
           document.exitFullscreen();
@@ -278,68 +289,69 @@
     muxClient?.destroy();
   });
 
-  // Detect Mac platform once (not on every keydown)
-  const isMac = typeof navigator !== 'undefined' && (
-    (navigator as any).userAgentData?.platform === 'macOS'
-    || /Mac|iPhone|iPad|iPod/.test(navigator.userAgent)
-  );
-
   // Setup keyboard shortcuts
   function handleKeydown(e: KeyboardEvent) {
-    const cmdOrCtrl = isMac ? e.metaKey : e.ctrlKey;
+    // Skip if dialog is open
+    if (commandPaletteOpen || tabOverviewOpen) {
+      return;
+    }
+    const downloadDialog = document.getElementById('download-dialog');
+    const uploadDialog = document.getElementById('upload-dialog');
+    if (downloadDialog?.classList.contains('visible') ||
+        uploadDialog?.classList.contains('visible')) {
+      return;
+    }
+
     const key = e.key.toLowerCase();
 
-    if (cmdOrCtrl && e.shiftKey && key === 'p') {
+    if (e.metaKey && e.shiftKey && key === 'p') {
       e.preventDefault();
       commandPaletteOpen = true;
-    } else if (cmdOrCtrl && key === '/') {
+    } else if (e.metaKey && key === '/') {
       e.preventDefault();
       handleNewTab();
-    } else if (cmdOrCtrl && e.shiftKey && key === '.') {
+    } else if (e.metaKey && e.shiftKey && key === '.') {
       e.preventDefault();
       handleCommand('_close_all_tabs');
-    } else if (cmdOrCtrl && key === '.') {
+    } else if (e.metaKey && key === '.') {
       e.preventDefault();
       const tabId = $activeTabId;
       if (tabId) handleCloseTab(tabId);
-    } else if (cmdOrCtrl && key === 'd') {
+    } else if (e.metaKey && key === 'd') {
       e.preventDefault();
       if (e.shiftKey) {
         handleCommand('_split_down');
       } else {
         handleCommand('_split_right');
       }
-    } else if (cmdOrCtrl && key === '`') {
-      e.preventDefault();
-      toggleQuickTerminal();
-    } else if (cmdOrCtrl && e.shiftKey && (key === 'a' || key === '\\')) {
+    } else if (e.metaKey && e.shiftKey && (key === 'a' || key === '\\')) {
       e.preventDefault();
       handleShowAllTabs();
-    } else if (cmdOrCtrl && key === 'u') {
+    } else if (e.metaKey && key === 'u') {
       e.preventDefault();
       handleCommand('_upload');
-    } else if (cmdOrCtrl && e.shiftKey && key === 's') {
+    } else if (e.metaKey && e.shiftKey && key === 's') {
       e.preventDefault();
       handleCommand('_download');
-    } else if (cmdOrCtrl && e.shiftKey && key === 'f') {
+    } else if (e.metaKey && e.shiftKey && key === 'f') {
       e.preventDefault();
       handleCommand('_toggle_fullscreen');
-    } else if (cmdOrCtrl && e.shiftKey && key === '[') {
+    } else if (e.metaKey && e.shiftKey && key === '[') {
       e.preventDefault();
       handleCommand('_previous_tab');
-    } else if (cmdOrCtrl && e.shiftKey && key === ']') {
+    } else if (e.metaKey && e.shiftKey && key === ']') {
       e.preventDefault();
       handleCommand('_next_tab');
-    } else if (cmdOrCtrl && key === '[') {
+    } else if (e.metaKey && key === '[') {
       e.preventDefault();
       handleCommand('_previous_split');
-    } else if (cmdOrCtrl && key === ']') {
+    } else if (e.metaKey && key === ']') {
       e.preventDefault();
       handleCommand('_next_split');
-    } else if (cmdOrCtrl && e.shiftKey && key === 'enter') {
+    } else if (e.metaKey && e.shiftKey && key === 'enter') {
       e.preventDefault();
       handleCommand('_zoom_split');
-    } else if (cmdOrCtrl && e.shiftKey) {
+    } else if (e.metaKey && e.shiftKey) {
       // Cmd+Shift+arrow keys for split selection
       if (key === 'arrowup') {
         e.preventDefault();
@@ -354,19 +366,19 @@
         e.preventDefault();
         handleCommand('_select_split_right');
       }
-    } else if (cmdOrCtrl && e.altKey && key === 'i') {
+    } else if (e.metaKey && e.altKey && key === 'i') {
       e.preventDefault();
       handleCommand('_toggle_inspector');
-    } else if (cmdOrCtrl && key === '=') {
+    } else if (e.metaKey && key === '=') {
       e.preventDefault();
       handleCommand('zoom-in');
-    } else if (cmdOrCtrl && key === '-') {
+    } else if (e.metaKey && key === '-') {
       e.preventDefault();
       handleCommand('zoom-out');
-    } else if (cmdOrCtrl && key === '0') {
+    } else if (e.metaKey && key === '0') {
       e.preventDefault();
       handleCommand('zoom-reset');
-    } else if (cmdOrCtrl && key >= '1' && key <= '9') {
+    } else if (e.metaKey && key >= '1' && key <= '9') {
       // Tab switching with Cmd+1-9
       e.preventDefault();
       const tabIndex = parseInt(key) - 1;
