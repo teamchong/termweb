@@ -418,14 +418,22 @@ pub const VideoEncoder = struct {
         // Prioritize speed over power efficiency
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_MaximizePowerEfficiency, c.kCFBooleanFalse);
 
-        // Prioritize encoding speed over quality (macOS 13+)
-        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, c.kCFBooleanTrue);
+        // Prioritize quality over speed for sharp terminal text
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, c.kCFBooleanFalse);
 
         // Disable B-frames (critical for zero latency)
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_AllowFrameReordering, c.kCFBooleanFalse);
 
-        // Set profile to Baseline (no B-frames, widely compatible)
-        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_ProfileLevel, c.kVTProfileLevel_H264_Baseline_AutoLevel);
+        // Set profile to Main for better quality (still no B-frames due to AllowFrameReordering=false)
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_ProfileLevel, c.kVTProfileLevel_H264_Main_AutoLevel);
+
+        // Color settings for accurate terminal rendering
+        // BT.709 color primaries (standard for HD video)
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_ColorPrimaries, c.kCMFormatDescriptionColorPrimaries_ITU_R_709_2);
+        // BT.709 transfer function
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_TransferFunction, c.kCMFormatDescriptionTransferFunction_ITU_R_709_2);
+        // BT.709 YCbCr matrix
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_YCbCrMatrix, c.kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2);
 
         // Keyframe interval (every 120 frames = 4 seconds at 30fps)
         var interval: c.SInt32 = 120;
@@ -443,8 +451,8 @@ pub const VideoEncoder = struct {
             c.CFRelease(fps_number);
         }
 
-        // Lower bitrate for faster encoding (2 Mbps is enough for terminal text)
-        var bitrate: c.SInt32 = 2_000_000;
+        // Higher bitrate for sharp terminal text (5 Mbps)
+        var bitrate: c.SInt32 = 5_000_000;
         const bitrate_number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &bitrate);
         if (bitrate_number != null) {
             _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_AverageBitRate, bitrate_number);
