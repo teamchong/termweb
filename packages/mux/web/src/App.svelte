@@ -274,6 +274,8 @@
       case '_previous_split':
       case '_next_split':
       case '_zoom_split':
+        muxClient?.zoomSplit();
+        break;
       case '_equalize_splits':
       case '_select_split_up':
       case '_select_split_down':

@@ -2,9 +2,9 @@
  * Mux Client Service
  * Centralized WebSocket and state management using Svelte stores
  */
-import { writable } from 'svelte/store';
+import { writable, get } from 'svelte/store';
 import { mount, unmount } from 'svelte';
-import { tabs, activeTabId, panels, activePanelId, ui, createPanelInfo, createTabInfo } from '../stores/index';
+import { tabs, activeTabId as activeTabIdStore, panels, activePanelId, ui, createPanelInfo, createTabInfo } from '../stores/index';
 import PanelComponent from '../components/Panel.svelte';
 import { SplitContainer, type PanelLike } from '../split-container';
 import { FileTransferHandler } from '../file-transfer';
@@ -470,7 +470,7 @@ export class MuxClient {
       t.element.classList.remove('active');
     }
     tab.element.classList.add('active');
-    activeTabId.set(tabId);
+    activeTabIdStore.set(tabId);
     this.tabHistory = this.tabHistory.filter(id => id !== tabId);
     this.tabHistory.push(tabId);
     const allPanels = tab.root.getAllPanels();
@@ -502,7 +502,7 @@ export class MuxClient {
       const firstTabId = this.tabInstances.keys().next().value;
       if (firstTabId) this.selectTab(firstTabId);
     } else {
-      activeTabId.set(null);
+      activeTabIdStore.set(null);
       activePanelId.set(null);
       this.currentActivePanel = null;
     }
@@ -689,6 +689,63 @@ export class MuxClient {
     this.setActivePanel(newPanel);
     const allPanels = tab.root.getAllPanels();
     tabs.updateTab(tabId, { panelIds: allPanels.map(p => p.id) });
+  }
+
+  zoomSplit(): void {
+    const activeTabId = get(activeTabIdStore);
+    if (!activeTabId || !this.currentActivePanel) return;
+    const tab = this.tabInstances.get(activeTabId);
+    if (!tab) return;
+
+    const container = tab.root.element;
+    const isZoomed = container.classList.toggle('zoomed');
+
+    if (isZoomed) {
+      // Store which panel is zoomed
+      container.dataset.zoomedPanel = this.currentActivePanel.id;
+
+      // Hide all split-panes and dividers
+      container.querySelectorAll('.split-pane').forEach((pane: Element) => {
+        (pane as HTMLElement).dataset.zoomStyle = (pane as HTMLElement).style.cssText;
+        (pane as HTMLElement).style.display = 'none';
+      });
+      container.querySelectorAll('.split-divider').forEach((d: Element) => {
+        (d as HTMLElement).style.display = 'none';
+      });
+
+      // Show the active panel's container chain and make it fill
+      const activeEl = this.currentActivePanel.element;
+      let el: HTMLElement | null = activeEl.closest('.split-pane');
+      while (el && container.contains(el)) {
+        el.style.display = 'flex';
+        el.style.flex = '1';
+        el.style.width = '100%';
+        el.style.height = '100%';
+        el = el.parentElement?.closest('.split-pane') || null;
+      }
+    } else {
+      // Restore all split-panes
+      container.querySelectorAll('.split-pane').forEach((pane: Element) => {
+        (pane as HTMLElement).style.cssText = (pane as HTMLElement).dataset.zoomStyle || '';
+        delete (pane as HTMLElement).dataset.zoomStyle;
+      });
+      // Show dividers
+      container.querySelectorAll('.split-divider').forEach((d: Element) => {
+        (d as HTMLElement).style.display = '';
+      });
+      delete container.dataset.zoomedPanel;
+    }
+
+    // Trigger resize after layout updates
+    requestAnimationFrame(() => {
+      const allPanels = tab.root.getAllPanels();
+      for (const panel of allPanels) {
+        const el = panel.element;
+        el.style.visibility = 'hidden';
+        el.offsetHeight; // Force reflow
+        el.style.visibility = '';
+      }
+    });
   }
 
   private restoreLayoutFromServer(layout: LayoutData): void {
