@@ -1,7 +1,7 @@
-From 4159c4affc219d0fbc8b0ba3046d4ea73a9e22ad Mon Sep 17 00:00:00 2001
+From 5f0b413f8855d25e000e73a55a8c7b773028aa98 Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 10:45:53 -0500
-Subject: [PATCH 1/2] feat(linux): add headless EGL rendering with PBO and
+Subject: [PATCH 1/6] feat(linux): add headless EGL rendering with PBO and
  viewport
 
 ---
@@ -723,10 +723,10 @@ index 4b01da0c5..8d5edd8f4 100644
 2.43.0
 
 
-From bfd1ce58dd99da49d2264d03a0a6bf9e304bfd8b Mon Sep 17 00:00:00 2001
+From 2fec32064a2d4d477a87beecd92fa827408070c4 Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 10:53:13 -0500
-Subject: [PATCH 2/2] feat(linux): add headless EGL rendering support for
+Subject: [PATCH 2/6] feat(linux): add headless EGL rendering support for
  embedded platform
 
 ---
@@ -970,6 +970,509 @@ index 8d5edd8f4..3a024624f 100644
  }
  
  /// Actions taken after `drawFrame` is done.
+-- 
+2.43.0
+
+
+From 5a0c16887e537b87bda90285db1b7c9910d5dbd2 Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Wed, 4 Feb 2026 11:06:56 -0500
+Subject: [PATCH 3/6] feat(linux): add headless EGL rendering support for
+ embedded platform
+
+---
+ src/apprt/egl_headless.zig | 151 ++++++-------------------------------
+ src/apprt/embedded.zig     |  13 +++-
+ src/renderer/OpenGL.zig    |  10 +--
+ 3 files changed, 36 insertions(+), 138 deletions(-)
+
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index 5fa56451d..0198cd862 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -178,7 +178,9 @@ pub const PboState = struct {
+ 
+     /// Async readPixels using double-buffered PBO
+     /// Returns false on first frame (no previous data available yet)
+-    pub fn readPixelsAsync(self: *PboState, dest_buffer: [*]u8, dest_len: usize, width: u32, height: u32) bool {
++    /// @param fbo_id The FBO to read from (already bound by caller)
++    pub fn readPixelsAsync(self: *PboState, dest_buffer: [*]u8, dest_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
++        _ = fbo_id; // FBO already bound by caller
+         // Validate dimensions
+         const expected_size = @as(usize, width) * @as(usize, height) * 4;
+         if (dest_len < expected_size) return false;
+@@ -193,7 +195,7 @@ pub const PboState = struct {
+ 
+         // For FBO reading, use GL_COLOR_ATTACHMENT0 (not GL_BACK)
+         if (gl.glad.context.ReadBuffer) |readBuf| {
+-            readBuf(OffscreenFbo.GL_COLOR_ATTACHMENT0);
++            readBuf(GL_COLOR_ATTACHMENT0);
+         }
+ 
+         const next_index: u1 = self.current_index +% 1;
+@@ -255,105 +257,9 @@ pub const PboState = struct {
+ /// Global PBO state for async readback
+ var global_pbo_state: PboState = .{};
+ 
+-/// Offscreen FBO for headless rendering
+-/// Required because headless EGL has no real default framebuffer
+-pub const OffscreenFbo = struct {
+-    fbo: c_uint = 0,
+-    rbo: c_uint = 0,
+-    width: u32 = 0,
+-    height: u32 = 0,
+-
+-    // OpenGL constants
+-    const GL_FRAMEBUFFER: c_uint = 0x8D40;
+-    const GL_DRAW_FRAMEBUFFER: c_uint = 0x8CA9;
+-    const GL_READ_FRAMEBUFFER: c_uint = 0x8CA8;
+-    const GL_RENDERBUFFER: c_uint = 0x8D41;
+-    const GL_COLOR_ATTACHMENT0: c_uint = 0x8CE0;
+-    const GL_FRAMEBUFFER_COMPLETE: c_uint = 0x8CD5;
+-    const GL_RGBA8: c_uint = 0x8058;
+-
+-    pub fn init(self: *OffscreenFbo, width: u32, height: u32) bool {
+-        if (width == 0 or height == 0) return false;
+-
+-        const genFramebuffers = gl.glad.context.GenFramebuffers orelse return false;
+-        const genRenderbuffers = gl.glad.context.GenRenderbuffers orelse return false;
+-        const bindFramebuffer = gl.glad.context.BindFramebuffer orelse return false;
+-        const bindRenderbuffer = gl.glad.context.BindRenderbuffer orelse return false;
+-        const renderbufferStorage = gl.glad.context.RenderbufferStorage orelse return false;
+-        const framebufferRenderbuffer = gl.glad.context.FramebufferRenderbuffer orelse return false;
+-        const checkStatus = gl.glad.context.CheckFramebufferStatus orelse return false;
+-
+-        // Generate FBO and RBO
+-        genFramebuffers(1, &self.fbo);
+-        genRenderbuffers(1, &self.rbo);
+-
+-        // Setup renderbuffer with RGBA8 format
+-        bindRenderbuffer(GL_RENDERBUFFER, self.rbo);
+-        renderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, @intCast(width), @intCast(height));
+-
+-        // Attach renderbuffer to FBO
+-        bindFramebuffer(GL_FRAMEBUFFER, self.fbo);
+-        framebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, self.rbo);
+-
+-        // Check completeness
+-        const status = checkStatus(GL_FRAMEBUFFER);
+-        if (status != GL_FRAMEBUFFER_COMPLETE) {
+-            log.err("FBO incomplete: status=0x{X}", .{status});
+-            self.deinit();
+-            return false;
+-        }
+-
+-        // Keep FBO bound as draw target
+-        bindFramebuffer(GL_DRAW_FRAMEBUFFER, self.fbo);
+-
+-        self.width = width;
+-        self.height = height;
+-        log.info("Offscreen FBO created: {}x{}", .{ width, height });
+-        return true;
+-    }
+-
+-    pub fn deinit(self: *OffscreenFbo) void {
+-        if (self.fbo != 0) {
+-            if (gl.glad.context.DeleteFramebuffers) |del| {
+-                del(1, &self.fbo);
+-            }
+-            self.fbo = 0;
+-        }
+-        if (self.rbo != 0) {
+-            if (gl.glad.context.DeleteRenderbuffers) |del| {
+-                del(1, &self.rbo);
+-            }
+-            self.rbo = 0;
+-        }
+-        self.width = 0;
+-        self.height = 0;
+-    }
+-
+-    pub fn resize(self: *OffscreenFbo, width: u32, height: u32) bool {
+-        if (self.width == width and self.height == height and self.fbo != 0) return true;
+-        self.deinit();
+-        return self.init(width, height);
+-    }
+-
+-    /// Bind the FBO as the draw target (call before rendering)
+-    pub fn bindForDraw(self: *OffscreenFbo) void {
+-        if (self.fbo == 0) return;
+-        if (gl.glad.context.BindFramebuffer) |bind| {
+-            bind(GL_DRAW_FRAMEBUFFER, self.fbo);
+-        }
+-    }
+-
+-    /// Bind the FBO as the read target (call before readPixels)
+-    pub fn bindForRead(self: *OffscreenFbo) void {
+-        if (self.fbo == 0) return;
+-        if (gl.glad.context.BindFramebuffer) |bind| {
+-            bind(GL_READ_FRAMEBUFFER, self.fbo);
+-        }
+-    }
+-};
+-
+-/// Global offscreen FBO
+-var global_offscreen_fbo: OffscreenFbo = .{};
++/// OpenGL constants for FBO binding
++const GL_READ_FRAMEBUFFER: c_uint = 0x8CA8;
++const GL_COLOR_ATTACHMENT0: c_uint = 0x8CE0;
+ 
+ pub const EglHeadless = struct {
+     display: c.EGLDisplay,
+@@ -531,55 +437,43 @@ pub fn releaseContext() void {
+     }
+ }
+ 
+-/// Set the OpenGL viewport size. Must be called when surface size changes
+-/// so that rendering and readPixels work correctly.
+-/// Also creates/resizes the offscreen FBO for headless rendering.
++/// Set the OpenGL viewport size. Must be called when surface size changes.
+ pub fn setViewportSize(width: u32, height: u32) void {
+     if (!makeCurrentOnThread()) {
+         log.warn("setViewportSize: makeCurrent failed", .{});
+         return;
+     }
+ 
+-    // Create/resize offscreen FBO for headless rendering
+-    // This FBO is where Ghostty's blit will render to
+-    if (!global_offscreen_fbo.resize(width, height)) {
+-        log.warn("setViewportSize: failed to create offscreen FBO", .{});
+-    }
+-
+-    // Set viewport
+     if (gl.glad.context.Viewport) |viewport| {
+         viewport(0, 0, @intCast(width), @intCast(height));
+-        log.info("setViewportSize: {}x{} (FBO={})", .{ width, height, global_offscreen_fbo.fbo });
++        log.info("setViewportSize: {}x{}", .{ width, height });
+     }
+ }
+ 
+-/// Bind the offscreen FBO as the draw target.
+-/// Call this before Ghostty's present() to ensure the blit goes to our FBO.
+-pub fn bindOffscreenFboForDraw() void {
+-    global_offscreen_fbo.bindForDraw();
+-}
+-
+-/// Read pixels from the offscreen FBO (RGBA format)
++/// Read pixels from the specified FBO (RGBA format)
+ /// Uses double-buffered PBO for async readback with sync fallback.
+ /// PBO returns previous frame's data while current frame reads (pipelined).
+ /// Falls back to sync read on first frame to ensure we always have data.
+-pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) bool {
+-    // Bind FBO for reading
+-    global_offscreen_fbo.bindForRead();
++/// @param fbo_id The OpenGL framebuffer object ID to read from (from renderer's last_target)
++pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
++    // Bind the renderer's FBO for reading
++    if (gl.glad.context.BindFramebuffer) |bindFbo| {
++        bindFbo(GL_READ_FRAMEBUFFER, fbo_id);
++    }
+ 
+     // Try async PBO first
+-    const pbo_ok = global_pbo_state.readPixelsAsync(buffer, buffer_len, width, height);
++    const pbo_ok = global_pbo_state.readPixelsAsync(buffer, buffer_len, width, height, fbo_id);
+     if (pbo_ok) {
+         return true;
+     }
+     // Fall back to sync read (first frame or PBO error)
+-    const sync_ok = readPixelsSync(buffer, buffer_len, width, height);
++    const sync_ok = readPixelsSync(buffer, buffer_len, width, height, fbo_id);
+     // Debug: log first pixel after sync read
+     if (sync_ok and buffer_len >= 4) {
+         const first_pixel = buffer[0..4];
+         if (global_pbo_state.frame_count < 3) {
+-            log.info("readPixels sync fallback: frame={}, first_pixel=({},{},{},{})", .{
+-                global_pbo_state.frame_count, first_pixel[0], first_pixel[1], first_pixel[2], first_pixel[3],
++            log.info("readPixels sync (fbo={}): frame={}, first_pixel=({},{},{},{})", .{
++                fbo_id, global_pbo_state.frame_count, first_pixel[0], first_pixel[1], first_pixel[2], first_pixel[3],
+             });
+         }
+     }
+@@ -588,7 +482,8 @@ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) boo
+ 
+ /// Synchronous fallback for cases where we absolutely need the current frame
+ /// (e.g., single-shot capture). Slower but provides immediate data.
+-pub fn readPixelsSync(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) bool {
++pub fn readPixelsSync(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
++    _ = fbo_id; // FBO already bound by caller
+     const readPixelsFn = gl.glad.context.ReadPixels orelse return false;
+ 
+     const expected_size = @as(usize, width) * @as(usize, height) * 4;
+@@ -596,7 +491,7 @@ pub fn readPixelsSync(buffer: [*]u8, buffer_len: usize, width: u32, height: u32)
+ 
+     // For FBO reading, use GL_COLOR_ATTACHMENT0 (not GL_BACK)
+     if (gl.glad.context.ReadBuffer) |readBuf| {
+-        readBuf(OffscreenFbo.GL_COLOR_ATTACHMENT0);
++        readBuf(GL_COLOR_ATTACHMENT0);
+     }
+ 
+     // Read pixels (OpenGL origin is bottom-left)
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 2cb4f5947..b7177b70f 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -2248,7 +2248,18 @@ pub const CAPI = struct {
+ 
+             if (comptime builtin.target.os.tag == .linux) {
+                 const egl_headless = @import("egl_headless.zig");
+-                return egl_headless.readPixels(buffer, buffer_len, width, height);
++
++                // Get the FBO ID from the renderer's last_target
++                // Path: Surface -> core_surface -> renderer -> api -> last_target -> framebuffer.id
++                const fbo_id: c_uint = blk: {
++                    const last_target = ptr.core_surface.renderer.api.last_target orelse {
++                        // No target rendered yet
++                        return false;
++                    };
++                    break :blk last_target.framebuffer.id;
++                };
++
++                return egl_headless.readPixels(buffer, buffer_len, width, height, fbo_id);
+             }
+             return false;
+         }
+diff --git a/src/renderer/OpenGL.zig b/src/renderer/OpenGL.zig
+index 3a024624f..8d5edd8f4 100644
+--- a/src/renderer/OpenGL.zig
++++ b/src/renderer/OpenGL.zig
+@@ -260,17 +260,9 @@ pub fn displayRealized(self: *const OpenGL) void {
+ 
+ /// Actions taken before doing anything in `drawFrame`.
+ ///
+-/// For embedded Linux, bind the offscreen FBO as the draw target
+-/// so that the blit in present() goes to our FBO instead of the
+-/// non-existent default framebuffer.
++/// Right now there's nothing we need to do for OpenGL.
+ pub fn drawFrameStart(self: *OpenGL) void {
+     _ = self;
+-    if (comptime builtin.target.os.tag == .linux) {
+-        if (comptime apprt.runtime == apprt.embedded) {
+-            const egl_headless = @import("../apprt/egl_headless.zig");
+-            egl_headless.bindOffscreenFboForDraw();
+-        }
+-    }
+ }
+ 
+ /// Actions taken after `drawFrame` is done.
+-- 
+2.43.0
+
+
+From be266ea93e90012c3e94c55e7241bc7a761dce6c Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Wed, 4 Feb 2026 11:12:56 -0500
+Subject: [PATCH 4/6] feat(linux): add headless EGL rendering support for
+ embedded platform
+
+---
+ src/apprt/egl_headless.zig | 25 +++++--------------------
+ 1 file changed, 5 insertions(+), 20 deletions(-)
+
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index 0198cd862..5bc488dd4 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -451,9 +451,9 @@ pub fn setViewportSize(width: u32, height: u32) void {
+ }
+ 
+ /// Read pixels from the specified FBO (RGBA format)
+-/// Uses double-buffered PBO for async readback with sync fallback.
+-/// PBO returns previous frame's data while current frame reads (pipelined).
+-/// Falls back to sync read on first frame to ensure we always have data.
++/// Currently uses synchronous readPixels. PBO is disabled because the global
++/// PBO state is shared across all surfaces, causing race conditions.
++/// TODO: Implement per-surface PBO state for async readback.
+ /// @param fbo_id The OpenGL framebuffer object ID to read from (from renderer's last_target)
+ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
+     // Bind the renderer's FBO for reading
+@@ -461,23 +461,8 @@ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo
+         bindFbo(GL_READ_FRAMEBUFFER, fbo_id);
+     }
+ 
+-    // Try async PBO first
+-    const pbo_ok = global_pbo_state.readPixelsAsync(buffer, buffer_len, width, height, fbo_id);
+-    if (pbo_ok) {
+-        return true;
+-    }
+-    // Fall back to sync read (first frame or PBO error)
+-    const sync_ok = readPixelsSync(buffer, buffer_len, width, height, fbo_id);
+-    // Debug: log first pixel after sync read
+-    if (sync_ok and buffer_len >= 4) {
+-        const first_pixel = buffer[0..4];
+-        if (global_pbo_state.frame_count < 3) {
+-            log.info("readPixels sync (fbo={}): frame={}, first_pixel=({},{},{},{})", .{
+-                fbo_id, global_pbo_state.frame_count, first_pixel[0], first_pixel[1], first_pixel[2], first_pixel[3],
+-            });
+-        }
+-    }
+-    return sync_ok;
++    // Use synchronous read - PBO disabled due to global state shared across surfaces
++    return readPixelsSync(buffer, buffer_len, width, height, fbo_id);
+ }
+ 
+ /// Synchronous fallback for cases where we absolutely need the current frame
+-- 
+2.43.0
+
+
+From 63bae98fedffe550851b343569b6726ca01ee74f Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Wed, 4 Feb 2026 11:14:40 -0500
+Subject: [PATCH 5/6] feat(linux): add headless EGL rendering support for
+ embedded platform
+
+---
+ src/apprt/egl_headless.zig | 73 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 67 insertions(+), 6 deletions(-)
+
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index 5bc488dd4..1827817ae 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -254,8 +254,59 @@ pub const PboState = struct {
+     }
+ };
+ 
+-/// Global PBO state for async readback
+-var global_pbo_state: PboState = .{};
++/// Per-FBO PBO state manager
++/// Maps FBO IDs to their own PBO states to avoid race conditions between surfaces
++const PboStateManager = struct {
++    const MAX_SURFACES = 16; // Max concurrent surfaces/FBOs
++
++    /// Entry mapping FBO ID to its PBO state
++    const Entry = struct {
++        fbo_id: c_uint = 0,
++        pbo_state: PboState = .{},
++        in_use: bool = false,
++    };
++
++    entries: [MAX_SURFACES]Entry = [_]Entry{.{}} ** MAX_SURFACES,
++
++    /// Get or create PBO state for a given FBO ID
++    pub fn getOrCreate(self: *PboStateManager, fbo_id: c_uint) ?*PboState {
++        // First, look for existing entry
++        for (&self.entries) |*entry| {
++            if (entry.in_use and entry.fbo_id == fbo_id) {
++                return &entry.pbo_state;
++            }
++        }
++
++        // Not found, create new entry
++        for (&self.entries) |*entry| {
++            if (!entry.in_use) {
++                entry.fbo_id = fbo_id;
++                entry.in_use = true;
++                entry.pbo_state = .{};
++                return &entry.pbo_state;
++            }
++        }
++
++        // No free slots
++        log.warn("PBO state manager full, cannot create state for FBO {}", .{fbo_id});
++        return null;
++    }
++
++    /// Remove PBO state for a given FBO ID (call when surface is destroyed)
++    pub fn remove(self: *PboStateManager, fbo_id: c_uint) void {
++        for (&self.entries) |*entry| {
++            if (entry.in_use and entry.fbo_id == fbo_id) {
++                entry.pbo_state.deinit();
++                entry.in_use = false;
++                entry.fbo_id = 0;
++                return;
++            }
++        }
++    }
++};
++
++/// Per-FBO PBO state manager instance
++var pbo_manager: PboStateManager = .{};
+ 
+ /// OpenGL constants for FBO binding
+ const GL_READ_FRAMEBUFFER: c_uint = 0x8CA8;
+@@ -451,9 +502,8 @@ pub fn setViewportSize(width: u32, height: u32) void {
+ }
+ 
+ /// Read pixels from the specified FBO (RGBA format)
+-/// Currently uses synchronous readPixels. PBO is disabled because the global
+-/// PBO state is shared across all surfaces, causing race conditions.
+-/// TODO: Implement per-surface PBO state for async readback.
++/// Uses per-FBO double-buffered PBO for async readback with sync fallback.
++/// Each FBO has its own PBO state to avoid race conditions between surfaces.
+ /// @param fbo_id The OpenGL framebuffer object ID to read from (from renderer's last_target)
+ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
+     // Bind the renderer's FBO for reading
+@@ -461,7 +511,18 @@ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo
+         bindFbo(GL_READ_FRAMEBUFFER, fbo_id);
+     }
+ 
+-    // Use synchronous read - PBO disabled due to global state shared across surfaces
++    // Get per-FBO PBO state
++    const pbo_state = pbo_manager.getOrCreate(fbo_id) orelse {
++        // Fall back to sync if we can't get PBO state
++        return readPixelsSync(buffer, buffer_len, width, height, fbo_id);
++    };
++
++    // Try async PBO first
++    if (pbo_state.readPixelsAsync(buffer, buffer_len, width, height, fbo_id)) {
++        return true;
++    }
++
++    // Fall back to sync read (first frame or PBO error)
+     return readPixelsSync(buffer, buffer_len, width, height, fbo_id);
+ }
+ 
+-- 
+2.43.0
+
+
+From eb117cd0930aac1ff5b4c00bc6f9c20425a4d6a1 Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Wed, 4 Feb 2026 11:17:00 -0500
+Subject: [PATCH 6/6] feat(linux): add headless EGL rendering support for
+ embedded platform
+
+---
+ src/apprt/egl_headless.zig | 5 +++++
+ src/apprt/embedded.zig     | 8 ++++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index 1827817ae..a10cec773 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -308,6 +308,11 @@ const PboStateManager = struct {
+ /// Per-FBO PBO state manager instance
+ var pbo_manager: PboStateManager = .{};
+ 
++/// Clean up PBO state for a given FBO ID (call when surface is destroyed)
++pub fn cleanupPboState(fbo_id: c_uint) void {
++    pbo_manager.remove(fbo_id);
++}
++
+ /// OpenGL constants for FBO binding
+ const GL_READ_FRAMEBUFFER: c_uint = 0x8CA8;
+ const GL_COLOR_ATTACHMENT0: c_uint = 0x8CE0;
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index b7177b70f..bac683c8b 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -613,6 +613,14 @@ pub const Surface = struct {
+         // Free our title
+         if (self.title) |v| self.app.core_app.alloc.free(v);
+ 
++        // Clean up PBO state for this surface's FBO (Linux only)
++        if (comptime builtin.target.os.tag == .linux) {
++            if (self.core_surface.renderer.api.last_target) |target| {
++                const egl_headless = @import("egl_headless.zig");
++                egl_headless.cleanupPboState(target.framebuffer.id);
++            }
++        }
++
+         // Remove ourselves from the list of known surfaces in the app.
+         self.app.core_app.deleteSurface(self);
+ 
 -- 
 2.43.0
 
