@@ -10,7 +10,7 @@
   import { connectionStatus, initMuxClient, type MuxClient } from './services/mux';
 
   // MuxClient instance
-  let muxClient: MuxClient | null = null;
+  let muxClient: MuxClient | null = $state(null);
 
   // DOM refs
   let panelsEl: HTMLElement | undefined = $state();
@@ -85,7 +85,7 @@
   // Build dynamic tab list items with active marker and shortcuts
   let windowTabListItems = $derived<MenuItem[]>(
     Array.from($tabs.values()).map((tab, index) => ({
-      label: tab.title || 'Terminal',
+      label: tab.title || '👻',
       action: `_select_tab:${tab.id}`,
       icon: tab.id === $activeTabId ? '•' : '',
       shortcut: index < 9 ? `⌘${index + 1}` : undefined,
@@ -431,7 +431,7 @@
     {#if showLoading}
       <div id="panels-loading">
         <div class="spinner"></div>
-        <span>Connecting...</span>
+        <span>Loading...</span>
       </div>
     {/if}
 
@@ -468,6 +468,8 @@
   <!-- Tab Overview -->
   <TabOverview
     open={tabOverviewOpen}
+    panelsEl={panelsEl}
+    {muxClient}
     onClose={() => tabOverviewOpen = false}
     onSelectTab={handleSelectTab}
     onCloseTab={handleCloseTab}

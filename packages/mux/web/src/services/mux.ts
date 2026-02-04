@@ -810,6 +810,30 @@ export class MuxClient {
     return this.currentActivePanel;
   }
 
+  getTabElements(): Map<string, HTMLElement> {
+    const result = new Map<string, HTMLElement>();
+    for (const [tabId, tabInfo] of this.tabInstances) {
+      result.set(tabId, tabInfo.element);
+    }
+    return result;
+  }
+
+  getPanelsEl(): HTMLElement | null {
+    return this.panelsEl;
+  }
+
+  pauseAllPanels(): void {
+    for (const panel of this.panelInstances.values()) {
+      panel.hide();
+    }
+  }
+
+  resumeAllPanels(): void {
+    for (const panel of this.panelInstances.values()) {
+      panel.show();
+    }
+  }
+
   toggleQuickTerminal(container: HTMLElement): void {
     ui.update(s => {
       if (s.quickTerminalOpen) {

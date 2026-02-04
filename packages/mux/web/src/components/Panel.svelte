@@ -891,7 +891,7 @@
     ></canvas>
     <div class="panel-loading" bind:this={loadingEl}>
       <div class="spinner"></div>
-      <span>Connecting...</span>
+      <span>Loading...</span>
     </div>
     {#if debugEnabled}
       <div class="panel-stats">
