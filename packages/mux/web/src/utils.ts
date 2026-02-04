@@ -1,5 +1,45 @@
 // Utility functions
 
+import {
+  BYTES,
+  COLORS,
+  ID_GENERATION,
+  WS_PATHS,
+} from './constants';
+
+// ============================================================================
+// WebSocket utilities
+// ============================================================================
+
+/**
+ * Build WebSocket URL from path - auto-detects ws/wss based on page protocol
+ */
+export function getWsUrl(path: string): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.host;
+  return `${protocol}//${host}${path}`;
+}
+
+// ============================================================================
+// Shared instances (avoid creating on every call)
+// ============================================================================
+
+/** Shared TextEncoder instance - reuse to avoid allocation */
+export const sharedTextEncoder = new TextEncoder();
+
+/** Shared TextDecoder instance - reuse to avoid allocation */
+export const sharedTextDecoder = new TextDecoder();
+
+// ============================================================================
+// Platform detection (computed once)
+// ============================================================================
+
+/** Whether the current platform is macOS/iOS */
+export const isMac = typeof navigator !== 'undefined' && (
+  (navigator as { userAgentData?: { platform?: string } }).userAgentData?.platform === 'macOS'
+  || /Mac|iPhone|iPad|iPod/.test(navigator.userAgent)
+);
+
 // ============================================================================
 // Color utilities
 // ============================================================================
@@ -16,9 +56,11 @@ export function hexToRgb(hex: string): RGB | null {
 }
 
 export function rgbToHex(r: number, g: number, b: number): string {
-  return `#${Math.round(r).toString(16).padStart(2, '0')}${Math.round(g).toString(16).padStart(2, '0')}${Math.round(b).toString(16).padStart(2, '0')}`;
+  const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+  return `#${clamp(r).toString(16).padStart(2, '0')}${clamp(g).toString(16).padStart(2, '0')}${clamp(b).toString(16).padStart(2, '0')}`;
 }
 
+/** Calculate relative luminance using BT.601 coefficients */
 export function luminance(hex: string): number {
   const rgb = hexToRgb(hex);
   if (!rgb) return 0;
@@ -26,11 +68,11 @@ export function luminance(hex: string): number {
 }
 
 export function isLightColor(hex: string): boolean {
-  return luminance(hex) > 0.5;
+  return luminance(hex) > COLORS.LUMINANCE_LIGHT_THRESHOLD;
 }
 
 export function isVeryDark(hex: string): boolean {
-  return luminance(hex) < 0.05;
+  return luminance(hex) < COLORS.LUMINANCE_VERY_DARK_THRESHOLD;
 }
 
 export function highlightColor(hex: string, level: number): string {
@@ -68,17 +110,17 @@ export function blendWithBlack(hex: string, alpha: number): string {
  * Format bytes to human readable string
  */
 export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (bytes < BYTES.KB) return `${bytes} B`;
+  if (bytes < BYTES.MB) return `${(bytes / BYTES.KB).toFixed(1)} KB`;
+  if (bytes < BYTES.GB) return `${(bytes / BYTES.MB).toFixed(1)} MB`;
+  return `${(bytes / BYTES.GB).toFixed(2)} GB`;
 }
 
 /**
  * Generate a unique ID
  */
 export function generateId(): string {
-  return Math.random().toString(36).substring(2, 9);
+  return Math.random().toString(ID_GENERATION.RADIX).substring(ID_GENERATION.START, ID_GENERATION.START + ID_GENERATION.LENGTH);
 }
 
 /**
@@ -98,7 +140,7 @@ export function debounce<T extends (...args: unknown[]) => void>(
 /**
  * Throttle a function
  */
-export function throttle<T extends (...args: unknown[]) => void>(
+export function throttle<T extends (...args: never[]) => void>(
   fn: T,
   limit: number
 ): (...args: Parameters<T>) => void {
@@ -154,19 +196,14 @@ export function applyColors(colors: Record<string, string>): void {
 }
 
 /**
- * Parse query string parameters
+ * Parse query string parameters using modern URLSearchParams API
  */
 export function parseQueryParams(): Record<string, string> {
   const params: Record<string, string> = {};
-  const search = window.location.search.substring(1);
-  if (!search) return params;
-
-  for (const pair of search.split('&')) {
-    const [key, value] = pair.split('=');
-    if (key) {
-      params[decodeURIComponent(key)] = decodeURIComponent(value || '');
-    }
-  }
+  const searchParams = new URLSearchParams(window.location.search);
+  searchParams.forEach((value, key) => {
+    params[key] = value;
+  });
   return params;
 }
 
@@ -225,4 +262,189 @@ export function writeU16LE(view: DataView, offset: number, value: number): void 
  */
 export function writeU32LE(view: DataView, offset: number, value: number): void {
   view.setUint32(offset, value, true);
+}
+
+// ============================================================================
+// BinaryReader utility class for parsing binary messages
+// ============================================================================
+
+/**
+ * BinaryReader - helper class for reading binary protocol messages
+ * Tracks offset automatically and provides bounds checking
+ */
+export class BinaryReader {
+  private view: DataView;
+  private bytes: Uint8Array;
+  private _offset: number;
+  private length: number;
+
+  constructor(data: ArrayBuffer, startOffset = 0) {
+    this.view = new DataView(data);
+    this.bytes = new Uint8Array(data);
+    this._offset = startOffset;
+    this.length = data.byteLength;
+  }
+
+  get offset(): number {
+    return this._offset;
+  }
+
+  get remaining(): number {
+    return this.length - this._offset;
+  }
+
+  hasBytes(count: number): boolean {
+    return this._offset + count <= this.length;
+  }
+
+  readU8(): number {
+    if (!this.hasBytes(1)) throw new RangeError('Buffer overflow reading u8');
+    return this.view.getUint8(this._offset++);
+  }
+
+  readU16(): number {
+    if (!this.hasBytes(2)) throw new RangeError('Buffer overflow reading u16');
+    const val = this.view.getUint16(this._offset, true);
+    this._offset += 2;
+    return val;
+  }
+
+  readU32(): number {
+    if (!this.hasBytes(4)) throw new RangeError('Buffer overflow reading u32');
+    const val = this.view.getUint32(this._offset, true);
+    this._offset += 4;
+    return val;
+  }
+
+  readU64(): bigint {
+    if (!this.hasBytes(8)) throw new RangeError('Buffer overflow reading u64');
+    const val = this.view.getBigUint64(this._offset, true);
+    this._offset += 8;
+    return val;
+  }
+
+  readF32(): number {
+    if (!this.hasBytes(4)) throw new RangeError('Buffer overflow reading f32');
+    const val = this.view.getFloat32(this._offset, true);
+    this._offset += 4;
+    return val;
+  }
+
+  readF64(): number {
+    if (!this.hasBytes(8)) throw new RangeError('Buffer overflow reading f64');
+    const val = this.view.getFloat64(this._offset, true);
+    this._offset += 8;
+    return val;
+  }
+
+  readBytes(length: number): Uint8Array {
+    if (!this.hasBytes(length)) throw new RangeError(`Buffer overflow reading ${length} bytes`);
+    const val = this.bytes.slice(this._offset, this._offset + length);
+    this._offset += length;
+    return val;
+  }
+
+  readString(length: number): string {
+    return sharedTextDecoder.decode(this.readBytes(length));
+  }
+
+  readLengthPrefixedString(lengthBytes: 1 | 2 = 2): string {
+    const len = lengthBytes === 1 ? this.readU8() : this.readU16();
+    return this.readString(len);
+  }
+
+  skip(count: number): void {
+    if (!this.hasBytes(count)) throw new RangeError(`Buffer overflow skipping ${count} bytes`);
+    this._offset += count;
+  }
+}
+
+// ============================================================================
+// Circular buffer for efficient fixed-size collections
+// ============================================================================
+
+/**
+ * CircularBuffer - fixed-size buffer that overwrites oldest entries
+ * Useful for latency samples, timestamps, etc.
+ */
+export class CircularBuffer<T> {
+  private buffer: T[];
+  private head = 0;
+  private count = 0;
+  private capacity: number;
+
+  constructor(capacity: number) {
+    this.capacity = capacity;
+    this.buffer = new Array(capacity);
+  }
+
+  push(item: T): void {
+    this.buffer[this.head] = item;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.count < this.capacity) this.count++;
+  }
+
+  toArray(): T[] {
+    if (this.count === 0) return [];
+    if (this.count < this.capacity) {
+      return this.buffer.slice(0, this.count);
+    }
+    // Buffer is full, need to reorder from oldest to newest
+    return [...this.buffer.slice(this.head), ...this.buffer.slice(0, this.head)];
+  }
+
+  get length(): number {
+    return this.count;
+  }
+
+  clear(): void {
+    this.head = 0;
+    this.count = 0;
+  }
+
+  /** Get items newer than the given threshold (for timestamp buffers) */
+  filterRecent(threshold: T, compare: (a: T, b: T) => number): T[] {
+    return this.toArray().filter(item => compare(item, threshold) > 0);
+  }
+
+  /** Calculate average of numeric buffer (avoids allocation of intermediate array) */
+  average(this: CircularBuffer<number>): number {
+    if (this.count === 0) return 0;
+    let sum = 0;
+    for (let i = 0; i < this.count; i++) {
+      const idx = (this.head - this.count + i + this.capacity) % this.capacity;
+      sum += this.buffer[idx];
+    }
+    return sum / this.count;
+  }
+}
+
+// ============================================================================
+// Stream utilities
+// ============================================================================
+
+/**
+ * Collect all chunks from a ReadableStream into a single Uint8Array
+ */
+export async function collectStreamChunks(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
 }

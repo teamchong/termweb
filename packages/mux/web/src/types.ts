@@ -1,5 +1,16 @@
 // Type definitions for the termweb-mux client
 
+// File System Access API type declarations
+export interface FileSystemDirectoryHandleIterator {
+  entries(): AsyncIterableIterator<[string, FileSystemFileHandle | FileSystemDirectoryHandle]>;
+}
+
+declare global {
+  interface Window {
+    showDirectoryPicker(options?: { mode?: 'read' | 'readwrite' }): Promise<FileSystemDirectoryHandle>;
+  }
+}
+
 export interface PanelOptions {
   id: string;
   container: HTMLElement;
@@ -37,15 +48,6 @@ export interface PanelInstance {
   handleInspectorState(state: unknown): void;
 }
 
-import type { SplitContainer } from './split-container';
-
-export interface TabInfo {
-  id: string;
-  title: string;
-  root: SplitContainer;
-  element: HTMLElement;
-}
-
 export interface SplitContainerInstance {
   direction: 'horizontal' | 'vertical';
   element: HTMLElement;
@@ -57,29 +59,8 @@ export interface SplitContainerInstance {
   getAllPanels(): PanelInstance[];
 }
 
-export interface TransferState {
-  id: number;
-  direction: 'upload' | 'download';
-  serverPath: string;
-  files: TransferFile[];
-  currentFileIndex: number;
-  currentChunkOffset: number;
-  state: 'pending' | 'active' | 'paused' | 'complete' | 'error';
-  options: TransferOptions;
-}
-
-export interface TransferFile {
-  path: string;
-  size: number;
-  mtime: number;
-  hash: bigint;
-}
-
-export interface TransferOptions {
-  deleteExtra?: boolean;
-  dryRun?: boolean;
-  excludes?: string[];
-}
+// Re-export transfer types from file-transfer for backwards compatibility
+export type { TransferFile, TransferOptions, TransferState } from './file-transfer';
 
 export interface AuthState {
   authRequired: boolean;

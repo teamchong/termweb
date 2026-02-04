@@ -60,25 +60,30 @@ export class CompressionPool {
     // Use native CompressionStream with deflate-raw
     const cs = new CompressionStream('deflate-raw');
     const writer = cs.writable.getWriter();
-    writer.write(data);
-    writer.close();
-
-    const chunks: Uint8Array[] = [];
     const reader = cs.readable.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
 
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
+    try {
+      writer.write(data as Uint8Array<ArrayBuffer>);
+      await writer.close();
+
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+
+      const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return result;
+    } finally {
+      reader.releaseLock();
     }
-    return result;
   }
 
   /**
@@ -109,25 +114,30 @@ export class CompressionPool {
     // Fallback to native DecompressionStream
     const ds = new DecompressionStream('deflate-raw');
     const writer = ds.writable.getWriter();
-    writer.write(data);
-    writer.close();
-
-    const chunks: Uint8Array[] = [];
     const reader = ds.readable.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
 
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
+    try {
+      writer.write(data as Uint8Array<ArrayBuffer>);
+      await writer.close();
+
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+
+      const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return result;
+    } finally {
+      reader.releaseLock();
     }
-    return result;
   }
 
   /**

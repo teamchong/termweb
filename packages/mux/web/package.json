@@ -3,15 +3,18 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "bun build src/index.ts --outfile=client.js --minify --format=iife",
-    "build:dev": "bun build src/index.ts --outfile=client.js --format=iife",
-    "dev": "bun build src/index.ts --outfile=client.js --watch --format=iife",
+    "build": "vite build",
+    "build:legacy": "bun build src/index.ts --outfile=client.js --minify --format=iife",
+    "dev": "vite build --watch",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/dom-webcodecs": "^0.1.11",
     "@webgpu/types": "^0.1.69",
-    "typescript": "^5.3.0"
+    "svelte": "^5.49.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
   },
   "dependencies": {
     "fzstd": "^0.1.1",

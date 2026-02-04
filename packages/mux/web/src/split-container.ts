@@ -1,36 +1,50 @@
-import type { Panel } from './panel';
+import { SPLIT } from './constants';
 
 type SplitDirection = 'horizontal' | 'vertical';
 type SplitCommand = 'right' | 'down' | 'left' | 'up';
+
+// Minimal interface for panels - works with both vanilla JS and Svelte components
+export interface PanelLike {
+  id: string;
+  serverId: number | null;
+  element: HTMLElement;
+  canvas?: HTMLCanvasElement;
+  destroy: () => void;
+}
 
 export class SplitContainer {
   parent: SplitContainer | null;
   direction: SplitDirection | null = null;
   first: SplitContainer | null = null;
   second: SplitContainer | null = null;
-  panel: Panel | null = null;
-  ratio = 0.5;
+  panel: PanelLike | null = null;
+  ratio: number = SPLIT.DEFAULT_RATIO;
   element: HTMLElement;
   divider: HTMLElement | null = null;
   private isDragging = false;
   private dividerMouseDownHandler: ((e: MouseEvent) => void) | null = null;
+  private documentMoveHandler: ((e: MouseEvent) => void) | null = null;
+  private documentUpHandler: (() => void) | null = null;
 
   constructor(parent: SplitContainer | null = null) {
     this.parent = parent;
     this.element = document.createElement('div');
   }
 
-  static createLeaf(panel: Panel, parent: SplitContainer | null = null): SplitContainer {
+  static createLeaf(panel: PanelLike, parent: SplitContainer | null = null): SplitContainer {
     const container = new SplitContainer(parent);
     container.panel = panel;
     container.element = document.createElement('div');
     container.element.className = 'split-pane';
     container.element.style.flex = '1';
-    panel.reparent(container.element);
+    if (panel.element.parentElement) {
+      panel.element.parentElement.removeChild(panel.element);
+    }
+    container.element.appendChild(panel.element);
     return container;
   }
 
-  split(splitDirection: SplitCommand, newPanel: Panel): SplitContainer | null {
+  split(splitDirection: SplitCommand, newPanel: PanelLike): SplitContainer | null {
     if (this.direction !== null) {
       console.error('Cannot split a non-leaf container directly');
       return null;
@@ -61,7 +75,6 @@ export class SplitContainer {
 
     this.element = document.createElement('div');
     this.element.className = `split-container ${this.direction}`;
-    // Preserve flex style from old element so parent's ratio still works
     if (oldElement.style.flex) {
       this.element.style.flex = oldElement.style.flex;
     }
@@ -86,8 +99,6 @@ export class SplitContainer {
     let startPos = 0;
     let startRatio = 0;
     let containerSize = 0;
-    let moveHandler: ((e: MouseEvent) => void) | null = null;
-    let upHandler: (() => void) | null = null;
 
     const onMouseDown = (e: MouseEvent) => {
       e.preventDefault();
@@ -104,10 +115,10 @@ export class SplitContainer {
       }
       startRatio = this.ratio;
 
-      moveHandler = onMouseMove;
-      upHandler = onMouseUp;
-      document.addEventListener('mousemove', moveHandler);
-      document.addEventListener('mouseup', upHandler);
+      this.documentMoveHandler = onMouseMove;
+      this.documentUpHandler = onMouseUp;
+      document.addEventListener('mousemove', this.documentMoveHandler);
+      document.addEventListener('mouseup', this.documentUpHandler);
     };
 
     const onMouseMove = (e: MouseEvent) => {
@@ -120,25 +131,32 @@ export class SplitContainer {
         delta = e.clientY - startPos;
       }
 
-      const dividerSize = 4;
-      const availableSize = containerSize - dividerSize;
+      const availableSize = containerSize - SPLIT.DIVIDER_SIZE;
       const deltaRatio = delta / availableSize;
 
-      this.ratio = Math.max(0.1, Math.min(0.9, startRatio + deltaRatio));
+      this.ratio = Math.max(SPLIT.MIN_RATIO, Math.min(SPLIT.MAX_RATIO, startRatio + deltaRatio));
       this.applyRatio();
     };
 
     const onMouseUp = () => {
       this.isDragging = false;
       this.divider?.classList.remove('dragging');
-      if (moveHandler) document.removeEventListener('mousemove', moveHandler);
-      if (upHandler) document.removeEventListener('mouseup', upHandler);
-      moveHandler = null;
-      upHandler = null;
+      this.cleanupDragListeners();
     };
 
     this.dividerMouseDownHandler = onMouseDown;
     this.divider!.addEventListener('mousedown', onMouseDown);
+  }
+
+  private cleanupDragListeners(): void {
+    if (this.documentMoveHandler) {
+      document.removeEventListener('mousemove', this.documentMoveHandler);
+      this.documentMoveHandler = null;
+    }
+    if (this.documentUpHandler) {
+      document.removeEventListener('mouseup', this.documentUpHandler);
+      this.documentUpHandler = null;
+    }
   }
 
   applyRatio(): void {
@@ -151,8 +169,8 @@ export class SplitContainer {
     this.second.element.style.flex = `0 0 calc(${secondPercent}% - 2px)`;
   }
 
-  findContainer(panel: Panel): SplitContainer | null {
-    if (this.panel === panel) return this;
+  findContainer(panel: PanelLike): SplitContainer | null {
+    if (this.panel?.id === panel.id) return this;
     if (this.first) {
       const found = this.first.findContainer(panel);
       if (found) return found;
@@ -164,8 +182,8 @@ export class SplitContainer {
     return null;
   }
 
-  getAllPanels(): Panel[] {
-    const panels: Panel[] = [];
+  getAllPanels(): PanelLike[] {
+    const panels: PanelLike[] = [];
     if (this.panel) {
       panels.push(this.panel);
     }
@@ -178,19 +196,19 @@ export class SplitContainer {
     return panels;
   }
 
-  removePanel(panel: Panel): boolean {
-    if (this.panel === panel) {
+  removePanel(panel: PanelLike): boolean {
+    if (this.panel?.id === panel.id) {
       return true;
     }
 
-    if (this.first && this.first.panel === panel) {
+    if (this.first && this.first.panel?.id === panel.id) {
       const toRemove = this.first;
       this.promoteChild(this.second!);
       if (toRemove.element) toRemove.element.remove();
       return true;
     }
 
-    if (this.second && this.second.panel === panel) {
+    if (this.second && this.second.panel?.id === panel.id) {
       const toRemove = this.second;
       this.promoteChild(this.first!);
       if (toRemove.element) toRemove.element.remove();
@@ -231,7 +249,12 @@ export class SplitContainer {
       this.element = document.createElement('div');
       this.element.className = 'split-pane';
       this.element.style.flex = '1';
-      this.panel!.reparent(this.element);
+      if (this.panel && this.panel.element.parentElement) {
+        this.panel.element.parentElement.removeChild(this.panel.element);
+      }
+      if (this.panel) {
+        this.element.appendChild(this.panel.element);
+      }
 
       if (parent) {
         parent.replaceChild(this.element, oldElement);
@@ -240,11 +263,12 @@ export class SplitContainer {
   }
 
   destroy(): void {
-    // Clean up divider event listener
     if (this.divider && this.dividerMouseDownHandler) {
       this.divider.removeEventListener('mousedown', this.dividerMouseDownHandler);
       this.dividerMouseDownHandler = null;
     }
+    this.cleanupDragListeners();
+    this.isDragging = false;
 
     if (this.panel) {
       this.panel.destroy();
@@ -260,18 +284,14 @@ export class SplitContainer {
     }
   }
 
-  // Count weight for equalization - only count children with same direction
-  // A split with different direction counts as 1 (like Ghostty)
   private weight(forDirection: SplitDirection): number {
     if (this.panel) return 1;
-    // If this split has a different direction, count as 1
     if (this.direction !== forDirection) return 1;
     const leftWeight = this.first?.weight(forDirection) ?? 0;
     const rightWeight = this.second?.weight(forDirection) ?? 0;
     return leftWeight + rightWeight;
   }
 
-  // Equalize splits based on the number of leaves on each side (like Ghostty)
   equalize(): void {
     if (this.direction !== null && this.first && this.second) {
       const leftWeight = this.first.weight(this.direction);
@@ -283,13 +303,10 @@ export class SplitContainer {
     }
   }
 
-  // Resize split by moving divider in the given direction
   resizeSplit(direction: 'up' | 'down' | 'left' | 'right', amount: number): void {
-    // Find the appropriate divider to move based on direction
     const isVerticalMove = direction === 'up' || direction === 'down';
     const isNegative = direction === 'up' || direction === 'left';
 
-    // Find a container with matching direction
     const targetDirection: SplitDirection = isVerticalMove ? 'vertical' : 'horizontal';
     const container = this.findContainerWithDirection(targetDirection);
 
@@ -297,13 +314,12 @@ export class SplitContainer {
       const rect = container.element.getBoundingClientRect();
       const containerSize = isVerticalMove ? rect.height : rect.width;
       const deltaRatio = (isNegative ? -amount : amount) / containerSize;
-      container.ratio = Math.max(0.1, Math.min(0.9, container.ratio + deltaRatio));
+      container.ratio = Math.max(SPLIT.MIN_RATIO, Math.min(SPLIT.MAX_RATIO, container.ratio + deltaRatio));
       container.applyRatio();
     }
   }
 
   private findContainerWithDirection(targetDirection: SplitDirection): SplitContainer | null {
-    // Walk up the tree to find a container with the matching direction
     let current: SplitContainer | null = this;
     while (current) {
       if (current.direction === targetDirection) {
@@ -314,49 +330,46 @@ export class SplitContainer {
     return null;
   }
 
-  // Select split in the given direction from the panel with panelId
-  selectSplitInDirection(direction: 'up' | 'down' | 'left' | 'right', panelId: number | undefined): Panel | null {
+  selectSplitInDirection(direction: 'up' | 'down' | 'left' | 'right', panelId: string | undefined): PanelLike | null {
     if (!panelId) return null;
 
-    // Get all panels with their bounding rects
     const panels = this.getAllPanels();
     const currentPanel = panels.find(p => p.id === panelId);
-    if (!currentPanel) return null;
+    if (!currentPanel || !currentPanel.canvas) return null;
 
     const currentRect = currentPanel.canvas.getBoundingClientRect();
     const currentCenterX = currentRect.left + currentRect.width / 2;
     const currentCenterY = currentRect.top + currentRect.height / 2;
 
-    let bestPanel: Panel | null = null;
+    let bestPanel: PanelLike | null = null;
     let bestDistance = Infinity;
 
     for (const panel of panels) {
-      if (panel.id === panelId) continue;
+      if (panel.id === panelId || !panel.canvas) continue;
 
       const rect = panel.canvas.getBoundingClientRect();
       const centerX = rect.left + rect.width / 2;
       const centerY = rect.top + rect.height / 2;
 
-      // Check if panel is in the correct direction
       let inDirection = false;
       let distance = 0;
 
       switch (direction) {
         case 'up':
           inDirection = centerY < currentCenterY;
-          distance = currentCenterY - centerY + Math.abs(centerX - currentCenterX) * 0.5;
+          distance = currentCenterY - centerY + Math.abs(centerX - currentCenterX) * SPLIT.PERPENDICULAR_WEIGHT;
           break;
         case 'down':
           inDirection = centerY > currentCenterY;
-          distance = centerY - currentCenterY + Math.abs(centerX - currentCenterX) * 0.5;
+          distance = centerY - currentCenterY + Math.abs(centerX - currentCenterX) * SPLIT.PERPENDICULAR_WEIGHT;
           break;
         case 'left':
           inDirection = centerX < currentCenterX;
-          distance = currentCenterX - centerX + Math.abs(centerY - currentCenterY) * 0.5;
+          distance = currentCenterX - centerX + Math.abs(centerY - currentCenterY) * SPLIT.PERPENDICULAR_WEIGHT;
           break;
         case 'right':
           inDirection = centerX > currentCenterX;
-          distance = centerX - currentCenterX + Math.abs(centerY - currentCenterY) * 0.5;
+          distance = centerX - currentCenterX + Math.abs(centerY - currentCenterY) * SPLIT.PERPENDICULAR_WEIGHT;
           break;
       }
 
