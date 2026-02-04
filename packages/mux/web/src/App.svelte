@@ -58,9 +58,10 @@
     { label: 'Split Left', action: '_split_left', icon: '▌⬚', disabled: !hasTabs },
     { label: 'Split Up', action: '_split_up', icon: '▀⬚', disabled: !hasTabs },
     { separator: true },
-    { label: 'Close Tab', action: '_close_tab', shortcut: '⌘.', icon: '✕', disabled: !hasTabs },
+    { label: 'Close', action: '_close', shortcut: '⌘.', icon: '✕', disabled: !hasTabs },
+    { label: 'Close Tab', action: '_close_tab', shortcut: '⌥⌘.', icon: '⊠', disabled: !hasTabs },
     { label: 'Close Other Tabs', action: '_close_other_tabs', icon: '⊟', disabled: !hasTabs },
-    { label: 'Close All Tabs', action: '_close_all_tabs', shortcut: '⌘⇧.', icon: '⊠', disabled: !hasTabs },
+    { label: 'Close Window', action: '_close_window', shortcut: '⌘⇧.', icon: '⊠', disabled: !hasTabs },
   ]);
 
   // Edit menu: Undo/Redo, Copy, Paste, Select All
@@ -85,7 +86,7 @@
     { label: 'Command Palette', action: '_command_palette', shortcut: '⌘⇧P', icon: '⌘' },
     { label: 'Change Title...', action: '_change_title', icon: '✎', disabled: !hasTabs },
     { separator: true },
-    { label: 'Quick Terminal', action: '_quick_terminal', icon: '▼' },
+    { label: 'Quick Terminal', action: '_quick_terminal', shortcut: '⌥⌘`', icon: '▼' },
     { separator: true },
     { label: 'Toggle Inspector', action: '_toggle_inspector', shortcut: '⌥⌘I', icon: '🔍', disabled: !hasTabs },
   ]);
@@ -186,6 +187,14 @@
       case '_new_tab':
         handleNewTab();
         break;
+      case '_close': {
+        // Smart close: close panel if multiple, close tab if single
+        const activePanel = muxClient?.getActivePanel();
+        if (activePanel) {
+          muxClient?.closePanel(activePanel.id);
+        }
+        break;
+      }
       case '_close_tab': {
         const tabId = $activeTabId;
         if (tabId) handleCloseTab(tabId);
@@ -226,8 +235,8 @@
       case '_download':
         muxClient?.showDownloadDialog();
         break;
-      case '_close_all_tabs':
-        // Close all tabs
+      case '_close_window':
+        // Close all tabs (close window)
         for (const tab of $tabs.values()) {
           muxClient?.closeTab(tab.id);
         }
@@ -348,12 +357,15 @@
       return;
     } else if (e.metaKey && e.shiftKey && key === '.') {
       e.preventDefault();
-      handleCommand('_close_all_tabs');
+      handleCommand('_close_window');
+      return;
+    } else if (e.metaKey && e.altKey && key === '.') {
+      e.preventDefault();
+      handleCommand('_close_tab');
       return;
     } else if (e.metaKey && key === '.') {
       e.preventDefault();
-      const tabId = $activeTabId;
-      if (tabId) handleCloseTab(tabId);
+      handleCommand('_close');
       return;
     } else if (e.metaKey && key === 'd') {
       e.preventDefault();
@@ -378,6 +390,10 @@
     } else if (e.metaKey && e.shiftKey && key === 'f') {
       e.preventDefault();
       handleCommand('_toggle_fullscreen');
+      return;
+    } else if (e.metaKey && e.altKey && key === '`') {
+      e.preventDefault();
+      handleCommand('_quick_terminal');
       return;
     } else if (e.metaKey && e.shiftKey && key === '[') {
       e.preventDefault();

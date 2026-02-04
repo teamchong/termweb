@@ -484,12 +484,14 @@ export class MuxClient {
     if (!tab) return;
     const allPanels = tab.root.getAllPanels();
     for (const panel of allPanels) {
-      this.panelInstances.delete(panel.id);
+      // Send close message to server (optimistic update - frontend updates immediately)
       if (panel.serverId !== null) {
+        this.sendClosePanel(panel.serverId);
         this.panelsByServerId.delete(panel.serverId);
       }
+      this.panelInstances.delete(panel.id);
       panels.remove(panel.id);
-      panel.destroy();
+      // Note: Don't call panel.destroy() here - SplitContainer.destroy() will do it
     }
     tab.root.destroy();
     tab.element.remove();
@@ -627,8 +629,10 @@ export class MuxClient {
         this.bellTimeouts.delete(panel.serverId);
       }
     }
+    // Handle quick terminal specially - just hide it, don't close
     if (this.quickTerminalPanel === panel) {
-      this.quickTerminalPanel = null;
+      this.hideQuickTerminal();
+      return;
     }
     if (this.previousActivePanel === panel) {
       this.previousActivePanel = null;
@@ -641,11 +645,13 @@ export class MuxClient {
     if (allPanels.length === 1) {
       this.closeTab(tabId);
     } else {
-      tab.root.removePanel(panel);
-      this.panelInstances.delete(panelId);
+      // Send close message to server (optimistic update - frontend updates immediately)
       if (panel.serverId !== null) {
+        this.sendClosePanel(panel.serverId);
         this.panelsByServerId.delete(panel.serverId);
       }
+      tab.root.removePanel(panel);
+      this.panelInstances.delete(panelId);
       panels.remove(panelId);
       panel.destroy();
       const remainingPanels = tab.root.getAllPanels();
@@ -885,6 +891,13 @@ export class MuxClient {
     }
   }
 
+  private sendClosePanel(serverId: number): void {
+    const data = new Uint8Array(4);
+    const view = new DataView(data.buffer);
+    view.setUint32(0, serverId, true);
+    this.sendControlMessage(BinaryCtrlMsg.CLOSE_PANEL, data);
+  }
+
   sendViewAction(action: string): void {
     const panel = this.currentActivePanel;
     if (!panel || panel.serverId === null) return;
@@ -951,6 +964,22 @@ export class MuxClient {
 
   getQuickTerminalPanel(): PanelInstance | null {
     return this.quickTerminalPanel;
+  }
+
+  hideQuickTerminal(): void {
+    if (!this.quickTerminalPanel) return;
+    // Just hide the quick terminal UI, keep the panel running on server
+    if (this.previousActivePanel && this.panelInstances.has(this.previousActivePanel.id)) {
+      this.setActivePanel(this.previousActivePanel);
+    } else {
+      const firstPanel = this.panelInstances.values().next().value;
+      if (firstPanel && firstPanel !== this.quickTerminalPanel) {
+        this.setActivePanel(firstPanel);
+      }
+    }
+    this.previousActivePanel = null;
+    // Update UI state to hide quick terminal
+    ui.update(s => ({ ...s, quickTerminalOpen: false }));
   }
 
   toggleInspector(): void {

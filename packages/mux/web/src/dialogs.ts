@@ -49,9 +49,10 @@ const cachedCommands: Command[] = [
   { title: 'Move Tab Left', action: 'move_tab:-1', description: 'Move current tab left', requiresTab: true },
   { title: 'Move Tab Right', action: 'move_tab:1', description: 'Move current tab right', requiresTab: true },
   { title: 'New Tab', action: '_new_tab', description: 'Open a new tab', shortcut: '⌘/' },
-  { title: 'Close All Tabs', action: '_close_all_tabs', description: 'Close all tabs', requiresTab: true },
+  { title: 'Close', action: '_close', description: 'Close current panel or tab', shortcut: '⌘.', requiresTab: true },
+  { title: 'Close Tab', action: '_close_tab', description: 'Close current tab', shortcut: '⌥⌘.', requiresTab: true },
   { title: 'Close Other Tabs', action: '_close_other_tabs', description: 'Close all other tabs', requiresTab: true },
-  { title: 'Close Tab', action: '_close_tab', description: 'Close current tab', shortcut: '⌘.', requiresTab: true },
+  { title: 'Close Window', action: '_close_window', description: 'Close all tabs', shortcut: '⌘⇧.', requiresTab: true },
   { title: 'Show All Tabs', action: '_show_all_tabs', description: 'Show tab overview', shortcut: '⌘⇧A', requiresTab: true },
 
   // Split Management (require active panel)
@@ -82,6 +83,7 @@ const cachedCommands: Command[] = [
   { title: 'Open Config', action: 'open_config', description: 'Open config file in editor', shortcut: '⌘,' },
   { title: 'Reload Config', action: 'reload_config', description: 'Reload configuration', shortcut: '⇧⌘,' },
   { title: 'Toggle Inspector', action: '_toggle_inspector', description: 'Toggle terminal inspector', shortcut: '⌥⌘I', requiresPanel: true },
+  { title: 'Quick Terminal', action: '_quick_terminal', description: 'Toggle quick terminal', shortcut: '⌥⌘`' },
 
   // Title (require tab)
   { title: 'Change Title...', action: '_change_title', description: 'Change the terminal title', requiresTab: true },
