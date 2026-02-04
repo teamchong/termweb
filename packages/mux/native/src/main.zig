@@ -1,3 +1,18 @@
+//! Terminal multiplexer server for termweb.
+//!
+//! This is the core server that manages terminal sessions and streams them to web clients.
+//! It handles:
+//! - Terminal lifecycle management via libghostty (macOS) or PTY (Linux)
+//! - Real-time H.264 video encoding of terminal surfaces
+//! - WebSocket message routing for input/output
+//! - Multi-panel/split management with layout persistence
+//! - File transfer operations with compression
+//!
+//! Architecture:
+//! - HTTP server serves embedded web assets and handles WebSocket upgrades
+//! - Separate WebSocket endpoints for panel streams, control messages, and file transfers
+//! - Platform-specific video encoding (VideoToolbox on macOS, VA-API on Linux)
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 const ws = @import("ws_server.zig");
@@ -52,9 +67,9 @@ const objc = if (is_macos) @cImport({
     pub fn objc_msgSend() callconv(.c) ?*anyopaque { return null; }
 };
 
-// ============================================================================
+
 // Frame Protocol (same as termweb)
-// ============================================================================
+
 
 pub const FrameType = enum(u8) {
     keyframe = 0x01,
@@ -124,9 +139,9 @@ const MouseScrollMsg = packed struct {
     mods: u8,
 };
 
-// ============================================================================
+
 // Control Channel Protocol (Binary + JSON fallback)
-// ============================================================================
+
 
 // Binary control message types (wire protocol)
 pub const BinaryCtrlMsg = enum(u8) {
@@ -197,9 +212,9 @@ pub const ControlMsgType = enum {
     close_tab,       // Close a tab
 };
 
-// ============================================================================
+
 // Layout Management (persisted to disk)
-// ============================================================================
+
 
 pub const SplitDirection = enum {
     horizontal,
@@ -477,9 +492,9 @@ pub const Layout = struct {
     }
 };
 
-// ============================================================================
+
 // Input Event Queue (for thread-safe input to ghostty)
-// ============================================================================
+
 
 const InputEvent = union(enum) {
     key: struct {
@@ -494,9 +509,9 @@ const InputEvent = union(enum) {
     resize: struct { width: u32, height: u32 },
 };
 
-// ============================================================================
+
 // Panel - One ghostty surface + streamer + websocket connection
-// ============================================================================
+
 
 // Import SharedMemory for Linux IPC
 const SharedMemory = @import("shared_memory").SharedMemory;
@@ -1387,9 +1402,9 @@ const Panel = struct {
     }
 };
 
-// ============================================================================
+
 // Server - manages multiple panels and WebSocket connections
-// ============================================================================
+
 
 // Panel creation request (to be processed on main thread)
 const PanelRequest = struct {
@@ -1749,7 +1764,7 @@ const Server = struct {
         if (self.app) |app| c.ghostty_app_tick(app);
     }
 
-    // ========== Control WebSocket callbacks ==========
+    // --- Control WebSocket callbacks---
 
     fn onControlConnect(conn: *ws.Connection) void {
         const self = global_server orelse return;
@@ -1817,7 +1832,7 @@ const Server = struct {
         self.mutex.unlock();
     }
 
-    // ========== Panel WebSocket callbacks ==========
+    // --- Panel WebSocket callbacks---
 
     fn onPanelConnect(conn: *ws.Connection) void {
         _ = conn;
@@ -1986,7 +2001,7 @@ const Server = struct {
         conn.sendBinary(&buf) catch {};
     }
 
-    // ========== Control message handling ==========
+    // --- Control message handling---
 
     fn handleControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len == 0) return;
@@ -2132,7 +2147,7 @@ const Server = struct {
         }
     }
 
-    // ========== Auth/Session Message Handlers ==========
+    // --- Auth/Session Message Handlers---
 
     fn handleAuthMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len < 1) return;
@@ -3391,7 +3406,7 @@ const Server = struct {
         };
     }
 
-    // ========== File WebSocket callbacks ==========
+    // --- File WebSocket callbacks---
 
     fn onFileConnect(conn: *ws.Connection) void {
         const self = global_server orelse return;
@@ -3435,7 +3450,7 @@ const Server = struct {
         std.debug.print("File transfer client disconnected\n", .{});
     }
 
-    // ========== Preview WebSocket callbacks ==========
+    // --- Preview WebSocket callbacks---
 
     fn onPreviewConnect(conn: *ws.Connection) void {
         const self = global_server orelse return;
@@ -4115,9 +4130,9 @@ const Server = struct {
     }
 };
 
-// ============================================================================
+
 // Objective-C helpers
-// ============================================================================
+
 
 fn getClass(name: [*:0]const u8) objc.Class {
     return objc.objc_getClass(name);
@@ -4287,9 +4302,9 @@ fn getIOSurfaceFromView(nsview: objc.id) ?IOSurfacePtr {
     return null;
 }
 
-// ============================================================================
+
 // Ghostty callbacks
-// ============================================================================
+
 
 fn wakeupCallback(userdata: ?*anyopaque) callconv(.c) void {
     _ = userdata;
@@ -4468,9 +4483,9 @@ fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c)
     self.mutex.unlock();
 }
 
-// ============================================================================
+
 // Main
-// ============================================================================
+
 
 const Args = struct {
     http_port: u16 = 8080,

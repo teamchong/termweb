@@ -1,8 +1,13 @@
-// Platform abstraction layer for termweb-mux
-// Uses comptime to select platform-specific implementations:
-// - macOS: libghostty + IOSurface + VideoToolbox
-// - Linux: VTE/PTY + SharedMemory + x264 (TODO)
-
+//! Platform abstraction layer for termweb-mux.
+//!
+//! Uses comptime to select platform-specific implementations:
+//! - macOS: libghostty + IOSurface + VideoToolbox
+//! - Linux: PTY terminal + shared memory + VA-API
+//!
+//! This module centralizes platform detection and provides unified types
+//! for cross-platform code. Import this instead of repeating platform
+//! checks throughout the codebase.
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -30,9 +35,9 @@ pub const objc = if (is_macos) @cImport({
     pub const Class = *anyopaque;
 };
 
-// ============================================================================
+
 // Terminal Backend Abstraction
-// ============================================================================
+
 
 pub const TerminalBackend = if (is_macos) MacOSTerminal else LinuxTerminal;
 
@@ -92,9 +97,9 @@ pub const LinuxTerminal = struct {
     }
 };
 
-// ============================================================================
+
 // Surface/Rendering Abstraction
-// ============================================================================
+
 
 /// Get pixel data from rendering surface
 pub fn getSurfacePixels(backend: *TerminalBackend, width: u32, height: u32) ?[]const u8 {
@@ -122,9 +127,9 @@ pub fn getSurfacePixels(backend: *TerminalBackend, width: u32, height: u32) ?[]c
     }
 }
 
-// ============================================================================
+
 // Utility Functions
-// ============================================================================
+
 
 /// Get platform name for logging
 pub fn getPlatformName() []const u8 {

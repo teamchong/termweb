@@ -1,12 +1,21 @@
+//! Authentication and authorization system for terminal sharing.
+//!
+//! Provides role-based access control for shared terminal sessions:
+//! - Admin: Full access, can manage sessions and create share links
+//! - Editor: Can interact with terminal (input, resize)
+//! - Viewer: Read-only access (can only view terminal output)
+//!
+//! Features:
+//! - Cryptographically secure token generation (32-byte random + base64)
+//! - Share links with optional expiration and usage limits
+//! - Session management with persistent tokens
+//! - Password/passkey authentication for admin access
+//!
 const std = @import("std");
 const fs = std.fs;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const crypto = std.crypto;
-
-// ============================================================================
-// Access Roles
-// ============================================================================
 
 pub const Role = enum(u8) {
     admin = 0,    // Full access, can manage sessions and tokens
@@ -15,9 +24,9 @@ pub const Role = enum(u8) {
     none = 255,   // No access
 };
 
-// ============================================================================
+
 // Token Types
-// ============================================================================
+
 
 pub const TokenType = enum(u8) {
     admin = 0,    // Admin token (for admin auth after password/passkey set)
@@ -34,9 +43,9 @@ fn tokenPrefix(token_type: TokenType) []const u8 {
     };
 }
 
-// ============================================================================
+
 // Share Link
-// ============================================================================
+
 
 pub const ShareLink = struct {
     token: [44]u8,        // Base64-encoded 32-byte token
@@ -61,9 +70,9 @@ pub const ShareLink = struct {
     }
 };
 
-// ============================================================================
+
 // Session
-// ============================================================================
+
 
 pub const Session = struct {
     id: []const u8,
@@ -75,9 +84,9 @@ pub const Session = struct {
     viewer_token: [44]u8,
 };
 
-// ============================================================================
+
 // Auth State
-// ============================================================================
+
 
 pub const AuthState = struct {
     // Admin auth (optional - if not set, first connection is admin)
@@ -153,9 +162,9 @@ pub const AuthState = struct {
         self.allocator.destroy(self);
     }
 
-    // ========================================================================
+    
     // Session Management
-    // ========================================================================
+    
 
     pub fn createSession(self: *AuthState, id: []const u8, name: []const u8) !void {
         const session = Session{
@@ -194,9 +203,9 @@ pub const AuthState = struct {
         return list.toOwnedSlice() catch &[_]Session{};
     }
 
-    // ========================================================================
+    
     // Token Management
-    // ========================================================================
+    
 
     pub fn generateToken(token_type: TokenType) [44]u8 {
         // 30 random bytes → 40 base64 chars (no padding)
@@ -262,9 +271,9 @@ pub const AuthState = struct {
         }
     }
 
-    // ========================================================================
+    
     // Share Links
-    // ========================================================================
+    
 
     pub fn createShareLink(self: *AuthState, token_type: TokenType, expires_in_secs: ?i64, max_uses: ?u32, label: ?[]const u8) ![]const u8 {
         const now = std.time.timestamp();
@@ -303,9 +312,9 @@ pub const AuthState = struct {
         try self.save();
     }
 
-    // ========================================================================
+    
     // Admin Password
-    // ========================================================================
+    
 
     pub fn setAdminPassword(self: *AuthState, password: []const u8) !void {
         // Generate salt
@@ -356,9 +365,9 @@ pub const AuthState = struct {
         try self.save();
     }
 
-    // ========================================================================
+    
     // Passkey (WebAuthn) - simplified storage
-    // ========================================================================
+    
 
     pub fn addPasskeyCredential(self: *AuthState, id: []const u8, public_key: []const u8, name: ?[]const u8) !void {
         const cred = PasskeyCredential{
@@ -392,9 +401,9 @@ pub const AuthState = struct {
         }
     }
 
-    // ========================================================================
+    
     // Persistence
-    // ========================================================================
+    
 
     pub fn save(self: *AuthState) !void {
         var file = try fs.createFileAbsolute(self.config_path, .{});
@@ -567,9 +576,9 @@ pub const AuthState = struct {
     }
 };
 
-// ============================================================================
+
 // Passkey Credential
-// ============================================================================
+
 
 pub const PasskeyCredential = struct {
     id: []const u8,
@@ -578,9 +587,9 @@ pub const PasskeyCredential = struct {
     created_at: i64,
 };
 
-// ============================================================================
+
 // Auth Middleware Helper
-// ============================================================================
+
 
 pub fn getRoleFromRequest(auth_state: *AuthState, token: ?[]const u8) Role {
     // If no auth required, everyone is admin

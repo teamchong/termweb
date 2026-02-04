@@ -1,3 +1,16 @@
+//! WebSocket server implementation with zstd compression support.
+//!
+//! Implements RFC 6455 WebSocket protocol with extensions:
+//! - Binary and text message framing
+//! - Per-connection zstd compression (app-level, not permessage-deflate)
+//! - SIMD-accelerated XOR masking for frame decoding
+//! - Configurable read/write timeouts for connection health
+//!
+//! Used for three separate WebSocket endpoints:
+//! - Panel streams: H.264 video frames to browser
+//! - Control channel: Terminal input, resize, panel management
+//! - File transfer: Compressed file upload/download with hashing
+//!
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
@@ -6,6 +19,21 @@ const Allocator = std.mem.Allocator;
 
 const zstd = @import("zstd.zig");
 const simd_mask = @import("simd_mask");
+
+/// Maximum WebSocket payload size (16MB).
+/// Prevents memory exhaustion from malicious or malformed frames.
+const max_payload_size = 16 * 1024 * 1024;
+
+/// Maximum size for decompressed messages (16MB).
+/// Prevents zip bomb attacks via compressed payloads.
+const max_decompressed_size = 16 * 1024 * 1024;
+
+/// Buffer size for HTTP header parsing.
+const header_buffer_size = 4096;
+
+/// Socket write timeout in milliseconds.
+/// Prevents blocking on slow/unresponsive clients.
+const write_timeout_ms = 1000;
 
 // Set socket read timeout for blocking I/O with periodic wakeup
 fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
@@ -64,9 +92,9 @@ fn findHeaderValue(request: []const u8, header_name: []const u8) ?[]const u8 {
     return null;
 }
 
-// ============================================================================
+
 // WebSocket Protocol
-// ============================================================================
+
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -84,9 +112,9 @@ pub const Frame = struct {
     payload: []u8,
 };
 
-// ============================================================================
+
 // WebSocket Connection
-// ============================================================================
+
 
 pub const Connection = struct {
     stream: net.Stream,
@@ -141,7 +169,7 @@ pub const Connection = struct {
     }
 
     fn acceptHandshakeWithOptions(self: *Connection, enable_zstd: bool) !void {
-        var buf: [4096]u8 = undefined;
+        var buf: [header_buffer_size]u8 = undefined;
         const n = try self.stream.read(&buf);
         if (n == 0) return error.ConnectionClosed;
 
@@ -265,7 +293,7 @@ pub const Connection = struct {
         }
 
         // Read payload
-        if (payload_len > 16 * 1024 * 1024) return error.PayloadTooLarge;
+        if (payload_len > max_payload_size) return error.PayloadTooLarge;
         var payload = try self.allocator.alloc(u8, @intCast(payload_len));
         errdefer self.allocator.free(payload);
 
@@ -290,7 +318,7 @@ pub const Connection = struct {
                 // zstd compressed
                 if (self.decompressor) |*decomp| {
                     const compressed_data = payload[1..];
-                    const max_decompressed = 16 * 1024 * 1024; // 16MB max
+                    const max_decompressed = max_decompressed_size;
 
                     const decompressed = decomp.decompress(compressed_data, max_decompressed) catch {
                         return error.DecompressionFailed;
@@ -422,9 +450,9 @@ pub const Connection = struct {
     }
 };
 
-// ============================================================================
+
 // WebSocket Server
-// ============================================================================
+
 
 pub const Server = struct {
     listener: net.Server,
@@ -501,7 +529,7 @@ pub const Server = struct {
 
         // Set socket timeouts for blocking I/O
         setReadTimeout(stream.stream.handle, 100); // 100ms wakeup for shutdown check
-        setWriteTimeout(stream.stream.handle, 1000); // 1s write timeout to prevent blocking
+        setWriteTimeout(stream.stream.handle, write_timeout_ms);
 
         // Perform handshake (with or without zstd based on server config)
         try conn.acceptHandshakeWithOptions(self.enable_zstd);
@@ -581,7 +609,7 @@ pub const Server = struct {
 
         // Set socket timeouts for blocking I/O
         setReadTimeout(stream.handle, 100); // 100ms wakeup for shutdown check
-        setWriteTimeout(stream.handle, 1000); // 1s write timeout to prevent blocking
+        setWriteTimeout(stream.handle, write_timeout_ms);
 
         // Complete WebSocket handshake with pre-read request
         conn.acceptHandshakeFromRequest(request, self.enable_zstd) catch {

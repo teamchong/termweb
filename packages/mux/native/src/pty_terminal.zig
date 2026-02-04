@@ -1,6 +1,14 @@
-// PTY-based terminal for Linux
-// Replaces libghostty with direct PTY + VT100 parsing
-
+//! PTY-based terminal emulator for Linux.
+//!
+//! Provides terminal emulation without libghostty dependency by using:
+//! - POSIX PTY (pseudo-terminal) for shell communication
+//! - VT100/ANSI escape sequence parsing
+//! - Software rendering to BGRA framebuffer
+//!
+//! The framebuffer can be encoded to H.264 by the video encoder for
+//! streaming to web clients. This is the Linux alternative to macOS's
+//! libghostty + IOSurface path.
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;

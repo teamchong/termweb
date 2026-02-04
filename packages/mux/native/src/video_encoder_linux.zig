@@ -1,12 +1,17 @@
-// VA-API H.264 Hardware Encoder for Linux
-// Equivalent to macOS VideoToolbox - uses GPU for hardware-accelerated encoding
-//
-// This provides real H.264 output matching what the WebCodecs client expects.
-// Uses VA-API (Video Acceleration API) for Intel/AMD/NVIDIA GPUs.
-//
-// Note: We manually define VA-API structures to work around Zig's cImport
-// limitations with C bitfield unions.
-
+//! VA-API H.264 hardware encoder for Linux.
+//!
+//! Equivalent to macOS VideoToolbox - uses GPU for hardware-accelerated encoding.
+//! Provides real H.264 output matching what the WebCodecs client expects.
+//!
+//! Supports Intel (i915/xe), AMD (radeonsi), and NVIDIA GPUs via VA-API
+//! (Video Acceleration API). The encoder outputs H.264 Constrained Baseline
+//! or Main profile NAL units compatible with WebCodecs VideoDecoder.
+//!
+//! Implementation note: VA-API structures are manually defined to work around
+//! Zig's cImport limitations with C bitfield unions.
+//!
+//! For macOS, see `video_encoder.zig` which uses VideoToolbox.
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 

@@ -1,8 +1,12 @@
-// Cross-platform video encoder
-// Uses comptime to select platform-specific implementation:
-// - macOS: VideoToolbox hardware encoder
-// - Linux: Software x264 encoder (stub for now)
-
+//! Cross-platform video encoder selection.
+//!
+//! Uses comptime to select the appropriate H.264 encoder:
+//! - macOS: VideoToolbox hardware encoder (`video_encoder.zig`)
+//! - Linux: VA-API hardware encoder (`video_encoder_linux.zig`)
+//!
+//! Import this module for platform-agnostic video encoding. The encoder
+//! API is identical across platforms - only the implementation differs.
+//!
 const builtin = @import("builtin");
 
 // Select implementation at compile time

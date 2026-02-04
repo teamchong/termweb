@@ -1,7 +1,14 @@
-// Ghostty stub types for Linux
-// These provide type-compatible stubs for compiling without libghostty
-// Actual terminal emulation will use PTY directly
-
+//! Ghostty C API stub types for Linux compilation.
+//!
+//! Provides type-compatible stubs for the ghostty.h C API, allowing the
+//! codebase to compile on Linux without libghostty. These stubs define:
+//! - Opaque handle types (ghostty_app_t, ghostty_surface_t, etc.)
+//! - Input constants (modifier keys, mouse buttons, actions)
+//! - Callback signatures for clipboard and title operations
+//!
+//! On Linux, actual terminal emulation uses `pty_terminal.zig` instead.
+//! These stubs only exist to satisfy type checking at compile time.
+//!
 const std = @import("std");
 
 // Constants

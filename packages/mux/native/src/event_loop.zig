@@ -1,10 +1,15 @@
+//! Platform-specific event loop for async I/O multiplexing.
+//!
+//! Provides a unified interface for monitoring file descriptors:
+//! - macOS: kqueue with EVFILT_READ
+//! - Linux: epoll with EPOLLIN
+//!
+//! Used to efficiently wait for data on multiple PTY master file descriptors
+//! without busy-polling. Supports edge-triggered notifications and EOF detection.
+//!
 const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
-
-// ============================================================================
-// Platform-specific event loop (kqueue on macOS, epoll on Linux)
-// ============================================================================
 
 const is_darwin = builtin.os.tag == .macos;
 const is_linux = builtin.os.tag == .linux;
@@ -16,9 +21,9 @@ pub const Event = struct {
     eof: bool,
 };
 
-// ============================================================================
+
 // macOS kqueue implementation
-// ============================================================================
+
 
 const KqueueLoop = struct {
     const EVFILT_READ: i16 = -1;
@@ -118,9 +123,9 @@ const KqueueLoop = struct {
     }
 };
 
-// ============================================================================
+
 // Linux epoll implementation
-// ============================================================================
+
 
 const EpollLoop = struct {
     const EPOLLIN: u32 = 0x001;
@@ -197,9 +202,9 @@ const EpollLoop = struct {
     }
 };
 
-// ============================================================================
+
 // Platform-agnostic EventLoop type
-// ============================================================================
+
 
 pub const EventLoop = if (is_darwin)
     KqueueLoop
@@ -208,9 +213,9 @@ else if (is_linux)
 else
     @compileError("EventLoop only supports macOS and Linux");
 
-// ============================================================================
+
 // Simple blocking I/O helper (works on all platforms)
-// ============================================================================
+
 
 pub fn setReadTimeout(fd: posix.fd_t, timeout_ms: u32) !void {
     const tv = posix.timeval{

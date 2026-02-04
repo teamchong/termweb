@@ -1,8 +1,12 @@
-// Cross-platform terminal abstraction
-// Uses comptime to select:
-// - macOS: libghostty
-// - Linux: PTY-based terminal
-
+//! Cross-platform terminal abstraction.
+//!
+//! Provides a unified interface for terminal emulation:
+//! - macOS: libghostty with native Metal rendering
+//! - Linux: PTY-based terminal with software rendering
+//!
+//! The terminal handle abstracts platform differences, allowing the main
+//! server code to work with terminals without platform-specific branches.
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 

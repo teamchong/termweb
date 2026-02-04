@@ -1,7 +1,17 @@
-// VideoToolbox H.264 Encoder for macOS
-// Zero-latency configuration for real-time terminal streaming
-// Optimizations: CVPixelBufferPool, direct IOSurface encoding, Metal GPU sync
-
+//! VideoToolbox H.264 hardware encoder for macOS.
+//!
+//! Provides real-time, low-latency video encoding of terminal surfaces for
+//! streaming to web browsers via WebCodecs. Optimized for:
+//! - Zero-latency encoding (no B-frames, immediate output)
+//! - Direct IOSurface input (no CPU-side pixel copies)
+//! - Adaptive bitrate based on client buffer health
+//! - CVPixelBufferPool for efficient memory reuse
+//!
+//! The encoder accepts IOSurface references from Ghostty's Metal renderer
+//! and outputs H.264 NAL units suitable for WebCodecs VideoDecoder.
+//!
+//! For Linux, see `video_encoder_linux.zig` which uses VA-API.
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 

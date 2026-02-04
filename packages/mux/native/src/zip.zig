@@ -1,3 +1,15 @@
+//! ZIP file format writer with DEFLATE compression.
+//!
+//! Creates ZIP archives for directory downloads. Uses libdeflate for
+//! DEFLATE compression (required by ZIP format - zstd not supported).
+//!
+//! Implements:
+//! - Local file headers with CRC-32 checksums
+//! - Central directory for file listing
+//! - DEFLATE compression (level 6) for text-heavy content
+//!
+//! Used by the file transfer system to package directories for download.
+//!
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fs = std.fs;
@@ -5,10 +17,6 @@ const fs = std.fs;
 const c = @cImport({
     @cInclude("libdeflate.h");
 });
-
-// ============================================================================
-// ZIP File Format (using libdeflate for compression)
-// ============================================================================
 
 // ZIP signatures
 const LOCAL_FILE_HEADER_SIG: u32 = 0x04034b50;
@@ -204,9 +212,9 @@ pub const ZipWriter = struct {
     }
 };
 
-// ============================================================================
+
 // Helper: Create zip from directory
-// ============================================================================
+
 
 pub fn zipDirectory(allocator: Allocator, dir_path: []const u8, base_name: []const u8) ![]const u8 {
     var zip = try ZipWriter.init(allocator);

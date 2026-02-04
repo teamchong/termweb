@@ -1,3 +1,17 @@
+//! HTTP server for embedded web assets and WebSocket upgrades.
+//!
+//! Serves the termweb web client (index.html, client.js) from embedded assets
+//! compiled into the binary. Also provides:
+//! - `/config` endpoint for terminal configuration (colors, fonts)
+//! - WebSocket upgrade handling for panel, control, file, and preview endpoints
+//! - COOP/COEP headers for SharedArrayBuffer support in Web Workers
+//!
+//! The server runs on a single port and routes requests based on path:
+//! - `/` or `/index.html` → embedded HTML
+//! - `/client.js` → embedded JavaScript bundle
+//! - `/config` → JSON terminal configuration from ghostty
+//! - `/ws/*` → WebSocket upgrade to appropriate handler
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 const net = std.net;

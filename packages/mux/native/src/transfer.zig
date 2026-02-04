@@ -1,28 +1,49 @@
+//! File transfer protocol with compression and integrity verification.
+//!
+//! Handles bidirectional file transfers between server and browser:
+//! - Upload: Browser sends files to server filesystem
+//! - Download: Server sends files/directories to browser
+//!
+//! Features:
+//! - zstd compression for bandwidth efficiency
+//! - XXH3 SIMD-accelerated hashing for integrity (3-5x faster than xxHash64)
+//! - Incremental sync with hash comparison (only transfer changed files)
+//! - Directory traversal with exclude patterns
+//! - Dry-run preview mode
+//!
+//! Platform-specific async I/O:
+//! - Linux: io_uring for high-performance async reads
+//! - macOS: libdispatch for concurrent file operations
+//!
 const std = @import("std");
 const fs = std.fs;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
-// zstd compression
 const zstd = @import("zstd.zig");
 
-// XXH3 SIMD-accelerated hashing
-// Use extern declaration directly to avoid cImport macro expansion issues
-// XXH3 is SIMD-accelerated on ARM64 (NEON) and x86-64 (AVX2/SSE2)
-// 3-5x faster than xxHash64 for large inputs
+/// XXH3 SIMD-accelerated hashing.
+/// Uses NEON on ARM64 and AVX2/SSE2 on x86-64.
 extern fn XXH3_64bits(input: ?*const anyopaque, length: usize) u64;
 
 inline fn xxh3Hash(data: []const u8) u64 {
     return XXH3_64bits(data.ptr, data.len);
 }
 
-// ============================================================================
-// Platform Detection (comptime)
-// ============================================================================
-
 const is_linux = builtin.os.tag == .linux;
 const is_darwin = builtin.os.tag == .macos;
+
+/// Chunk size for parallel compression (256KB).
+/// Balances parallelism overhead with compression efficiency.
+const default_chunk_size = 256 * 1024;
+
+/// High water mark for dispatch I/O (256KB).
+/// Controls buffer size for macOS async I/O.
+const dispatch_high_water = 256 * 1024;
+
+/// Maximum file size to read into memory (1MB).
+const max_read_size = 1024 * 1024;
 
 // Platform-specific imports
 const dispatch = if (is_darwin) @cImport({
@@ -33,9 +54,9 @@ const dispatch = if (is_darwin) @cImport({
 const linux = if (is_linux) std.os.linux else void;
 const IoUring = if (is_linux) linux.IoUring else void;
 
-// ============================================================================
+
 // Linux io_uring for async I/O
-// ============================================================================
+
 
 pub const IoUringReader = if (is_linux) struct {
     ring: IoUring,
@@ -158,9 +179,9 @@ pub const IoUringReader = if (is_linux) struct {
     }
 };
 
-// ============================================================================
+
 // macOS dispatch_io for async/parallel I/O
-// ============================================================================
+
 
 pub const DispatchIO = if (is_darwin) struct {
     channel: dispatch.dispatch_io_t,
@@ -175,7 +196,7 @@ pub const DispatchIO = if (is_darwin) struct {
             null, // cleanup handler
         );
         // Set high water mark for better throughput
-        dispatch.dispatch_io_set_high_water(channel, 256 * 1024);
+        dispatch.dispatch_io_set_high_water(channel, dispatch_high_water);
         return .{ .channel = channel, .queue = queue };
     }
 
@@ -267,12 +288,12 @@ pub const DispatchIO = if (is_darwin) struct {
     }
 };
 
-// ============================================================================
+
 // Parallel Chunk Compression (dispatch on macOS)
-// ============================================================================
+
 
 pub const ParallelCompressor = struct {
-    const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
+    const CHUNK_SIZE: usize = default_chunk_size;
 
     // Compress multiple chunks in parallel using dispatch on macOS
     // Returns array of compressed chunks - caller owns all memory
@@ -383,9 +404,9 @@ pub const ParallelCompressor = struct {
     }
 };
 
-// ============================================================================
+
 // Parallel File Hasher (dispatch on macOS)
-// ============================================================================
+
 
 // Parallel file hasher - dispatch on macOS, thread pool on Linux
 pub const ParallelHasher = struct {
@@ -516,9 +537,9 @@ pub const MappedFile = struct {
     }
 };
 
-// ============================================================================
+
 // File Transfer Protocol
-// ============================================================================
+
 
 // Message types from client (0x20-0x2F)
 pub const ClientMsgType = enum(u8) {
@@ -573,9 +594,9 @@ pub const DryRunAction = enum(u8) {
     delete = 2,
 };
 
-// ============================================================================
+
 // Transfer Session
-// ============================================================================
+
 
 pub const TransferSession = struct {
     id: u32,
@@ -964,9 +985,9 @@ pub const TransferSession = struct {
     }
 };
 
-// ============================================================================
+
 // Message Builders
-// ============================================================================
+
 
 // Build TRANSFER_READY message
 // [0x30][transfer_id:u32]
@@ -1191,9 +1212,9 @@ pub fn buildDryRunReport(allocator: Allocator, transfer_id: u32, entries: []cons
     return msg;
 }
 
-// ============================================================================
+
 // Message Parsers
-// ============================================================================
+
 
 // Parse TRANSFER_INIT message
 // [0x20][direction:u8][flags:u8][exclude_count:u8][path_len:u16][path][excludes...]
@@ -1305,9 +1326,9 @@ pub fn parseFileData(data: []const u8) !FileDataMsg {
     };
 }
 
-// ============================================================================
+
 // Glob Pattern Matching
-// ============================================================================
+
 
 fn matchGlob(pattern: []const u8, path: []const u8) bool {
     var p_idx: usize = 0;
@@ -1349,9 +1370,9 @@ fn matchGlob(pattern: []const u8, path: []const u8) bool {
     return p_idx == pattern.len;
 }
 
-// ============================================================================
+
 // Transfer Manager
-// ============================================================================
+
 
 pub const TransferManager = struct {
     sessions: std.AutoHashMap(u32, *TransferSession),

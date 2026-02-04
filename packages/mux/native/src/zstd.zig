@@ -1,9 +1,19 @@
+//! Zstd compression wrapper for Zig.
+//!
+//! Provides a safe Zig interface to Facebook's zstd compression library.
+//! Used throughout termweb for:
+//! - WebSocket message compression (control and file channels)
+//! - File transfer compression
+//!
+//! Features:
+//! - Streaming compression/decompression with context reuse
+//! - Automatic buffer management with Zig allocators
+//! - Error handling with descriptive error names
+//!
+//! Note: Uses extern declarations instead of cImport to avoid macro issues.
+//!
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-
-// ============================================================================
-// zstd C API bindings (extern declarations to avoid cImport issues)
-// ============================================================================
 
 // Context types
 const ZSTD_CCtx = opaque {};
@@ -31,9 +41,9 @@ extern fn ZSTD_getFrameContentSize(src: [*]const u8, srcSize: usize) u64;
 extern fn ZSTD_isError(code: usize) c_uint;
 extern fn ZSTD_getErrorName(code: usize) [*:0]const u8;
 
-// ============================================================================
+
 // Error Handling
-// ============================================================================
+
 
 pub const Error = error{
     CompressionFailed,
@@ -52,9 +62,9 @@ fn checkError(code: usize) Error!usize {
     return code;
 }
 
-// ============================================================================
+
 // Compressor
-// ============================================================================
+
 
 pub const Compressor = struct {
     cctx: *ZSTD_CCtx,
@@ -118,9 +128,9 @@ pub const Compressor = struct {
     }
 };
 
-// ============================================================================
+
 // Decompressor
-// ============================================================================
+
 
 pub const Decompressor = struct {
     dctx: *ZSTD_DCtx,
@@ -189,9 +199,9 @@ pub const Decompressor = struct {
     }
 };
 
-// ============================================================================
+
 // Convenience Functions (stateless, for simple use cases)
-// ============================================================================
+
 
 /// Simple one-shot compression
 pub fn compressSimple(allocator: Allocator, src: []const u8, level: c_int) ![]u8 {
@@ -229,9 +239,9 @@ pub fn decompressSimple(allocator: Allocator, src: []const u8, max_size: usize) 
     };
 }
 
-// ============================================================================
+
 // Tests
-// ============================================================================
+
 
 test "round-trip compression" {
     const allocator = std.testing.allocator;
