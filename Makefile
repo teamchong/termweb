@@ -112,6 +112,7 @@ vendor-build-ghostty:
 # Generate patch from current vendor changes (use after editing vendor files)
 # Usage: edit vendor/ghostty files, then run `make vendor-generate-patch`
 # This generates a patch containing ALL changes from the upstream commit to current state
+# After generating, it syncs, rebuilds libghostty.a, and copies to vendor/libs/
 vendor-generate-patch:
 	@echo "Generating patch from changes in vendor/ghostty (since $(GHOSTTY_UPSTREAM_COMMIT))..."
 	@cd vendor/ghostty && \
@@ -121,7 +122,14 @@ vendor-generate-patch:
 		git reset --soft $(GHOSTTY_UPSTREAM_COMMIT) && \
 		git reset HEAD
 	@echo "Patch saved to patches/ghostty/001-linux-egl-headless.patch"
-	@echo "Now run 'make vendor-sync' to test the patch applies cleanly."
+	@echo ""
+	@echo "Syncing vendor and rebuilding libghostty.a..."
+	@$(MAKE) vendor-sync
+	@$(MAKE) vendor-build-ghostty
+	@cp vendor/ghostty/zig-out/lib/libghostty.a vendor/libs/
+	@echo ""
+	@echo "Done! Library updated at vendor/libs/libghostty.a"
+	@echo "Now run 'zig build' to build with the updated library."
 
 # =============================================================================
 # UI Asset Generation
@@ -179,8 +187,8 @@ help:
 	@echo ""
 	@echo "Vendor management:"
 	@echo "  make vendor-sync  - Reset submodules and apply patches"
-	@echo "  make vendor-generate-patch - Generate patch from vendor changes"
-	@echo "  make vendor-build-ghostty - Build libghostty from source"
+	@echo "  make vendor-generate-patch - Generate patch, rebuild lib, and copy to vendor/libs/"
+	@echo "  make vendor-build-ghostty - Build libghostty from source only"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make gen-ui       - Generate UI assets from templates"
