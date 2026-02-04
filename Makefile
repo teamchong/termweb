@@ -109,10 +109,27 @@ vendor-build-ghostty:
 	cd vendor/ghostty && zig build -Doptimize=ReleaseFast -Dapp-runtime=none
 	@echo "libghostty built."
 
+# Detect platform for library paths
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Darwin)
+    ifeq ($(UNAME_M),arm64)
+        LIBGHOSTTY_DIR := vendor/libs/darwin-arm64
+    else
+        LIBGHOSTTY_DIR := vendor/libs/darwin-x86_64
+    endif
+else
+    ifeq ($(UNAME_M),aarch64)
+        LIBGHOSTTY_DIR := vendor/libs/linux-aarch64
+    else
+        LIBGHOSTTY_DIR := vendor/libs/linux-x86_64
+    endif
+endif
+
 # Generate patch from current vendor changes (use after editing vendor files)
 # Usage: edit vendor/ghostty files, then run `make vendor-generate-patch`
 # This generates a patch containing ALL changes from the upstream commit to current state
-# After generating, it syncs, rebuilds libghostty.a, and copies to vendor/libs/
+# After generating, it syncs, rebuilds libghostty.a, and copies to platform-specific dir
 vendor-generate-patch:
 	@echo "Generating patch from changes in vendor/ghostty (since $(GHOSTTY_UPSTREAM_COMMIT))..."
 	@cd vendor/ghostty && \
@@ -126,9 +143,10 @@ vendor-generate-patch:
 	@echo "Syncing vendor and rebuilding libghostty.a..."
 	@$(MAKE) vendor-sync
 	@$(MAKE) vendor-build-ghostty
-	@cp vendor/ghostty/zig-out/lib/libghostty.a vendor/libs/
+	@mkdir -p $(LIBGHOSTTY_DIR)
+	@cp vendor/ghostty/zig-out/lib/libghostty.a $(LIBGHOSTTY_DIR)/
 	@echo ""
-	@echo "Done! Library updated at vendor/libs/libghostty.a"
+	@echo "Done! Library updated at $(LIBGHOSTTY_DIR)/libghostty.a"
 	@echo "Now run 'zig build' to build with the updated library."
 
 # =============================================================================

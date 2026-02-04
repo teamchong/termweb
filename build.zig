@@ -273,8 +273,25 @@ pub fn build(b: *std.Build) void {
         // Add mux module to main exe
         exe.root_module.addImport("mux", mux_mod);
 
-        // Link pre-built libghostty (both platforms)
-        exe.addObjectFile(b.path("vendor/libs/libghostty.a"));
+        // Link pre-built libghostty (platform and architecture specific)
+        const libghostty_path = blk: {
+            const os = target.result.os.tag;
+            const arch = target.result.cpu.arch;
+            if (os == .macos) {
+                break :blk switch (arch) {
+                    .aarch64 => "vendor/libs/darwin-arm64/libghostty.a",
+                    .x86_64 => "vendor/libs/darwin-x86_64/libghostty.a",
+                    else => @panic("Unsupported macOS architecture"),
+                };
+            } else {
+                break :blk switch (arch) {
+                    .x86_64 => "vendor/libs/linux-x86_64/libghostty.a",
+                    .aarch64 => "vendor/libs/linux-aarch64/libghostty.a",
+                    else => @panic("Unsupported Linux architecture"),
+                };
+            }
+        };
+        exe.addObjectFile(b.path(libghostty_path));
         exe.addIncludePath(b.path("vendor/ghostty/include"));
 
         // Platform-specific dependencies for mux

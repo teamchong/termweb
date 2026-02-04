@@ -1,0 +1,103 @@
+name: Build libghostty
+
+on:
+  push:
+    paths:
+      - 'patches/ghostty/**'
+      - '.github/workflows/build-libghostty.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-macos
+            lib_dir: darwin-arm64
+            cross: false
+          - os: macos-13  # x86_64 runner
+            target: x86_64-macos
+            lib_dir: darwin-x86_64
+            cross: false
+          - os: ubuntu-latest
+            target: x86_64-linux-gnu
+            lib_dir: linux-x86_64
+            cross: false
+          - os: ubuntu-latest
+            target: aarch64-linux-gnu
+            lib_dir: linux-aarch64
+            cross: true
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cross-compile tools (Linux aarch64)
+        if: matrix.cross && matrix.target == 'aarch64-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Apply patches
+        run: make vendor-sync
+
+      - name: Build libghostty
+        run: |
+          cd vendor/ghostty
+          zig build -Doptimize=ReleaseFast -Dapp-runtime=none -Dtarget=${{ matrix.target }}
+
+      - name: Copy library to target directory
+        run: |
+          mkdir -p vendor/libs/${{ matrix.lib_dir }}
+          cp vendor/ghostty/zig-out/lib/libghostty.a vendor/libs/${{ matrix.lib_dir }}/
+
+      - name: Upload library artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libghostty-${{ matrix.lib_dir }}
+          path: vendor/libs/${{ matrix.lib_dir }}/libghostty.a
+
+  commit:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all library artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Copy libraries to vendor/libs
+        run: |
+          for dir in darwin-arm64 darwin-x86_64 linux-x86_64 linux-aarch64; do
+            mkdir -p vendor/libs/$dir
+            if [ -f "artifacts/libghostty-$dir/libghostty.a" ]; then
+              cp "artifacts/libghostty-$dir/libghostty.a" "vendor/libs/$dir/"
+              echo "Copied libghostty.a to vendor/libs/$dir/"
+            fi
+          done
+          ls -la vendor/libs/*/
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add vendor/libs/*/libghostty.a
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "build: update libghostty.a for all platforms"
+            git pull --rebase origin main
+            git push
+          fi

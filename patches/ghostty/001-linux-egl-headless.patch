@@ -1,7 +1,7 @@
-From 5f0b413f8855d25e000e73a55a8c7b773028aa98 Mon Sep 17 00:00:00 2001
+From 8175bfd8da388f3e1392a3560bc574de2e5a4830 Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 10:45:53 -0500
-Subject: [PATCH 1/6] feat(linux): add headless EGL rendering with PBO and
+Subject: [PATCH 1/8] feat(linux): add headless EGL rendering with PBO and
  viewport
 
 ---
@@ -723,10 +723,10 @@ index 4b01da0c5..8d5edd8f4 100644
 2.43.0
 
 
-From 2fec32064a2d4d477a87beecd92fa827408070c4 Mon Sep 17 00:00:00 2001
+From f2a1db6c6e5570880d18eadb89c42bcc31d9fa1b Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 10:53:13 -0500
-Subject: [PATCH 2/6] feat(linux): add headless EGL rendering support for
+Subject: [PATCH 2/8] feat(linux): add headless EGL rendering support for
  embedded platform
 
 ---
@@ -974,10 +974,10 @@ index 8d5edd8f4..3a024624f 100644
 2.43.0
 
 
-From 5a0c16887e537b87bda90285db1b7c9910d5dbd2 Mon Sep 17 00:00:00 2001
+From 54bc1c06fa8c3dccb7858365734fcba936a820c7 Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 11:06:56 -0500
-Subject: [PATCH 3/6] feat(linux): add headless EGL rendering support for
+Subject: [PATCH 3/8] feat(linux): add headless EGL rendering support for
  embedded platform
 
 ---
@@ -1258,10 +1258,10 @@ index 3a024624f..8d5edd8f4 100644
 2.43.0
 
 
-From be266ea93e90012c3e94c55e7241bc7a761dce6c Mon Sep 17 00:00:00 2001
+From 25ac6ed935b3e72e2e3526648590a50cfe828c0d Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 11:12:56 -0500
-Subject: [PATCH 4/6] feat(linux): add headless EGL rendering support for
+Subject: [PATCH 4/8] feat(linux): add headless EGL rendering support for
  embedded platform
 
 ---
@@ -1315,10 +1315,10 @@ index 0198cd862..5bc488dd4 100644
 2.43.0
 
 
-From 63bae98fedffe550851b343569b6726ca01ee74f Mon Sep 17 00:00:00 2001
+From 5e8d9e90f796d7ddf97780bc10e96d772ebc99ac Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 11:14:40 -0500
-Subject: [PATCH 5/6] feat(linux): add headless EGL rendering support for
+Subject: [PATCH 5/8] feat(linux): add headless EGL rendering support for
  embedded platform
 
 ---
@@ -1427,10 +1427,10 @@ index 5bc488dd4..1827817ae 100644
 2.43.0
 
 
-From eb117cd0930aac1ff5b4c00bc6f9c20425a4d6a1 Mon Sep 17 00:00:00 2001
+From e514e36ad3f5c658cb2b0f47beb7ed636b8edcdf Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
 Date: Wed, 4 Feb 2026 11:17:00 -0500
-Subject: [PATCH 6/6] feat(linux): add headless EGL rendering support for
+Subject: [PATCH 6/8] feat(linux): add headless EGL rendering support for
  embedded platform
 
 ---
@@ -1473,6 +1473,123 @@ index b7177b70f..bac683c8b 100644
          // Remove ourselves from the list of known surfaces in the app.
          self.app.core_app.deleteSurface(self);
  
+-- 
+2.43.0
+
+
+From 8d94a0bfb24a1e1cc6d0cfabc723ee76b8bd1447 Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Wed, 4 Feb 2026 11:22:14 -0500
+Subject: [PATCH 7/8] feat(linux): add headless EGL rendering support for
+ embedded platform
+
+---
+ src/apprt/egl_headless.zig | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index a10cec773..27eaa48d7 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -511,14 +511,29 @@ pub fn setViewportSize(width: u32, height: u32) void {
+ /// Each FBO has its own PBO state to avoid race conditions between surfaces.
+ /// @param fbo_id The OpenGL framebuffer object ID to read from (from renderer's last_target)
+ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
+-    // Bind the renderer's FBO for reading
++    // Ensure GL state is correct for this specific read
+     if (gl.glad.context.BindFramebuffer) |bindFbo| {
+         bindFbo(GL_READ_FRAMEBUFFER, fbo_id);
+     }
+ 
++    // Set viewport to match the FBO dimensions (prevent state leak between surfaces)
++    if (gl.glad.context.Viewport) |viewport| {
++        viewport(0, 0, @intCast(width), @intCast(height));
++    }
++
++    // Set pixel pack alignment to 1 (tightly packed)
++    if (gl.glad.context.PixelStorei) |pixelStorei| {
++        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
++    }
++
++    // DIAGNOSTIC: Force GPU sync to test if flashing is a timing issue
++    // Remove this once the issue is diagnosed - it kills performance
++    if (gl.glad.context.Finish) |finish| {
++        finish();
++    }
++
+     // Get per-FBO PBO state
+     const pbo_state = pbo_manager.getOrCreate(fbo_id) orelse {
+-        // Fall back to sync if we can't get PBO state
+         return readPixelsSync(buffer, buffer_len, width, height, fbo_id);
+     };
+ 
+-- 
+2.43.0
+
+
+From d902f1d11f5f71a2bc0aafa299700ab9379a2e95 Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Wed, 4 Feb 2026 11:25:59 -0500
+Subject: [PATCH 8/8] feat(linux): add headless EGL rendering support for
+ embedded platform
+
+---
+ src/apprt/egl_headless.zig | 29 ++++++++++++-----------------
+ 1 file changed, 12 insertions(+), 17 deletions(-)
+
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index 27eaa48d7..036e77127 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -506,11 +506,16 @@ pub fn setViewportSize(width: u32, height: u32) void {
+     }
+ }
+ 
++/// Debug frame counter for logging
++var debug_frame_counter: u32 = 0;
++
+ /// Read pixels from the specified FBO (RGBA format)
+ /// Uses per-FBO double-buffered PBO for async readback with sync fallback.
+ /// Each FBO has its own PBO state to avoid race conditions between surfaces.
+ /// @param fbo_id The OpenGL framebuffer object ID to read from (from renderer's last_target)
+ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
++    debug_frame_counter +%= 1;
++
+     // Ensure GL state is correct for this specific read
+     if (gl.glad.context.BindFramebuffer) |bindFbo| {
+         bindFbo(GL_READ_FRAMEBUFFER, fbo_id);
+@@ -526,24 +531,14 @@ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo
+         pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
+     }
+ 
+-    // DIAGNOSTIC: Force GPU sync to test if flashing is a timing issue
+-    // Remove this once the issue is diagnosed - it kills performance
+-    if (gl.glad.context.Finish) |finish| {
+-        finish();
+-    }
+-
+-    // Get per-FBO PBO state
+-    const pbo_state = pbo_manager.getOrCreate(fbo_id) orelse {
+-        return readPixelsSync(buffer, buffer_len, width, height, fbo_id);
+-    };
+-
+-    // Try async PBO first
+-    if (pbo_state.readPixelsAsync(buffer, buffer_len, width, height, fbo_id)) {
+-        return true;
++    // DIAGNOSTIC: Use sync-only to isolate if issue is in PBO logic
++    // If flashing stops → issue is in PBO
++    // If flashing persists → issue is in readPixelsSync or elsewhere
++    const result = readPixelsSync(buffer, buffer_len, width, height, fbo_id);
++    if (debug_frame_counter % 120 == 0) {
++        log.info("readPixels: fbo={} {}x{} result={}", .{ fbo_id, width, height, result });
+     }
+-
+-    // Fall back to sync read (first frame or PBO error)
+-    return readPixelsSync(buffer, buffer_len, width, height, fbo_id);
++    return result;
+ }
+ 
+ /// Synchronous fallback for cases where we absolutely need the current frame
 -- 
 2.43.0
 
