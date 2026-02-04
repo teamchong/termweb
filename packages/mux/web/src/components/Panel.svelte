@@ -21,6 +21,7 @@
     onTitleChange?: (title: string) => void;
     onPwdChange?: (pwd: string) => void;
     onServerIdAssigned?: (serverId: number) => void;
+    onActivate?: () => void;
   }
 
   let {
@@ -35,6 +36,7 @@
     onTitleChange,
     onPwdChange,
     onServerIdAssigned,
+    onActivate,
   }: Props = $props();
 
   // ============================================================================
@@ -549,6 +551,7 @@
 
   function handleMouseDown(e: MouseEvent): void {
     panelEl?.focus();
+    onActivate?.();
     sendMouseButton(e, true);
   }
 

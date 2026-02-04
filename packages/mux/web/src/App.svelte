@@ -7,7 +7,7 @@
   import QuickTerminal from './components/QuickTerminal.svelte';
   import TabOverview from './components/TabOverview.svelte';
   import { tabs, activeTabId } from './stores/index';
-  import { connectionStatus, initMuxClient, type MuxClient } from './services/mux';
+  import { connectionStatus, initialLayoutLoaded, initMuxClient, type MuxClient } from './services/mux';
 
   // MuxClient instance
   let muxClient: MuxClient | null = $state(null);
@@ -33,8 +33,14 @@
   // Subscribe to connection status
   let status = $derived($connectionStatus);
 
+  // Subscribe to initial layout loaded state
+  let layoutLoaded = $derived($initialLayoutLoaded);
+
   // Check if there are tabs
   let hasTabs = $derived($tabs.size > 0);
+
+  // Show loading while waiting for initial layout from server
+  let isLoading = $derived(showLoading || !layoutLoaded);
 
   // Menu definitions - disabled state based on hasTabs
   // File menu: New Tab, Upload/Download, Split operations, Close Tab/All
@@ -428,14 +434,14 @@
 
   <!-- Panels area -->
   <div id="panels" bind:this={panelsEl}>
-    {#if showLoading}
+    {#if isLoading}
       <div id="panels-loading">
         <div class="spinner"></div>
         <span>Loading...</span>
       </div>
     {/if}
 
-    {#if !showLoading && !hasTabs}
+    {#if !isLoading && !hasTabs}
       <div id="panels-empty" class="visible">
         <h2>No Open Tabs</h2>
         <div class="shortcuts">

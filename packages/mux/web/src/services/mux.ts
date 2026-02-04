@@ -48,6 +48,9 @@ function isValidLayoutData(data: unknown): data is LayoutData {
 // Connection status store
 export const connectionStatus = writable<'connected' | 'disconnected' | 'error'>('disconnected');
 
+// Initial layout loaded store - true once we've received the initial panel list from server
+export const initialLayoutLoaded = writable<boolean>(false);
+
 // Auth state store
 export const authState = writable<{
   role: number;
@@ -142,6 +145,7 @@ export class MuxClient {
 
   destroy(): void {
     this.destroyed = true;
+    initialLayoutLoaded.set(false);
     if (this.initialPanelListResolve) {
       this.initialPanelListResolve();
       this.initialPanelListResolve = null;
@@ -370,6 +374,8 @@ export class MuxClient {
     } else if (panelList.length > 0) {
       this.reconnectPanelsAsSplits(panelList);
     }
+    // Mark that we've received the initial layout from server
+    initialLayoutLoaded.set(true);
     if (this.initialPanelListResolve) {
       this.initialPanelListResolve();
       this.initialPanelListResolve = null;
@@ -502,7 +508,12 @@ export class MuxClient {
     }
   }
 
-  private createPanel(container: HTMLElement, serverId: number | null, isQuickTerminal = false): PanelInstance {
+  private createPanel(
+    container: HTMLElement,
+    serverId: number | null,
+    isQuickTerminal = false,
+    splitInfo?: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' }
+  ): PanelInstance {
     const panelId = generateId();
 
     // Create wrapper element
@@ -517,6 +528,7 @@ export class MuxClient {
         id: panelId,
         serverId,
         isQuickTerminal,
+        splitInfo,
         onViewAction: (action: string, data?: unknown) => this.handleViewAction(panelId, action, data),
         onStatusChange: (status: PanelStatus) => panels.updatePanel(panelId, { status }),
         onTitleChange: (title: string) => {
@@ -529,6 +541,7 @@ export class MuxClient {
           panel.serverId = newServerId;
           this.panelsByServerId.set(newServerId, panel);
         },
+        onActivate: () => this.setActivePanel(panel),
       },
     });
 
@@ -669,7 +682,9 @@ export class MuxClient {
     if (!tab) return;
     const container = tab.root.findContainer(panel);
     if (!container) return;
-    const newPanel = this.createPanel(tab.element, null);
+    // Pass splitInfo so the server knows to add the new panel to the existing tab's split tree
+    const splitInfo = panel.serverId !== null ? { parentPanelId: panel.serverId, direction } : undefined;
+    const newPanel = this.createPanel(tab.element, null, false, splitInfo);
     container.split(direction, newPanel);
     this.setActivePanel(newPanel);
     const allPanels = tab.root.getAllPanels();
@@ -720,26 +735,36 @@ export class MuxClient {
     tabs.updateTab(tabId, { panelIds: allPanels.map(p => p.id) });
   }
 
+  /**
+   * Recursively build the split tree from layout data.
+   * This properly handles nested splits with different directions.
+   */
   private buildSplitTree(node: LayoutNode, container: SplitContainer): void {
     if (node.type === 'leaf' && node.panelId !== undefined) {
+      // Leaf node - create a panel
       const panel = this.createPanel(container.element, node.panelId);
       container.panel = panel;
     } else if (node.type === 'split' && node.first && node.second) {
-      const firstPanel = this.getFirstLeafPanel(node.first);
-      if (firstPanel !== undefined) {
-        const panel = this.createPanel(container.element, firstPanel);
-        container.panel = panel;
-      }
-      const secondPanel = this.getFirstLeafPanel(node.second);
-      if (secondPanel !== undefined) {
-        const panel = this.createPanel(container.element, secondPanel);
-        const dir = node.direction === 'horizontal' ? 'right' : 'down';
-        container.split(dir, panel);
-        if (node.first.type === 'split' && container.first) {
-          this.buildNestedSplit(node.first, container.first);
-        }
-        if (node.second.type === 'split' && container.second) {
-          this.buildNestedSplit(node.second, container.second);
+      // Split node - recursively build first child, then split and build second
+      // First, build the first child into this container
+      this.buildSplitTree(node.first, container);
+
+      // Now split the container and build the second child
+      // We need to find the leaf container that was just created to split it
+      const leafToSplit = this.findLeafContainer(container);
+      if (leafToSplit && leafToSplit.panel) {
+        // Create a temporary panel for the second child (will be replaced by recursive call)
+        const secondLeafPanel = this.getFirstLeafPanel(node.second);
+        if (secondLeafPanel !== undefined) {
+          const tempPanel = this.createPanel(container.element, secondLeafPanel);
+          const dir = node.direction === 'horizontal' ? 'right' : 'down';
+          leafToSplit.split(dir, tempPanel);
+
+          // If the second child is also a split, recursively build it
+          if (node.second.type === 'split' && leafToSplit.second) {
+            // The second child's first panel is already created, build remaining structure
+            this.buildNestedSplit(node.second, leafToSplit.second);
+          }
         }
       }
     }
@@ -751,28 +776,33 @@ export class MuxClient {
     return undefined;
   }
 
+  /**
+   * Build nested splits recursively, preserving the correct direction at each level.
+   */
   private buildNestedSplit(node: LayoutNode, container: SplitContainer): void {
     if (node.type !== 'split' || !node.first || !node.second) return;
-    const remainingPanels = this.collectLeafPanels(node.second);
-    for (const panelId of remainingPanels) {
-      const leaf = this.findLeafContainer(container);
-      if (leaf && leaf.panel) {
-        const panel = this.createPanel(container.element, panelId);
-        const dir = node.direction === 'horizontal' ? 'right' : 'down';
-        leaf.split(dir, panel);
-      }
-    }
-  }
 
-  private collectLeafPanels(node: LayoutNode): number[] {
-    const panelIds: number[] = [];
-    if (node.type === 'leaf' && node.panelId !== undefined) {
-      panelIds.push(node.panelId);
-    } else if (node.type === 'split') {
-      if (node.first) panelIds.push(...this.collectLeafPanels(node.first));
-      if (node.second) panelIds.push(...this.collectLeafPanels(node.second));
+    // The first child's first leaf is already in the container
+    // We need to handle if first child has more nested structure
+    if (node.first.type === 'split') {
+      this.buildNestedSplit(node.first, container);
     }
-    return panelIds;
+
+    // Now handle the second child
+    const leafToSplit = this.findLeafContainer(container);
+    if (!leafToSplit || !leafToSplit.panel) return;
+
+    const secondLeafPanel = this.getFirstLeafPanel(node.second);
+    if (secondLeafPanel === undefined) return;
+
+    const panel = this.createPanel(container.element, secondLeafPanel);
+    const dir = node.direction === 'horizontal' ? 'right' : 'down';
+    leafToSplit.split(dir, panel);
+
+    // Recursively handle second child's nested structure
+    if (node.second.type === 'split' && leafToSplit.second) {
+      this.buildNestedSplit(node.second, leafToSplit.second);
+    }
   }
 
   private findLeafContainer(container: SplitContainer): SplitContainer | null {
