@@ -110,6 +110,8 @@ pub const AuthState = struct {
 
     pub fn init(allocator: Allocator) !*AuthState {
         const state = try allocator.create(AuthState);
+        errdefer allocator.destroy(state);
+
         state.* = .{
             .admin_password_hash = null,
             .admin_password_salt = null,
@@ -124,6 +126,7 @@ pub const AuthState = struct {
         // Get config path
         const home = posix.getenv("HOME") orelse "/tmp";
         state.config_path = try std.fmt.allocPrint(allocator, "{s}/.termweb/auth.json", .{home});
+        errdefer allocator.free(state.config_path);
 
         // Ensure directory exists
         const dir_path = try std.fmt.allocPrint(allocator, "{s}/.termweb", .{home});

@@ -58,7 +58,9 @@ const Color = extern struct {
     b: u8,
 };
 
-// WebSocket upgrade callback type
+/// Callback for WebSocket upgrade requests.
+/// Called when a client requests upgrade to WebSocket protocol.
+/// Parameters: network stream, HTTP request headers, user context data.
 pub const WsUpgradeCallback = *const fn (stream: net.Stream, request: []const u8, user_data: ?*anyopaque) void;
 
 // Simple HTTP server for embedded static files + config endpoint + WebSocket upgrades

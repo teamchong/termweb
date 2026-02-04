@@ -119,6 +119,52 @@ fn writeI32(buf: []u8, offset: usize, val: i32) void {
     @memcpy(buf[offset..][0..4], &bytes);
 }
 
+/// Errors that can occur during VA-API encoder operations.
+pub const VaError = error{
+    /// Failed to open DRM device for VA-API.
+    DrmOpenFailed,
+    /// Failed to get VA display from DRM fd.
+    VaDisplayFailed,
+    /// VA-API initialization failed.
+    VaInitFailed,
+    /// H.264 encoding not supported by this GPU.
+    H264NotSupported,
+    /// Failed to create VA surfaces.
+    VaSurfacesFailed,
+    /// Failed to create VA context.
+    VaContextFailed,
+    /// Failed to create VA buffer.
+    VaBufferFailed,
+    /// Failed to create/derive VA image.
+    VaImageFailed,
+    /// Failed to map VA buffer/image.
+    VaMapFailed,
+    /// vaBeginPicture failed.
+    VaBeginPictureFailed,
+    /// Failed to create sequence parameter buffer.
+    VaSeqBufferFailed,
+    /// Failed to create picture parameter buffer.
+    VaPicBufferFailed,
+    /// Failed to create slice parameter buffer.
+    VaSliceBufferFailed,
+    /// vaRenderPicture failed.
+    VaRenderFailed,
+    /// vaEndPicture failed.
+    VaEndPictureFailed,
+    /// vaSyncSurface failed.
+    VaSyncFailed,
+    /// Failed to map coded buffer.
+    VaMapCodedFailed,
+    /// Operation not supported.
+    NotSupported,
+};
+
+/// Combined error type for encoder creation.
+pub const CreateError = VaError || std.mem.Allocator.Error;
+
+/// Error type for resize operations.
+pub const ResizeError = VaError;
+
 const VACodedBufferSegment = extern struct {
     size: u32,
     bit_offset: u32,
@@ -386,7 +432,7 @@ pub const VideoEncoder = struct {
         self.pps_len = 5 + bs.getLength();
     }
 
-    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !*VideoEncoder {
+    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) CreateError!*VideoEncoder {
         const encoder = try allocator.create(VideoEncoder);
         errdefer allocator.destroy(encoder);
 
@@ -402,7 +448,6 @@ pub const VideoEncoder = struct {
         const drm_fd = c.open("/dev/dri/renderD128", c.O_RDWR);
         if (drm_fd < 0) {
             std.debug.print("ENCODER: Failed to open /dev/dri/renderD128\n", .{});
-            allocator.free(output_buffer);
             return error.DrmOpenFailed;
         }
         errdefer _ = c.close(drm_fd);
@@ -411,8 +456,6 @@ pub const VideoEncoder = struct {
         const va_display = c.vaGetDisplayDRM(drm_fd);
         if (va_display == null) {
             std.debug.print("ENCODER: Failed to get VA display\n", .{});
-            _ = c.close(drm_fd);
-            allocator.free(output_buffer);
             return error.VaDisplayFailed;
         }
 
@@ -422,8 +465,6 @@ pub const VideoEncoder = struct {
         var status = c.vaInitialize(va_display, &major, &minor);
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("ENCODER: vaInitialize failed: {}\n", .{status});
-            _ = c.close(drm_fd);
-            allocator.free(output_buffer);
             return error.VaInitFailed;
         }
         errdefer _ = c.vaTerminate(va_display);
@@ -462,9 +503,6 @@ pub const VideoEncoder = struct {
 
         if (!found_profile) {
             std.debug.print("ENCODER: No H.264 encoding profile supported\n", .{});
-            _ = c.vaTerminate(va_display);
-            _ = c.close(drm_fd);
-            allocator.free(output_buffer);
             return error.H264NotSupported;
         }
 
@@ -484,10 +522,6 @@ pub const VideoEncoder = struct {
         );
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("ENCODER: vaCreateSurfaces failed: {}\n", .{status});
-            _ = c.vaDestroyConfig(va_display, config);
-            _ = c.vaTerminate(va_display);
-            _ = c.close(drm_fd);
-            allocator.free(output_buffer);
             return error.VaSurfacesFailed;
         }
         const src_surface = surfaces[0];
@@ -509,11 +543,6 @@ pub const VideoEncoder = struct {
         );
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("ENCODER: vaCreateContext failed: {}\n", .{status});
-            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
-            _ = c.vaDestroyConfig(va_display, config);
-            _ = c.vaTerminate(va_display);
-            _ = c.close(drm_fd);
-            allocator.free(output_buffer);
             return error.VaContextFailed;
         }
         errdefer _ = c.vaDestroyContext(va_display, va_context);
@@ -531,12 +560,6 @@ pub const VideoEncoder = struct {
         );
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("ENCODER: vaCreateBuffer (coded) failed: {}\n", .{status});
-            _ = c.vaDestroyContext(va_display, va_context);
-            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
-            _ = c.vaDestroyConfig(va_display, config);
-            _ = c.vaTerminate(va_display);
-            _ = c.close(drm_fd);
-            allocator.free(output_buffer);
             return error.VaBufferFailed;
         }
 
@@ -605,7 +628,7 @@ pub const VideoEncoder = struct {
         }
     }
 
-    pub fn resize(self: *VideoEncoder, width: u32, height: u32) !void {
+    pub fn resize(self: *VideoEncoder, width: u32, height: u32) ResizeError!void {
         if (self.source_width == width and self.source_height == height) return;
 
         const scaled = calcScaledDimensions(width, height);
@@ -679,7 +702,7 @@ pub const VideoEncoder = struct {
     }
 
     /// Convert RGBA to NV12 and upload to VA surface using vaCreateImage + vaPutImage
-    fn uploadFrame(self: *VideoEncoder, rgba_data: []const u8) !void {
+    fn uploadFrame(self: *VideoEncoder, rgba_data: []const u8) VaError!void {
         const dst_width = self.width;
         const dst_height = self.height;
         const src_width = self.source_width;
@@ -792,7 +815,7 @@ pub const VideoEncoder = struct {
     }
 
     /// Encode RGBA frame to H.264
-    pub fn encode(self: *VideoEncoder, rgba_data: []const u8, force_keyframe: bool) !?EncodeResult {
+    pub fn encode(self: *VideoEncoder, rgba_data: []const u8, force_keyframe: bool) VaError!?EncodeResult {
         const is_keyframe = force_keyframe or (self.frame_count == 0) or
             (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
 

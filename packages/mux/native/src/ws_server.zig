@@ -20,6 +20,28 @@ const Allocator = std.mem.Allocator;
 const zstd = @import("zstd.zig");
 const simd_mask = @import("simd_mask");
 
+/// Callback invoked when a new WebSocket connection is established.
+pub const OnConnectFn = *const fn (*Connection) void;
+
+/// Callback invoked when a message is received.
+/// Parameters: connection, payload data, is_binary flag.
+pub const OnMessageFn = *const fn (*Connection, []u8, bool) void;
+
+/// Callback invoked when a WebSocket connection is closed.
+pub const OnDisconnectFn = *const fn (*Connection) void;
+
+/// WebSocket-specific errors.
+pub const WsError = error{
+    /// Connection was closed before handshake completed.
+    ConnectionClosed,
+    /// Missing or invalid Sec-WebSocket-Key header.
+    InvalidHandshake,
+    /// Payload exceeds maximum allowed size.
+    PayloadTooLarge,
+    /// zstd decompression failed.
+    DecompressionFailed,
+};
+
 /// Maximum WebSocket payload size (16MB).
 /// Prevents memory exhaustion from malicious or malformed frames.
 const max_payload_size = 16 * 1024 * 1024;
@@ -158,8 +180,8 @@ pub const Connection = struct {
         self.is_open = false;
     }
 
-    // Perform WebSocket handshake (server side)
-    // Set enable_zstd=false for connections that carry pre-compressed data (like video frames)
+    /// Perform WebSocket handshake (server side).
+    /// Set enable_zstd=false for connections that carry pre-compressed data (like video frames).
     pub fn acceptHandshake(self: *Connection) !void {
         return self.acceptHandshakeWithOptions(true);
     }
@@ -218,7 +240,7 @@ pub const Connection = struct {
         _ = try self.stream.write("\r\n\r\n");
     }
 
-    // Accept handshake with pre-read request (for HTTP server upgrade)
+    /// Accept handshake with pre-read request (for HTTP server upgrade).
     pub fn acceptHandshakeFromRequest(self: *Connection, request: []const u8, enable_zstd: bool) !void {
         // Extract request URI from first line (e.g., "GET /ws/panel?token=xyz HTTP/1.1")
         if (std.mem.indexOf(u8, request, " ")) |method_end| {
@@ -263,8 +285,8 @@ pub const Connection = struct {
         _ = try self.stream.write("\r\n\r\n");
     }
 
-    // Read a WebSocket frame
-    // App-level zstd: first byte of binary payload is compression flag (0x01 = zstd compressed)
+    /// Read a WebSocket frame.
+    /// App-level zstd: first byte of binary payload is compression flag (0x01 = zstd compressed).
     pub fn readFrame(self: *Connection) !?Frame {
         var header: [2]u8 = undefined;
         const header_read = self.stream.read(&header) catch return null;
@@ -346,9 +368,9 @@ pub const Connection = struct {
         };
     }
 
-    // Write a WebSocket frame with optional zstd compression
-    // For binary frames with zstd enabled: [compression_flag:u8][data...]
-    // compression_flag: 0x00 = uncompressed, 0x01 = zstd compressed
+    /// Write a WebSocket frame with optional zstd compression.
+    /// For binary frames with zstd enabled: [compression_flag:u8][data...].
+    /// compression_flag: 0x00 = uncompressed, 0x01 = zstd compressed.
     pub fn writeFrame(self: *Connection, opcode: Opcode, payload: []const u8) !void {
         // For binary frames with zstd enabled, add compression flag prefix
         var final_payload: []const u8 = payload;
@@ -395,7 +417,7 @@ pub const Connection = struct {
         try self.writeFrameRaw(opcode, final_payload, false);
     }
 
-    // Helper: send binary data with uncompressed flag prefix
+    /// Helper: send binary data with uncompressed flag prefix.
     fn sendUncompressedWithFlag(self: *Connection, payload: []const u8) !void {
         const with_flag = try self.allocator.alloc(u8, payload.len + 1);
         defer self.allocator.free(with_flag);
@@ -404,7 +426,7 @@ pub const Connection = struct {
         try self.writeFrameRaw(.binary, with_flag, false);
     }
 
-    // Write raw WebSocket frame without compression processing
+    /// Write raw WebSocket frame without compression processing.
     fn writeFrameRaw(self: *Connection, opcode: Opcode, payload: []const u8, _: bool) !void {
         var header: [10]u8 = undefined;
         var header_len: usize = 2;
@@ -427,24 +449,24 @@ pub const Connection = struct {
         _ = try self.stream.write(payload);
     }
 
-    // Send binary data
+    /// Send binary data.
     pub fn sendBinary(self: *Connection, data: []const u8) !void {
         try self.writeFrame(.binary, data);
     }
 
-    // Send text data
+    /// Send text data.
     pub fn sendText(self: *Connection, data: []const u8) !void {
         try self.writeFrame(.text, data);
     }
 
-    // Send close frame
+    /// Send close frame.
     pub fn sendClose(self: *Connection) !void {
         if (!self.is_open) return; // Already closed
         try self.writeFrame(.close, &[_]u8{});
         self.is_open = false;
     }
 
-    // Send pong in response to ping
+    /// Send pong in response to ping.
     pub fn sendPong(self: *Connection, data: []const u8) !void {
         try self.writeFrame(.pong, data);
     }
@@ -460,9 +482,12 @@ pub const Server = struct {
     running: std.atomic.Value(bool),
     active_connections: std.atomic.Value(u32), // Track active connection threads
     enable_zstd: bool,
-    on_connect: ?*const fn (*Connection) void,
-    on_message: ?*const fn (*Connection, []u8, bool) void, // conn, data, is_binary
-    on_disconnect: ?*const fn (*Connection) void,
+    /// Called when a new WebSocket connection is established.
+    on_connect: ?OnConnectFn,
+    /// Called when a message is received. Args: connection, payload, is_binary.
+    on_message: ?OnMessageFn,
+    /// Called when a connection is closed.
+    on_disconnect: ?OnDisconnectFn,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16) !*Server {
         return initWithOptions(allocator, address, port, true);
@@ -505,11 +530,12 @@ pub const Server = struct {
         self.allocator.destroy(self);
     }
 
+    /// Set callbacks for connection lifecycle events.
     pub fn setCallbacks(
         self: *Server,
-        on_connect: ?*const fn (*Connection) void,
-        on_message: ?*const fn (*Connection, []u8, bool) void,
-        on_disconnect: ?*const fn (*Connection) void,
+        on_connect: ?OnConnectFn,
+        on_message: ?OnMessageFn,
+        on_disconnect: ?OnDisconnectFn,
     ) void {
         self.on_connect = on_connect;
         self.on_message = on_message;

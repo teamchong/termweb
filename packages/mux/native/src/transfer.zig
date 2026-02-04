@@ -23,6 +23,22 @@ const builtin = @import("builtin");
 
 const zstd = @import("zstd.zig");
 
+/// Errors that can occur during async I/O operations.
+pub const IoError = error{
+    /// Async read operation failed.
+    ReadFailed,
+    /// No data returned from read operation.
+    NoData,
+    /// Invalid arguments provided.
+    InvalidArgs,
+} || std.mem.Allocator.Error;
+
+/// Errors that can occur during compression operations.
+pub const CompressionError = error{
+    /// Parallel compression failed.
+    CompressionFailed,
+} || std.mem.Allocator.Error || zstd.Error;
+
 /// XXH3 SIMD-accelerated hashing.
 /// Uses NEON on ARM64 and AVX2/SSE2 on x86-64.
 extern fn XXH3_64bits(input: ?*const anyopaque, length: usize) u64;
