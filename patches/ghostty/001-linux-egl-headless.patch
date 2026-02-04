@@ -1,15 +1,26 @@
-From 0dad46bae288cda76a0be80a7d99b76315182232 Mon Sep 17 00:00:00 2001
+From f6df74021c9e126fb26cedbd5c45d4a1dd77db9b Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
-Date: Wed, 4 Feb 2026 09:55:17 -0500
-Subject: [PATCH 1/2] feat(linux): add headless EGL rendering support for
+Date: Mon, 2 Feb 2026 06:49:49 -0500
+Subject: [PATCH 1/3] feat(linux): add headless EGL rendering support for
  embedded platform
 
+Add headless OpenGL rendering via EGL for Linux embedded platform:
+
+- Create egl_headless.zig module that dynamically loads libEGL and libgbm
+- Support multiple platforms: GBM (hardware GPU), surfaceless, default
+- Support multiple OpenGL versions: 4.3, 3.3, ES 3.2, 3.1, 3.0
+- Add must_draw_from_app_thread for Linux to handle threadlocal glad context
+- Initialize EGL context in surfaceInit for embedded Linux
+- Add ghostty_surface_read_pixels for video frame capture
+
+This enables headless GPU rendering on Linux servers without a display,
+using DRM render nodes (/dev/dri/renderD128) for hardware acceleration.
 ---
  include/ghostty.h          |  13 ++
- src/apprt/egl_headless.zig | 340 +++++++++++++++++++++++++++++++++++++
- src/apprt/embedded.zig     |  54 ++++++
- src/renderer/OpenGL.zig    |  49 ++++--
- 4 files changed, 446 insertions(+), 10 deletions(-)
+ src/apprt/egl_headless.zig | 327 +++++++++++++++++++++++++++++++++++++
+ src/apprt/embedded.zig     |  43 +++++
+ src/renderer/OpenGL.zig    |  21 ++-
+ 4 files changed, 398 insertions(+), 6 deletions(-)
  create mode 100644 src/apprt/egl_headless.zig
 
 diff --git a/include/ghostty.h b/include/ghostty.h
@@ -55,14 +66,14 @@ index 3d3973084..e04c2fabe 100644
  void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..7900d57b0
+index 000000000..ea96e753b
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,327 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
-+const gl = @import("opengl");
++const gl = @import("../renderer/opengl/main.zig");
 +
 +// GBM types and functions
 +const gbm = struct {
@@ -114,8 +125,11 @@ index 000000000..7900d57b0
 +    pub const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: c_int = 0x00000001;
 +    pub const EGL_OPENGL_API: c_int = 0x30A2;
 +    pub const EGL_OPENGL_ES_API: c_int = 0x30A0;
++    // EGL_EXT_platform_device
 +    pub const EGL_PLATFORM_DEVICE_EXT: c_int = 0x313F;
++    // EGL_MESA_platform_surfaceless
 +    pub const EGL_PLATFORM_SURFACELESS_MESA: c_int = 0x31DD;
++    // EGL_MESA_platform_gbm
 +    pub const EGL_PLATFORM_GBM_MESA: c_int = 0x31D7;
 +
 +    pub const EGLDisplay = ?*anyopaque;
@@ -139,6 +153,7 @@ index 000000000..7900d57b0
 +    pub var eglSwapBuffers: *const fn (EGLDisplay, EGLSurface) callconv(.c) c_int = undefined;
 +    pub var eglGetError: *const fn () callconv(.c) EGLint = undefined;
 +    pub var eglGetProcAddress: *const fn ([*:0]const u8) callconv(.c) ?*const fn () callconv(.c) void = undefined;
++    // EGL_EXT_device_enumeration / EGL_EXT_platform_device
 +    pub var eglQueryDevicesEXT: ?*const fn (c_int, [*]?*anyopaque, *c_int) callconv(.c) c_int = null;
 +    pub var eglGetPlatformDisplayEXT: ?*const fn (c_int, ?*anyopaque, [*]const c_int) callconv(.c) EGLDisplay = null;
 +
@@ -160,6 +175,7 @@ index 000000000..7900d57b0
 +        eglSwapBuffers = lib.?.lookup(@TypeOf(eglSwapBuffers), "eglSwapBuffers") orelse return error.EglSymbolNotFound;
 +        eglGetError = lib.?.lookup(@TypeOf(eglGetError), "eglGetError") orelse return error.EglSymbolNotFound;
 +        eglGetProcAddress = lib.?.lookup(@TypeOf(eglGetProcAddress), "eglGetProcAddress") orelse return error.EglSymbolNotFound;
++        // Optional extensions for headless - must use eglGetProcAddress
 +        if (eglGetProcAddress("eglQueryDevicesEXT")) |ptr| {
 +            eglQueryDevicesEXT = @ptrCast(ptr);
 +        }
@@ -183,6 +199,8 @@ index 000000000..7900d57b0
 +    pub fn init() !EglHeadless {
 +        try c.loadEgl();
 +
++        // Try GBM first (hardware GPU), then surfaceless, then default
++        // GBM requires DRM render node access
 +        var try_gbm = false;
 +        if (c.eglGetPlatformDisplayEXT != null) {
 +            if (drm_fd == null) {
@@ -208,6 +226,7 @@ index 000000000..7900d57b0
 +        };
 +
 +        for (platforms) |plat| {
++            // Skip GBM if we couldn't open the device
 +            if (std.mem.eql(u8, plat.name, "gbm") and !try_gbm) continue;
 +
 +            var display: c.EGLDisplay = c.EGL_NO_DISPLAY;
@@ -231,6 +250,7 @@ index 000000000..7900d57b0
 +            var minor: c.EGLint = 0;
 +            if (c.eglInitialize(display, &major, &minor) == c.EGL_FALSE) continue;
 +
++            // Try desktop OpenGL first, then OpenGL ES
 +            const api_configs = [_]struct { api: c_int, renderable: c_int, maj: c_int, min: c_int, name: []const u8, use_profile: bool }{
 +                .{ .api = c.EGL_OPENGL_API, .renderable = c.EGL_OPENGL_BIT, .maj = 4, .min = 3, .name = "OpenGL 4.3", .use_profile = true },
 +                .{ .api = c.EGL_OPENGL_API, .renderable = c.EGL_OPENGL_BIT, .maj = 3, .min = 3, .name = "OpenGL 3.3", .use_profile = true },
@@ -242,6 +262,7 @@ index 000000000..7900d57b0
 +            for (api_configs) |api_cfg| {
 +                if (c.eglBindAPI(api_cfg.api) == c.EGL_FALSE) continue;
 +
++                // Try different config attribute combinations
 +                const config_variants = [_]struct { name: []const u8, attribs: []const c.EGLint }{
 +                    .{ .name = "pbuffer", .attribs = &[_]c.EGLint{ c.EGL_SURFACE_TYPE, c.EGL_PBUFFER_BIT, c.EGL_RENDERABLE_TYPE, api_cfg.renderable, c.EGL_RED_SIZE, 8, c.EGL_GREEN_SIZE, 8, c.EGL_BLUE_SIZE, 8, c.EGL_ALPHA_SIZE, 8, c.EGL_NONE } },
 +                    .{ .name = "surfaceless", .attribs = &[_]c.EGLint{ c.EGL_SURFACE_TYPE, 0, c.EGL_RENDERABLE_TYPE, api_cfg.renderable, c.EGL_RED_SIZE, 8, c.EGL_GREEN_SIZE, 8, c.EGL_BLUE_SIZE, 8, c.EGL_ALPHA_SIZE, 8, c.EGL_NONE } },
@@ -254,10 +275,12 @@ index 000000000..7900d57b0
 +                    const result = c.eglChooseConfig(display, cfg_var.attribs.ptr, &config, 1, &num_configs);
 +                    if (result == c.EGL_FALSE or num_configs == 0) continue;
 +
++                    // Surfaceless platform uses no surface, others try pbuffer
 +                    var surface: c.EGLSurface = c.EGL_NO_SURFACE;
 +                    if (!is_surfaceless) {
 +                        const pbuffer_attribs = [_]c.EGLint{ c.EGL_WIDTH, 1, c.EGL_HEIGHT, 1, c.EGL_NONE };
 +                        surface = c.eglCreatePbufferSurface(display, config, &pbuffer_attribs);
++                        // pbuffer is optional, continue even if it fails
 +                    }
 +
 +                    var context_attribs: [7]c.EGLint = undefined;
@@ -273,7 +296,7 @@ index 000000000..7900d57b0
 +                        continue;
 +                    }
 +
-+                    std.debug.print("EGL context created: {s} via {s} platform\n", .{ api_cfg.name, plat.name });
++                    log.info("EGL context created: {s} via {s} platform", .{ api_cfg.name, plat.name });
 +                    return .{ .display = display, .context = context, .surface = surface, .use_gles = api_cfg.api == c.EGL_OPENGL_ES_API };
 +                }
 +            }
@@ -303,15 +326,6 @@ index 000000000..7900d57b0
 +
 +var global_egl_context: ?EglHeadless = null;
 +var gl_initialized: bool = false;
-+var last_rendered_fbo: c_uint = 0;
-+
-+pub fn setLastRenderedFbo(fbo_id: c_uint) void {
-+    last_rendered_fbo = fbo_id;
-+}
-+
-+pub fn getLastRenderedFbo() c_uint {
-+    return last_rendered_fbo;
-+}
 +
 +pub fn initGlobalContext() !*EglHeadless {
 +    if (global_egl_context) |*ctx| return ctx;
@@ -349,48 +363,32 @@ index 000000000..7900d57b0
 +    }
 +}
 +
-+/// Set the viewport size. This must be called when the surface size changes
-+/// so that OpenGL.surfaceSize() returns the correct dimensions.
-+pub fn setViewportSize(width: u32, height: u32) void {
-+    std.debug.print("setViewportSize: {}x{}\n", .{ width, height });
-+    if (!makeCurrentOnThread()) {
-+        std.debug.print("setViewportSize: makeCurrent failed!\n", .{});
-+        return;
-+    }
-+    if (gl.glad.context.Viewport) |viewport| {
-+        viewport(0, 0, @intCast(width), @intCast(height));
-+        std.debug.print("setViewportSize: viewport set to {}x{}\n", .{ width, height });
-+    } else {
-+        std.debug.print("setViewportSize: Viewport function is null!\n", .{});
-+    }
-+}
-+
++/// Read pixels from the current OpenGL framebuffer (RGBA format)
++/// Used for video encoding on Linux (equivalent to IOSurface on macOS)
 +pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) bool {
-+    if (!makeCurrentOnThread()) return false;
-+
-+    const readPixelsFn = gl.glad.context.ReadPixels orelse return false;
++    if (gl.glReadPixels == null) return false;
 +
 +    const expected_size = @as(usize, width) * @as(usize, height) * 4;
 +    if (buffer_len < expected_size) return false;
 +
-+    if (gl.glad.context.Finish) |finish| {
-+        finish();
++    // Ensure we're reading from the right buffer
++    if (gl.glReadBuffer) |readBuf| {
++        readBuf(gl.c.GL_BACK);
 +    }
 +
-+    const fbo_to_use = if (last_rendered_fbo > 0) last_rendered_fbo else 1;
-+    if (gl.glad.context.BindFramebuffer) |bindFb| {
-+        bindFb(gl.c.GL_READ_FRAMEBUFFER, fbo_to_use);
-+    }
++    // Read pixels (OpenGL origin is bottom-left)
++    gl.glReadPixels.?(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, buffer);
 +
-+    readPixelsFn(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, buffer);
-+
++    // Flip image vertically (OpenGL has origin at bottom-left, we need top-left)
 +    const row_size = width * 4;
-+    var temp_row: [4096 * 4]u8 = undefined;
++    var temp_row: [4096 * 4]u8 = undefined; // Support up to 4K width
 +    if (row_size <= temp_row.len) {
 +        var y: u32 = 0;
 +        while (y < height / 2) : (y += 1) {
 +            const top_offset = y * row_size;
 +            const bottom_offset = (height - 1 - y) * row_size;
++
++            // Swap rows
 +            @memcpy(temp_row[0..row_size], buffer[top_offset..][0..row_size]);
 +            @memcpy(buffer[top_offset..][0..row_size], buffer[bottom_offset..][0..row_size]);
 +            @memcpy(buffer[bottom_offset..][0..row_size], temp_row[0..row_size]);
@@ -400,21 +398,20 @@ index 000000000..7900d57b0
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..ac28b5b08 100644
+index dcf8a6357..d0bb18d11 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
-@@ -26,6 +26,10 @@ const log = std.log.scoped(.embedded_window);
+@@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
  pub const resourcesDir = internal_os.resourcesDir;
  
  pub const App = struct {
 +    /// For embedded Linux with OpenGL, drawing must be done from the app thread
 +    /// because EGL contexts can only be current on one thread at a time.
 +    pub const must_draw_from_app_thread = if (builtin.target.os.tag == .linux) true else false;
-+
      /// Because we only expect the embedding API to be used in embedded
      /// environments, the options are extern so that we can expose it
      /// directly to a C callconv and not pay for any translation costs.
-@@ -342,6 +346,7 @@ pub const App = struct {
+@@ -342,6 +345,7 @@ pub const App = struct {
  pub const Platform = union(PlatformTag) {
      macos: MacOS,
      ios: IOS,
@@ -422,7 +419,7 @@ index dcf8a6357..ac28b5b08 100644
  
      // If our build target for libghostty is not darwin then we do
      // not include macos support at all.
-@@ -355,6 +360,12 @@ pub const Platform = union(PlatformTag) {
+@@ -355,6 +359,12 @@ pub const Platform = union(PlatformTag) {
          uiview: objc.Object,
      } else void;
  
@@ -435,7 +432,7 @@ index dcf8a6357..ac28b5b08 100644
      // The C ABI compatible version of this union. The tag is expected
      // to be stored elsewhere.
      pub const C = extern union {
-@@ -365,6 +376,12 @@ pub const Platform = union(PlatformTag) {
+@@ -365,6 +375,12 @@ pub const Platform = union(PlatformTag) {
          ios: extern struct {
              uiview: ?*anyopaque,
          },
@@ -448,7 +445,7 @@ index dcf8a6357..ac28b5b08 100644
      };
  
      /// Initialize a Platform a tag and configuration from the C ABI.
-@@ -384,6 +401,12 @@ pub const Platform = union(PlatformTag) {
+@@ -384,6 +400,12 @@ pub const Platform = union(PlatformTag) {
                      break :ios error.UIViewMustBeSet);
                  break :ios .{ .ios = .{ .uiview = uiview } };
              } else error.UnsupportedPlatform,
@@ -461,7 +458,7 @@ index dcf8a6357..ac28b5b08 100644
          };
      }
  };
-@@ -394,6 +417,7 @@ pub const PlatformTag = enum(c_int) {
+@@ -394,6 +416,7 @@ pub const PlatformTag = enum(c_int) {
  
      macos = 1,
      ios = 2,
@@ -469,21 +466,7 @@ index dcf8a6357..ac28b5b08 100644
  };
  
  pub const EnvVar = extern struct {
-@@ -792,6 +816,13 @@ pub const Surface = struct {
-             .height = height,
-         };
- 
-+        // For embedded Linux with headless EGL, set the OpenGL viewport
-+        // so that surfaceSize() returns the correct dimensions.
-+        if (comptime builtin.target.os.tag == .linux) {
-+            const egl_headless = @import("egl_headless.zig");
-+            egl_headless.setViewportSize(width, height);
-+        }
-+
-         // Call the primary callback.
-         self.core_surface.sizeCallback(self.size) catch |err| {
-             log.err("error in size callback err={}", .{err});
-@@ -2204,4 +2235,27 @@ pub const CAPI = struct {
+@@ -2204,4 +2227,24 @@ pub const CAPI = struct {
              }
          }
      };
@@ -493,14 +476,11 @@ index dcf8a6357..ac28b5b08 100644
 +        /// Read pixels from the OpenGL framebuffer for video encoding
 +        export fn ghostty_surface_read_pixels(ptr: *Surface, buffer: [*]u8, buffer_len: usize) bool {
 +            const surface = &ptr.core_surface;
-+            const width = surface.size.screen.width;
-+            const height = surface.size.screen.height;
-+
-+            if (width == 0 or height == 0) return false;
++            const size = surface.screen_size orelse return false;
 +
 +            if (comptime builtin.target.os.tag == .linux) {
 +                const egl_headless = @import("egl_headless.zig");
-+                return egl_headless.readPixels(buffer, buffer_len, width, height);
++                return egl_headless.readPixels(buffer, buffer_len, size.width, size.height);
 +            }
 +            return false;
 +        }
@@ -512,7 +492,7 @@ index dcf8a6357..ac28b5b08 100644
 +    }
  };
 diff --git a/src/renderer/OpenGL.zig b/src/renderer/OpenGL.zig
-index 4b01da0c5..502262293 100644
+index 4b01da0c5..8d5edd8f4 100644
 --- a/src/renderer/OpenGL.zig
 +++ b/src/renderer/OpenGL.zig
 @@ -170,9 +170,16 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
@@ -557,105 +537,275 @@ index 4b01da0c5..502262293 100644
          },
      }
  }
-@@ -229,7 +238,7 @@ pub fn threadExit(self: *const OpenGL) void {
-         },
- 
-         apprt.embedded => {
--            // TODO: see threadEnter
-+            // For embedded Linux, the EGL context is managed by the app thread.
-         },
-     }
- }
-@@ -251,9 +260,20 @@ pub fn displayRealized(self: *const OpenGL) void {
- 
- /// Actions taken before doing anything in `drawFrame`.
- ///
--/// Right now there's nothing we need to do for OpenGL.
-+/// For embedded Linux with headless EGL, we need to ensure the EGL context
-+/// is current on this thread before any GL calls (like surfaceSize()).
- pub fn drawFrameStart(self: *OpenGL) void {
-     _ = self;
-+    if (comptime builtin.target.os.tag == .linux) {
-+        switch (apprt.runtime) {
-+            apprt.embedded => {
-+                const egl_headless = @import("../apprt/egl_headless.zig");
-+                const result = egl_headless.makeCurrentOnThread();
-+                std.debug.print("drawFrameStart: makeCurrent={}\n", .{result});
-+            },
-+            else => {},
-+        }
-+    }
- }
- 
- /// Actions taken after `drawFrame` is done.
-@@ -280,9 +300,12 @@ pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
-     _ = self;
-     var viewport: [4]gl.c.GLint = undefined;
-     gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
-+    const w: u32 = @intCast(viewport[2]);
-+    const h: u32 = @intCast(viewport[3]);
-+    std.debug.print("surfaceSize: viewport={}x{}\n", .{ w, h });
-     return .{
--        .width = @intCast(viewport[2]),
--        .height = @intCast(viewport[3]),
-+        .width = w,
-+        .height = h,
-     };
- }
- 
-@@ -312,6 +335,12 @@ pub fn present(self: *OpenGL, target: Target) !void {
-     const fbobind = try target.framebuffer.bind(.read);
-     defer fbobind.unbind();
- 
-+    // Store FBO ID for headless pixel capture (Linux only)
-+    if (comptime builtin.target.os.tag == .linux) {
-+        const egl_headless = @import("../apprt/egl_headless.zig");
-+        egl_headless.setLastRenderedFbo(target.framebuffer.id);
-+    }
-+
-     // Blit
-     gl.glad.context.BlitFramebuffer.?(
-         0,
 -- 
 2.43.0
 
 
-From d65d8f7eb2ec08ec58554d77596d49a939ea68fd Mon Sep 17 00:00:00 2001
+From 343fe80eae09d8765ddf4cd1ff11781461601f29 Mon Sep 17 00:00:00 2001
 From: teamchong <steven@keplogic.com>
-Date: Wed, 4 Feb 2026 09:57:34 -0500
-Subject: [PATCH 2/2] feat(linux): add headless EGL rendering support for
- embedded platform
+Date: Wed, 4 Feb 2026 10:35:23 -0500
+Subject: [PATCH 2/3] feat(linux): add headless EGL rendering with
+ double-buffered PBO
 
 ---
- src/apprt/embedded.zig | 4 ++++
- 1 file changed, 4 insertions(+)
+ src/apprt/egl_headless.zig | 158 +++++++++++++++++++++++++++++++++++--
+ src/apprt/embedded.zig     |   8 +-
+ 2 files changed, 158 insertions(+), 8 deletions(-)
 
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index ea96e753b..56899226e 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -1,7 +1,7 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const posix = std.posix;
+-const gl = @import("../renderer/opengl/main.zig");
++const gl = @import("opengl");
+ 
+ // GBM types and functions
+ const gbm = struct {
+@@ -115,6 +115,146 @@ const c = struct {
+ 
+ const log = std.log.scoped(.egl_headless);
+ 
++/// Double-buffered PBO state for async pixel readback
++pub const PboState = struct {
++    /// Two PBOs for ping-pong buffering
++    pbos: [2]c_uint = .{ 0, 0 },
++    /// Current PBO index (the one we're reading INTO via glReadPixels)
++    current_index: u1 = 0,
++    /// Buffer size for validation
++    buffer_size: usize = 0,
++    /// Dimensions for validation
++    width: u32 = 0,
++    height: u32 = 0,
++    /// Frame counter - 0 means first frame (no previous data)
++    frame_count: u32 = 0,
++
++    // OpenGL constants
++    const GL_PIXEL_PACK_BUFFER: c_uint = 0x88EB;
++    const GL_STREAM_READ: c_uint = 0x88E1;
++    const GL_MAP_READ_BIT: c_uint = 0x0001;
++    const GL_READ_ONLY: c_uint = 0x88B8;
++
++    pub fn init(self: *PboState, width: u32, height: u32) bool {
++        const genBuffers = gl.glad.context.GenBuffers orelse return false;
++        const bindBuffer = gl.glad.context.BindBuffer orelse return false;
++        const bufferData = gl.glad.context.BufferData orelse return false;
++
++        self.width = width;
++        self.height = height;
++        self.buffer_size = @as(usize, width) * @as(usize, height) * 4;
++        self.frame_count = 0;
++
++        // Generate 2 PBOs
++        genBuffers(2, &self.pbos);
++
++        // Allocate storage for both PBOs
++        for (self.pbos) |pbo| {
++            bindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
++            bufferData(GL_PIXEL_PACK_BUFFER, @intCast(self.buffer_size), null, GL_STREAM_READ);
++        }
++
++        // Unbind
++        bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++
++        log.info("PBO initialized: 2x {}x{} ({} bytes each)", .{ width, height, self.buffer_size });
++        return true;
++    }
++
++    pub fn deinit(self: *PboState) void {
++        if (self.pbos[0] != 0) {
++            if (gl.glad.context.DeleteBuffers) |deleteBuffers| {
++                deleteBuffers(2, &self.pbos);
++            }
++            self.pbos = .{ 0, 0 };
++        }
++    }
++
++    pub fn resize(self: *PboState, width: u32, height: u32) bool {
++        if (self.width == width and self.height == height) return true;
++        self.deinit();
++        return self.init(width, height);
++    }
++
++    /// Async readPixels using double-buffered PBO
++    /// Returns false on first frame (no previous data available yet)
++    pub fn readPixelsAsync(self: *PboState, dest_buffer: [*]u8, dest_len: usize, width: u32, height: u32) bool {
++        // Validate dimensions
++        const expected_size = @as(usize, width) * @as(usize, height) * 4;
++        if (dest_len < expected_size) return false;
++
++        // Resize PBOs if needed
++        if (self.pbos[0] == 0 or self.width != width or self.height != height) {
++            if (!self.resize(width, height)) return false;
++        }
++
++        const bindBuffer = gl.glad.context.BindBuffer orelse return false;
++        const glReadPixels = gl.glad.context.ReadPixels orelse return false;
++
++        // Set read buffer
++        if (gl.glad.context.ReadBuffer) |readBuf| {
++            readBuf(gl.c.GL_BACK);
++        }
++
++        const next_index: u1 = self.current_index +% 1;
++
++        // 1. Bind next PBO and start async read (returns immediately)
++        bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[next_index]);
++        glReadPixels(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, null);
++
++        // 2. First frame: no previous data to read, just swap and return false
++        if (self.frame_count == 0) {
++            bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++            self.current_index = next_index;
++            self.frame_count = 1;
++            return false;
++        }
++
++        // 3. Bind current (previous) PBO and map it
++        bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[self.current_index]);
++
++        const mapped_ptr: ?[*]const u8 = blk: {
++            // Try MapBufferRange first (more control), fall back to MapBuffer
++            if (gl.glad.context.MapBufferRange) |mapRange| {
++                break :blk @ptrCast(mapRange(GL_PIXEL_PACK_BUFFER, 0, @intCast(self.buffer_size), GL_MAP_READ_BIT));
++            } else if (gl.glad.context.MapBuffer) |mapBuf| {
++                break :blk @ptrCast(mapBuf(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY));
++            }
++            break :blk null;
++        };
++
++        if (mapped_ptr == null) {
++            bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++            return false;
++        }
++
++        // 4. Copy with vertical flip (OpenGL origin is bottom-left)
++        // Read linearly from mapped memory, write flipped to dest
++        const row_size = width * 4;
++        var y: u32 = 0;
++        while (y < height) : (y += 1) {
++            const src_row = (height - 1 - y) * row_size; // Bottom-to-top
++            const dst_row = y * row_size; // Top-to-bottom
++            @memcpy(dest_buffer[dst_row..][0..row_size], mapped_ptr.?[src_row..][0..row_size]);
++        }
++
++        // 5. Unmap and unbind
++        if (gl.glad.context.UnmapBuffer) |unmapBuf| {
++            _ = unmapBuf(GL_PIXEL_PACK_BUFFER);
++        }
++        bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++
++        // 6. Swap indices for next frame
++        self.current_index = next_index;
++        self.frame_count +|= 1;
++
++        return true;
++    }
++};
++
++/// Global PBO state for async readback
++var global_pbo_state: PboState = .{};
++
+ pub const EglHeadless = struct {
+     display: c.EGLDisplay,
+     context: c.EGLContext,
+@@ -292,20 +432,28 @@ pub fn releaseContext() void {
+ }
+ 
+ /// Read pixels from the current OpenGL framebuffer (RGBA format)
+-/// Used for video encoding on Linux (equivalent to IOSurface on macOS)
++/// Uses double-buffered PBO for async readback - returns previous frame's data
++/// while current frame's read is in progress (pipelined for performance).
++/// Returns false on first frame (no previous data) or on error.
+ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) bool {
+-    if (gl.glReadPixels == null) return false;
++    return global_pbo_state.readPixelsAsync(buffer, buffer_len, width, height);
++}
++
++/// Synchronous fallback for cases where we absolutely need the current frame
++/// (e.g., single-shot capture). Slower but provides immediate data.
++pub fn readPixelsSync(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) bool {
++    const readPixelsFn = gl.glad.context.ReadPixels orelse return false;
+ 
+     const expected_size = @as(usize, width) * @as(usize, height) * 4;
+     if (buffer_len < expected_size) return false;
+ 
+     // Ensure we're reading from the right buffer
+-    if (gl.glReadBuffer) |readBuf| {
++    if (gl.glad.context.ReadBuffer) |readBuf| {
+         readBuf(gl.c.GL_BACK);
+     }
+ 
+     // Read pixels (OpenGL origin is bottom-left)
+-    gl.glReadPixels.?(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, buffer);
++    readPixelsFn(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, buffer);
+ 
+     // Flip image vertically (OpenGL has origin at bottom-left, we need top-left)
+     const row_size = width * 4;
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index ac28b5b08..dd3231459 100644
+index d0bb18d11..214f1731d 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
-@@ -780,10 +780,13 @@ pub const Surface = struct {
-     }
+@@ -2232,12 +2232,14 @@ pub const CAPI = struct {
+     const Linux = struct {
+         /// Read pixels from the OpenGL framebuffer for video encoding
+         export fn ghostty_surface_read_pixels(ptr: *Surface, buffer: [*]u8, buffer_len: usize) bool {
+-            const surface = &ptr.core_surface;
+-            const size = surface.screen_size orelse return false;
++            const width = ptr.size.width;
++            const height = ptr.size.height;
++
++            if (width == 0 or height == 0) return false;
  
-     pub fn draw(self: *Surface) void {
-+        std.debug.print("Surface.draw() called\n", .{});
-         self.core_surface.draw() catch |err| {
-             log.err("error in draw err={}", .{err});
-+            std.debug.print("Surface.draw() error: {}\n", .{err});
-             return;
-         };
-+        std.debug.print("Surface.draw() completed\n", .{});
-     }
+             if (comptime builtin.target.os.tag == .linux) {
+                 const egl_headless = @import("egl_headless.zig");
+-                return egl_headless.readPixels(buffer, buffer_len, size.width, size.height);
++                return egl_headless.readPixels(buffer, buffer_len, width, height);
+             }
+             return false;
+         }
+-- 
+2.43.0
+
+
+From f6902cbff05c90e6c1fbce67ba57b80262b785ec Mon Sep 17 00:00:00 2001
+From: teamchong <steven@keplogic.com>
+Date: Wed, 4 Feb 2026 10:40:19 -0500
+Subject: [PATCH 3/3] feat(linux): add headless EGL rendering with
+ double-buffered PBO
+
+---
+ src/apprt/egl_headless.zig | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
+index 56899226e..4a7bfb80b 100644
+--- a/src/apprt/egl_headless.zig
++++ b/src/apprt/egl_headless.zig
+@@ -432,11 +432,16 @@ pub fn releaseContext() void {
+ }
  
-     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
-@@ -1694,6 +1697,7 @@ pub const CAPI = struct {
-     /// Tell the surface that it needs to schedule a render
-     /// call as soon as possible (NOW if possible).
-     export fn ghostty_surface_draw(surface: *Surface) void {
-+        std.debug.print("ghostty_surface_draw() called\n", .{});
-         surface.draw();
-     }
+ /// Read pixels from the current OpenGL framebuffer (RGBA format)
+-/// Uses double-buffered PBO for async readback - returns previous frame's data
+-/// while current frame's read is in progress (pipelined for performance).
+-/// Returns false on first frame (no previous data) or on error.
++/// Uses double-buffered PBO for async readback with sync fallback.
++/// PBO returns previous frame's data while current frame reads (pipelined).
++/// Falls back to sync read on first frame to ensure we always have data.
+ pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32) bool {
+-    return global_pbo_state.readPixelsAsync(buffer, buffer_len, width, height);
++    // Try async PBO first
++    if (global_pbo_state.readPixelsAsync(buffer, buffer_len, width, height)) {
++        return true;
++    }
++    // Fall back to sync read (first frame or PBO error)
++    return readPixelsSync(buffer, buffer_len, width, height);
+ }
  
+ /// Synchronous fallback for cases where we absolutely need the current frame
 -- 
 2.43.0
 
