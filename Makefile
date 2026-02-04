@@ -94,7 +94,7 @@ vendor-patch:
 	@for patch in patches/ghostty/*.patch; do \
 		if [ -f "$$patch" ]; then \
 			echo "Applying $$patch..."; \
-			cd vendor/ghostty && git am --3way "../../$$patch" && cd ../..; \
+			cd vendor/ghostty && git apply "../../$$patch" && cd ../..; \
 		fi \
 	done
 	@echo "Patches applied."
@@ -128,15 +128,13 @@ endif
 
 # Generate patch from current vendor changes (use after editing vendor files)
 # Usage: edit vendor/ghostty files, then run `make vendor-generate-patch`
-# This generates a patch containing ALL changes from the upstream commit to current state
+# This generates a unified diff patch (no commits needed)
 # After generating, it syncs, rebuilds libghostty.a, and copies to platform-specific dir
 vendor-generate-patch:
 	@echo "Generating patch from changes in vendor/ghostty (since $(GHOSTTY_UPSTREAM_COMMIT))..."
 	@cd vendor/ghostty && \
 		git add -A && \
-		git commit -m "feat(linux): add headless EGL rendering support for embedded platform" --allow-empty && \
-		git format-patch $(GHOSTTY_UPSTREAM_COMMIT)..HEAD --stdout > ../../patches/ghostty/001-linux-egl-headless.patch && \
-		git reset --soft $(GHOSTTY_UPSTREAM_COMMIT) && \
+		git diff --cached $(GHOSTTY_UPSTREAM_COMMIT) > ../../patches/ghostty/001-linux-egl-headless.patch && \
 		git reset HEAD
 	@echo "Patch saved to patches/ghostty/001-linux-egl-headless.patch"
 	@echo ""

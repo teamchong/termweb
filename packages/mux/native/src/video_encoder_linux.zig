@@ -375,7 +375,39 @@ pub const VideoEncoder = struct {
         bs.writeBits(1, 1);
         // frame_cropping_flag = 0
         bs.writeBits(0, 1);
-        // vui_parameters_present_flag = 0
+        // vui_parameters_present_flag = 1 (enable VUI for full color range)
+        bs.writeBits(1, 1);
+
+        // === VUI Parameters ===
+        // aspect_ratio_info_present_flag = 0
+        bs.writeBits(0, 1);
+        // overscan_info_present_flag = 0
+        bs.writeBits(0, 1);
+        // video_signal_type_present_flag = 1 (needed for full range)
+        bs.writeBits(1, 1);
+        // video_format = 5 (unspecified)
+        bs.writeBits(5, 3);
+        // video_full_range_flag = 1 (FULL RANGE 0-255, not limited 16-235)
+        bs.writeBits(1, 1);
+        // colour_description_present_flag = 1
+        bs.writeBits(1, 1);
+        // colour_primaries = 1 (BT.709)
+        bs.writeBits(1, 8);
+        // transfer_characteristics = 1 (BT.709)
+        bs.writeBits(1, 8);
+        // matrix_coefficients = 1 (BT.709)
+        bs.writeBits(1, 8);
+        // chroma_loc_info_present_flag = 0
+        bs.writeBits(0, 1);
+        // timing_info_present_flag = 0
+        bs.writeBits(0, 1);
+        // nal_hrd_parameters_present_flag = 0
+        bs.writeBits(0, 1);
+        // vcl_hrd_parameters_present_flag = 0
+        bs.writeBits(0, 1);
+        // pic_struct_present_flag = 0
+        bs.writeBits(0, 1);
+        // bitstream_restriction_flag = 0
         bs.writeBits(0, 1);
 
         bs.writeTrailingBits();
@@ -897,7 +929,9 @@ pub const VideoEncoder = struct {
         writeU8(&pic_param, PIC_seq_parameter_set_id, 0);
         // frame_num: 0 for IDR, increments for P-frames (mod max_frame_num)
         writeU16(&pic_param, PIC_frame_num, if (is_keyframe) 0 else @intCast(@mod(self.frame_count, 16)));
-        writeU8(&pic_param, PIC_pic_init_qp, 26);
+        // Lower QP = higher quality. 18-22 is high quality for terminal text.
+        // Default H.264 is 26, but terminals need sharp text, not smooth video.
+        writeU8(&pic_param, PIC_pic_init_qp, 20);
         writeU8(&pic_param, PIC_num_ref_idx_l0_active_minus1, 0);
         // pic_fields bits: idr_pic_flag(0), reference_pic_flag(1), entropy_coding_mode_flag(2)
         // For CAVLC: entropy_coding_mode_flag = 0
