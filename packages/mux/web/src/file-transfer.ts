@@ -3,30 +3,26 @@
 
 import { CompressionPool, getCompressionPool, destroyCompressionPool } from './compression-pool';
 import { initZstd, compressZstd, decompressZstd } from './zstd-wasm';
+import { TransferMsgType } from './protocol';
+import { getWsUrl, sharedTextEncoder, sharedTextDecoder, collectStreamChunks } from './utils';
+import {
+  WS_PATHS,
+  FILE_TRANSFER,
+  ZSTD_WASM_PATH,
+  PROTO_HEADER,
+  PROTO_SIZE,
+  PROTO_FILE_LIST,
+  PROTO_FILE_REQUEST,
+  PROTO_FILE_ACK,
+  PROTO_TRANSFER_COMPLETE,
+  PROTO_TRANSFER_ERROR,
+  PROTO_DRY_RUN,
+  DRY_RUN_ACTION,
+} from './constants';
+import type { FileSystemDirectoryHandleIterator } from './types';
 
-// WebSocket URL builder - auto-detects ws/wss based on page protocol
-function getWsUrl(path: string): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = window.location.host; // includes port if non-standard
-  return `${protocol}//${host}${path}`;
-}
-
-export const TransferMsgType = {
-  // Client -> Server
-  TRANSFER_INIT: 0x20,
-  FILE_LIST_REQUEST: 0x21,
-  FILE_DATA: 0x22,
-  TRANSFER_RESUME: 0x23,
-  TRANSFER_CANCEL: 0x24,
-  // Server -> Client
-  TRANSFER_READY: 0x30,
-  FILE_LIST: 0x31,
-  FILE_REQUEST: 0x32,
-  FILE_ACK: 0x33,
-  TRANSFER_COMPLETE: 0x34,
-  TRANSFER_ERROR: 0x35,
-  DRY_RUN_REPORT: 0x36,
-} as const;
+// Re-export TransferMsgType for backwards compatibility
+export { TransferMsgType };
 
 export interface TransferFile {
   path: string;
@@ -69,7 +65,7 @@ export interface DryRunReport {
 export class FileTransferHandler {
   private ws: WebSocket | null = null;
   private activeTransfers = new Map<number, TransferState>();
-  private chunkSize = 256 * 1024; // 256KB chunks
+  private chunkSize = FILE_TRANSFER.CHUNK_SIZE;
   private compressionPool: CompressionPool | null = null;
   private zstdInitialized = false;
   private useZstd = true; // Use zstd compression (negotiated with server)
@@ -81,7 +77,7 @@ export class FileTransferHandler {
   async connect(): Promise<void> {
     // Initialize zstd WASM and compression pool
     try {
-      await initZstd('/zstd.wasm');
+      await initZstd(ZSTD_WASM_PATH);
       this.zstdInitialized = true;
       this.compressionPool = getCompressionPool();
       console.log('zstd compression initialized');
@@ -91,7 +87,7 @@ export class FileTransferHandler {
     }
 
     // Add X-Compression header to signal zstd support
-    this.ws = new WebSocket(getWsUrl('/ws/file'));
+    this.ws = new WebSocket(getWsUrl(WS_PATHS.FILE));
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
@@ -107,11 +103,18 @@ export class FileTransferHandler {
     this.ws.onclose = () => {
       console.log('File transfer channel disconnected');
     };
+
+    this.ws.onerror = (event) => {
+      console.error('File transfer WebSocket error:', event);
+      this.onTransferError?.(0, 'File transfer connection error');
+    };
   }
 
   disconnect(): void {
     this.ws?.close();
     this.ws = null;
+    // Clear all active transfers to prevent memory leaks
+    this.activeTransfers.clear();
     // Don't destroy the compression pool here - it's shared
   }
 
@@ -127,7 +130,7 @@ export class FileTransferHandler {
         this.handleFileList(data);
         break;
       case TransferMsgType.FILE_REQUEST:
-        this.handleFileRequest(data);
+        this.handleFileRequest(data).catch(err => console.error('File request handling failed:', err));
         break;
       case TransferMsgType.FILE_ACK:
         this.handleFileAck(data);
@@ -146,7 +149,7 @@ export class FileTransferHandler {
 
   private handleTransferReady(data: ArrayBuffer): void {
     const view = new DataView(data);
-    const transferId = view.getUint32(1, true);
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
     console.log(`Transfer ${transferId} ready`);
 
     const transfer = this.activeTransfers.get(transferId);
@@ -159,19 +162,19 @@ export class FileTransferHandler {
     const view = new DataView(data);
     const bytes = new Uint8Array(data);
 
-    let offset = 1;
-    const transferId = view.getUint32(offset, true); offset += 4;
-    const fileCount = view.getUint32(offset, true); offset += 4;
-    const totalBytes = Number(view.getBigUint64(offset, true)); offset += 8;
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const fileCount = view.getUint32(PROTO_FILE_LIST.FILE_COUNT, true);
+    const totalBytes = Number(view.getBigUint64(PROTO_FILE_LIST.TOTAL_BYTES, true));
+    let offset = PROTO_FILE_LIST.PAYLOAD;
 
     const files: TransferFile[] = [];
     for (let i = 0; i < fileCount; i++) {
-      const pathLen = view.getUint16(offset, true); offset += 2;
-      const path = new TextDecoder().decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
-      const size = Number(view.getBigUint64(offset, true)); offset += 8;
-      const mtime = Number(view.getBigUint64(offset, true)); offset += 8;
-      const hash = view.getBigUint64(offset, true); offset += 8;
-      const isDir = bytes[offset] !== 0; offset += 1;
+      const pathLen = view.getUint16(offset, true); offset += PROTO_SIZE.UINT16;
+      const path = sharedTextDecoder.decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
+      const size = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
+      const mtime = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
+      const hash = view.getBigUint64(offset, true); offset += PROTO_SIZE.UINT64;
+      const isDir = bytes[offset] !== 0; offset += PROTO_SIZE.UINT8;
 
       files.push({ path, size, mtime, hash, isDir });
     }
@@ -201,12 +204,10 @@ export class FileTransferHandler {
     const view = new DataView(data);
     const bytes = new Uint8Array(data);
 
-    let offset = 1;
-    const transferId = view.getUint32(offset, true); offset += 4;
-    const fileIndex = view.getUint32(offset, true); offset += 4;
-    const chunkOffset = Number(view.getBigUint64(offset, true)); offset += 8;
-    offset += 4; // uncompressedSize
-    const compressedData = bytes.slice(offset);
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const fileIndex = view.getUint32(PROTO_FILE_REQUEST.FILE_INDEX, true);
+    const chunkOffset = Number(view.getBigUint64(PROTO_FILE_REQUEST.CHUNK_OFFSET, true));
+    const compressedData = bytes.slice(PROTO_FILE_REQUEST.DATA);
 
     const transfer = this.activeTransfers.get(transferId);
     if (!transfer || !transfer.files) return;
@@ -216,23 +217,29 @@ export class FileTransferHandler {
 
       // Re-check transfer state after async operation
       const currentTransfer = this.activeTransfers.get(transferId);
-      if (!currentTransfer || currentTransfer.state === 'complete' || currentTransfer.state === 'error') {
+      if (!currentTransfer || !currentTransfer.files || currentTransfer.state === 'complete' || currentTransfer.state === 'error') {
         return;
       }
 
-      const file = currentTransfer.files![fileIndex];
-      if (!file) return;
+      // Validate fileIndex is within bounds
+      if (fileIndex < 0 || fileIndex >= currentTransfer.files.length) {
+        console.error(`Invalid fileIndex ${fileIndex} for transfer ${transferId}`);
+        return;
+      }
+      const file = currentTransfer.files[fileIndex];
 
       if (!currentTransfer.receivedFiles) currentTransfer.receivedFiles = new Map();
-      if (!currentTransfer.receivedFiles.has(fileIndex)) {
-        currentTransfer.receivedFiles.set(fileIndex, []);
+      let fileChunks = currentTransfer.receivedFiles.get(fileIndex);
+      if (!fileChunks) {
+        fileChunks = [];
+        currentTransfer.receivedFiles.set(fileIndex, fileChunks);
       }
-      currentTransfer.receivedFiles.get(fileIndex)!.push({ offset: chunkOffset, data: fileData });
+      fileChunks.push({ offset: chunkOffset, data: fileData });
 
       currentTransfer.bytesTransferred += fileData.length;
 
       if (currentTransfer.bytesTransferred >= file.size) {
-        const chunks = currentTransfer.receivedFiles.get(fileIndex)!;
+        const chunks = fileChunks;
         chunks.sort((a, b) => a.offset - b.offset);
         const fullData = new Uint8Array(file.size);
         let writeOffset = 0;
@@ -241,31 +248,46 @@ export class FileTransferHandler {
           writeOffset += chunk.data.length;
         }
 
-        this.saveFile(file.path, fullData);
+        if (!this.saveFile(file.path, fullData)) {
+          currentTransfer.state = 'error';
+          currentTransfer.receivedFiles?.clear();
+          this.activeTransfers.delete(transferId);
+          this.onTransferError?.(transferId, `Failed to save file: ${file.path}`);
+          return;
+        }
         currentTransfer.receivedFiles.delete(fileIndex);
         currentTransfer.currentFileIndex++;
       }
     } catch (err) {
       console.error('Decompression failed:', err);
+      // Update transfer state and notify via callback
+      const failedTransfer = this.activeTransfers.get(transferId);
+      if (failedTransfer) {
+        failedTransfer.state = 'error';
+        // Clear received chunks to release memory immediately
+        failedTransfer.receivedFiles?.clear();
+        this.activeTransfers.delete(transferId);
+        this.onTransferError?.(transferId, err instanceof Error ? err.message : 'Decompression failed');
+      }
     }
   }
 
   private handleFileAck(data: ArrayBuffer): void {
     const view = new DataView(data);
-    const transferId = view.getUint32(1, true);
-    const bytesReceived = Number(view.getBigUint64(9, true));
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const bytesReceived = Number(view.getBigUint64(PROTO_FILE_ACK.BYTES_RECEIVED, true));
 
     const transfer = this.activeTransfers.get(transferId);
-    if (transfer) {
+    if (transfer && transfer.state !== 'error' && transfer.state !== 'complete') {
       transfer.bytesTransferred = bytesReceived;
-      this.sendNextChunk(transferId);
+      this.sendNextChunk(transferId).catch(err => console.error('Send chunk failed:', err));
     }
   }
 
   private handleTransferComplete(data: ArrayBuffer): void {
     const view = new DataView(data);
-    const transferId = view.getUint32(1, true);
-    const totalBytes = Number(view.getBigUint64(5, true));
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const totalBytes = Number(view.getBigUint64(PROTO_TRANSFER_COMPLETE.TOTAL_BYTES, true));
 
     console.log(`Transfer ${transferId} complete`);
 
@@ -281,9 +303,11 @@ export class FileTransferHandler {
     const view = new DataView(data);
     const bytes = new Uint8Array(data);
 
-    const transferId = view.getUint32(1, true);
-    const errorLen = view.getUint16(5, true);
-    const error = new TextDecoder().decode(bytes.slice(7, 7 + errorLen));
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const errorLen = view.getUint16(PROTO_TRANSFER_ERROR.ERROR_LEN, true);
+    const error = sharedTextDecoder.decode(
+      bytes.slice(PROTO_TRANSFER_ERROR.ERROR_MSG, PROTO_TRANSFER_ERROR.ERROR_MSG + errorLen)
+    );
 
     console.error(`Transfer ${transferId} error: ${error}`);
     this.activeTransfers.delete(transferId);
@@ -294,20 +318,20 @@ export class FileTransferHandler {
     const view = new DataView(data);
     const bytes = new Uint8Array(data);
 
-    let offset = 1;
-    const transferId = view.getUint32(offset, true); offset += 4;
-    const newCount = view.getUint32(offset, true); offset += 4;
-    const updateCount = view.getUint32(offset, true); offset += 4;
-    const deleteCount = view.getUint32(offset, true); offset += 4;
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const newCount = view.getUint32(PROTO_DRY_RUN.NEW_COUNT, true);
+    const updateCount = view.getUint32(PROTO_DRY_RUN.UPDATE_COUNT, true);
+    const deleteCount = view.getUint32(PROTO_DRY_RUN.DELETE_COUNT, true);
+    let offset = PROTO_DRY_RUN.ENTRIES;
 
     const entries: Array<{ action: string; path: string; size: number }> = [];
     while (offset < data.byteLength) {
-      const action = bytes[offset]; offset += 1;
-      const pathLen = view.getUint16(offset, true); offset += 2;
-      const path = new TextDecoder().decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
-      const size = Number(view.getBigUint64(offset, true)); offset += 8;
+      const action = bytes[offset]; offset += PROTO_SIZE.UINT8;
+      const pathLen = view.getUint16(offset, true); offset += PROTO_SIZE.UINT16;
+      const path = sharedTextDecoder.decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
+      const size = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
 
-      entries.push({ action: ['create', 'update', 'delete'][action], path, size });
+      entries.push({ action: action < DRY_RUN_ACTION.length ? DRY_RUN_ACTION[action] : 'unknown', path, size });
     }
 
     this.onDryRunReport?.(transferId, { newCount, updateCount, deleteCount, entries });
@@ -320,14 +344,23 @@ export class FileTransferHandler {
   ): Promise<void> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.error('File transfer WebSocket not connected');
+      this.onTransferError?.(0, 'File transfer connection not available');
       return;
     }
 
     const { deleteExtra = false, dryRun = false, excludes = [] } = options;
-    const files = await this.collectFilesFromHandle(dirHandle, '');
 
-    const pathBytes = new TextEncoder().encode(serverPath);
-    const excludeBytes = excludes.map(p => new TextEncoder().encode(p));
+    let files: Awaited<ReturnType<typeof this.collectFilesFromHandle>>;
+    try {
+      files = await this.collectFilesFromHandle(dirHandle, '');
+    } catch (err) {
+      console.error('Failed to collect files:', err);
+      this.onTransferError?.(0, err instanceof Error ? err.message : 'Failed to collect files');
+      return;
+    }
+
+    const pathBytes = sharedTextEncoder.encode(serverPath);
+    const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
     const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
 
     const msgLen = 1 + 1 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
@@ -366,13 +399,14 @@ export class FileTransferHandler {
   async startFolderDownload(serverPath: string, options: TransferOptions = {}): Promise<void> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.error('File transfer WebSocket not connected');
+      this.onTransferError?.(0, 'File transfer connection not available');
       return;
     }
 
     const { deleteExtra = false, dryRun = false, excludes = [] } = options;
 
-    const pathBytes = new TextEncoder().encode(serverPath);
-    const excludeBytes = excludes.map(p => new TextEncoder().encode(p));
+    const pathBytes = sharedTextEncoder.encode(serverPath);
+    const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
     const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
 
     const msgLen = 1 + 1 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
@@ -413,24 +447,29 @@ export class FileTransferHandler {
   ): Promise<TransferFile[]> {
     const files: TransferFile[] = [];
 
-    for await (const [name, handle] of (dirHandle as any).entries()) {
-      const path = prefix ? `${prefix}/${name}` : name;
+    try {
+      for await (const [name, handle] of (dirHandle as unknown as FileSystemDirectoryHandleIterator).entries()) {
+        const path = prefix ? `${prefix}/${name}` : name;
 
-      if (handle.kind === 'directory') {
-        files.push({ path, isDir: true, size: 0 });
-        const subFiles = await this.collectFilesFromHandle(handle as FileSystemDirectoryHandle, path);
-        files.push(...subFiles);
-      } else {
-        const fileHandle = handle as FileSystemFileHandle;
-        const file = await fileHandle.getFile();
-        files.push({
-          path,
-          isDir: false,
-          size: file.size,
-          handle: fileHandle,
-          file,
-        });
+        if (handle.kind === 'directory') {
+          files.push({ path, isDir: true, size: 0 });
+          const subFiles = await this.collectFilesFromHandle(handle as FileSystemDirectoryHandle, path);
+          files.push(...subFiles);
+        } else {
+          const fileHandle = handle as FileSystemFileHandle;
+          const file = await fileHandle.getFile();
+          files.push({
+            path,
+            isDir: false,
+            size: file.size,
+            handle: fileHandle,
+            file,
+          });
+        }
       }
+    } catch (err) {
+      console.error('Failed to collect files from directory:', prefix || '(root)', err);
+      throw err; // Re-throw to let caller handle
     }
 
     return files;
@@ -440,23 +479,51 @@ export class FileTransferHandler {
     const transfer = this.activeTransfers.get(transferId);
     if (!transfer || transfer.direction !== 'upload' || !transfer.files) return;
 
+    // Bounds check before array access
+    if (transfer.currentFileIndex >= transfer.files.length) return;
+
     const file = transfer.files[transfer.currentFileIndex];
     if (!file || file.isDir) {
       transfer.currentFileIndex++;
       if (transfer.currentFileIndex < transfer.files.length) {
-        this.sendNextChunk(transferId);
+        this.sendNextChunk(transferId).catch(err => console.error('Send chunk failed:', err));
       }
       return;
     }
 
     if (!file.file) return;
 
-    const fileData = await file.file.arrayBuffer();
+    let fileData: ArrayBuffer;
+    let compressed: Uint8Array;
+    try {
+      fileData = await file.file.arrayBuffer();
+    } catch (err) {
+      console.error('Failed to read file data:', err);
+      const failedTransfer = this.activeTransfers.get(transferId);
+      if (failedTransfer) failedTransfer.state = 'error';
+      this.onTransferError?.(transferId, `Failed to read file: ${file.path}`);
+      return;
+    }
+
     const chunkStart = transfer.currentChunkOffset || 0;
     const chunkEnd = Math.min(chunkStart + this.chunkSize, fileData.byteLength);
     const chunk = new Uint8Array(fileData.slice(chunkStart, chunkEnd));
 
-    const compressed = await this.compress(chunk);
+    try {
+      compressed = await this.compress(chunk);
+    } catch (err) {
+      console.error('Compression failed:', err);
+      const failedTransfer = this.activeTransfers.get(transferId);
+      if (failedTransfer) failedTransfer.state = 'error';
+      this.onTransferError?.(transferId, 'Compression failed');
+      return;
+    }
+
+    // Re-validate transfer still exists after async operations
+    const currentTransfer = this.activeTransfers.get(transferId);
+    if (!currentTransfer || currentTransfer.state === 'error' || currentTransfer.state === 'complete') {
+      return;
+    }
 
     const msgLen = 1 + 4 + 4 + 8 + 4 + compressed.length;
     const msg = new ArrayBuffer(msgLen);
@@ -465,18 +532,18 @@ export class FileTransferHandler {
 
     let offset = 0;
     view.setUint8(offset, TransferMsgType.FILE_DATA); offset += 1;
-    view.setUint32(offset, transfer.id, true); offset += 4;
-    view.setUint32(offset, transfer.currentFileIndex, true); offset += 4;
+    view.setUint32(offset, currentTransfer.id, true); offset += 4;
+    view.setUint32(offset, currentTransfer.currentFileIndex, true); offset += 4;
     view.setBigUint64(offset, BigInt(chunkStart), true); offset += 8;
     view.setUint32(offset, chunk.length, true); offset += 4;
     bytes.set(compressed, offset);
 
     this.ws?.send(msg);
 
-    transfer.currentChunkOffset = chunkEnd;
+    currentTransfer.currentChunkOffset = chunkEnd;
     if (chunkEnd >= fileData.byteLength) {
-      transfer.currentFileIndex++;
-      transfer.currentChunkOffset = 0;
+      currentTransfer.currentFileIndex++;
+      currentTransfer.currentChunkOffset = 0;
     }
   }
 
@@ -484,34 +551,23 @@ export class FileTransferHandler {
     // Use zstd compression if available
     if (this.useZstd && this.compressionPool) {
       try {
-        return await this.compressionPool.compress(data, 3);
+        return await this.compressionPool.compress(data, FILE_TRANSFER.COMPRESSION_LEVEL);
       } catch (err) {
         console.warn('zstd compression failed, falling back to deflate:', err);
       }
     }
 
     // Fall back to built-in deflate
-    const cs = new CompressionStream('deflate-raw');
-    const writer = cs.writable.getWriter();
-    writer.write(data as Uint8Array<ArrayBuffer>);
-    writer.close();
-
-    const chunks: Uint8Array[] = [];
-    const reader = cs.readable.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
+    try {
+      const cs = new CompressionStream('deflate-raw');
+      const writer = cs.writable.getWriter();
+      // Ensure data is backed by regular ArrayBuffer (not SharedArrayBuffer)
+      writer.write(new Uint8Array(data));
+      await writer.close();
+      return collectStreamChunks(cs.readable);
+    } catch (err) {
+      throw new Error(`Compression failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
   }
 
   private async decompress(data: Uint8Array): Promise<Uint8Array> {
@@ -525,39 +581,36 @@ export class FileTransferHandler {
     }
 
     // Fall back to built-in deflate
-    const ds = new DecompressionStream('deflate-raw');
-    const writer = ds.writable.getWriter();
-    writer.write(data as Uint8Array<ArrayBuffer>);
-    writer.close();
-
-    const chunks: Uint8Array[] = [];
-    const reader = ds.readable.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
+    try {
+      const ds = new DecompressionStream('deflate-raw');
+      const writer = ds.writable.getWriter();
+      // Ensure data is backed by regular ArrayBuffer (not SharedArrayBuffer)
+      writer.write(new Uint8Array(data));
+      await writer.close();
+      return collectStreamChunks(ds.readable);
+    } catch (err) {
+      throw new Error(`Decompression failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
   }
 
-  private saveFile(path: string, data: Uint8Array): void {
+  private saveFile(path: string, data: Uint8Array): boolean {
     const filename = path.split('/').pop() || path;
-    const blob = new Blob([data as Uint8Array<ArrayBuffer>]);
+    // Ensure data is backed by regular ArrayBuffer (not SharedArrayBuffer)
+    const blob = new Blob([new Uint8Array(data)]);
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      return true;
+    } catch (err) {
+      console.error('Failed to save file:', filename, err);
+      return false;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
   }
 }

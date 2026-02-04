@@ -4,16 +4,16 @@
  */
 
 import { ClientMsg, BinaryCtrlMsg } from './protocol';
-
-// WebSocket URL builder - auto-detects ws/wss based on page protocol
-function getWsUrl(path: string): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = window.location.host; // includes port if non-standard
-  return `${protocol}//${host}${path}`;
-}
+import type { PanelStatus } from './stores/types';
+import { getWsUrl, sharedTextEncoder, CircularBuffer, throttle } from './utils';
+import { PANEL, TIMING, WS_PATHS, UI, NAL, MODIFIER, WHEEL_MODE, STATS_THRESHOLD } from './constants';
 
 export interface PanelCallbacks {
   onViewAction?: (action: string, data?: unknown) => void;
+  onStatusChange?: (status: PanelStatus) => void;
+  onTitleChange?: (title: string) => void;
+  onPwdChange?: (pwd: string) => void;
+  onServerIdAssigned?: (serverId: number) => void;
 }
 
 export class Panel {
@@ -27,8 +27,24 @@ export class Panel {
 
   private ws: WebSocket | null = null;
   private callbacks: PanelCallbacks;
+  private _status: PanelStatus = 'disconnected';
   private destroyed = false;
   private paused = false;
+
+  get status(): PanelStatus {
+    return this._status;
+  }
+
+  private setStatus(status: PanelStatus): void {
+    if (this._status === status) return;
+    this._status = status;
+    this.callbacks.onStatusChange?.(status);
+  }
+
+  /** Check if WebSocket is connected and ready */
+  private isWsOpen(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+  }
 
   // WebCodecs decoder
   private decoder: VideoDecoder | null = null;
@@ -44,26 +60,68 @@ export class Panel {
 
   // Adaptive bitrate - buffer monitoring
   private lastBufferReport = 0;
-  private frameTimestamps: number[] = [];
+  private frameTimestamps: CircularBuffer<number> = new CircularBuffer(60); // ~2s at 30fps
   private pendingDecode = 0; // Frames waiting to be decoded
 
   // Debug stats overlay (enable with #debug=1 or ?debug=1 in URL)
   private static debugEnabled = window.location.hash.includes('debug') ||
     window.location.search.includes('debug');
   private static statsOverlay: HTMLElement | null = null; // Singleton overlay
+  private static statsElements: {
+    fpsValue: HTMLSpanElement;
+    recvFps: HTMLSpanElement;
+    queueValue: HTMLSpanElement;
+    decodeValue: HTMLSpanElement;
+    healthValue: HTMLSpanElement;
+  } | null = null;
   private renderedFrames = 0;
   private lastStatsUpdate = 0;
   private displayedFps = 0;
-  private decodeLatencies: number[] = [];
+  private decodeLatencies: CircularBuffer<number> = new CircularBuffer(PANEL.MAX_LATENCY_SAMPLES);
   private lastDecodeStart = 0;
+
+  // Pre-allocated buffers for hot paths (avoid allocation on every mouse move)
+  private mouseMoveBuffer = new ArrayBuffer(18);
+  private mouseMoveView = new DataView(this.mouseMoveBuffer);
+  private mouseButtonBuffer = new ArrayBuffer(20);
+  private mouseButtonView = new DataView(this.mouseButtonBuffer);
+  private wheelBuffer = new ArrayBuffer(34);
+  private wheelView = new DataView(this.wheelBuffer);
+  private resizeBuffer = new ArrayBuffer(5);
+  private resizeView = new DataView(this.resizeBuffer);
+
+  // Throttled mouse move handler
+  private throttledSendMouseMove: ((x: number, y: number, mods: number) => void) | null = null;
+
+  // Event handler references for cleanup
+  private handleMouseDownBound: ((e: MouseEvent) => void) | null = null;
+  private handleMouseUpBound: ((e: MouseEvent) => void) | null = null;
+  private handleMouseMoveBound: ((e: MouseEvent) => void) | null = null;
+  private handleWheelBound: ((e: WheelEvent) => void) | null = null;
+  private handleContextMenuBound: ((e: Event) => void) | null = null;
 
   // Inspector state
   private inspectorVisible = false;
-  private inspectorHeight = 200;
-  private inspectorActiveTab = 'screen';
+  private inspectorHeight: number = PANEL.DEFAULT_INSPECTOR_HEIGHT;
+  private inspectorActiveTab: string = UI.DEFAULT_INSPECTOR_TAB;
   private inspectorState: Record<string, number> | null = null;
   private inspectorEl: HTMLElement | null = null;
+  private inspectorSidebarEl: HTMLElement | null = null;
+  private inspectorMainEl: HTMLElement | null = null;
+  private inspectorFieldEls: {
+    screenSize: Element | null;
+    gridSize: Element | null;
+    cellSize: Element | null;
+  } | null = null;
   private documentClickHandler: (() => void) | null = null;
+
+  // Inspector event handler references for cleanup
+  private inspectorHandlers: Array<{ element: Element; type: string; handler: EventListener }> = [];
+  private inspectorResizeHandler: ((e: Event) => void) | null = null;
+  // Document-level resize handlers (added during drag, need cleanup on destroy)
+  private inspectorResizeMoveHandler: ((e: MouseEvent) => void) | null = null;
+  private inspectorResizeUpHandler: (() => void) | null = null;
+  private connectTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
   private initialSize: { width: number; height: number } | null = null;
   private splitInfo: { parentPanelId: number; direction: 'right' | 'down' | 'left' | 'up' } | null = null;
@@ -94,7 +152,7 @@ export class Panel {
     this.element.innerHTML = `
       <div class="panel-content">
         <canvas class="panel-canvas"></canvas>
-        <div class="panel-loading">Connecting...</div>
+        <div class="panel-loading">${UI.LOADING_TEXT}</div>
       </div>
     `;
     container.appendChild(this.element);
@@ -152,44 +210,64 @@ export class Panel {
   private setupInspectorHandlers(): void {
     if (!this.inspectorEl) return;
 
+    // Helper to track handlers for cleanup
+    const addHandler = (element: Element, type: string, handler: EventListener) => {
+      element.addEventListener(type, handler);
+      this.inspectorHandlers.push({ element, type, handler });
+    };
+
     // Tab switching
     const tabs = this.inspectorEl.querySelectorAll('.inspector-tab');
     tabs.forEach(tab => {
-      tab.addEventListener('click', () => {
+      const handler = () => {
         tabs.forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         this.inspectorActiveTab = (tab as HTMLElement).dataset.tab || 'screen';
         this.renderInspectorView();
-      });
+      };
+      addHandler(tab, 'click', handler);
     });
 
     // Resize handle
     const handle = this.inspectorEl.querySelector('.inspector-resize');
-    let startY: number, startHeight: number;
-    const onMouseMove = (e: MouseEvent) => {
-      const delta = startY - e.clientY;
-      const newHeight = Math.min(Math.max(startHeight + delta, 100), this.element.clientHeight * 0.6);
-      this.inspectorHeight = newHeight;
-      if (this.inspectorEl) {
-        this.inspectorEl.style.height = newHeight + 'px';
-      }
-    };
-    const onMouseUp = () => {
-      document.removeEventListener('mousemove', onMouseMove);
-      document.removeEventListener('mouseup', onMouseUp);
-      this.triggerResize();
-    };
-    handle?.addEventListener('mousedown', (e) => {
-      startY = (e as MouseEvent).clientY;
-      startHeight = this.inspectorHeight;
-      document.addEventListener('mousemove', onMouseMove);
-      document.addEventListener('mouseup', onMouseUp);
-    });
+    if (handle) {
+      let startY: number, startHeight: number;
+      this.inspectorResizeMoveHandler = (e: MouseEvent) => {
+        const delta = startY - e.clientY;
+        const newHeight = Math.min(Math.max(startHeight + delta, PANEL.MIN_INSPECTOR_HEIGHT), this.element.clientHeight * PANEL.MAX_INSPECTOR_HEIGHT_RATIO);
+        this.inspectorHeight = newHeight;
+        if (this.inspectorEl) {
+          this.inspectorEl.style.height = newHeight + 'px';
+        }
+      };
+      this.inspectorResizeUpHandler = () => {
+        if (this.inspectorResizeMoveHandler) {
+          document.removeEventListener('mousemove', this.inspectorResizeMoveHandler);
+        }
+        if (this.inspectorResizeUpHandler) {
+          document.removeEventListener('mouseup', this.inspectorResizeUpHandler);
+        }
+        this.inspectorResizeMoveHandler = null;
+        this.inspectorResizeUpHandler = null;
+        this.triggerResize();
+      };
+      this.inspectorResizeHandler = (e: Event) => {
+        startY = (e as MouseEvent).clientY;
+        startHeight = this.inspectorHeight;
+        if (this.inspectorResizeMoveHandler) {
+          document.addEventListener('mousemove', this.inspectorResizeMoveHandler);
+        }
+        if (this.inspectorResizeUpHandler) {
+          document.addEventListener('mouseup', this.inspectorResizeUpHandler);
+        }
+      };
+      addHandler(handle, 'mousedown', this.inspectorResizeHandler);
+    }
 
     // Dock icon dropdown
     const dockIcons = this.inspectorEl.querySelectorAll('.inspector-dock-icon');
     dockIcons.forEach(icon => {
-      icon.addEventListener('click', (e) => {
+      const handler = (e: Event) => {
         e.stopPropagation();
         const menu = icon.parentElement?.querySelector('.inspector-dock-menu');
         // Close other menus
@@ -197,7 +275,8 @@ export class Panel {
           if (m !== menu) m.classList.remove('visible');
         });
         menu?.classList.toggle('visible');
-      });
+      };
+      addHandler(icon, 'click', handler);
     });
 
     // Hide menu when clicking elsewhere
@@ -211,23 +290,25 @@ export class Panel {
     // Menu item click - hide header
     const menuItems = this.inspectorEl.querySelectorAll('.inspector-dock-menu-item');
     menuItems.forEach(item => {
-      item.addEventListener('click', (e) => {
+      const handler = (e: Event) => {
         e.stopPropagation();
         const panel = (item as HTMLElement).closest('.inspector-left, .inspector-right');
         if (panel && (item as HTMLElement).dataset.action === 'hide-header') {
           panel.classList.add('header-hidden');
         }
         (item as HTMLElement).closest('.inspector-dock-menu')?.classList.remove('visible');
-      });
+      };
+      addHandler(item, 'click', handler);
     });
 
     // Collapsed toggle - show header again
     const toggles = this.inspectorEl.querySelectorAll('.inspector-collapsed-toggle');
     toggles.forEach(toggle => {
-      toggle.addEventListener('click', () => {
+      const handler = () => {
         const panel = toggle.closest('.inspector-left, .inspector-right');
         panel?.classList.remove('header-hidden');
-      });
+      };
+      addHandler(toggle, 'click', handler);
     });
   }
 
@@ -252,7 +333,10 @@ export class Panel {
   private initDecoder(): void {
     this.decoder = new VideoDecoder({
       output: (frame) => this.onFrame(frame),
-      error: (e) => console.error('Decoder error:', e),
+      error: (e) => {
+        console.error('Decoder error:', e);
+        this.setStatus('error');
+      },
     });
   }
 
@@ -276,58 +360,71 @@ export class Panel {
       pointer-events: none;
       line-height: 1.4;
     `;
+    Panel.statsOverlay.innerHTML = `
+      FPS: <span id="stats-fps">0</span> render / <span id="stats-recv">0</span> recv<br>
+      Queue: <span id="stats-queue">0</span> frames<br>
+      Decode: <span id="stats-decode">0.0</span>ms<br>
+      Health: <span id="stats-health">100</span>%
+    `;
     document.body.appendChild(Panel.statsOverlay);
+
+    // Cache span element references for efficient updates
+    Panel.statsElements = {
+      fpsValue: Panel.statsOverlay.querySelector('#stats-fps') as HTMLSpanElement,
+      recvFps: Panel.statsOverlay.querySelector('#stats-recv') as HTMLSpanElement,
+      queueValue: Panel.statsOverlay.querySelector('#stats-queue') as HTMLSpanElement,
+      decodeValue: Panel.statsOverlay.querySelector('#stats-decode') as HTMLSpanElement,
+      healthValue: Panel.statsOverlay.querySelector('#stats-health') as HTMLSpanElement,
+    };
   }
 
   private updateStatsOverlay(): void {
-    if (!Panel.statsOverlay) return;
+    if (!Panel.statsOverlay || !Panel.statsElements) return;
 
     const now = performance.now();
 
     // Update displayed FPS every 500ms
-    if (now - this.lastStatsUpdate > 500) {
+    if (now - this.lastStatsUpdate > TIMING.STATS_UPDATE_INTERVAL) {
       this.displayedFps = this.renderedFrames * 2; // 2x because 500ms interval
       this.renderedFrames = 0;
       this.lastStatsUpdate = now;
     }
 
-    // Calculate average decode latency
-    const avgLatency = this.decodeLatencies.length > 0
-      ? (this.decodeLatencies.reduce((a, b) => a + b, 0) / this.decodeLatencies.length).toFixed(1)
-      : '0.0';
+    // Calculate average decode latency from circular buffer
+    const avgLatency = this.decodeLatencies.average().toFixed(1);
 
-    // Keep only recent latencies
-    if (this.decodeLatencies.length > 30) {
-      this.decodeLatencies.shift();
-    }
-
-    // Calculate received FPS
-    const oneSecondAgo = now - 1000;
-    const receivedFps = this.frameTimestamps.filter(t => t > oneSecondAgo).length;
+    // Calculate received FPS from circular buffer
+    const oneSecondAgo = now - TIMING.FPS_CALCULATION_WINDOW;
+    const receivedFps = this.frameTimestamps.filterRecent(oneSecondAgo, (a, b) => a - b).length;
 
     // Buffer health
-    const health = Math.max(0, 100 - this.pendingDecode * 20);
+    const health = Math.max(0, PANEL.MAX_BUFFER_HEALTH - this.pendingDecode * PANEL.HEALTH_PENALTY_PER_PENDING);
 
-    Panel.statsOverlay.innerHTML = `
-      FPS: <span style="color: ${this.displayedFps >= 25 ? '#0f0' : this.displayedFps >= 15 ? '#ff0' : '#f00'}">${this.displayedFps}</span> render / ${receivedFps} recv<br>
-      Queue: <span style="color: ${this.pendingDecode <= 1 ? '#0f0' : this.pendingDecode <= 3 ? '#ff0' : '#f00'}">${this.pendingDecode}</span> frames<br>
-      Decode: ${avgLatency}ms<br>
-      Health: <span style="color: ${health >= 80 ? '#0f0' : health >= 40 ? '#ff0' : '#f00'}">${health}%</span>
-    `;
+    // Update cached span elements (avoids innerHTML reflow)
+    const els = Panel.statsElements;
+    els.fpsValue.textContent = String(this.displayedFps);
+    els.fpsValue.style.color = this.displayedFps >= STATS_THRESHOLD.FPS_GOOD ? '#0f0' : this.displayedFps >= STATS_THRESHOLD.FPS_WARN ? '#ff0' : '#f00';
+    els.recvFps.textContent = String(receivedFps);
+    els.queueValue.textContent = String(this.pendingDecode);
+    els.queueValue.style.color = this.pendingDecode <= STATS_THRESHOLD.QUEUE_GOOD ? '#0f0' : this.pendingDecode <= STATS_THRESHOLD.QUEUE_WARN ? '#ff0' : '#f00';
+    els.decodeValue.textContent = avgLatency;
+    els.healthValue.textContent = String(health);
+    els.healthValue.style.color = health >= STATS_THRESHOLD.HEALTH_GOOD ? '#0f0' : health >= STATS_THRESHOLD.HEALTH_WARN ? '#ff0' : '#f00';
   }
 
   private onFrame(frame: VideoFrame): void {
     this.pendingDecode--;
 
-    // Track decode latency
-    if (this.lastDecodeStart > 0) {
-      this.decodeLatencies.push(performance.now() - this.lastDecodeStart);
-    }
-
+    // Check destroyed early to avoid side effects on destroyed panel
     if (this.destroyed || !this.ctx) {
       console.warn(`Panel ${this.id}: onFrame skipped - destroyed=${this.destroyed}, ctx=${!!this.ctx}`);
       frame.close();
       return;
+    }
+
+    // Track decode latency using circular buffer
+    if (this.lastDecodeStart > 0) {
+      this.decodeLatencies.push(performance.now() - this.lastDecodeStart);
     }
 
     // Log first frame
@@ -354,21 +451,27 @@ export class Panel {
   }
 
   private setupEventHandlers(): void {
+    // Initialize throttled mouse move (30fps = ~33ms between sends)
+    this.throttledSendMouseMove = throttle((x: number, y: number, mods: number) => {
+      this.sendMouseMoveInternal(x, y, mods);
+    }, PANEL.APPROX_FRAME_DURATION_MS);
+
+    // Store bound references for cleanup
+    this.handleMouseDownBound = (e: MouseEvent) => this.handleMouseDown(e);
+    this.handleMouseUpBound = (e: MouseEvent) => this.handleMouseUp(e);
+    this.handleMouseMoveBound = (e: MouseEvent) => this.handleMouseMove(e);
+    this.handleWheelBound = (e: WheelEvent) => this.handleWheel(e);
+    this.handleContextMenuBound = (e: Event) => e.preventDefault();
+
     // Mouse events on canvas
-    this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-    this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-    this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-    this.canvas.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
-    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    this.canvas.addEventListener('mousedown', this.handleMouseDownBound);
+    this.canvas.addEventListener('mouseup', this.handleMouseUpBound);
+    this.canvas.addEventListener('mousemove', this.handleMouseMoveBound);
+    this.canvas.addEventListener('wheel', this.handleWheelBound, { passive: false });
+    this.canvas.addEventListener('contextmenu', this.handleContextMenuBound);
 
     // Focus handling
-    this.canvas.tabIndex = 1;
-
-    // Inspector close button
-    const closeBtn = this.element.querySelector('.inspector-close');
-    if (closeBtn) {
-      closeBtn.addEventListener('click', () => this.toggleInspector(false));
-    }
+    this.canvas.tabIndex = PANEL.CANVAS_TAB_INDEX;
   }
 
   private setupResizeObserver(): void {
@@ -394,15 +497,13 @@ export class Panel {
   }
 
   private sendResizeBinary(width: number, height: number): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
-    // Binary format: [0x10, width_lo, width_hi, height_lo, height_hi]
-    const buffer = new ArrayBuffer(5);
-    const view = new DataView(buffer);
-    view.setUint8(0, 0x10); // resize message type
-    view.setUint16(1, width, true); // little endian
-    view.setUint16(3, height, true);
-    this.ws.send(buffer);
+    // Use pre-allocated buffer to avoid GC
+    this.resizeView.setUint8(0, ClientMsg.RESIZE);
+    this.resizeView.setUint16(1, width, true);
+    this.resizeView.setUint16(3, height, true);
+    this.ws!.send(this.resizeBuffer);
   }
 
   connect(): void {
@@ -410,11 +511,14 @@ export class Panel {
       this.ws.close();
     }
 
-    const wsUrl = getWsUrl('/ws/panel');
+    this.setStatus('connecting');
+
+    const wsUrl = getWsUrl(WS_PATHS.PANEL);
     this.ws = new WebSocket(wsUrl);
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
+      this.setStatus('connected');
       // Delay slightly to ensure DOM layout is complete before measuring
       requestAnimationFrame(() => requestAnimationFrame(() => {
         if (this.serverId !== null) {
@@ -435,25 +539,33 @@ export class Panel {
 
     this.ws.onclose = () => {
       this.ws = null;
+      if (!this.destroyed) {
+        this.setStatus('disconnected');
+      }
     };
 
     this.ws.onerror = (e) => {
       console.error('WebSocket error:', e);
+      this.setStatus('error');
     };
   }
 
   private sendConnectPanel(panelId: number): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
     const buf = new ArrayBuffer(5);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.CONNECT_PANEL);
     view.setUint32(1, panelId, true);
-    this.ws.send(buf);
+    this.ws!.send(buf);
 
     // Send resize after a short delay to ensure correct dimensions after layout
-    setTimeout(() => {
+    this.connectTimeoutId = setTimeout(() => {
+      this.connectTimeoutId = null;
+      if (this.destroyed) return;
       requestAnimationFrame(() => {
+        // Re-check destroyed after rAF delay
+        if (this.destroyed) return;
         const rect = this.element.getBoundingClientRect();
         const width = Math.floor(rect.width);
         const height = Math.floor(rect.height);
@@ -463,11 +575,11 @@ export class Panel {
           this.sendResizeBinary(width, height);
         }
       });
-    }, 100);
+    }, TIMING.RESIZE_DELAY_AFTER_CONNECT);
   }
 
   private sendCreatePanel(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
     // Use pre-calculated size if provided, otherwise measure element
     let width: number, height: number;
@@ -477,8 +589,8 @@ export class Panel {
       this.initialSize = null; // Clear after use
     } else {
       const rect = this.element.getBoundingClientRect();
-      width = Math.floor(rect.width) || 800;
-      height = Math.floor(rect.height) || 600;
+      width = Math.floor(rect.width) || PANEL.DEFAULT_WIDTH;
+      height = Math.floor(rect.height) || PANEL.DEFAULT_HEIGHT;
     }
     const scale = window.devicePixelRatio || 1;
 
@@ -495,11 +607,11 @@ export class Panel {
     view.setFloat32(5, scale, true);
     view.setUint32(9, this.inheritCwdFrom ?? 0, true);
     view.setUint8(13, this.isQuickTerminal ? 1 : 0);
-    this.ws.send(buf);
+    this.ws!.send(buf);
   }
 
   private sendSplitPanel(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.splitInfo) return;
+    if (!this.isWsOpen() || !this.splitInfo) return;
 
     // Use pre-calculated size if provided, otherwise measure element
     let width: number, height: number;
@@ -509,8 +621,8 @@ export class Panel {
       this.initialSize = null;
     } else {
       const rect = this.element.getBoundingClientRect();
-      width = Math.floor(rect.width) || 800;
-      height = Math.floor(rect.height) || 600;
+      width = Math.floor(rect.width) || PANEL.DEFAULT_WIDTH;
+      height = Math.floor(rect.height) || PANEL.DEFAULT_HEIGHT;
     }
     const scale = window.devicePixelRatio || 1;
 
@@ -530,7 +642,7 @@ export class Panel {
     view.setUint16(6, width, true);
     view.setUint16(8, height, true);
     view.setUint16(10, Math.round(scale * 100), true);
-    this.ws.send(buf);
+    this.ws!.send(buf);
     this.splitInfo = null; // Clear after use
   }
 
@@ -562,7 +674,7 @@ export class Panel {
   private getCodecFromSps(sps: Uint8Array): string {
     // SPS structure: [NAL header][profile_idc][constraint_flags][level_idc]...
     // Format: avc1.PPCCLL (PP=profile, CC=constraints, LL=level)
-    if (sps.length < 4) return 'avc1.42E01F'; // Default baseline 3.1
+    if (sps.length < 4) return PANEL.DEFAULT_H264_CODEC; // Default baseline 3.1
 
     const profile = sps[1];     // Skip NAL header byte
     const constraints = sps[2];
@@ -574,7 +686,7 @@ export class Panel {
   private handleFrame(data: ArrayBuffer): void {
     if (this.destroyed) return;
 
-    this.frameTimestamps.push(performance.now());
+    this.frameTimestamps.push(performance.now()); // CircularBuffer handles size limit
     const frameData = new Uint8Array(data);
 
     // Handle H.264 frame
@@ -589,13 +701,13 @@ export class Panel {
     // Check NAL unit types
     for (const nal of nalUnits) {
       if (nal.length === 0) continue;
-      const nalType = nal[0] & 0x1f;
+      const nalType = nal[0] & NAL.TYPE_MASK;
 
-      if (nalType === 7) { // SPS
+      if (nalType === NAL.TYPE_SPS) {
         sps = nal;
-      } else if (nalType === 8) { // PPS
+      } else if (nalType === NAL.TYPE_PPS) {
         pps = nal;
-      } else if (nalType === 5) { // IDR (keyframe)
+      } else if (nalType === NAL.TYPE_IDR) {
         isKeyframe = true;
       }
     }
@@ -624,6 +736,7 @@ export class Panel {
           console.log('Decoder configured:', codec);
         } catch (e) {
           console.error('Failed to configure decoder:', e);
+          this.setStatus('error');
           return;
         }
       }
@@ -650,7 +763,7 @@ export class Panel {
   private decodeFrame(data: Uint8Array, isKeyframe: boolean): void {
     if (!this.decoder || this.decoder.state !== 'configured') return;
 
-    const timestamp = this.frameCount * (1000000 / 30); // microseconds at 30fps
+    const timestamp = this.frameCount * (1000000 / PANEL.ASSUMED_FPS); // microseconds
     this.frameCount++;
     this.pendingDecode++;
     this.lastDecodeStart = performance.now();
@@ -665,50 +778,49 @@ export class Panel {
     } catch (e) {
       console.error('Decode error:', e);
       this.pendingDecode--;
+      this.setStatus('error');
     }
   }
 
   private checkBufferHealth(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
     const now = performance.now();
 
-    // Calculate received FPS
-    const oneSecondAgo = now - 1000;
-    this.frameTimestamps = this.frameTimestamps.filter(t => t > oneSecondAgo);
-    const receivedFps = this.frameTimestamps.length;
+    // Calculate received FPS using CircularBuffer filterRecent
+    const oneSecondAgo = now - TIMING.FPS_CALCULATION_WINDOW;
+    const receivedFps = this.frameTimestamps.filterRecent(oneSecondAgo, (a, b) => a - b).length;
 
     // Buffer health based on pending decode queue
     // 0 pending = healthy (100), many pending = unhealthy (0)
-    const health = Math.max(0, 100 - this.pendingDecode * 20);
+    const health = Math.max(0, PANEL.MAX_BUFFER_HEALTH - this.pendingDecode * PANEL.HEALTH_PENALTY_PER_PENDING);
 
     // Report every second
-    if (now - this.lastBufferReport > 1000) {
+    if (now - this.lastBufferReport > TIMING.BUFFER_STATS_INTERVAL) {
       this.sendBufferStats(health, receivedFps);
       this.lastBufferReport = now;
     }
   }
 
   private sendBufferStats(health: number, fps: number): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
     const buf = new ArrayBuffer(5);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.BUFFER_STATS);
     view.setUint8(1, Math.round(health));
     view.setUint8(2, Math.round(fps));
-    view.setUint16(3, this.pendingDecode * 33, true); // Approx ms of buffer
-    this.ws.send(buf);
+    view.setUint16(3, this.pendingDecode * PANEL.APPROX_FRAME_DURATION_MS, true);
+    this.ws!.send(buf);
   }
 
   // Input handling
   sendKeyInput(e: KeyboardEvent, action: number): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
-    const encoder = new TextEncoder();
-    const codeBytes = encoder.encode(e.code);
+    const codeBytes = sharedTextEncoder.encode(e.code);
     const text = (e.key.length === 1) ? e.key : '';
-    const textBytes = encoder.encode(text);
+    const textBytes = sharedTextEncoder.encode(text);
 
     const buf = new ArrayBuffer(5 + codeBytes.length + textBytes.length);
     const view = new Uint8Array(buf);
@@ -719,7 +831,7 @@ export class Panel {
     view.set(codeBytes, 4);
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
-    this.ws.send(buf);
+    this.ws!.send(buf);
   }
 
   private handleMouseDown(e: MouseEvent): void {
@@ -732,43 +844,49 @@ export class Panel {
   }
 
   private handleMouseMove(e: MouseEvent): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
     // Use CSS pixels (points), not device pixels - Ghostty expects point coordinates
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+    const mods = this.getModifiers(e);
 
-    const buf = new ArrayBuffer(18);
-    const view = new DataView(buf);
-    view.setUint8(0, ClientMsg.MOUSE_MOVE);
-    view.setFloat64(1, x, true);
-    view.setFloat64(9, y, true);
-    view.setUint8(17, this.getModifiers(e));
-    this.ws.send(buf);
+    // Use throttled handler to reduce event frequency
+    this.throttledSendMouseMove?.(x, y, mods);
+  }
+
+  private sendMouseMoveInternal(x: number, y: number, mods: number): void {
+    if (!this.isWsOpen()) return;
+
+    // Use pre-allocated buffer to avoid GC in hot path
+    this.mouseMoveView.setUint8(0, ClientMsg.MOUSE_MOVE);
+    this.mouseMoveView.setFloat64(1, x, true);
+    this.mouseMoveView.setFloat64(9, y, true);
+    this.mouseMoveView.setUint8(17, mods);
+    this.ws!.send(this.mouseMoveBuffer);
   }
 
   private sendMouseButton(e: MouseEvent, pressed: boolean): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    const buf = new ArrayBuffer(20);
-    const view = new DataView(buf);
-    view.setUint8(0, ClientMsg.MOUSE_INPUT);
-    view.setFloat64(1, x, true);
-    view.setFloat64(9, y, true);
-    view.setUint8(17, e.button);
-    view.setUint8(18, pressed ? 1 : 0);
-    view.setUint8(19, this.getModifiers(e));
-    this.ws.send(buf);
+    // Use pre-allocated buffer to avoid GC in hot path
+    this.mouseButtonView.setUint8(0, ClientMsg.MOUSE_INPUT);
+    this.mouseButtonView.setFloat64(1, x, true);
+    this.mouseButtonView.setFloat64(9, y, true);
+    this.mouseButtonView.setUint8(17, e.button);
+    this.mouseButtonView.setUint8(18, pressed ? 1 : 0);
+    this.mouseButtonView.setUint8(19, this.getModifiers(e));
+    this.ws!.send(this.mouseButtonBuffer);
   }
 
   private handleWheel(e: WheelEvent): void {
     e.preventDefault();
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -776,31 +894,30 @@ export class Panel {
 
     let dx = e.deltaX;
     let dy = e.deltaY;
-    if (e.deltaMode === 1) {
-      dx *= 20;
-      dy *= 20;
-    } else if (e.deltaMode === 2) {
+    if (e.deltaMode === WHEEL_MODE.LINE) {
+      dx *= PANEL.LINE_SCROLL_MULTIPLIER;
+      dy *= PANEL.LINE_SCROLL_MULTIPLIER;
+    } else if (e.deltaMode === WHEEL_MODE.PAGE) {
       dx *= this.canvas.clientWidth;
       dy *= this.canvas.clientHeight;
     }
 
-    const buf = new ArrayBuffer(34);
-    const view = new DataView(buf);
-    view.setUint8(0, ClientMsg.MOUSE_SCROLL);
-    view.setFloat64(1, x, true);
-    view.setFloat64(9, y, true);
-    view.setFloat64(17, dx, true);
-    view.setFloat64(25, dy, true);
-    view.setUint8(33, this.getModifiers(e));
-    this.ws.send(buf);
+    // Use pre-allocated buffer to avoid GC in hot path
+    this.wheelView.setUint8(0, ClientMsg.MOUSE_SCROLL);
+    this.wheelView.setFloat64(1, x, true);
+    this.wheelView.setFloat64(9, y, true);
+    this.wheelView.setFloat64(17, dx, true);
+    this.wheelView.setFloat64(25, dy, true);
+    this.wheelView.setUint8(33, this.getModifiers(e));
+    this.ws!.send(this.wheelBuffer);
   }
 
   private getModifiers(e: KeyboardEvent | MouseEvent): number {
     let mods = 0;
-    if (e.shiftKey) mods |= 1;
-    if (e.ctrlKey) mods |= 2;
-    if (e.altKey) mods |= 4;
-    if (e.metaKey) mods |= 8;
+    if (e.shiftKey) mods |= MODIFIER.SHIFT;
+    if (e.ctrlKey) mods |= MODIFIER.CTRL;
+    if (e.altKey) mods |= MODIFIER.ALT;
+    if (e.metaKey) mods |= MODIFIER.META;
     return mods;
   }
 
@@ -859,10 +976,10 @@ export class Panel {
     if (this.paused) return;
     this.paused = true;
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.isWsOpen()) {
       const buf = new ArrayBuffer(1);
       new DataView(buf).setUint8(0, ClientMsg.PAUSE_STREAM);
-      this.ws.send(buf);
+      this.ws!.send(buf);
     }
   }
 
@@ -870,17 +987,17 @@ export class Panel {
     if (!this.paused) return;
     this.paused = false;
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.isWsOpen()) {
       const buf = new ArrayBuffer(1);
       new DataView(buf).setUint8(0, ClientMsg.RESUME_STREAM);
-      this.ws.send(buf);
+      this.ws!.send(buf);
     }
   }
 
   // Decode a preview frame received via preview WebSocket
   decodePreviewFrame(frameData: Uint8Array): void {
     console.log(`Panel ${this.serverId}: decodePreviewFrame, decoder configured=${this.decoderConfigured}, gotFirstKeyframe=${this.gotFirstKeyframe}`);
-    this.handleFrame(frameData.buffer.slice(frameData.byteOffset, frameData.byteOffset + frameData.byteLength));
+    this.handleFrame(frameData.buffer.slice(frameData.byteOffset, frameData.byteOffset + frameData.byteLength) as ArrayBuffer);
   }
 
   handleInspectorState(state: unknown): void {
@@ -892,14 +1009,17 @@ export class Panel {
   }
 
   private renderInspectorSidebar(): void {
-    const sidebarEl = this.inspectorEl?.querySelector('.inspector-sidebar') as HTMLElement;
-    if (!sidebarEl || !this.inspectorState) return;
+    // Cache sidebar element reference
+    if (!this.inspectorSidebarEl) {
+      this.inspectorSidebarEl = this.inspectorEl?.querySelector('.inspector-sidebar') as HTMLElement;
+    }
+    if (!this.inspectorSidebarEl || !this.inspectorState) return;
 
     const s = this.inspectorState;
 
-    if (!sidebarEl.dataset.initialized) {
-      sidebarEl.dataset.initialized = 'true';
-      sidebarEl.innerHTML = `
+    // Initialize HTML once and cache field element references
+    if (!this.inspectorFieldEls) {
+      this.inspectorSidebarEl.innerHTML = `
         <div class="inspector-simple-section">
           <span class="inspector-simple-title">Dimensions</span>
           <hr>
@@ -908,24 +1028,35 @@ export class Panel {
         <div class="inspector-row"><span class="inspector-label">Grid Size</span><span class="inspector-value" data-field="grid-size"></span></div>
         <div class="inspector-row"><span class="inspector-label">Cell Size</span><span class="inspector-value" data-field="cell-size"></span></div>
       `;
+      this.inspectorFieldEls = {
+        screenSize: this.inspectorSidebarEl.querySelector('[data-field="screen-size"]'),
+        gridSize: this.inspectorSidebarEl.querySelector('[data-field="grid-size"]'),
+        cellSize: this.inspectorSidebarEl.querySelector('[data-field="cell-size"]'),
+      };
     }
 
-    const f = (field: string) => sidebarEl.querySelector(`[data-field="${field}"]`);
-    const screenSize = f('screen-size');
-    const gridSize = f('grid-size');
-    const cellSize = f('cell-size');
-    if (screenSize) screenSize.textContent = `${s.width_px ?? 0}px × ${s.height_px ?? 0}px`;
-    if (gridSize) gridSize.textContent = `${s.cols ?? 0}c × ${s.rows ?? 0}r`;
-    if (cellSize) cellSize.textContent = `${s.cell_width ?? 0}px × ${s.cell_height ?? 0}px`;
+    // Update cached elements directly
+    if (this.inspectorFieldEls.screenSize) {
+      this.inspectorFieldEls.screenSize.textContent = `${s.width_px ?? 0}px × ${s.height_px ?? 0}px`;
+    }
+    if (this.inspectorFieldEls.gridSize) {
+      this.inspectorFieldEls.gridSize.textContent = `${s.cols ?? 0}c × ${s.rows ?? 0}r`;
+    }
+    if (this.inspectorFieldEls.cellSize) {
+      this.inspectorFieldEls.cellSize.textContent = `${s.cell_width ?? 0}px × ${s.cell_height ?? 0}px`;
+    }
   }
 
   private renderInspectorView(): void {
-    const mainEl = this.inspectorEl?.querySelector('.inspector-main');
-    if (!mainEl) return;
+    // Cache main element reference
+    if (!this.inspectorMainEl) {
+      this.inspectorMainEl = this.inspectorEl?.querySelector('.inspector-main') as HTMLElement;
+    }
+    if (!this.inspectorMainEl) return;
 
     const s = this.inspectorState || {};
 
-    mainEl.innerHTML = `
+    this.inspectorMainEl.innerHTML = `
       <div class="inspector-simple-section">
         <span class="inspector-simple-title">Terminal Size</span>
         <hr>
@@ -937,29 +1068,81 @@ export class Panel {
   }
 
   sendTextInput(text: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.isWsOpen()) return;
 
-    const encoder = new TextEncoder();
-    const textBytes = encoder.encode(text);
+    const textBytes = sharedTextEncoder.encode(text);
     const buf = new ArrayBuffer(1 + textBytes.length);
     const view = new Uint8Array(buf);
     view[0] = ClientMsg.TEXT_INPUT;
     view.set(textBytes, 1);
-    this.ws.send(buf);
+    this.ws!.send(buf);
   }
 
   destroy(): void {
     this.destroyed = true;
+
+    // Clear pending timeouts
+    if (this.connectTimeoutId) {
+      clearTimeout(this.connectTimeoutId);
+      this.connectTimeoutId = null;
+    }
 
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
     }
 
+    // Remove canvas event listeners
+    if (this.handleMouseDownBound) {
+      this.canvas.removeEventListener('mousedown', this.handleMouseDownBound);
+      this.handleMouseDownBound = null;
+    }
+    if (this.handleMouseUpBound) {
+      this.canvas.removeEventListener('mouseup', this.handleMouseUpBound);
+      this.handleMouseUpBound = null;
+    }
+    if (this.handleMouseMoveBound) {
+      this.canvas.removeEventListener('mousemove', this.handleMouseMoveBound);
+      this.handleMouseMoveBound = null;
+    }
+    if (this.handleWheelBound) {
+      this.canvas.removeEventListener('wheel', this.handleWheelBound);
+      this.handleWheelBound = null;
+    }
+    if (this.handleContextMenuBound) {
+      this.canvas.removeEventListener('contextmenu', this.handleContextMenuBound);
+      this.handleContextMenuBound = null;
+    }
+
     if (this.documentClickHandler) {
       document.removeEventListener('click', this.documentClickHandler);
       this.documentClickHandler = null;
     }
+
+    // Remove all inspector event listeners
+    for (const { element, type, handler } of this.inspectorHandlers) {
+      element.removeEventListener(type, handler);
+    }
+    this.inspectorHandlers = [];
+    this.inspectorResizeHandler = null;
+
+    // Remove document-level resize handlers if drag was in progress
+    if (this.inspectorResizeMoveHandler) {
+      document.removeEventListener('mousemove', this.inspectorResizeMoveHandler);
+      this.inspectorResizeMoveHandler = null;
+    }
+    if (this.inspectorResizeUpHandler) {
+      document.removeEventListener('mouseup', this.inspectorResizeUpHandler);
+      this.inspectorResizeUpHandler = null;
+    }
+
+    // Clear cached inspector elements
+    this.inspectorSidebarEl = null;
+    this.inspectorMainEl = null;
+    this.inspectorFieldEls = null;
+
+    // Clear throttled handler
+    this.throttledSendMouseMove = null;
 
     if (this.ws) {
       this.ws.close();
@@ -970,6 +1153,10 @@ export class Panel {
       this.decoder.close();
       this.decoder = null;
     }
+
+    // Clear circular buffers
+    this.frameTimestamps.clear();
+    this.decodeLatencies.clear();
 
     // Note: statsOverlay is shared/static, don't remove it
 
