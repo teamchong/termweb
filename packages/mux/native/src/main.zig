@@ -3886,8 +3886,21 @@ const Server = struct {
         self.mutex.unlock();
 
         for (pending) |req| {
+            // Pause parent panel to prevent frame capture race during split
+            // The parent will resume when client sends resize after layout update
+            self.mutex.lock();
+            const parent_panel = self.panels.get(req.parent_panel_id);
+            self.mutex.unlock();
+            if (parent_panel) |parent| {
+                parent.pause();
+            }
+
             const panel = self.createPanelAsSplit(req.width, req.height, req.scale, req.parent_panel_id, req.direction) catch |err| {
                 std.debug.print("Failed to create split panel: {}\n", .{err});
+                // Resume parent on failure
+                if (parent_panel) |parent| {
+                    parent.resumeStream();
+                }
                 continue;
             };
 
@@ -3901,6 +3914,12 @@ const Server = struct {
 
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
+
+            // Resume parent panel streaming (will get keyframe on next frame)
+            // Note: If parent will be resized, resizeInternal sets force_keyframe
+            if (parent_panel) |parent| {
+                parent.resumeStream();
+            }
         }
 
         self.allocator.free(pending);
@@ -4562,7 +4581,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16) !void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
-    std.debug.print("termweb-mux server starting...\n", .{});
+    std.debug.print("termweb mux server starting...\n", .{});
 
     // WS ports use 0 to let OS assign random available ports
     const server = try Server.init(allocator, http_port, 0, 0);

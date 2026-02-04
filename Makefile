@@ -1,6 +1,6 @@
 # Termweb Makefile
 
-.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean vendor-reset vendor-patch vendor-sync vendor-build-ghostty
+.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean vendor-reset vendor-patch vendor-sync vendor-build-ghostty vendor-generate-patch
 
 # Default: build everything (JS must be bundled before Zig embeds it)
 all: build-all
@@ -77,11 +77,16 @@ mux-clean:
 # Vendor Management (submodules + patches)
 # =============================================================================
 
+# Upstream commit for ghostty (BEFORE our patches)
+# IMPORTANT: This must be an upstream commit, NOT a local patch commit
+GHOSTTY_UPSTREAM_COMMIT := 1b7a15899
+
 # Reset all submodules to pinned commits
 vendor-reset:
 	@echo "Resetting vendor submodules..."
 	git submodule update --init --recursive --force
-	cd vendor/ghostty && git clean -fd
+	@echo "Checking out ghostty upstream commit $(GHOSTTY_UPSTREAM_COMMIT)..."
+	cd vendor/ghostty && git checkout $(GHOSTTY_UPSTREAM_COMMIT) && git clean -fd
 
 # Apply patches to vendor submodules
 vendor-patch:
@@ -103,6 +108,20 @@ vendor-build-ghostty:
 	@echo "Building libghostty..."
 	cd vendor/ghostty && zig build -Doptimize=ReleaseFast -Dapp-runtime=none
 	@echo "libghostty built."
+
+# Generate patch from current vendor changes (use after editing vendor files)
+# Usage: edit vendor/ghostty files, then run `make vendor-generate-patch`
+# This generates a patch containing ALL changes from the upstream commit to current state
+vendor-generate-patch:
+	@echo "Generating patch from changes in vendor/ghostty (since $(GHOSTTY_UPSTREAM_COMMIT))..."
+	@cd vendor/ghostty && \
+		git add -A && \
+		git commit -m "feat(linux): add headless EGL rendering support for embedded platform" --allow-empty && \
+		git format-patch $(GHOSTTY_UPSTREAM_COMMIT)..HEAD --stdout > ../../patches/ghostty/001-linux-egl-headless.patch && \
+		git reset --soft $(GHOSTTY_UPSTREAM_COMMIT) && \
+		git reset HEAD
+	@echo "Patch saved to patches/ghostty/001-linux-egl-headless.patch"
+	@echo "Now run 'make vendor-sync' to test the patch applies cleanly."
 
 # =============================================================================
 # UI Asset Generation
@@ -160,8 +179,7 @@ help:
 	@echo ""
 	@echo "Vendor management:"
 	@echo "  make vendor-sync  - Reset submodules and apply patches"
-	@echo "  make vendor-reset - Reset submodules to pinned commits"
-	@echo "  make vendor-patch - Apply patches to submodules"
+	@echo "  make vendor-generate-patch - Generate patch from vendor changes"
 	@echo "  make vendor-build-ghostty - Build libghostty from source"
 	@echo ""
 	@echo "Other targets:"

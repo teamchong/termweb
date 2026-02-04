@@ -11,7 +11,7 @@ import { FileTransferHandler } from '../file-transfer';
 import type { AppConfig, LayoutData, LayoutNode, LayoutTab } from '../types';
 import type { PanelStatus } from '../stores/types';
 import { applyColors, generateId, getWsUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
-import { TIMING, WS_PATHS, CONFIG_ENDPOINT, SERVER_MSG } from '../constants';
+import { TIMING, WS_PATHS, CONFIG_ENDPOINT, SERVER_MSG, UI } from '../constants';
 import { BinaryCtrlMsg } from '../protocol';
 
 // Extended panel interface with all methods
@@ -452,13 +452,13 @@ export class MuxClient {
 
     const tabInfo: InternalTabInfo = {
       id: tabId,
-      title: title || 'Terminal',
+      title: title || UI.DEFAULT_TAB_TITLE,
       root,
       element: tabContent,
     };
     this.tabInstances.set(tabId, tabInfo);
     tabs.add(createTabInfo(tabId));
-    tabs.updateTab(tabId, { title: title || 'Terminal', panelIds: [panel.id] });
+    tabs.updateTab(tabId, { title: title || UI.DEFAULT_TAB_TITLE, panelIds: [panel.id] });
     this.selectTab(tabId);
     return tabId;
   }
@@ -788,7 +788,7 @@ export class MuxClient {
 
     const tabInfo: InternalTabInfo = {
       id: tabId,
-      title: 'Terminal',
+      title: UI.DEFAULT_TAB_TITLE,
       root,
       element: tabContent,
     };

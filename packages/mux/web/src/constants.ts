@@ -199,8 +199,8 @@ export const COLORS = {
 // ============================================================================
 
 export const UI = {
-  /** Default tab title */
-  DEFAULT_TAB_TITLE: 'Terminal',
+  /** Default tab title - empty, will be set by shell's title */
+  DEFAULT_TAB_TITLE: 'zsh',
   /** Loading text */
   LOADING_TEXT: 'Connecting...',
   /** Default inspector tab */

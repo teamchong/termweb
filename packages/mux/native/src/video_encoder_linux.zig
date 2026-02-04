@@ -213,6 +213,7 @@ pub const VideoEncoder = struct {
 
     // VA-API handles
     drm_fd: c_int,
+    owns_drm_fd: bool, // True if we opened the fd and should close it
     va_display: c.VADisplay,
     va_config: c.VAConfigID,
     va_context: c.VAContextID,
@@ -432,7 +433,15 @@ pub const VideoEncoder = struct {
         self.pps_len = 5 + bs.getLength();
     }
 
+    /// Initialize encoder, opening our own DRM render node.
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) CreateError!*VideoEncoder {
+        return initWithDrmFd(allocator, width, height, -1);
+    }
+
+    /// Initialize encoder with optional external DRM fd.
+    /// If external_drm_fd is provided (>= 0), it will be used instead of opening our own.
+    /// This enables zero-copy encoding when ghostty and VA-API share the same GPU.
+    pub fn initWithDrmFd(allocator: std.mem.Allocator, width: u32, height: u32, external_drm_fd: c_int) CreateError!*VideoEncoder {
         const encoder = try allocator.create(VideoEncoder);
         errdefer allocator.destroy(encoder);
 
@@ -443,14 +452,19 @@ pub const VideoEncoder = struct {
         const encode_width = scaled.w;
         const encode_height = scaled.h;
 
-
-        // Open DRM render node
-        const drm_fd = c.open("/dev/dri/renderD128", c.O_RDWR);
-        if (drm_fd < 0) {
-            std.debug.print("ENCODER: Failed to open /dev/dri/renderD128\n", .{});
-            return error.DrmOpenFailed;
-        }
-        errdefer _ = c.close(drm_fd);
+        // Use external DRM fd if provided, otherwise open our own
+        const owns_drm_fd = external_drm_fd < 0;
+        const drm_fd = if (external_drm_fd >= 0) external_drm_fd else blk: {
+            const fd = c.open("/dev/dri/renderD128", c.O_RDWR);
+            if (fd < 0) {
+                std.debug.print("ENCODER: Failed to open /dev/dri/renderD128\n", .{});
+                return error.DrmOpenFailed;
+            }
+            break :blk fd;
+        };
+        errdefer if (owns_drm_fd) {
+            _ = c.close(drm_fd);
+        };
 
         // Get VA display from DRM
         const va_display = c.vaGetDisplayDRM(drm_fd);
@@ -571,6 +585,7 @@ pub const VideoEncoder = struct {
             .frame_count = 0,
             .allocator = allocator,
             .drm_fd = drm_fd,
+            .owns_drm_fd = owns_drm_fd,
             .va_display = va_display,
             .va_config = config,
             .va_context = va_context,
@@ -604,7 +619,11 @@ pub const VideoEncoder = struct {
         _ = c.vaDestroySurfaces(self.va_display, &surfaces, 3);
         _ = c.vaDestroyConfig(self.va_display, self.va_config);
         _ = c.vaTerminate(self.va_display);
-        _ = c.close(self.drm_fd);
+
+        // Only close DRM fd if we opened it ourselves
+        if (self.owns_drm_fd) {
+            _ = c.close(self.drm_fd);
+        }
 
         self.allocator.free(self.output_buffer);
         self.allocator.destroy(self);
