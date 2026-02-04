@@ -889,7 +889,10 @@
       onwheel={handleWheel}
       oncontextmenu={handleContextMenu}
     ></canvas>
-    <div class="panel-loading" bind:this={loadingEl}>{UI.LOADING_TEXT}</div>
+    <div class="panel-loading" bind:this={loadingEl}>
+      <div class="spinner"></div>
+      <span>Connecting...</span>
+    </div>
     {#if debugEnabled}
       <div class="panel-stats">
         <span class="stat" class:good={displayedFps >= STATS_THRESHOLD.FPS_GOOD} class:warn={displayedFps < STATS_THRESHOLD.FPS_GOOD && displayedFps >= STATS_THRESHOLD.FPS_WARN} class:bad={displayedFps < STATS_THRESHOLD.FPS_WARN}>FPS: {displayedFps}</span>
@@ -1023,11 +1026,26 @@
     position: absolute;
     inset: 0;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: 12px;
     color: var(--text-dim);
     font: 14px system-ui, sans-serif;
     background: var(--bg);
+  }
+
+  .panel-loading .spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid #333;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
   }
 
   .panel-stats {

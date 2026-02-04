@@ -33,9 +33,10 @@
           aria-label="Close tab"
         >×</button>
         <div class="title-wrapper">
-          <span class="indicator">{i + 1}</span>
-          <span class="title">{tab.title || 'Terminal'}</span>
+          <span class="indicator">•</span>
+          <span class="title">{tab.title || '👻'}</span>
         </div>
+        <span class="hotkey">{i < 9 ? `⌘${i + 1}` : ''}</span>
       </div>
     {/each}
   </div>
@@ -122,12 +123,19 @@
   }
 
   .tab .indicator {
-    font-size: 14px;
-    font-weight: 100;
+    font-size: 10px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+    line-height: 1;
+  }
+
+  .tab .hotkey {
+    font-size: 10px;
     color: var(--text-dim);
     font-family: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
     flex-shrink: 0;
-    line-height: 1;
+    opacity: 0.5;
+    margin-left: 4px;
   }
 
   .tab .title {
