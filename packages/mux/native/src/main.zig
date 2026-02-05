@@ -618,6 +618,10 @@ const Panel = struct {
         // Set size in pixels
         c.ghostty_surface_set_size(surface, pixel_width, pixel_height);
 
+        // Force initial render to populate the FBO
+        // This prevents blank/stale frames when the panel is first created
+        c.ghostty_surface_draw(surface);
+
         panel.* = .{
             .id = id,
             .surface = surface,
@@ -4067,7 +4071,8 @@ const Server = struct {
                         // Read pixels from OpenGL framebuffer
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
                         if (read_ok) {
-                            if (panel.video_encoder.?.encode(panel.bgra_buffer.?, panel.force_keyframe) catch null) |result| {
+                            // Pass explicit dimensions to ensure encoder matches frame size
+                            if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
                             }

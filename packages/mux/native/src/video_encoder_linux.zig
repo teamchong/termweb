@@ -251,9 +251,11 @@ pub const VideoEncoder = struct {
     };
 
     fn calcScaledDimensions(width: u32, height: u32) struct { w: u32, h: u32 } {
+        // VA-API hardware encoders require 16-pixel aligned surfaces.
+        // We align the destination but handle stride differences in uploadFrame.
         const pixels: u64 = @as(u64, width) * @as(u64, height);
         if (pixels <= MAX_PIXELS) {
-            // Round to 16-pixel alignment (required by H.264)
+            // Round to 16-pixel alignment (required by H.264 hardware encoders)
             return .{
                 .w = (width + 15) & ~@as(u32, 15),
                 .h = (height + 15) & ~@as(u32, 15),
@@ -806,17 +808,28 @@ pub const VideoEncoder = struct {
         // NV12 has Y plane followed by interleaved UV plane
         const y_offset = image.offsets[0];
         const uv_offset = image.offsets[1];
-        const y_pitch = image.pitches[0];
+        const y_pitch = image.pitches[0]; // Hardware stride (may be > dst_width due to alignment)
         const uv_pitch = image.pitches[1];
 
-        // Simple nearest-neighbor scaling + RGBA to NV12 conversion
+        // 1:1 copy from source to destination with padding (no scaling/stretching)
+        // Source: tightly packed at src_width x src_height
+        // Destination: aligned surface with y_pitch stride, dst_width x dst_height
+        // Copy source pixels directly, fill padding with black (Y=16, U=V=128)
         var y: u32 = 0;
         while (y < dst_height) : (y += 1) {
-            const src_y = @min(y * src_height / dst_height, src_height - 1);
             var x: u32 = 0;
-            while (x < dst_width) : (x += 1) {
-                const src_x = @min(x * src_width / dst_width, src_width - 1);
-                const src_idx = (src_y * src_width + src_x) * 4;
+
+            // If this row is beyond source height, fill entire row with black
+            if (y >= src_height) {
+                while (x < dst_width) : (x += 1) {
+                    mapped[y_offset + y * y_pitch + x] = 16; // Black in Y
+                }
+                continue;
+            }
+
+            // Copy source pixels 1:1 (no scaling)
+            while (x < src_width and x < dst_width) : (x += 1) {
+                const src_idx = (y * src_width + x) * 4;
 
                 const r = @as(u32, rgba_data[src_idx]);
                 const g = @as(u32, rgba_data[src_idx + 1]);
@@ -826,16 +839,41 @@ pub const VideoEncoder = struct {
                 const y_val: u8 = @intCast(@min(255, 16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)));
                 mapped[y_offset + y * y_pitch + x] = y_val;
             }
+
+            // Fill padding columns with black (Y=16)
+            while (x < dst_width) : (x += 1) {
+                mapped[y_offset + y * y_pitch + x] = 16; // Black in Y
+            }
         }
 
         // UV plane (half resolution, interleaved)
+        // For 4:2:0 chroma, use ceiling division to handle odd dimensions
+        // e.g., src_width=961 needs 481 UV columns, not 480
+        const src_uv_width = (src_width + 1) / 2;
+        const src_uv_height = (src_height + 1) / 2;
+        const dst_uv_width = dst_width / 2;
+        const dst_uv_height = dst_height / 2;
+
         y = 0;
-        while (y < dst_height / 2) : (y += 1) {
-            const src_y = @min(y * 2 * src_height / dst_height, src_height - 1);
+        while (y < dst_uv_height) : (y += 1) {
             var x: u32 = 0;
-            while (x < dst_width / 2) : (x += 1) {
-                const src_x = @min(x * 2 * src_width / dst_width, src_width - 1);
-                const src_idx = (src_y * src_width + src_x) * 4;
+            const src_y = y * 2;
+
+            // If this UV row is beyond source height, fill entire row with neutral
+            if (y >= src_uv_height) {
+                while (x < dst_uv_width) : (x += 1) {
+                    mapped[uv_offset + y * uv_pitch + x * 2] = 128; // Neutral U
+                    mapped[uv_offset + y * uv_pitch + x * 2 + 1] = 128; // Neutral V
+                }
+                continue;
+            }
+
+            // Copy source pixels 1:1
+            // Clamp src_x to valid range for odd widths
+            while (x < src_uv_width and x < dst_uv_width) : (x += 1) {
+                const src_x = @min(x * 2, src_width - 1);
+                const clamped_src_y = @min(src_y, src_height - 1);
+                const src_idx = (clamped_src_y * src_width + src_x) * 4;
 
                 const r = @as(i32, @intCast(rgba_data[src_idx]));
                 const g = @as(i32, @intCast(rgba_data[src_idx + 1]));
@@ -847,6 +885,12 @@ pub const VideoEncoder = struct {
 
                 mapped[uv_offset + y * uv_pitch + x * 2] = u_val;
                 mapped[uv_offset + y * uv_pitch + x * 2 + 1] = v_val;
+            }
+
+            // Fill padding with neutral chroma (U=V=128)
+            while (x < dst_uv_width) : (x += 1) {
+                mapped[uv_offset + y * uv_pitch + x * 2] = 128; // Neutral U
+                mapped[uv_offset + y * uv_pitch + x * 2 + 1] = 128; // Neutral V
             }
         }
 
@@ -866,7 +910,26 @@ pub const VideoEncoder = struct {
     }
 
     /// Encode RGBA frame to H.264
+    /// If width/height are provided and differ from source dimensions, auto-resize.
     pub fn encode(self: *VideoEncoder, rgba_data: []const u8, force_keyframe: bool) VaError!?EncodeResult {
+        return self.encodeWithDimensions(rgba_data, force_keyframe, null, null);
+    }
+
+    /// Encode RGBA frame to H.264 with explicit dimensions
+    /// Auto-resizes encoder if frame dimensions don't match current source dimensions.
+    pub fn encodeWithDimensions(self: *VideoEncoder, rgba_data: []const u8, force_keyframe: bool, width: ?u32, height: ?u32) VaError!?EncodeResult {
+        // Auto-resize if explicit dimensions provided and differ from source
+        if (width != null and height != null) {
+            const w = width.?;
+            const h = height.?;
+            if (w != self.source_width or h != self.source_height) {
+                self.resize(w, h) catch |err| {
+                    std.debug.print("ENCODER: auto-resize failed: {}\n", .{err});
+                    return error.VaSurfacesFailed;
+                };
+            }
+        }
+
         const is_keyframe = force_keyframe or (self.frame_count == 0) or
             (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
 

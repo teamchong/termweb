@@ -593,6 +593,21 @@ pub const VideoEncoder = struct {
 
     // Encode a BGRA frame, returns encoded H.264 data
     pub fn encode(self: *VideoEncoder, bgra_data: []const u8, force_keyframe: bool) !?EncodeResult {
+        return self.encodeWithDimensions(bgra_data, force_keyframe, null, null);
+    }
+
+    /// Encode BGRA frame to H.264 with explicit dimensions
+    /// Auto-resizes encoder if frame dimensions don't match current source dimensions.
+    pub fn encodeWithDimensions(self: *VideoEncoder, bgra_data: []const u8, force_keyframe: bool, width: ?u32, height: ?u32) !?EncodeResult {
+        // Auto-resize if explicit dimensions provided and differ from source
+        if (width != null and height != null) {
+            const w = width.?;
+            const h = height.?;
+            if (w != self.source_width or h != self.source_height) {
+                try self.resize(w, h);
+            }
+        }
+
         // Reset output
         self.output_len = 0;
         self.is_keyframe = false;

@@ -41,10 +41,10 @@ index 3d3973084..e04c2fabe 100644
  void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..143881d86
+index 000000000..6a4a591b3
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,673 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
@@ -197,7 +197,7 @@ index 000000000..143881d86
 +        // Generate 2 PBOs
 +        genBuffers(2, &self.pbos);
 +
-+        // Allocate storage for both PBOs
++        // Allocate storage for both PBOs (tight packing)
 +        for (self.pbos) |pbo| {
 +            bindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
 +            bufferData(GL_PIXEL_PACK_BUFFER, @intCast(self.buffer_size), null, GL_STREAM_READ);
@@ -255,7 +255,7 @@ index 000000000..143881d86
 +            // 2. Generate new buffers
 +            genBuffers(2, &self.pbos);
 +
-+            // 3. Allocate storage for BOTH ping-pong buffers with new size
++            // 3. Allocate storage for BOTH ping-pong buffers (tight packing)
 +            const new_size: isize = @intCast(width * height * 4);
 +            bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[0]);
 +            bufferData(GL_PIXEL_PACK_BUFFER, new_size, null, GL_STREAM_READ);
@@ -278,12 +278,6 @@ index 000000000..143881d86
 +            return false;
 +        }
 +
-+        // CRITICAL: Force exact row length to prevent GPU padding
-+        // GL_PACK_ROW_LENGTH tells driver: row length in memory == image width (no padding)
-+        // GL_PACK_ALIGNMENT = 1 ensures no byte alignment padding
-+        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(width));
-+        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
-+
 +        // For FBO reading, use GL_COLOR_ATTACHMENT0 (not GL_BACK)
 +        if (gl.glad.context.ReadBuffer) |readBuf| {
 +            readBuf(GL_COLOR_ATTACHMENT0);
@@ -291,15 +285,29 @@ index 000000000..143881d86
 +
 +        // Ping-pong: write to current buffer
 +        bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[self.write_index]);
++
++        // STRICT STATE ISOLATION: Set ALL packing parameters before EVERY read
++        // This prevents state pollution from other panels sharing the GL context
++        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1); // Tight byte alignment
++        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0); // Row length = width (no padding)
++        pixelStorei(gl.c.GL_PACK_SKIP_PIXELS, 0); // Start at column 0
++        pixelStorei(gl.c.GL_PACK_SKIP_ROWS, 0); // Start at row 0
++
 +        glReadPixels(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, null);
 +
-+        // Reset row length to default
-+        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0);
++        // CRITICAL: Ensure the async write completes before proceeding
++        // This prevents GPU-side race conditions when multiple panels share the context
++        // (defeats async but necessary for correctness with shared context)
++        if (gl.glad.context.Finish) |glFinish| {
++            glFinish();
++        }
++
++        // Unbind PBO after write completes to prevent state leak to other panels
++        bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 +
 +        // If not primed, we just started the first write - cannot read yet
 +        // Return false to force sync fallback for this frame
 +        if (!self.is_primed) {
-+            bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 +            self.write_index +%= 1; // Next frame will write to other buffer
 +            self.is_primed = true; // Now primed - next frame can read
 +            return false;
@@ -307,16 +315,7 @@ index 000000000..143881d86
 +
 +        // Read from the OTHER buffer (the one we wrote to LAST frame)
 +        const read_index: u1 = self.write_index +% 1;
-+
-+        // CRITICAL: Ensure the async write from last frame is complete before mapping
-+        if (gl.glad.context.Finish) |glFinish| {
-+            glFinish();
-+        }
-+
 +        bindBuffer(GL_PIXEL_PACK_BUFFER, self.pbos[read_index]);
-+
-+        // Ensure GL_PACK_ROW_LENGTH is set before mapping (some drivers need this)
-+        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(self.width));
 +
 +        const mapped_ptr: ?[*]const u8 = blk: {
 +            // Try MapBufferRange first (more control), fall back to MapBuffer
@@ -334,9 +333,7 @@ index 000000000..143881d86
 +            return false;
 +        }
 +
-+        // Simple row-by-row copy with vertical flip
-+        // MUST use self.width (the width at write time) for source offsets
-+        // and width (current) for destination - but they should match after hard reset
++        // Simple row-by-row copy with vertical flip (tight packing)
 +        const row_bytes = self.width * 4;
 +        const src_ptr = mapped_ptr.?;
 +        var y: u32 = 0;
@@ -348,14 +345,11 @@ index 000000000..143881d86
 +            @memcpy(dest_buffer[dst_offset..][0..row_bytes], src_ptr[src_offset..][0..row_bytes]);
 +        }
 +
-+        // Unmap and unbind
++        // Unmap and unbind PBO
 +        if (gl.glad.context.UnmapBuffer) |unmapBuf| {
 +            _ = unmapBuf(GL_PIXEL_PACK_BUFFER);
 +        }
 +        bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-+
-+        // Reset row length
-+        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0);
 +
 +        // Swap write index for next frame
 +        self.write_index +%= 1;
@@ -364,31 +358,33 @@ index 000000000..143881d86
 +    }
 +};
 +
-+/// Per-FBO PBO state manager
-+/// Maps FBO IDs to their own PBO states to avoid race conditions between surfaces
++/// Per-surface PBO state manager
++/// Maps surface IDs (pointers) to their own PBO states to avoid race conditions between surfaces.
++/// CRITICAL: We key by surface_id (pointer) NOT fbo_id because FBO IDs can be recycled by OpenGL
++/// when surfaces are destroyed and recreated, causing state collisions between different panels.
 +const PboStateManager = struct {
-+    const MAX_SURFACES = 16; // Max concurrent surfaces/FBOs
++    const MAX_SURFACES = 16; // Max concurrent surfaces
 +
-+    /// Entry mapping FBO ID to its PBO state
++    /// Entry mapping surface ID to its PBO state
 +    const Entry = struct {
-+        fbo_id: c_uint = 0,
++        surface_id: usize = 0,
 +        pbo_state: PboState = .{},
 +        in_use: bool = false,
 +    };
 +
 +    entries: [MAX_SURFACES]Entry = [_]Entry{.{}} ** MAX_SURFACES,
 +
-+    /// Get or create PBO state for a given FBO ID and dimensions
++    /// Get or create PBO state for a given surface ID and dimensions
 +    /// If dimensions changed, the PBO is resized and is_primed is reset
-+    pub fn getOrCreate(self: *PboStateManager, fbo_id: c_uint, width: u32, height: u32) ?*PboState {
++    pub fn getOrCreate(self: *PboStateManager, surface_id: usize, width: u32, height: u32) ?*PboState {
 +        // First, look for existing entry
 +        for (&self.entries) |*entry| {
-+            if (entry.in_use and entry.fbo_id == fbo_id) {
++            if (entry.in_use and entry.surface_id == surface_id) {
 +                // Check if dimensions changed (resize case)
 +                if (entry.pbo_state.width != width or entry.pbo_state.height != height) {
 +                    // Dimensions changed - must reallocate PBOs
-+                    log.info("PBO resize: FBO {} {}x{} -> {}x{}", .{
-+                        fbo_id,
++                    log.info("PBO resize: surface 0x{x} {}x{} -> {}x{}", .{
++                        surface_id,
 +                        entry.pbo_state.width,
 +                        entry.pbo_state.height,
 +                        width,
@@ -406,37 +402,39 @@ index 000000000..143881d86
 +        // Not found, create new entry
 +        for (&self.entries) |*entry| {
 +            if (!entry.in_use) {
-+                entry.fbo_id = fbo_id;
++                entry.surface_id = surface_id;
 +                entry.in_use = true;
 +                entry.pbo_state = .{};
++                log.info("PBO state created for surface 0x{x}", .{surface_id});
 +                return &entry.pbo_state;
 +            }
 +        }
 +
 +        // No free slots
-+        log.warn("PBO state manager full, cannot create state for FBO {}", .{fbo_id});
++        log.warn("PBO state manager full, cannot create state for surface 0x{x}", .{surface_id});
 +        return null;
 +    }
 +
-+    /// Remove PBO state for a given FBO ID (call when surface is destroyed)
-+    pub fn remove(self: *PboStateManager, fbo_id: c_uint) void {
++    /// Remove PBO state for a given surface ID (call when surface is destroyed)
++    pub fn remove(self: *PboStateManager, surface_id: usize) void {
 +        for (&self.entries) |*entry| {
-+            if (entry.in_use and entry.fbo_id == fbo_id) {
++            if (entry.in_use and entry.surface_id == surface_id) {
 +                entry.pbo_state.deinit();
 +                entry.in_use = false;
-+                entry.fbo_id = 0;
++                entry.surface_id = 0;
++                log.info("PBO state removed for surface 0x{x}", .{surface_id});
 +                return;
 +            }
 +        }
 +    }
 +};
 +
-+/// Per-FBO PBO state manager instance
++/// Per-surface PBO state manager instance
 +var pbo_manager: PboStateManager = .{};
 +
-+/// Clean up PBO state for a given FBO ID (call when surface is destroyed)
-+pub fn cleanupPboState(fbo_id: c_uint) void {
-+    pbo_manager.remove(fbo_id);
++/// Clean up PBO state for a given surface ID (call when surface is destroyed)
++pub fn cleanupPboState(surface_id: usize) void {
++    pbo_manager.remove(surface_id);
 +}
 +
 +/// OpenGL constants for FBO binding
@@ -633,13 +631,19 @@ index 000000000..143881d86
 +}
 +
 +/// Read pixels from the specified FBO (RGBA format)
-+/// Uses per-FBO double-buffered PBO for async readback.
-+/// Each FBO has its own PBO state to avoid race conditions between surfaces.
++/// Uses per-surface double-buffered PBO for async readback.
++/// Each surface has its own PBO state to avoid race conditions between panels.
 +/// @param fbo_id The OpenGL framebuffer object ID to read from (from renderer's last_target)
-+pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
++/// @param surface_id Unique surface identifier (pointer) - used to key PBO state
++pub fn readPixels(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint, surface_id: usize) bool {
++    // CRITICAL: Ensure GL context is current on this thread
++    if (!makeCurrentOnThread()) {
++        log.warn("readPixels: makeCurrent failed", .{});
++        return false;
++    }
++
 +    // CRITICAL: Force GPU synchronization before reading from FBO
 +    // This ensures all rendering commands from potentially different threads are complete.
-+    // Without this, we may read stale/incomplete data causing flashing artifacts.
 +    if (gl.glad.context.Finish) |glFinish| {
 +        glFinish();
 +    }
@@ -654,16 +658,9 @@ index 000000000..143881d86
 +        viewport(0, 0, @intCast(width), @intCast(height));
 +    }
 +
-+    // CRITICAL: Force exact row length to prevent GPU padding (stride mismatch)
-+    // Must be set BEFORE any glReadPixels call (both async and sync paths)
-+    if (gl.glad.context.PixelStorei) |pixelStorei| {
-+        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(width));
-+        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
-+    }
-+
-+    // Use per-FBO PBO state for async readback
-+    // Pass dimensions so PBO is resized if needed (handles split/resize case)
-+    if (pbo_manager.getOrCreate(fbo_id, width, height)) |pbo_state| {
++    // Use per-surface PBO state for async readback (keyed by surface_id, not fbo_id)
++    // This prevents state collisions when FBO IDs are recycled by OpenGL
++    if (pbo_manager.getOrCreate(surface_id, width, height)) |pbo_state| {
 +        if (pbo_state.readPixelsAsync(buffer, buffer_len, width, height, fbo_id)) {
 +            return true;
 +        }
@@ -678,6 +675,7 @@ index 000000000..143881d86
 +pub fn readPixelsSync(buffer: [*]u8, buffer_len: usize, width: u32, height: u32, fbo_id: c_uint) bool {
 +    _ = fbo_id; // FBO already bound by caller
 +    const readPixelsFn = gl.glad.context.ReadPixels orelse return false;
++    const pixelStorei = gl.glad.context.PixelStorei orelse return false;
 +
 +    const expected_size = @as(usize, width) * @as(usize, height) * 4;
 +    if (buffer_len < expected_size) return false;
@@ -687,24 +685,20 @@ index 000000000..143881d86
 +        bindBuf(0x88EB, 0); // GL_PIXEL_PACK_BUFFER = 0x88EB
 +    }
 +
-+    // CRITICAL: Set GL_PACK_ROW_LENGTH (async path may have reset it to 0)
-+    if (gl.glad.context.PixelStorei) |pixelStorei| {
-+        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, @intCast(width));
-+        pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1);
-+    }
-+
 +    // For FBO reading, use GL_COLOR_ATTACHMENT0 (not GL_BACK)
 +    if (gl.glad.context.ReadBuffer) |readBuf| {
 +        readBuf(GL_COLOR_ATTACHMENT0);
 +    }
 +
++    // STRICT STATE ISOLATION: Set ALL packing parameters before EVERY read
++    // This prevents state pollution from other panels sharing the GL context
++    pixelStorei(gl.c.GL_PACK_ALIGNMENT, 1); // Tight byte alignment
++    pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0); // Row length = width (no padding)
++    pixelStorei(gl.c.GL_PACK_SKIP_PIXELS, 0); // Start at column 0
++    pixelStorei(gl.c.GL_PACK_SKIP_ROWS, 0); // Start at row 0
++
 +    // Read pixels (OpenGL origin is bottom-left)
 +    readPixelsFn(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, buffer);
-+
-+    // Reset row length
-+    if (gl.glad.context.PixelStorei) |pixelStorei| {
-+        pixelStorei(gl.c.GL_PACK_ROW_LENGTH, 0);
-+    }
 +
 +    // Flip image vertically (OpenGL has origin at bottom-left, we need top-left)
 +    const row_size = width * 4;
@@ -725,7 +719,7 @@ index 000000000..143881d86
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..bac683c8b 100644
+index dcf8a6357..310aaef15 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -793,22 +787,21 @@ index dcf8a6357..bac683c8b 100644
  };
  
  pub const EnvVar = extern struct {
-@@ -590,6 +613,14 @@ pub const Surface = struct {
+@@ -590,6 +613,13 @@ pub const Surface = struct {
          // Free our title
          if (self.title) |v| self.app.core_app.alloc.free(v);
  
-+        // Clean up PBO state for this surface's FBO (Linux only)
++        // Clean up PBO state for this surface (Linux only)
++        // Use surface pointer as ID (not FBO ID which can be recycled)
 +        if (comptime builtin.target.os.tag == .linux) {
-+            if (self.core_surface.renderer.api.last_target) |target| {
-+                const egl_headless = @import("egl_headless.zig");
-+                egl_headless.cleanupPboState(target.framebuffer.id);
-+            }
++            const egl_headless = @import("egl_headless.zig");
++            egl_headless.cleanupPboState(@intFromPtr(self));
 +        }
 +
          // Remove ourselves from the list of known surfaces in the app.
          self.app.core_app.deleteSurface(self);
  
-@@ -781,6 +812,15 @@ pub const Surface = struct {
+@@ -781,6 +811,15 @@ pub const Surface = struct {
      }
  
      pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -824,7 +817,7 @@ index dcf8a6357..bac683c8b 100644
          // Runtimes sometimes generate superfluous resize events even
          // if the size did not actually change (SwiftUI). We check
          // that the size actually changed from what we last recorded
-@@ -2204,4 +2244,37 @@ pub const CAPI = struct {
+@@ -2204,4 +2243,44 @@ pub const CAPI = struct {
              }
          }
      };
@@ -845,13 +838,20 @@ index dcf8a6357..bac683c8b 100644
 +                // Path: Surface -> core_surface -> renderer -> api -> last_target -> framebuffer.id
 +                const fbo_id: c_uint = blk: {
 +                    const last_target = ptr.core_surface.renderer.api.last_target orelse {
-+                        // No target rendered yet
++                        // No target rendered yet - surface hasn't presented a frame
 +                        return false;
 +                    };
-+                    break :blk last_target.framebuffer.id;
++                    const id = last_target.framebuffer.id;
++                    // FBO ID 0 means default framebuffer (not our offscreen FBO)
++                    if (id == 0) return false;
++                    break :blk id;
 +                };
 +
-+                return egl_headless.readPixels(buffer, buffer_len, width, height, fbo_id);
++                // Use surface pointer as unique ID for PBO state management
++                // This prevents PBO state collisions when FBO IDs are recycled
++                const surface_id = @intFromPtr(ptr);
++
++                return egl_headless.readPixels(buffer, buffer_len, width, height, fbo_id, surface_id);
 +            }
 +            return false;
 +        }
