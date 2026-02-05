@@ -19,7 +19,7 @@ const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
 const auth = @import("auth.zig");
-const zip = @import("zip.zig");
+
 
 // Debug logging to stderr
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
@@ -38,12 +38,9 @@ const ghostty_stub = @import("ghostty_stub.zig");
 
 // Platform-specific C imports + ghostty
 const c = if (is_macos) @cImport({
-    @cInclude("libdeflate.h");
     @cInclude("ghostty.h");
     @cInclude("IOSurface/IOSurfaceRef.h");
 }) else @cImport({
-    // Linux: libghostty + libdeflate (no IOSurface)
-    @cInclude("libdeflate.h");
     @cInclude("ghostty.h");
 });
 
@@ -143,7 +140,7 @@ const MouseScrollMsg = packed struct {
 };
 
 
-// Control Channel Protocol (Binary + JSON fallback)
+// Control Channel Protocol (Binary)
 
 
 // Binary control message types (wire protocol)
@@ -172,10 +169,6 @@ pub const BinaryCtrlMsg = enum(u8) {
     close_panel = 0x81,
     resize_panel = 0x82,
     focus_panel = 0x83,
-    split_panel = 0x84,
-    inspector_subscribe = 0x85,
-    inspector_unsubscribe = 0x86,
-    inspector_tab = 0x87,
     view_action = 0x88,
     set_overview = 0x89,  // Set overview open/closed state
     set_quick_terminal = 0x8A,  // Set quick terminal open/closed state
@@ -194,27 +187,6 @@ pub const BinaryCtrlMsg = enum(u8) {
     add_passkey = 0x99,          // Add passkey credential
     remove_passkey = 0x9A,       // Remove passkey credential
 };
-
-// Control message types (text/JSON - legacy)
-pub const ControlMsgType = enum {
-    // Server → Client
-    panel_list,      // List of all panels
-    panel_created,   // New panel created
-    panel_closed,    // Panel was closed
-    panel_title,     // Panel title changed
-    panel_pwd,       // Panel working directory changed
-    panel_bell,      // Bell notification
-    layout_update,   // Split layout changed
-
-    // Client → Server
-    create_panel,    // Request new panel
-    close_panel,     // Close a panel
-    focus_panel,     // Set active panel
-    split_panel,     // Split current panel
-    create_tab,      // Create new tab
-    close_tab,       // Close a tab
-};
-
 
 // Layout Management (persisted to disk)
 
@@ -525,8 +497,20 @@ const InputEvent = union(enum) {
 // Import SharedMemory for Linux IPC
 const SharedMemory = @import("shared_memory").SharedMemory;
 
+/// Panel kind determines how a panel participates in layout and streaming.
+/// All panels are the same underlying struct, but their kind affects:
+/// - Whether they appear in the tab layout tree
+/// - Whether they stream when not in the active tab
+pub const PanelKind = enum(u8) {
+    /// Regular panel inside a tab's split tree
+    regular = 0,
+    /// Quick terminal panel (not in any tab, always streams when open)
+    quick_terminal = 1,
+};
+
 const Panel = struct {
     id: u32,
+    kind: PanelKind,
     surface: c.ghostty_surface_t,
     // Platform-specific fields (comptime selected)
     nsview: if (is_macos) objc.id else void,
@@ -557,7 +541,7 @@ const Panel = struct {
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
 
-    fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64, working_directory: ?[]const u8) !*Panel {
+    fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, kind: PanelKind) !*Panel {
         const panel = try allocator.create(Panel);
         errdefer allocator.destroy(panel);
 
@@ -633,6 +617,7 @@ const Panel = struct {
 
         panel.* = .{
             .id = id,
+            .kind = kind,
             .surface = surface,
             .nsview = nsview_val,
             .window = window_val,
@@ -1428,7 +1413,7 @@ const PanelRequest = struct {
     height: u32,
     scale: f64,
     inherit_cwd_from: u32, // Panel ID to inherit CWD from, 0 = use initial_cwd
-    is_quick_terminal: bool, // Don't add to layout if true
+    kind: PanelKind,
 };
 
 // Panel destruction request (to be processed on main thread)
@@ -1681,14 +1666,10 @@ const Server = struct {
     }
 
     fn createPanel(self: *Server, width: u32, height: u32, scale: f64) !*Panel {
-        return self.createPanelWithCwd(width, height, scale, self.initial_cwd);
+        return self.createPanelWithOptions(width, height, scale, self.initial_cwd, .regular);
     }
 
-    fn createPanelWithCwd(self: *Server, width: u32, height: u32, scale: f64, working_directory: ?[]const u8) !*Panel {
-        return self.createPanelWithCwdAndLayout(width, height, scale, working_directory, true);
-    }
-
-    fn createPanelWithCwdAndLayout(self: *Server, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, add_to_layout: bool) !*Panel {
+    fn createPanelWithOptions(self: *Server, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, kind: PanelKind) !*Panel {
         // Lazy init ghostty on first panel (scale to zero)
         // ensureGhosttyInit handles its own mutex
         try self.ensureGhosttyInit();
@@ -1703,11 +1684,11 @@ const Server = struct {
         const id = self.next_panel_id;
         self.next_panel_id += 1;
 
-        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory);
+        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory, kind);
         try self.panels.put(id, panel);
 
-        // Add to layout as a new tab (unless it's a special panel like quick terminal)
-        if (add_to_layout) {
+        // Only add to layout for regular panels (quick terminal lives outside the tab tree)
+        if (kind == .regular) {
             _ = self.layout.createTab(id) catch {};
         }
 
@@ -1736,7 +1717,7 @@ const Server = struct {
         const id = self.next_panel_id;
         self.next_panel_id += 1;
 
-        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory);
+        const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory, .regular);
         try self.panels.put(id, panel);
 
         // Add to layout as a split of the parent panel
@@ -1912,12 +1893,12 @@ const Server = struct {
                 },
                 .create_panel => {
                     // Create new panel: [msg_type:u8][width:u16][height:u16][scale:f32][inherit_panel_id:u32][flags:u8]?
-                    // flags: bit 0 = is_quick_terminal (don't add to layout)
+                    // flags: bit 0 = quick_terminal (don't add to layout)
                     var width: u32 = 800;
                     var height: u32 = 600;
                     var scale: f64 = 2.0;
                     var inherit_cwd_from: u32 = 0;
-                    var is_quick_terminal: bool = false;
+                    var kind: PanelKind = .regular;
                     if (data.len >= 5) {
                         width = std.mem.readInt(u16, data[1..3], .little);
                         height = std.mem.readInt(u16, data[3..5], .little);
@@ -1930,7 +1911,7 @@ const Server = struct {
                         inherit_cwd_from = std.mem.readInt(u32, data[9..13], .little);
                     }
                     if (data.len >= 14) {
-                        is_quick_terminal = (data[13] & 1) != 0;
+                        kind = if (data[13] & 1 != 0) .quick_terminal else .regular;
                     }
                     self.mutex.lock();
                     self.pending_panels.append(self.allocator, .{
@@ -1939,7 +1920,7 @@ const Server = struct {
                         .height = height,
                         .scale = scale,
                         .inherit_cwd_from = inherit_cwd_from,
-                        .is_quick_terminal = is_quick_terminal,
+                        .kind = kind,
                     }) catch {};
                     self.mutex.unlock();
                 },
@@ -2317,489 +2298,13 @@ const Server = struct {
 
         const msg_type = data[0];
         switch (msg_type) {
-            // File transfer
-            0x10 => self.handleBinaryFileUpload(conn, data[1..]),
-            0x11 => self.handleBinaryFileDownload(conn, data[1..]),
-            0x14 => self.handleBinaryFolderDownload(conn, data[1..]),
-            // Preview (dry-run)
-            0x17 => self.handleBinaryFilePreview(conn, data[1..]),
-            0x18 => self.handleBinaryFolderPreview(conn, data[1..]),
             // Client control messages
-            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B => {
+            0x81, 0x82, 0x83, 0x88, 0x89, 0x8A, 0x8B => {
                 self.handleBinaryControlMessageFromClient(conn, data);
             },
             else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
         }
     }
-
-    // Binary file upload: [panel_id:u32][name_len:u16][name][compressed_data]
-    fn handleBinaryFileUpload(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        if (data.len < 6) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const panel_id = std.mem.readInt(u32, data[0..4], .little);
-        const name_len = std.mem.readInt(u16, data[4..6], .little);
-
-        if (data.len < 6 + name_len) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const filename = data[6 .. 6 + name_len];
-        const compressed_data = data[6 + name_len ..];
-
-        // Get panel's cwd
-        self.mutex.lock();
-        const panel = self.panels.get(panel_id);
-        self.mutex.unlock();
-
-        if (panel == null) {
-            self.sendBinaryFileError(conn, "Panel not found");
-            return;
-        }
-
-        const cwd = panel.?.pwd;
-        if (cwd.len == 0) {
-            self.sendBinaryFileError(conn, "No working directory");
-            return;
-        }
-
-        // Build full path
-        var path_buf: [4096]u8 = undefined;
-        const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cwd, filename }) catch {
-            self.sendBinaryFileError(conn, "Path too long");
-            return;
-        };
-
-        // Decompress with libdeflate
-        const decompressor = c.libdeflate_alloc_decompressor() orelse {
-            self.sendBinaryFileError(conn, "Decompressor init failed");
-            return;
-        };
-        defer c.libdeflate_free_decompressor(decompressor);
-
-        // Allocate buffer for decompressed data (use 100x ratio for text files)
-        const max_decompressed = @max(compressed_data.len * 100, 1024 * 1024);
-        const capped = @min(max_decompressed, 100 * 1024 * 1024);
-        const decompressed = self.allocator.alloc(u8, capped) catch {
-            self.sendBinaryFileError(conn, "Out of memory");
-            return;
-        };
-        defer self.allocator.free(decompressed);
-
-        var actual_size: usize = 0;
-        const result = c.libdeflate_deflate_decompress(
-            decompressor,
-            compressed_data.ptr,
-            compressed_data.len,
-            decompressed.ptr,
-            decompressed.len,
-            &actual_size,
-        );
-
-        // 0=SUCCESS, 1=BAD_DATA, 2=SHORT_OUTPUT, 3=INSUFFICIENT_SPACE
-        if (result != 0) {
-            std.log.err("Upload decompression failed: result={d}, compressed_size={d}", .{ result, compressed_data.len });
-            const err_msg = switch (result) {
-                1 => "Upload failed: corrupted data",
-                2 => "Upload failed: incomplete data",
-                3 => "Upload failed: file too large",
-                else => "Upload failed: decompression error",
-            };
-            self.sendBinaryFileError(conn, err_msg);
-            return;
-        }
-
-        // Create parent directories if needed (for folder uploads)
-        if (std.mem.lastIndexOfScalar(u8, full_path, '/')) |last_slash| {
-            const dir_path = full_path[0..last_slash];
-            std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
-                error.PathAlreadyExists => {}, // Directory exists, that's fine
-                else => {
-                    // Try recursive mkdir
-                    var i: usize = 0;
-                    while (i < dir_path.len) {
-                        if (std.mem.indexOfScalarPos(u8, dir_path, i + 1, '/')) |next_slash| {
-                            std.fs.makeDirAbsolute(dir_path[0..next_slash]) catch |e| switch (e) {
-                                error.PathAlreadyExists => {},
-                                else => {},
-                            };
-                            i = next_slash;
-                        } else {
-                            std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
-                                error.PathAlreadyExists => {},
-                                else => {
-                                    self.sendBinaryFileError(conn, "Cannot create directory");
-                                    return;
-                                },
-                            };
-                            break;
-                        }
-                    }
-                },
-            };
-        }
-
-        // Write file
-        const file = std.fs.createFileAbsolute(full_path, .{}) catch {
-            self.sendBinaryFileError(conn, "Cannot create file");
-            return;
-        };
-        defer file.close();
-
-        file.writeAll(decompressed[0..actual_size]) catch {
-            self.sendBinaryFileError(conn, "Write failed");
-            return;
-        };
-
-        // Send success (use simple JSON for success since it's small)
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"file_upload_result\",\"filename\":\"{s}\",\"success\":true}}", .{filename}) catch return;
-        conn.sendText(msg) catch {};
-        std.log.info("File uploaded: {s} ({d} bytes compressed -> {d} bytes)", .{ full_path, compressed_data.len, actual_size });
-    }
-
-    // Binary file download: [panel_id:u32][path_len:u16][path]
-    // Response: [0x12][name_len:u16][name][compressed_data]
-    // Error: [0x13][error_len:u16][error]
-    fn handleBinaryFileDownload(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        if (data.len < 6) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const panel_id = std.mem.readInt(u32, data[0..4], .little);
-        const path_len = std.mem.readInt(u16, data[4..6], .little);
-
-        if (data.len < 6 + path_len) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        var path = data[6 .. 6 + path_len];
-
-        // Get panel for cwd resolution
-        self.mutex.lock();
-        const panel = self.panels.get(panel_id);
-        self.mutex.unlock();
-
-        // Expand ~ or relative paths
-        var resolved_path_buf: [4096]u8 = undefined;
-        var resolved_path: []const u8 = path;
-
-        if (path.len > 0 and path[0] == '~') {
-            const home = std.posix.getenv("HOME") orelse "/tmp";
-            if (path.len > 1 and path[1] == '/') {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
-            } else {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
-            }
-        } else if (path.len > 0 and path[0] != '/') {
-            if (panel) |p| {
-                if (p.pwd.len > 0) {
-                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
-                }
-            }
-        }
-
-        const filename = std.fs.path.basename(resolved_path);
-
-        // Read file
-        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch {
-            self.sendBinaryFileError(conn, "Cannot open file");
-            return;
-        };
-        defer file.close();
-
-        const stat = file.stat() catch {
-            self.sendBinaryFileError(conn, "Cannot stat file");
-            return;
-        };
-
-        if (stat.size > 100 * 1024 * 1024) {
-            self.sendBinaryFileError(conn, "File too large (max 100MB)");
-            return;
-        }
-
-        const file_data = file.readToEndAlloc(self.allocator, 100 * 1024 * 1024) catch {
-            self.sendBinaryFileError(conn, "Read failed");
-            return;
-        };
-        defer self.allocator.free(file_data);
-
-        // Send uncompressed - WebSocket permessage-deflate handles compression
-        // Format: [0x12][name_len:u16][name][file_data]
-        const msg_len = 1 + 2 + filename.len + file_data.len;
-        const msg = self.allocator.alloc(u8, msg_len) catch {
-            self.sendBinaryFileError(conn, "Out of memory");
-            return;
-        };
-        defer self.allocator.free(msg);
-
-        msg[0] = 0x12; // file_data type
-        std.mem.writeInt(u16, msg[1..3], @intCast(filename.len), .little);
-        @memcpy(msg[3 .. 3 + filename.len], filename);
-        @memcpy(msg[3 + filename.len ..], file_data);
-
-        conn.sendBinary(msg) catch {
-            std.log.err("Failed to send file data", .{});
-            return;
-        };
-        std.log.info("File downloaded: {s} ({d} bytes)", .{ resolved_path, file_data.len });
-    }
-
-    fn sendBinaryFileError(self: *Server, conn: *ws.Connection, err: []const u8) void {
-        _ = self;
-        // Error format: [0x13][error_len:u16][error]
-        var buf: [256]u8 = undefined;
-        buf[0] = 0x13;
-        std.mem.writeInt(u16, buf[1..3], @intCast(err.len), .little);
-        @memcpy(buf[3..][0..err.len], err);
-        conn.sendBinary(buf[0 .. 3 + err.len]) catch {};
-    }
-
-    // Binary folder download: [panel_id:u32][path_len:u16][path]
-    // Response: [0x15][name_len:u16][name.zip][zip_data]
-    fn handleBinaryFolderDownload(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        if (data.len < 6) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const panel_id = std.mem.readInt(u32, data[0..4], .little);
-        const path_len = std.mem.readInt(u16, data[4..6], .little);
-
-        if (data.len < 6 + path_len) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const path = data[6 .. 6 + path_len];
-
-        // Get panel for cwd resolution
-        self.mutex.lock();
-        const panel = self.panels.get(panel_id);
-        self.mutex.unlock();
-
-        // Expand ~ or relative paths
-        var resolved_path_buf: [4096]u8 = undefined;
-        var resolved_path: []const u8 = path;
-
-        if (path.len > 0 and path[0] == '~') {
-            const home = std.posix.getenv("HOME") orelse "/tmp";
-            if (path.len > 1 and path[1] == '/') {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
-            } else {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
-            }
-        } else if (path.len > 0 and path[0] != '/') {
-            if (panel) |p| {
-                if (p.pwd.len > 0) {
-                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
-                }
-            }
-        }
-
-        // Check if it's a directory
-        var dir = std.fs.openDirAbsolute(resolved_path, .{}) catch {
-            self.sendBinaryFileError(conn, "Cannot open directory");
-            return;
-        };
-        dir.close();
-
-        // Get folder name for zip filename
-        const folder_name = std.fs.path.basename(resolved_path);
-        var zip_name_buf: [256]u8 = undefined;
-        const zip_name = std.fmt.bufPrint(&zip_name_buf, "{s}.zip", .{folder_name}) catch {
-            self.sendBinaryFileError(conn, "Path too long");
-            return;
-        };
-
-        // Create zip
-        const zip_data = zip.zipDirectory(self.allocator, resolved_path, folder_name) catch {
-            self.sendBinaryFileError(conn, "Failed to create zip");
-            return;
-        };
-        defer self.allocator.free(zip_data);
-
-        // Build response: [0x15][name_len:u16][name.zip][zip_data]
-        const msg_len = 1 + 2 + zip_name.len + zip_data.len;
-        const msg = self.allocator.alloc(u8, msg_len) catch {
-            self.sendBinaryFileError(conn, "Out of memory");
-            return;
-        };
-        defer self.allocator.free(msg);
-
-        msg[0] = 0x15; // folder_data type (zip)
-        std.mem.writeInt(u16, msg[1..3], @intCast(zip_name.len), .little);
-        @memcpy(msg[3 .. 3 + zip_name.len], zip_name);
-        @memcpy(msg[3 + zip_name.len ..], zip_data);
-
-        conn.sendBinary(msg) catch {
-            std.log.err("Failed to send folder zip", .{});
-            return;
-        };
-        std.log.info("Folder downloaded: {s} -> {s} ({d} bytes)", .{ resolved_path, zip_name, zip_data.len });
-    }
-
-    // Binary file preview (dry-run): [panel_id:u32][path_len:u16][path]
-    // Response: [0x19][name_len:u16][name][size:u64]
-    fn handleBinaryFilePreview(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        if (data.len < 6) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const panel_id = std.mem.readInt(u32, data[0..4], .little);
-        const path_len = std.mem.readInt(u16, data[4..6], .little);
-
-        if (data.len < 6 + path_len) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        var path = data[6 .. 6 + path_len];
-
-        // Get panel for cwd resolution
-        self.mutex.lock();
-        const panel = self.panels.get(panel_id);
-        self.mutex.unlock();
-
-        // Expand ~ or relative paths
-        var resolved_path_buf: [4096]u8 = undefined;
-        var resolved_path: []const u8 = path;
-
-        if (path.len > 0 and path[0] == '~') {
-            const home = std.posix.getenv("HOME") orelse "/tmp";
-            if (path.len > 1 and path[1] == '/') {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
-            } else {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
-            }
-        } else if (path.len > 0 and path[0] != '/') {
-            if (panel) |p| {
-                if (p.pwd.len > 0) {
-                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
-                }
-            }
-        }
-
-        const filename = std.fs.path.basename(resolved_path);
-
-        // Stat file to get size
-        const file = std.fs.openFileAbsolute(resolved_path, .{}) catch {
-            self.sendBinaryFileError(conn, "Cannot open file");
-            return;
-        };
-        defer file.close();
-
-        const stat = file.stat() catch {
-            self.sendBinaryFileError(conn, "Cannot stat file");
-            return;
-        };
-
-        // Send preview response: [0x19][name_len:u16][name][size:u64]
-        var buf: [512]u8 = undefined;
-        buf[0] = 0x19; // file_preview type
-        std.mem.writeInt(u16, buf[1..3], @intCast(filename.len), .little);
-        @memcpy(buf[3 .. 3 + filename.len], filename);
-        std.mem.writeInt(u64, buf[3 + filename.len ..][0..8], stat.size, .little);
-
-        conn.sendBinary(buf[0 .. 3 + filename.len + 8]) catch {
-            std.log.err("Failed to send file preview", .{});
-        };
-    }
-
-    // Binary folder preview (dry-run): [panel_id:u32][path_len:u16][path]
-    // Response: [0x1A][name_len:u16][name.zip][size:u64][file_count:u32]
-    fn handleBinaryFolderPreview(self: *Server, conn: *ws.Connection, data: []const u8) void {
-        if (data.len < 6) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const panel_id = std.mem.readInt(u32, data[0..4], .little);
-        const path_len = std.mem.readInt(u16, data[4..6], .little);
-
-        if (data.len < 6 + path_len) {
-            self.sendBinaryFileError(conn, "Invalid message");
-            return;
-        }
-
-        const path = data[6 .. 6 + path_len];
-
-        // Get panel for cwd resolution
-        self.mutex.lock();
-        const panel = self.panels.get(panel_id);
-        self.mutex.unlock();
-
-        // Expand ~ or relative paths
-        var resolved_path_buf: [4096]u8 = undefined;
-        var resolved_path: []const u8 = path;
-
-        if (path.len > 0 and path[0] == '~') {
-            const home = std.posix.getenv("HOME") orelse "/tmp";
-            if (path.len > 1 and path[1] == '/') {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
-            } else {
-                resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}", .{home}) catch path;
-            }
-        } else if (path.len > 0 and path[0] != '/') {
-            if (panel) |p| {
-                if (p.pwd.len > 0) {
-                    resolved_path = std.fmt.bufPrint(&resolved_path_buf, "{s}/{s}", .{ p.pwd, path }) catch path;
-                }
-            }
-        }
-
-        const folder_name = std.fs.path.basename(resolved_path);
-        var zip_name_buf: [256]u8 = undefined;
-        const zip_name = std.fmt.bufPrint(&zip_name_buf, "{s}.zip", .{folder_name}) catch "folder.zip";
-
-        // Open directory and count files + total size
-        var dir = std.fs.openDirAbsolute(resolved_path, .{ .iterate = true }) catch {
-            self.sendBinaryFileError(conn, "Cannot open directory");
-            return;
-        };
-        defer dir.close();
-
-        var total_size: u64 = 0;
-        var file_count: u32 = 0;
-
-        var walker = dir.walk(self.allocator) catch {
-            self.sendBinaryFileError(conn, "Cannot iterate directory");
-            return;
-        };
-        defer walker.deinit();
-
-        while (walker.next() catch null) |entry| {
-            if (entry.kind == .file) {
-                file_count += 1;
-                // Get file size
-                if (dir.statFile(entry.path)) |stat| {
-                    total_size += stat.size;
-                } else |_| {}
-            }
-        }
-
-        // Estimate zip size (rough compression estimate: 60% of original)
-        const estimated_zip_size = total_size * 6 / 10;
-
-        // Send preview response: [0x1A][name_len:u16][name.zip][size:u64][file_count:u32]
-        var buf: [512]u8 = undefined;
-        buf[0] = 0x1A; // folder_preview type
-        std.mem.writeInt(u16, buf[1..3], @intCast(zip_name.len), .little);
-        @memcpy(buf[3 .. 3 + zip_name.len], zip_name);
-        std.mem.writeInt(u64, buf[3 + zip_name.len ..][0..8], estimated_zip_size, .little);
-        std.mem.writeInt(u32, buf[3 + zip_name.len + 8 ..][0..4], file_count, .little);
-
-        conn.sendBinary(buf[0 .. 3 + zip_name.len + 12]) catch {
-            std.log.err("Failed to send folder preview", .{});
-        };
-    }
-
 
     fn broadcastInspectorUpdates(self: *Server) void {
         self.mutex.lock();
@@ -3341,12 +2846,23 @@ const Server = struct {
         if (file_data.file_index >= session.files.items.len) return;
         const file_entry = session.files.items[file_data.file_index];
 
-        // Decompress the data
-        const uncompressed = session.decompress(file_data.compressed_data, file_data.uncompressed_size) catch |err| {
-            std.debug.print("Failed to decompress file data: {}\n", .{err});
-            return;
+        // Decompress the data (detect zstd by magic bytes, otherwise assume raw)
+        const is_zstd = file_data.compressed_data.len >= 4 and
+            file_data.compressed_data[0] == 0x28 and file_data.compressed_data[1] == 0xB5 and
+            file_data.compressed_data[2] == 0x2F and file_data.compressed_data[3] == 0xFD;
+
+        var uncompressed_owned = false;
+        const uncompressed = if (is_zstd)
+            session.decompress(file_data.compressed_data, file_data.uncompressed_size) catch |err| {
+                std.debug.print("Failed to decompress file data: {}\n", .{err});
+                return;
+            }
+        else blk: {
+            // Data sent uncompressed (browser has no zstd compressor yet)
+            uncompressed_owned = false;
+            break :blk file_data.compressed_data;
         };
-        defer self.allocator.free(uncompressed);
+        defer if (uncompressed_owned or is_zstd) self.allocator.free(uncompressed);
 
         // Build full path
         const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ session.base_path, file_entry.path }) catch return;
@@ -3496,9 +3012,7 @@ const Server = struct {
                 break :blk self.initial_cwd;
             } else self.initial_cwd;
 
-            // Quick terminal panels don't get added to layout
-            const add_to_layout = !req.is_quick_terminal;
-            const panel = self.createPanelWithCwdAndLayout(req.width, req.height, req.scale, working_dir, add_to_layout) catch {
+            const panel = self.createPanelWithOptions(req.width, req.height, req.scale, working_dir, req.kind) catch {
                 continue;
             };
 
@@ -3510,8 +3024,8 @@ const Server = struct {
             self.mutex.unlock();
 
             self.broadcastPanelCreated(panel.id);
-            // Only broadcast layout update if we modified the layout
-            if (add_to_layout) {
+            // Only broadcast layout update for regular panels (quick terminal is outside layout)
+            if (req.kind == .regular) {
                 self.broadcastLayoutUpdate();
             }
 
@@ -3776,9 +3290,9 @@ const Server = struct {
                             break;
                         }
                     }
-                    // Panels not in any tab (e.g. quick terminal) are active when streaming
-                    if (!in_active and is_streaming) {
-                        in_active = self.layout.findTabByPanel(panel.id) == null;
+                    // Quick terminal panels are always active when streaming
+                    if (!in_active and is_streaming and panel.kind == .quick_terminal) {
+                        in_active = true;
                     }
 
                     // Skip panels not in active tab (unless preview needs them)

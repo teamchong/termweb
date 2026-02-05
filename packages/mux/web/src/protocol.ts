@@ -26,13 +26,9 @@ export const FrameType = {
 
 // Binary control message types (client -> server)
 export const BinaryCtrlMsg = {
-  FILE_UPLOAD: 0x10,
-  FILE_DOWNLOAD: 0x11,
-  FOLDER_DOWNLOAD: 0x14,
   CLOSE_PANEL: 0x81,
   RESIZE_PANEL: 0x82,
   FOCUS_PANEL: 0x83,
-  SPLIT_PANEL: 0x84,
   VIEW_ACTION: 0x88,
   SET_OVERVIEW: 0x89,  // Set overview open/closed state
   SET_QUICK_TERMINAL: 0x8A,  // Set quick terminal open/closed state
@@ -49,13 +45,6 @@ export const BinaryCtrlMsg = {
   REVOKE_SHARE_LINK: 0x98,
   GET_SESSION_LIST: 0x99,
   GET_SHARE_LINKS: 0x9A,
-} as const;
-
-// Server -> client file response types
-export const FileResponseType = {
-  FILE_DATA: 0x12,
-  FILE_ERROR: 0x13,
-  FOLDER_DATA: 0x15,
 } as const;
 
 // Server -> client auth response types

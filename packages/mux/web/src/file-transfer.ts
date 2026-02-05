@@ -553,21 +553,12 @@ export class FileTransferHandler {
       try {
         return await this.compressionPool.compress(data, FILE_TRANSFER.COMPRESSION_LEVEL);
       } catch (err) {
-        console.warn('zstd compression failed, falling back to deflate:', err);
+        console.warn('zstd compression failed, sending uncompressed:', err);
       }
     }
 
-    // Fall back to built-in deflate
-    try {
-      const cs = new CompressionStream('deflate-raw');
-      const writer = cs.writable.getWriter();
-      // Ensure data is backed by regular ArrayBuffer (not SharedArrayBuffer)
-      writer.write(new Uint8Array(data));
-      await writer.close();
-      return collectStreamChunks(cs.readable);
-    } catch (err) {
-      throw new Error(`Compression failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    // Send uncompressed - server detects by checking zstd magic bytes
+    return data;
   }
 
   private async decompress(data: Uint8Array): Promise<Uint8Array> {

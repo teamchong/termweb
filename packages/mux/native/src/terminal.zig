@@ -18,12 +18,9 @@ const PtyTerminal = if (is_linux) @import("pty_terminal.zig").Terminal else void
 
 // C imports for macOS
 pub const c = if (is_macos) @cImport({
-    @cInclude("libdeflate.h");
     @cInclude("ghostty.h");
     @cInclude("IOSurface/IOSurfaceRef.h");
-}) else @cImport({
-    @cInclude("libdeflate.h");
-});
+}) else @cImport({});
 
 // Objective-C runtime (macOS only)
 pub const objc = if (is_macos) @cImport({
