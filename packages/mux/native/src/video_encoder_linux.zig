@@ -89,6 +89,8 @@ const SLICE_RefPicList1: usize = 1188; // 32 * VAPictureH264
 const SLICE_cabac_init_idc: usize = 3118; // u8
 const SLICE_slice_qp_delta: usize = 3119; // i8
 const SLICE_disable_deblocking_filter_idc: usize = 3120; // u8
+const SLICE_slice_alpha_c0_offset_div2: usize = 3121; // i8
+const SLICE_slice_beta_offset_div2: usize = 3122; // i8
 
 // Struct field offsets for VAPictureH264
 const PICH264_picture_id: usize = 0; // u32
@@ -353,7 +355,7 @@ pub const VideoEncoder = struct {
     rgba_height: u32,
     has_vpp: bool,
 
-    const MAX_OUTPUT_SIZE = 4 * 1024 * 1024; // 4MB max per frame
+    const MAX_OUTPUT_SIZE = 16 * 1024 * 1024; // 16MB max per frame (low QP keyframes can be large)
     const MAX_PIXELS: u64 = 2048 * 2048; // Reduced for fast encode
 
     // Quality presets - FPS fixed at 30, only bitrate varies
@@ -579,8 +581,8 @@ pub const VideoEncoder = struct {
         bs.writeBits(0, 1);
         // weighted_bipred_idc = 0
         bs.writeBits(0, 2);
-        // pic_init_qp_minus26 = 0
-        bs.writeSE(0);
+        // pic_init_qp_minus26 = -6 (so pic_init_qp = 20, matching encoder param)
+        bs.writeSE(-6);
         // pic_init_qs_minus26 = 0
         bs.writeSE(0);
         // chroma_qp_index_offset = 0
@@ -692,7 +694,8 @@ pub const VideoEncoder = struct {
         var actual_rgba_h: u32 = 0;
         const has_vpp = shared.has_vpp;
         if (has_vpp) vpp_blk: {
-            // Create BGRX surface at encode resolution (universally supported format)
+            // Create BGRX surface at source resolution for GPU-accelerated
+            // scaling + color conversion via VPP (avoids CPU downscale loop)
             var rgba_attribs = [_]c.VASurfaceAttrib{
                 .{
                     .type = c.VASurfaceAttribPixelFormat,
@@ -703,8 +706,8 @@ pub const VideoEncoder = struct {
             status = c.vaCreateSurfaces(
                 va_display,
                 c.VA_RT_FORMAT_RGB32,
-                encode_width,
-                encode_height,
+                width,
+                height,
                 @ptrCast(&rgba_surface),
                 1,
                 &rgba_attribs,
@@ -714,10 +717,11 @@ pub const VideoEncoder = struct {
                 std.debug.print("ENCODER: VPP BGRX surface failed: {}, falling back to CPU\n", .{status});
                 break :vpp_blk;
             }
-            actual_rgba_w = encode_width;
-            actual_rgba_h = encode_height;
+            actual_rgba_w = width;
+            actual_rgba_h = height;
 
-            // Create VPP context at encode resolution (no scaling needed)
+            // Create VPP context at encode resolution (output size).
+            // Input BGRX surface is larger but VPP handles scaling via regions.
             status = c.vaCreateContext(
                 va_display,
                 shared.vpp_config,
@@ -884,7 +888,7 @@ pub const VideoEncoder = struct {
         self.source_height = height;
         self.frame_count = 0;
 
-        // Recreate VPP resources at new encode resolution
+        // Recreate VPP resources at source resolution (VPP does scaling on GPU)
         if (self.shared.has_vpp) vpp_blk: {
             var rgba_attribs = [_]c.VASurfaceAttrib{
                 .{
@@ -893,15 +897,15 @@ pub const VideoEncoder = struct {
                     .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = @as(c_int, @bitCast(@as(u32, c.VA_FOURCC_BGRX))) } },
                 },
             };
-            status = c.vaCreateSurfaces(va_display, c.VA_RT_FORMAT_RGB32, encode_width, encode_height, @ptrCast(&self.rgba_surface), 1, &rgba_attribs, 1);
+            status = c.vaCreateSurfaces(va_display, c.VA_RT_FORMAT_RGB32, width, height, @ptrCast(&self.rgba_surface), 1, &rgba_attribs, 1);
             if (status != c.VA_STATUS_SUCCESS) break :vpp_blk;
             status = c.vaCreateContext(va_display, self.shared.vpp_config, @intCast(encode_width), @intCast(encode_height), c.VA_PROGRESSIVE, @ptrCast(&self.rgba_surface), 1, &self.vpp_context);
             if (status != c.VA_STATUS_SUCCESS) {
                 _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
                 break :vpp_blk;
             }
-            self.rgba_width = encode_width;
-            self.rgba_height = encode_height;
+            self.rgba_width = width;
+            self.rgba_height = height;
             self.has_vpp = true;
         }
 
@@ -919,16 +923,14 @@ pub const VideoEncoder = struct {
         return self.uploadFrameCpu(rgba_data);
     }
 
-    /// GPU path: CPU does R↔B swap + nearest-neighbor downscale to BGRX surface
-    /// at encode resolution, then VPP converts BGRX→NV12 on GPU (no scaling).
+    /// GPU path: CPU does R↔B byte swap (RGBA→BGRX) at source resolution,
+    /// then VPP does both downscale and NV12 conversion on GPU.
     fn uploadFrameGpu(self: *VideoEncoder, rgba_data: []const u8) VaError!void {
         const va_display = self.shared.va_display;
-        const dst_width = self.width;
-        const dst_height = self.height;
         const src_width = self.source_width;
         const src_height = self.source_height;
 
-        // Derive image from BGRX surface for direct memory write
+        // Derive image from BGRX surface (source resolution) for direct memory write
         var image: c.VAImage = undefined;
         var status = c.vaDeriveImage(va_display, self.rgba_surface, &image);
         if (status != c.VA_STATUS_SUCCESS) {
@@ -945,46 +947,25 @@ pub const VideoEncoder = struct {
         const pitch = image.pitches[0];
         const offset = image.offsets[0];
 
-        // R↔B swap + 2x2 box-filter downscale from source to encode resolution.
-        // Uses fixed-point 16.16 integer math to avoid per-pixel float conversions.
-        // Reads source as u32 words and uses bitmasked extraction for speed.
+        // R↔B byte swap only (no downscaling). Read/write u32 words.
+        // GL gives RGBA (R=byte0), VA-API wants BGRX (B=byte0).
+        // Swap: 0xAABBGGRR → 0xFFRRGGBB
         const src_pixels: [*]align(1) const u32 = @ptrCast(rgba_data.ptr);
-        const src_stride_px = @as(usize, src_width); // stride in pixels (u32 words)
         const dst_pixels: [*]align(1) u32 = @ptrCast(mapped + offset);
-        const dst_stride_px = @as(usize, pitch) / 4; // pitch in pixels (u32 words)
-
-        // Fixed-point 16.16 scale factors
-        const fp_shift = 16;
-        const fp_scale_x = (@as(u64, src_width) << fp_shift) / @as(u64, dst_width);
-        const fp_scale_y = (@as(u64, src_height) << fp_shift) / @as(u64, dst_height);
-        const src_max_x = src_width - 1;
-        const src_max_y = src_height - 1;
+        const dst_stride_px = @as(usize, pitch) / 4;
+        const src_stride_px = @as(usize, src_width);
 
         var y: u32 = 0;
-        while (y < dst_height) : (y += 1) {
-            const sy: u32 = @intCast(@min(@as(u64, y) * fp_scale_y >> fp_shift, src_max_y));
-            const sy1: u32 = @min(sy + 1, src_max_y);
-            const row0 = @as(usize, sy) * src_stride_px;
-            const row1 = @as(usize, sy1) * src_stride_px;
+        while (y < src_height) : (y += 1) {
+            const src_row = @as(usize, y) * src_stride_px;
             const dst_row = @as(usize, y) * dst_stride_px;
-
             var x: u32 = 0;
-            while (x < dst_width) : (x += 1) {
-                const sx: u32 = @intCast(@min(@as(u64, x) * fp_scale_x >> fp_shift, src_max_x));
-                const sx1: u32 = @min(sx + 1, src_max_x);
-
-                // Read 4 source pixels as u32 (RGBA byte order from GL)
-                const p00 = src_pixels[row0 + sx];
-                const p01 = src_pixels[row0 + sx1];
-                const p10 = src_pixels[row1 + sx];
-                const p11 = src_pixels[row1 + sx1];
-
-                // Average each channel via bitmask extraction
-                const r = ((p00 & 0xFF) + (p01 & 0xFF) + (p10 & 0xFF) + (p11 & 0xFF) + 2) >> 2;
-                const g = (((p00 >> 8) & 0xFF) + ((p01 >> 8) & 0xFF) + ((p10 >> 8) & 0xFF) + ((p11 >> 8) & 0xFF) + 2) >> 2;
-                const b = (((p00 >> 16) & 0xFF) + ((p01 >> 16) & 0xFF) + ((p10 >> 16) & 0xFF) + ((p11 >> 16) & 0xFF) + 2) >> 2;
-
-                // Write BGRX as single u32: 0xFF_RR_GG_BB
+            while (x < src_width) : (x += 1) {
+                const px = src_pixels[src_row + x];
+                // Swap R and B channels: RGBA→BGRA, set alpha to 0xFF for X
+                const r = px & 0xFF;
+                const g = (px >> 8) & 0xFF;
+                const b = (px >> 16) & 0xFF;
                 dst_pixels[dst_row + x] = b | (g << 8) | (r << 16) | 0xFF000000;
             }
         }
@@ -992,9 +973,23 @@ pub const VideoEncoder = struct {
         status = c.vaUnmapBuffer(va_display, image.buf);
         if (status != c.VA_STATUS_SUCCESS) return error.VaMapFailed;
 
-        // VPP: convert BGRX → NV12 on GPU (no scaling, same resolution).
+        // VPP: downscale BGRX (source res) → NV12 (encode res) on GPU.
+        var src_region = c.VARectangle{
+            .x = 0,
+            .y = 0,
+            .width = @intCast(src_width),
+            .height = @intCast(src_height),
+        };
+        var dst_region = c.VARectangle{
+            .x = 0,
+            .y = 0,
+            .width = @intCast(self.width),
+            .height = @intCast(self.height),
+        };
         var pipeline_param = std.mem.zeroes(c.VAProcPipelineParameterBuffer);
         pipeline_param.surface = self.rgba_surface;
+        pipeline_param.surface_region = &src_region;
+        pipeline_param.output_region = &dst_region;
         pipeline_param.surface_color_standard = c.VAProcColorStandardNone;
         pipeline_param.output_color_standard = c.VAProcColorStandardBT601;
 
@@ -1207,7 +1202,7 @@ pub const VideoEncoder = struct {
         writeU8(&pic_param, PIC_seq_parameter_set_id, 0);
         // frame_num: 0 for IDR, increments for P-frames (mod max_frame_num)
         writeU16(&pic_param, PIC_frame_num, if (is_keyframe) 0 else @intCast(@mod(self.frame_count, 16)));
-        // Lower QP = higher quality. 18-22 is high quality for terminal text.
+        // Lower QP = higher quality. 14 minimizes ringing artifacts around text.
         // Default H.264 is 26, but terminals need sharp text, not smooth video.
         writeU8(&pic_param, PIC_pic_init_qp, 20);
         writeU8(&pic_param, PIC_num_ref_idx_l0_active_minus1, 0);
@@ -1279,8 +1274,12 @@ pub const VideoEncoder = struct {
         }
 
         writeU8(&slice_param, SLICE_cabac_init_idc, 0);
-        writeI8(&slice_param, SLICE_slice_qp_delta, 0);
+        writeI8(&slice_param, SLICE_slice_qp_delta, -4);
         writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 0);
+        // Increase deblocking strength to reduce ringing/glow around sharp text edges.
+        // Range: -6 to +6, positive = stronger deblocking.
+        writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 3);
+        writeI8(&slice_param, SLICE_slice_beta_offset_div2, 3);
 
         var slice_buf: c.VABufferID = 0;
         status = vaCreateBuffer(
