@@ -14,6 +14,9 @@ export const ClientMsg = {
   CONNECT_PANEL: 0x20,
   CREATE_PANEL: 0x21,
   SPLIT_PANEL: 0x22, // Create panel as split of existing panel (panel WebSocket)
+  INSPECTOR_SUBSCRIBE: 0x30,   // Subscribe to inspector: [msg_type:u8][tab_len:u8][tab:...]
+  INSPECTOR_UNSUBSCRIBE: 0x31, // Unsubscribe from inspector: [msg_type:u8]
+  INSPECTOR_TAB: 0x32,         // Change inspector tab: [msg_type:u8][tab_len:u8][tab:...]
 } as const;
 
 export const FrameType = {
@@ -30,9 +33,6 @@ export const BinaryCtrlMsg = {
   RESIZE_PANEL: 0x82,
   FOCUS_PANEL: 0x83,
   SPLIT_PANEL: 0x84,
-  INSPECTOR_SUBSCRIBE: 0x85,
-  INSPECTOR_UNSUBSCRIBE: 0x86,
-  INSPECTOR_TAB: 0x87,
   VIEW_ACTION: 0x88,
   SET_OVERVIEW: 0x89,  // Set overview open/closed state
   SET_QUICK_TERMINAL: 0x8A,  // Set quick terminal open/closed state

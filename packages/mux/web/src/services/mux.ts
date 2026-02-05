@@ -466,13 +466,6 @@ export class MuxClient {
   selectTab(tabId: string): void {
     const tab = this.tabInstances.get(tabId);
     if (!tab) return;
-    for (const t of this.tabInstances.values()) {
-      t.element.classList.remove('active');
-    }
-    tab.element.classList.add('active');
-    activeTabIdStore.set(tabId);
-    this.tabHistory = this.tabHistory.filter(id => id !== tabId);
-    this.tabHistory.push(tabId);
     const allPanels = tab.root.getAllPanels();
     if (allPanels.length > 0) {
       this.setActivePanel(allPanels[0] as PanelInstance);
@@ -531,7 +524,6 @@ export class MuxClient {
         serverId,
         isQuickTerminal,
         splitInfo,
-        onViewAction: (action: string, data?: unknown) => this.handleViewAction(panelId, action, data),
         onStatusChange: (status: PanelStatus) => panels.updatePanel(panelId, { status }),
         onTitleChange: (title: string) => {
           panels.updatePanel(panelId, { title });
@@ -613,6 +605,26 @@ export class MuxClient {
       activePanelId.set(panel.id);
       this.currentActivePanel = panel;
       panel.focus();
+
+      // Derive active tab from the panel's tab
+      const tabId = this.findTabIdForPanel(panel);
+      if (tabId && tabId !== get(activeTabIdStore)) {
+        for (const t of this.tabInstances.values()) {
+          t.element.classList.remove('active');
+        }
+        const tab = this.tabInstances.get(tabId);
+        if (tab) tab.element.classList.add('active');
+        activeTabIdStore.set(tabId);
+        this.tabHistory = this.tabHistory.filter(id => id !== tabId);
+        this.tabHistory.push(tabId);
+      }
+
+      // Notify server so it persists the active panel/tab
+      if (panel.serverId !== null) {
+        const data = new Uint8Array(4);
+        new DataView(data.buffer).setUint32(0, panel.serverId, true);
+        this.sendControlMessage(BinaryCtrlMsg.FOCUS_PANEL, data);
+      }
     } else {
       activePanelId.set(null);
       this.currentActivePanel = null;
@@ -665,21 +677,6 @@ export class MuxClient {
     this.closePanel(panelId);
   }
 
-  private handleViewAction(panelId: string, action: string, _data?: unknown): void {
-    const panel = this.panelInstances.get(panelId);
-    if (!panel) return;
-    switch (action) {
-      case 'split-right':
-        this.splitPanel(panel, 'right');
-        break;
-      case 'split-down':
-        this.splitPanel(panel, 'down');
-        break;
-      case 'close':
-        this.closePanel(panel.id);
-        break;
-    }
-  }
 
   splitPanel(panel: PanelInstance, direction: 'right' | 'down' | 'left' | 'up'): void {
     const tabId = this.findTabIdForPanel(panel);
@@ -761,10 +758,17 @@ export class MuxClient {
     for (const tabLayout of layout.tabs) {
       this.restoreTab(tabLayout);
     }
-    if (layout.activeTabId !== undefined) {
-      const tabId = String(layout.activeTabId);
-      if (this.tabInstances.has(tabId)) {
-        this.selectTab(tabId);
+    // Restore active panel (active tab is derived from it)
+    const activePanel = layout.activePanelId !== undefined
+      ? this.panelsByServerId.get(layout.activePanelId) as PanelInstance | undefined
+      : undefined;
+    if (activePanel) {
+      this.setActivePanel(activePanel);
+    } else if (this.tabInstances.size > 0) {
+      const firstTab = this.tabInstances.values().next().value;
+      if (firstTab) {
+        const panels = firstTab.root.getAllPanels();
+        if (panels.length > 0) this.setActivePanel(panels[0] as PanelInstance);
       }
     }
   }

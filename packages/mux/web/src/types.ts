@@ -16,7 +16,6 @@ export interface PanelOptions {
   container: HTMLElement;
   serverId?: number | null;
   onResize?: (width: number, height: number) => void;
-  onViewAction?: (action: string, data?: unknown) => void;
 }
 
 export interface SplitContainerOptions {
@@ -115,10 +114,9 @@ export interface LayoutNode {
 export interface LayoutTab {
   id: number;
   root: LayoutNode;
-  activePanelId?: number;
 }
 
 export interface LayoutData {
   tabs: LayoutTab[];
-  activeTabId?: number;
+  activePanelId?: number;
 }
