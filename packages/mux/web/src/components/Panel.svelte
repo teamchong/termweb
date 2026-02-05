@@ -85,6 +85,8 @@
   let lastCodec: string | null = null;
   let gotFirstKeyframe = false;
   let frameCount = 0;
+  let connectStartTime = 0;
+  let firstMessageReceived = false;
   let ctx: CanvasRenderingContext2D | null = null;
   let lastReportedWidth = 0;
   let lastReportedHeight = 0;
@@ -183,7 +185,7 @@
     }
 
     if (renderedFrames === 0) {
-      console.log(`Panel ${id}: First frame rendered, size=${frame.displayWidth}x${frame.displayHeight}`);
+      console.log(`Panel ${id}: FIRST FRAME RENDERED at T+${(performance.now() - connectStartTime).toFixed(0)}ms, size=${frame.displayWidth}x${frame.displayHeight}`);
     }
 
     if (canvasEl && (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight)) {
@@ -268,7 +270,7 @@
           decoder.configure({ codec, optimizeForLatency: true });
           decoderConfigured = true;
           lastCodec = codec;
-          console.log('Decoder configured:', codec);
+          console.log(`Panel ${id}: decoder configured at T+${(performance.now() - connectStartTime).toFixed(0)}ms, codec=${codec}`);
         } catch (e) {
           console.error('Failed to configure decoder:', e);
           setStatus('error');
@@ -282,7 +284,7 @@
     if (!gotFirstKeyframe) {
       if (!isKeyframe) return;
       gotFirstKeyframe = true;
-      console.log('Got first keyframe, starting decode');
+      console.log(`Panel ${id}: got first keyframe at T+${(performance.now() - connectStartTime).toFixed(0)}ms`);
     }
 
     decodeFrame(frameData, isKeyframe);
@@ -377,6 +379,9 @@
     }
 
     setStatus('connecting');
+    connectStartTime = performance.now();
+    firstMessageReceived = false;
+    console.log(`Panel ${id}: connect() called at T+0ms`);
 
     const wsUrl = getWsUrl(WS_PATHS.PANEL);
     ws = new WebSocket(wsUrl);
@@ -384,7 +389,9 @@
 
     ws.onopen = () => {
       setStatus('connected');
+      console.log(`Panel ${id}: ws.onopen at T+${(performance.now() - connectStartTime).toFixed(0)}ms`);
       requestAnimationFrame(() => requestAnimationFrame(() => {
+        console.log(`Panel ${id}: double rAF done at T+${(performance.now() - connectStartTime).toFixed(0)}ms`);
         if (_serverId !== null) {
           sendConnectPanel(_serverId);
         } else if (_splitInfo) {
@@ -397,6 +404,10 @@
 
     ws.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
+        if (!firstMessageReceived) {
+          firstMessageReceived = true;
+          console.log(`Panel ${id}: first frame at T+${(performance.now() - connectStartTime).toFixed(0)}ms, size=${event.data.byteLength}`);
+        }
         handleFrame(event.data);
       }
     };

@@ -544,6 +544,8 @@ const Panel = struct {
     last_frame_time: i64, // For FPS control
     last_tick_time: i128, // For rate limiting panel.tick()
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
+    debug_skip_count: u32, // Debug counter for skipped frames
+    debug_frames_sent: u32, // Debug counter for frames sent
 
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
@@ -606,9 +608,12 @@ const Panel = struct {
             shm_val = shm;
         }
 
+        var panel_timer = std.time.Timer.start() catch unreachable;
+
         const surface = c.ghostty_surface_new(app, &surface_config);
         if (surface == null) return error.SurfaceCreationFailed;
         errdefer c.ghostty_surface_free(surface);
+        const t_surface_new = panel_timer.read();
 
         // Focus the surface so it accepts input
         c.ghostty_surface_set_focus(surface, true);
@@ -621,6 +626,12 @@ const Panel = struct {
         // Force initial render to populate the FBO
         // This prevents blank/stale frames when the panel is first created
         c.ghostty_surface_draw(surface);
+        const t_draw = panel_timer.read();
+
+        std.debug.print("TIMING: Panel.init surface_new={}ms draw={}ms\n", .{
+            t_surface_new / std.time.ns_per_ms,
+            (t_draw - t_surface_new) / std.time.ns_per_ms,
+        });
 
         panel.* = .{
             .id = id,
@@ -649,6 +660,8 @@ const Panel = struct {
             .last_frame_time = 0,
             .last_tick_time = 0,
             .ticks_since_connect = 0,
+            .debug_skip_count = 0,
+            .debug_frames_sent = 0,
         };
 
         return panel;
@@ -1476,6 +1489,7 @@ const Server = struct {
     overview_open: bool,  // Whether tab overview is currently open
     quick_terminal_open: bool,  // Whether quick terminal is open
     inspector_open: bool,  // Whether inspector is open
+    shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
 
     const InspectorSubscription = struct {
         conn: *ws.Connection,
@@ -1547,6 +1561,12 @@ const Server = struct {
             .overview_open = false,
             .quick_terminal_open = false,
             .inspector_open = false,
+            .shared_va_ctx = if (is_linux) blk: {
+                break :blk video.SharedVaContext.init() catch |err| {
+                    std.debug.print("VAAPI: SharedVaContext init failed: {}, encoders will be unavailable\n", .{err});
+                    break :blk null;
+                };
+            } else {},
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -1661,6 +1681,10 @@ const Server = struct {
         self.connection_roles.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
         if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
+        // Free shared VA-API context (after all panels/encoders are destroyed)
+        if (is_linux) {
+            if (self.shared_va_ctx) |*ctx| ctx.deinit();
+        }
         // Only free ghostty if it was initialized
         if (self.app) |app| c.ghostty_app_free(app);
         if (self.config) |cfg| c.ghostty_config_free(cfg);
@@ -1676,9 +1700,12 @@ const Server = struct {
     }
 
     fn createPanelWithCwdAndLayout(self: *Server, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, add_to_layout: bool) !*Panel {
+        var timer = std.time.Timer.start() catch unreachable;
+
         // Lazy init ghostty on first panel (scale to zero)
         // ensureGhosttyInit handles its own mutex
         try self.ensureGhosttyInit();
+        const t_ghostty_init = timer.read();
 
         // Now lock for panel creation - app is guaranteed valid after ensureGhosttyInit
         self.mutex.lock();
@@ -1691,12 +1718,19 @@ const Server = struct {
         self.next_panel_id += 1;
 
         const panel = try Panel.init(self.allocator, self.app.?, id, width, height, scale, working_directory);
+        const t_panel_init = timer.read();
         try self.panels.put(id, panel);
 
         // Add to layout as a new tab (unless it's a special panel like quick terminal)
         if (add_to_layout) {
             _ = self.layout.createTab(id) catch {};
         }
+
+        std.debug.print("TIMING: createPanel total={}ms ghosttyInit={}ms panelInit={}ms\n", .{
+            timer.read() / std.time.ns_per_ms,
+            t_ghostty_init / std.time.ns_per_ms,
+            (t_panel_init - t_ghostty_init) / std.time.ns_per_ms,
+        });
 
         return panel;
     }
@@ -1921,7 +1955,9 @@ const Server = struct {
                     const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
                     const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
 
+                    std.debug.print("DIAG: split_panel msg received parent={} at t={}\n", .{ parent_id, std.time.milliTimestamp() });
                     self.mutex.lock();
+                    std.debug.print("DIAG: split_panel mutex acquired at t={}\n", .{std.time.milliTimestamp()});
                     self.pending_splits.append(self.allocator, .{
                         .conn = conn,
                         .parent_panel_id = parent_id,
@@ -3754,6 +3790,8 @@ const Server = struct {
         self.mutex.unlock();
 
         for (pending) |req| {
+            var pend_timer = std.time.Timer.start() catch unreachable;
+            defer std.debug.print("TIMING: processPendingPanel total={}ms\n", .{pend_timer.read() / std.time.ns_per_ms});
             // Determine CWD: inherit from specified panel, or use initial_cwd
             const working_dir: []const u8 = if (req.inherit_cwd_from != 0) blk: {
                 if (self.panels.get(req.inherit_cwd_from)) |parent_panel| {
@@ -3889,6 +3927,10 @@ const Server = struct {
         };
         self.mutex.unlock();
 
+        if (pending.len > 0) {
+            std.debug.print("DIAG: processPendingSplits picked up {} splits at t={}\n", .{ pending.len, std.time.milliTimestamp() });
+        }
+
         for (pending) |req| {
             // Pause parent panel to prevent frame capture race during split
             // The parent will resume when client sends resize after layout update
@@ -4000,20 +4042,38 @@ const Server = struct {
                 const send_preview = has_preview_clients and (needs_immediate or frame_blocks % 6 == 0);
 
                 // Tick ghostty to render content to IOSurface
+                var tick_timer = std.time.Timer.start() catch unreachable;
                 self.tick();
+                const tick_ms = tick_timer.read() / std.time.ns_per_ms;
+                if (tick_ms > 50) {
+                    std.debug.print("DIAG: ghostty_app_tick took {}ms\n", .{tick_ms});
+                }
 
                 var frames_sent: u32 = 0;
                 var frames_attempted: u32 = 0;
+                var frame_loop_timer = std.time.Timer.start() catch unreachable;
 
-                // Capture and send frames
+                // Collect panels to process (release mutex before heavy encode work)
+                var frame_panels_buf: [64]*Panel = undefined;
+                var frame_panels_streaming: [64]bool = undefined;
+                var frame_panels_count: usize = 0;
                 self.mutex.lock();
                 panel_it = self.panels.valueIterator();
                 while (panel_it.next()) |panel_ptr| {
                     const panel = panel_ptr.*;
-
-                    // Skip if not streaming AND no preview needed
                     const is_streaming = panel.streaming.load(.acquire);
                     if (!is_streaming and !send_preview) continue;
+                    if (frame_panels_count < frame_panels_buf.len) {
+                        frame_panels_buf[frame_panels_count] = panel;
+                        frame_panels_streaming[frame_panels_count] = is_streaming;
+                        frame_panels_count += 1;
+                    }
+                }
+                self.mutex.unlock();
+
+                // Process each panel WITHOUT holding the server mutex
+                // This prevents mutex starvation when encoding takes 100+ms per panel
+                for (frame_panels_buf[0..frame_panels_count], frame_panels_streaming[0..frame_panels_count]) |panel, is_streaming| {
 
                     frames_attempted += 1;
 
@@ -4044,7 +4104,12 @@ const Server = struct {
 
                         // Lazy init video encoder and BGRA buffer for Linux
                         if (panel.video_encoder == null) {
-                            panel.video_encoder = video.VideoEncoder.init(panel.allocator, pixel_width, pixel_height) catch null;
+                            var enc_timer = std.time.Timer.start() catch unreachable;
+                            panel.video_encoder = if (self.shared_va_ctx) |*ctx|
+                                video.VideoEncoder.initWithShared(panel.allocator, ctx, pixel_width, pixel_height) catch null
+                            else
+                                null;
+                            std.debug.print("TIMING: encoder init={}ms dims={}x{}\n", .{ enc_timer.read() / std.time.ns_per_ms, pixel_width, pixel_height });
                             if (panel.video_encoder != null) {
                                 panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch {
                                     panel.video_encoder.?.deinit();
@@ -4054,11 +4119,21 @@ const Server = struct {
                             }
                         }
 
-                        if (panel.video_encoder == null or panel.bgra_buffer == null) continue;
+                        if (panel.video_encoder == null or panel.bgra_buffer == null) {
+                            if (panel.debug_skip_count % 300 == 0) {
+                                std.debug.print("DIAG: panel {} skip: encoder={} bgra={} dims={}x{}\n", .{ panel.id, panel.video_encoder != null, panel.bgra_buffer != null, pixel_width, pixel_height });
+                            }
+                            panel.debug_skip_count += 1;
+                            continue;
+                        }
 
                         // Resize encoder if dimensions changed
                         if (pixel_width != panel.video_encoder.?.source_width or pixel_height != panel.video_encoder.?.source_height) {
-                            panel.video_encoder.?.resize(pixel_width, pixel_height) catch continue;
+                            std.debug.print("DIAG: panel {} resize {}x{} -> {}x{}\n", .{ panel.id, panel.video_encoder.?.source_width, panel.video_encoder.?.source_height, pixel_width, pixel_height });
+                            panel.video_encoder.?.resize(pixel_width, pixel_height) catch {
+                                std.debug.print("DIAG: panel {} resize FAILED\n", .{panel.id});
+                                continue;
+                            };
                             if (panel.bgra_buffer.?.len != buffer_size) {
                                 panel.allocator.free(panel.bgra_buffer.?);
                                 panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch continue;
@@ -4069,12 +4144,33 @@ const Server = struct {
                         if (panel.ticks_since_connect < 3) continue;
 
                         // Read pixels from OpenGL framebuffer
+                        var read_timer = std.time.Timer.start() catch unreachable;
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
+                        const read_ms = read_timer.read() / std.time.ns_per_ms;
+                        if (read_ms > 50) {
+                            std.debug.print("DIAG: panel {} readPixels took {}ms\n", .{ panel.id, read_ms });
+                        }
+                        if (!read_ok) {
+                            if (panel.debug_skip_count % 300 == 0) {
+                                std.debug.print("DIAG: panel {} read_pixels FAILED dims={}x{}\n", .{ panel.id, pixel_width, pixel_height });
+                            }
+                            panel.debug_skip_count += 1;
+                        }
                         if (read_ok) {
                             // Pass explicit dimensions to ensure encoder matches frame size
+                            var enc_timer2 = std.time.Timer.start() catch unreachable;
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
+                                const enc_ms = enc_timer2.read() / std.time.ns_per_ms;
+                                if (enc_ms > 50) {
+                                    std.debug.print("DIAG: panel {} encode took {}ms size={}\n", .{ panel.id, enc_ms, result.data.len });
+                                }
+                            } else {
+                                if (panel.debug_skip_count % 300 == 0) {
+                                    std.debug.print("DIAG: panel {} encode returned null dims={}x{} keyframe={}\n", .{ panel.id, pixel_width, pixel_height, panel.force_keyframe });
+                                }
+                                panel.debug_skip_count += 1;
                             }
                         }
                     }
@@ -4082,7 +4178,20 @@ const Server = struct {
                     // Send frame to panel connection (if streaming)
                     if (frame_data) |data| {
                         if (is_streaming) {
-                            panel.sendFrame(data) catch {};
+                            var send_timer = std.time.Timer.start() catch unreachable;
+                            panel.sendFrame(data) catch |err| {
+                                if (panel.debug_frames_sent < 5) {
+                                    std.debug.print("DIAG: panel {} sendFrame FAILED err={} size={}\n", .{ panel.id, err, data.len });
+                                }
+                            };
+                            const send_ms = send_timer.read() / std.time.ns_per_ms;
+                            if (send_ms > 50) {
+                                std.debug.print("DIAG: panel {} sendFrame took {}ms size={}\n", .{ panel.id, send_ms, data.len });
+                            }
+                            if (panel.debug_frames_sent < 10) {
+                                std.debug.print("DIAG: panel {} frame#{} sent size={} dims={}x{}\n", .{ panel.id, panel.debug_frames_sent, data.len, panel.getPixelWidth(), panel.getPixelHeight() });
+                            }
+                            panel.debug_frames_sent += 1;
                             frames_sent += 1;
                         }
 
@@ -4092,7 +4201,11 @@ const Server = struct {
                         }
                     }
                 }
-                self.mutex.unlock();
+
+                const frame_loop_elapsed = frame_loop_timer.read() / std.time.ns_per_ms;
+                if (frame_loop_elapsed > 100) {
+                    std.debug.print("DIAG: SLOW frame loop took {}ms panels={} sent={} at t={}\n", .{ frame_loop_elapsed, frames_attempted, frames_sent, std.time.milliTimestamp() });
+                }
 
                 fps_counter += frames_sent;
                 fps_attempts += frames_attempted;

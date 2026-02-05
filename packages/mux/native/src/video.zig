@@ -18,3 +18,9 @@ else
 // Re-export types and functions
 pub const VideoEncoder = impl.VideoEncoder;
 pub const EncodeResult = impl.EncodeResult;
+
+// Linux-only: shared VA-API context for fast encoder creation
+pub const SharedVaContext = if (@import("builtin").os.tag == .linux)
+    impl.SharedVaContext
+else
+    void;

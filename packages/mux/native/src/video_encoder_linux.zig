@@ -201,6 +201,86 @@ pub const EncodeResult = struct {
     is_keyframe: bool,
 };
 
+/// Shared VA-API context for all encoders.
+/// Holds the expensive-to-create DRM fd, VA display, and VA config.
+/// Initialize once at server startup, pass to each VideoEncoder.
+pub const SharedVaContext = struct {
+    drm_fd: c_int,
+    va_display: c.VADisplay,
+    va_config: c.VAConfigID,
+
+    /// Initialize the shared VA-API context (open DRM, vaInitialize, create config).
+    /// Call once at server startup. All VideoEncoders share this context.
+    pub fn init() VaError!SharedVaContext {
+        const drm_fd = c.open("/dev/dri/renderD128", c.O_RDWR);
+        if (drm_fd < 0) {
+            std.debug.print("VAAPI: Failed to open /dev/dri/renderD128\n", .{});
+            return error.DrmOpenFailed;
+        }
+        errdefer _ = c.close(drm_fd);
+
+        const va_display = c.vaGetDisplayDRM(drm_fd);
+        if (va_display == null) {
+            std.debug.print("VAAPI: Failed to get VA display\n", .{});
+            return error.VaDisplayFailed;
+        }
+
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        var status = c.vaInitialize(va_display, &major, &minor);
+        if (status != c.VA_STATUS_SUCCESS) {
+            std.debug.print("VAAPI: vaInitialize failed: {}\n", .{status});
+            return error.VaInitFailed;
+        }
+        errdefer _ = c.vaTerminate(va_display);
+
+        // Find a supported H.264 encoding profile
+        const profiles = [_]c_int{
+            VAProfileH264Main,
+            VAProfileH264High,
+            VAProfileH264ConstrainedBaseline,
+        };
+
+        var config: c.VAConfigID = 0;
+        var found_profile = false;
+
+        for (profiles) |profile| {
+            var attrib = c.VAConfigAttrib{
+                .type = c.VAConfigAttribRTFormat,
+                .value = 0,
+            };
+            status = c.vaGetConfigAttributes(va_display, profile, VAEntrypointEncSlice, &attrib, 1);
+            if (status == c.VA_STATUS_SUCCESS and (attrib.value & c.VA_RT_FORMAT_YUV420) != 0) {
+                var config_attribs = [_]c.VAConfigAttrib{
+                    .{ .type = c.VAConfigAttribRTFormat, .value = c.VA_RT_FORMAT_YUV420 },
+                };
+                status = c.vaCreateConfig(va_display, profile, VAEntrypointEncSlice, &config_attribs, 1, &config);
+                if (status == c.VA_STATUS_SUCCESS) {
+                    found_profile = true;
+                    break;
+                }
+            }
+        }
+
+        if (!found_profile) {
+            std.debug.print("VAAPI: No H.264 encoding profile supported\n", .{});
+            return error.H264NotSupported;
+        }
+
+        return .{
+            .drm_fd = drm_fd,
+            .va_display = va_display,
+            .va_config = config,
+        };
+    }
+
+    pub fn deinit(self: *SharedVaContext) void {
+        _ = c.vaDestroyConfig(self.va_display, self.va_config);
+        _ = c.vaTerminate(self.va_display);
+        _ = c.close(self.drm_fd);
+    }
+};
+
 /// Linux video encoder using VA-API (hardware H.264)
 /// Matches VideoToolbox interface for cross-platform compatibility
 pub const VideoEncoder = struct {
@@ -211,11 +291,10 @@ pub const VideoEncoder = struct {
     frame_count: i64,
     allocator: std.mem.Allocator,
 
-    // VA-API handles
-    drm_fd: c_int,
-    owns_drm_fd: bool, // True if we opened the fd and should close it
-    va_display: c.VADisplay,
-    va_config: c.VAConfigID,
+    // Shared VA-API context (owned by Server, not this encoder)
+    shared: *SharedVaContext,
+
+    // Per-encoder VA-API handles (surfaces + context are per-resolution)
     va_context: c.VAContextID,
     src_surface: c.VASurfaceID,
     ref_surface: c.VASurfaceID,
@@ -250,7 +329,7 @@ pub const VideoEncoder = struct {
         .{ .bitrate = 8_000_000, .fps = 30 }, // Level 4: Max (8 Mbps)
     };
 
-    fn calcScaledDimensions(width: u32, height: u32) struct { w: u32, h: u32 } {
+    fn calcAlignedDimensions(width: u32, height: u32) struct { w: u32, h: u32 } {
         // VA-API hardware encoders require 16-pixel aligned surfaces.
         // We align the destination but handle stride differences in uploadFrame.
         const pixels: u64 = @as(u64, width) * @as(u64, height);
@@ -353,8 +432,8 @@ pub const VideoEncoder = struct {
         bs.writeBits(77, 8);
         // constraint_set1_flag=1 (Main compatible), others=0
         bs.writeBits(0x40, 8);
-        // level_idc = 41
-        bs.writeBits(41, 8);
+        // level_idc = 52 (Level 5.2 for large frame support)
+        bs.writeBits(52, 8);
         // seq_parameter_set_id = 0
         bs.writeUE(0);
         // log2_max_frame_num_minus4 = 0
@@ -467,98 +546,33 @@ pub const VideoEncoder = struct {
         self.pps_len = 5 + bs.getLength();
     }
 
-    /// Initialize encoder, opening our own DRM render node.
-    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) CreateError!*VideoEncoder {
-        return initWithDrmFd(allocator, width, height, -1);
+    /// Initialize encoder using a shared VA context.
+    /// Only creates per-encoder resources (surfaces, context, coded buffer).
+    pub fn init(_: std.mem.Allocator, _: u32, _: u32) CreateError!*VideoEncoder {
+        // Must use initWithShared() with a SharedVaContext instead
+        std.debug.print("ENCODER: init() without shared context not supported, use initWithShared()\n", .{});
+        return error.VaDisplayFailed;
     }
 
-    /// Initialize encoder with optional external DRM fd.
-    /// If external_drm_fd is provided (>= 0), it will be used instead of opening our own.
-    /// This enables zero-copy encoding when ghostty and VA-API share the same GPU.
-    pub fn initWithDrmFd(allocator: std.mem.Allocator, width: u32, height: u32, external_drm_fd: c_int) CreateError!*VideoEncoder {
+    /// Initialize encoder with a shared VA-API context (fast path).
+    /// The shared context owns the DRM fd, VA display, and VA config.
+    /// This encoder only creates surfaces + encoding context (~20-50ms vs ~400ms).
+    pub fn initWithShared(allocator: std.mem.Allocator, shared: *SharedVaContext, width: u32, height: u32) CreateError!*VideoEncoder {
         const encoder = try allocator.create(VideoEncoder);
         errdefer allocator.destroy(encoder);
 
         const output_buffer = try allocator.alloc(u8, MAX_OUTPUT_SIZE);
         errdefer allocator.free(output_buffer);
 
-        const scaled = calcScaledDimensions(width, height);
+        const scaled = calcAlignedDimensions(width, height);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
 
-        // Use external DRM fd if provided, otherwise open our own
-        const owns_drm_fd = external_drm_fd < 0;
-        const drm_fd = if (external_drm_fd >= 0) external_drm_fd else blk: {
-            const fd = c.open("/dev/dri/renderD128", c.O_RDWR);
-            if (fd < 0) {
-                std.debug.print("ENCODER: Failed to open /dev/dri/renderD128\n", .{});
-                return error.DrmOpenFailed;
-            }
-            break :blk fd;
-        };
-        errdefer if (owns_drm_fd) {
-            _ = c.close(drm_fd);
-        };
-
-        // Get VA display from DRM
-        const va_display = c.vaGetDisplayDRM(drm_fd);
-        if (va_display == null) {
-            std.debug.print("ENCODER: Failed to get VA display\n", .{});
-            return error.VaDisplayFailed;
-        }
-
-        // Initialize VA-API
-        var major: c_int = 0;
-        var minor: c_int = 0;
-        var status = c.vaInitialize(va_display, &major, &minor);
-        if (status != c.VA_STATUS_SUCCESS) {
-            std.debug.print("ENCODER: vaInitialize failed: {}\n", .{status});
-            return error.VaInitFailed;
-        }
-        errdefer _ = c.vaTerminate(va_display);
-
-
-        // Try multiple H.264 profiles - use Main first for better driver support
-        const profiles = [_]c_int{
-            VAProfileH264Main, // Best driver support
-            VAProfileH264High, // Good quality
-            VAProfileH264ConstrainedBaseline, // Fallback
-        };
-
-        var config: c.VAConfigID = 0;
-        var selected_profile: c_int = 0;
-        var found_profile = false;
-
-        for (profiles) |profile| {
-            var attrib = c.VAConfigAttrib{
-                .type = c.VAConfigAttribRTFormat,
-                .value = 0,
-            };
-            status = c.vaGetConfigAttributes(va_display, profile, VAEntrypointEncSlice, &attrib, 1);
-            if (status == c.VA_STATUS_SUCCESS and (attrib.value & c.VA_RT_FORMAT_YUV420) != 0) {
-                // Try to create config with this profile
-                var config_attribs = [_]c.VAConfigAttrib{
-                    .{ .type = c.VAConfigAttribRTFormat, .value = c.VA_RT_FORMAT_YUV420 },
-                };
-                status = c.vaCreateConfig(va_display, profile, VAEntrypointEncSlice, &config_attribs, 1, &config);
-                if (status == c.VA_STATUS_SUCCESS) {
-                    selected_profile = profile;
-                    found_profile = true;
-                    break;
-                }
-            }
-        }
-
-        if (!found_profile) {
-            std.debug.print("ENCODER: No H.264 encoding profile supported\n", .{});
-            return error.H264NotSupported;
-        }
-
-        errdefer _ = c.vaDestroyConfig(va_display, config);
+        const va_display = shared.va_display;
 
         // Create surfaces for encoding
         var surfaces: [3]c.VASurfaceID = undefined;
-        status = c.vaCreateSurfaces(
+        var status = c.vaCreateSurfaces(
             va_display,
             c.VA_RT_FORMAT_YUV420,
             encode_width,
@@ -581,7 +595,7 @@ pub const VideoEncoder = struct {
         var va_context: c.VAContextID = 0;
         status = c.vaCreateContext(
             va_display,
-            config,
+            shared.va_config,
             @intCast(encode_width),
             @intCast(encode_height),
             c.VA_PROGRESSIVE,
@@ -618,10 +632,7 @@ pub const VideoEncoder = struct {
             .source_height = height,
             .frame_count = 0,
             .allocator = allocator,
-            .drm_fd = drm_fd,
-            .owns_drm_fd = owns_drm_fd,
-            .va_display = va_display,
-            .va_config = config,
+            .shared = shared,
             .va_context = va_context,
             .src_surface = src_surface,
             .ref_surface = ref_surface,
@@ -647,18 +658,13 @@ pub const VideoEncoder = struct {
     }
 
     pub fn deinit(self: *VideoEncoder) void {
+        const va_display = self.shared.va_display;
         var surfaces = [_]c.VASurfaceID{ self.src_surface, self.ref_surface, self.recon_surface };
-        _ = vaDestroyBuffer(self.va_display, self.coded_buf);
-        _ = c.vaDestroyContext(self.va_display, self.va_context);
-        _ = c.vaDestroySurfaces(self.va_display, &surfaces, 3);
-        _ = c.vaDestroyConfig(self.va_display, self.va_config);
-        _ = c.vaTerminate(self.va_display);
-
-        // Only close DRM fd if we opened it ourselves
-        if (self.owns_drm_fd) {
-            _ = c.close(self.drm_fd);
-        }
-
+        _ = vaDestroyBuffer(va_display, self.coded_buf);
+        _ = c.vaDestroyContext(va_display, self.va_context);
+        _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
+        // Shared context (drm_fd, va_display, va_config) is NOT freed here -
+        // it's owned by the Server and outlives individual encoders.
         self.allocator.free(self.output_buffer);
         self.allocator.destroy(self);
     }
@@ -684,20 +690,22 @@ pub const VideoEncoder = struct {
     pub fn resize(self: *VideoEncoder, width: u32, height: u32) ResizeError!void {
         if (self.source_width == width and self.source_height == height) return;
 
-        const scaled = calcScaledDimensions(width, height);
+        const scaled = calcAlignedDimensions(width, height);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
 
+        const va_display = self.shared.va_display;
+
         // Destroy old surfaces
         var old_surfaces = [_]c.VASurfaceID{ self.src_surface, self.ref_surface, self.recon_surface };
-        _ = vaDestroyBuffer(self.va_display, self.coded_buf);
-        _ = c.vaDestroyContext(self.va_display, self.va_context);
-        _ = c.vaDestroySurfaces(self.va_display, &old_surfaces, 3);
+        _ = vaDestroyBuffer(va_display, self.coded_buf);
+        _ = c.vaDestroyContext(va_display, self.va_context);
+        _ = c.vaDestroySurfaces(va_display, &old_surfaces, 3);
 
         // Create new surfaces
         var surfaces: [3]c.VASurfaceID = undefined;
         var status = c.vaCreateSurfaces(
-            self.va_display,
+            va_display,
             c.VA_RT_FORMAT_YUV420,
             encode_width,
             encode_height,
@@ -710,8 +718,8 @@ pub const VideoEncoder = struct {
 
         // Create new context
         status = c.vaCreateContext(
-            self.va_display,
-            self.va_config,
+            va_display,
+            self.shared.va_config,
             @intCast(encode_width),
             @intCast(encode_height),
             c.VA_PROGRESSIVE,
@@ -720,13 +728,13 @@ pub const VideoEncoder = struct {
             &self.va_context,
         );
         if (status != c.VA_STATUS_SUCCESS) {
-            _ = c.vaDestroySurfaces(self.va_display, &surfaces, 3);
+            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
             return error.VaContextFailed;
         }
 
         // Create new coded buffer
         status = vaCreateBuffer(
-            self.va_display,
+            va_display,
             self.va_context,
             VAEncCodedBufferType,
             MAX_OUTPUT_SIZE,
@@ -735,8 +743,8 @@ pub const VideoEncoder = struct {
             &self.coded_buf,
         );
         if (status != c.VA_STATUS_SUCCESS) {
-            _ = c.vaDestroyContext(self.va_display, self.va_context);
-            _ = c.vaDestroySurfaces(self.va_display, &surfaces, 3);
+            _ = c.vaDestroyContext(va_display, self.va_context);
+            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
             return error.VaBufferFailed;
         }
 
@@ -756,6 +764,7 @@ pub const VideoEncoder = struct {
 
     /// Convert RGBA to NV12 and upload to VA surface using vaCreateImage + vaPutImage
     fn uploadFrame(self: *VideoEncoder, rgba_data: []const u8) VaError!void {
+        const va_display = self.shared.va_display;
         const dst_width = self.width;
         const dst_height = self.height;
         const src_width = self.source_width;
@@ -764,7 +773,7 @@ pub const VideoEncoder = struct {
         // Get supported image formats
         var formats: [64]c.VAImageFormat = undefined;
         var actual_formats: c_int = 0;
-        var status = c.vaQueryImageFormats(self.va_display, &formats, &actual_formats);
+        var status = c.vaQueryImageFormats(va_display, &formats, &actual_formats);
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("VAAPI: vaQueryImageFormats failed: {}\n", .{status});
             return error.VaImageFailed;
@@ -787,16 +796,16 @@ pub const VideoEncoder = struct {
 
         // Create an image
         var image: c.VAImage = undefined;
-        status = c.vaCreateImage(self.va_display, &nv12_format.?, @intCast(dst_width), @intCast(dst_height), &image);
+        status = c.vaCreateImage(va_display, &nv12_format.?, @intCast(dst_width), @intCast(dst_height), &image);
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("VAAPI: vaCreateImage failed: {}\n", .{status});
             return error.VaImageFailed;
         }
-        defer _ = c.vaDestroyImage(self.va_display, image.image_id);
+        defer _ = c.vaDestroyImage(va_display, image.image_id);
 
         // Map the image buffer
         var mapped_ptr: ?*anyopaque = null;
-        status = c.vaMapBuffer(self.va_display, image.buf, &mapped_ptr);
+        status = c.vaMapBuffer(va_display, image.buf, &mapped_ptr);
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("VAAPI: vaMapBuffer failed: status={}\n", .{status});
             return error.VaMapFailed;
@@ -895,14 +904,14 @@ pub const VideoEncoder = struct {
         }
 
         // Unmap the buffer before putting the image
-        status = c.vaUnmapBuffer(self.va_display, image.buf);
+        status = c.vaUnmapBuffer(va_display, image.buf);
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("VAAPI: vaUnmapBuffer failed: {}\n", .{status});
             return error.VaMapFailed;
         }
 
         // Put the image to the surface
-        status = c.vaPutImage(self.va_display, self.src_surface, image.image_id, 0, 0, @intCast(dst_width), @intCast(dst_height), 0, 0, @intCast(dst_width), @intCast(dst_height));
+        status = c.vaPutImage(va_display, self.src_surface, image.image_id, 0, 0, @intCast(dst_width), @intCast(dst_height), 0, 0, @intCast(dst_width), @intCast(dst_height));
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("VAAPI: vaPutImage failed: {}\n", .{status});
             return error.VaImageFailed;
@@ -918,6 +927,7 @@ pub const VideoEncoder = struct {
     /// Encode RGBA frame to H.264 with explicit dimensions
     /// Auto-resizes encoder if frame dimensions don't match current source dimensions.
     pub fn encodeWithDimensions(self: *VideoEncoder, rgba_data: []const u8, force_keyframe: bool, width: ?u32, height: ?u32) VaError!?EncodeResult {
+        const va_display = self.shared.va_display;
         // Auto-resize if explicit dimensions provided and differ from source
         if (width != null and height != null) {
             const w = width.?;
@@ -937,7 +947,7 @@ pub const VideoEncoder = struct {
         try self.uploadFrame(rgba_data);
 
         // Begin picture - use src_surface as both input and reconstruction target
-        var status = vaBeginPicture(self.va_display, self.va_context, self.src_surface);
+        var status = vaBeginPicture(va_display, self.va_context, self.src_surface);
         if (status != c.VA_STATUS_SUCCESS) {
             return error.VaBeginPictureFailed;
         }
@@ -945,7 +955,7 @@ pub const VideoEncoder = struct {
         // Create sequence parameter buffer (using raw byte buffer to avoid bitfield union issues)
         var seq_param: [SEQ_PARAM_SIZE]u8 = std.mem.zeroes([SEQ_PARAM_SIZE]u8);
         writeU8(&seq_param, SEQ_seq_parameter_set_id, 0);
-        writeU8(&seq_param, SEQ_level_idc, 41);
+        writeU8(&seq_param, SEQ_level_idc, 52); // Level 5.2 for large frame support
         writeU32(&seq_param, SEQ_intra_period, self.keyframe_interval);
         writeU32(&seq_param, SEQ_intra_idr_period, self.keyframe_interval);
         writeU32(&seq_param, SEQ_ip_period, 1);
@@ -966,7 +976,7 @@ pub const VideoEncoder = struct {
 
         var seq_buf: c.VABufferID = 0;
         status = vaCreateBuffer(
-            self.va_display,
+            va_display,
             self.va_context,
             VAEncSequenceParameterBufferType,
             SEQ_PARAM_SIZE,
@@ -976,10 +986,10 @@ pub const VideoEncoder = struct {
         );
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("ENCODER: vaCreateBuffer seq failed: {}\n", .{status});
-            _ = vaEndPicture(self.va_display, self.va_context);
+            _ = vaEndPicture(va_display, self.va_context);
             return error.VaSeqBufferFailed;
         }
-        defer _ = vaDestroyBuffer(self.va_display, seq_buf);
+        defer _ = vaDestroyBuffer(va_display, seq_buf);
 
         // Create picture parameter buffer
         var pic_param: [PIC_PARAM_SIZE]u8 = std.mem.zeroes([PIC_PARAM_SIZE]u8);
@@ -1017,7 +1027,7 @@ pub const VideoEncoder = struct {
 
         var pic_buf: c.VABufferID = 0;
         status = vaCreateBuffer(
-            self.va_display,
+            va_display,
             self.va_context,
             VAEncPictureParameterBufferType,
             PIC_PARAM_SIZE,
@@ -1027,10 +1037,10 @@ pub const VideoEncoder = struct {
         );
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("ENCODER: vaCreateBuffer pic failed: {}\n", .{status});
-            _ = vaEndPicture(self.va_display, self.va_context);
+            _ = vaEndPicture(va_display, self.va_context);
             return error.VaPicBufferFailed;
         }
-        defer _ = vaDestroyBuffer(self.va_display, pic_buf);
+        defer _ = vaDestroyBuffer(va_display, pic_buf);
 
         // Create slice parameter buffer
         var slice_param: [SLICE_PARAM_SIZE]u8 = std.mem.zeroes([SLICE_PARAM_SIZE]u8);
@@ -1069,7 +1079,7 @@ pub const VideoEncoder = struct {
 
         var slice_buf: c.VABufferID = 0;
         status = vaCreateBuffer(
-            self.va_display,
+            va_display,
             self.va_context,
             VAEncSliceParameterBufferType,
             SLICE_PARAM_SIZE,
@@ -1079,34 +1089,34 @@ pub const VideoEncoder = struct {
         );
         if (status != c.VA_STATUS_SUCCESS) {
             std.debug.print("ENCODER: vaCreateBuffer slice failed: {}\n", .{status});
-            _ = vaEndPicture(self.va_display, self.va_context);
+            _ = vaEndPicture(va_display, self.va_context);
             return error.VaSliceBufferFailed;
         }
-        defer _ = vaDestroyBuffer(self.va_display, slice_buf);
+        defer _ = vaDestroyBuffer(va_display, slice_buf);
 
         // Render all buffers
         var render_bufs = [_]c.VABufferID{ seq_buf, pic_buf, slice_buf };
-        status = vaRenderPicture(self.va_display, self.va_context, &render_bufs, 3);
+        status = vaRenderPicture(va_display, self.va_context, &render_bufs, 3);
         if (status != c.VA_STATUS_SUCCESS) {
-            _ = vaEndPicture(self.va_display, self.va_context);
+            _ = vaEndPicture(va_display, self.va_context);
             return error.VaRenderFailed;
         }
 
         // End picture
-        status = vaEndPicture(self.va_display, self.va_context);
+        status = vaEndPicture(va_display, self.va_context);
         if (status != c.VA_STATUS_SUCCESS) {
             return error.VaEndPictureFailed;
         }
 
         // Sync src surface (where encoding happens)
-        status = c.vaSyncSurface(self.va_display, self.src_surface);
+        status = c.vaSyncSurface(va_display, self.src_surface);
         if (status != c.VA_STATUS_SUCCESS) return error.VaSyncFailed;
 
         // Map coded buffer to get H.264 data
         var coded_seg_ptr: ?*anyopaque = null;
-        status = c.vaMapBuffer(self.va_display, self.coded_buf, &coded_seg_ptr);
+        status = c.vaMapBuffer(va_display, self.coded_buf, &coded_seg_ptr);
         if (status != c.VA_STATUS_SUCCESS) return error.VaMapCodedFailed;
-        defer _ = c.vaUnmapBuffer(self.va_display, self.coded_buf);
+        defer _ = c.vaUnmapBuffer(va_display, self.coded_buf);
 
         // Copy encoded data with SPS/PPS for keyframes
         self.output_len = 0;

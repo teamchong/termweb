@@ -41,10 +41,10 @@ index 3d3973084..e04c2fabe 100644
  void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..6a4a591b3
+index 000000000..31423962a
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,672 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
@@ -658,15 +658,14 @@ index 000000000..6a4a591b3
 +        viewport(0, 0, @intCast(width), @intCast(height));
 +    }
 +
-+    // Use per-surface PBO state for async readback (keyed by surface_id, not fbo_id)
-+    // This prevents state collisions when FBO IDs are recycled by OpenGL
++    // Try async PBO readback (returns previous frame, one frame behind)
 +    if (pbo_manager.getOrCreate(surface_id, width, height)) |pbo_state| {
 +        if (pbo_state.readPixelsAsync(buffer, buffer_len, width, height, fbo_id)) {
 +            return true;
 +        }
 +    }
 +
-+    // Fallback to sync if PBO fails or first frame
++    // Fallback to sync reads (first frame or PBO unavailable)
 +    return readPixelsSync(buffer, buffer_len, width, height, fbo_id);
 +}
 +
