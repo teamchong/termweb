@@ -41,10 +41,10 @@ index 3d3973084..e04c2fabe 100644
  void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..3c4236450
+index 000000000..6a4a591b3
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,667 @@
+@@ -0,0 +1,673 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
@@ -295,8 +295,14 @@ index 000000000..3c4236450
 +
 +        glReadPixels(0, 0, @intCast(width), @intCast(height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, null);
 +
-+        // Unbind PBO to prevent state leak to other panels
-+        // Note: We read from the OTHER PBO (previous frame) so no sync needed here
++        // CRITICAL: Ensure the async write completes before proceeding
++        // This prevents GPU-side race conditions when multiple panels share the context
++        // (defeats async but necessary for correctness with shared context)
++        if (gl.glad.context.Finish) |glFinish| {
++            glFinish();
++        }
++
++        // Unbind PBO after write completes to prevent state leak to other panels
 +        bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 +
 +        // If not primed, we just started the first write - cannot read yet
@@ -636,10 +642,10 @@ index 000000000..3c4236450
 +        return false;
 +    }
 +
-+    // Flush pending GL commands to ensure FBO content is ready
-+    // Using glFlush (non-blocking) instead of glFinish (blocking) for better performance
-+    if (gl.glad.context.Flush) |glFlush| {
-+        glFlush();
++    // CRITICAL: Force GPU synchronization before reading from FBO
++    // This ensures all rendering commands from potentially different threads are complete.
++    if (gl.glad.context.Finish) |glFinish| {
++        glFinish();
 +    }
 +
 +    // Bind the FBO for reading
