@@ -694,8 +694,8 @@ pub const VideoEncoder = struct {
         var actual_rgba_h: u32 = 0;
         const has_vpp = shared.has_vpp;
         if (has_vpp) vpp_blk: {
-            // Create BGRX surface at source resolution for GPU-accelerated
-            // scaling + color conversion via VPP (avoids CPU downscale loop)
+            // Create BGRX surface at encode resolution. CPU does R↔B swap +
+            // downscale in one pass over 2.3M dst pixels (fast), VPP does color convert only.
             var rgba_attribs = [_]c.VASurfaceAttrib{
                 .{
                     .type = c.VASurfaceAttribPixelFormat,
@@ -706,8 +706,8 @@ pub const VideoEncoder = struct {
             status = c.vaCreateSurfaces(
                 va_display,
                 c.VA_RT_FORMAT_RGB32,
-                width,
-                height,
+                encode_width,
+                encode_height,
                 @ptrCast(&rgba_surface),
                 1,
                 &rgba_attribs,
@@ -717,11 +717,10 @@ pub const VideoEncoder = struct {
                 std.debug.print("ENCODER: VPP BGRX surface failed: {}, falling back to CPU\n", .{status});
                 break :vpp_blk;
             }
-            actual_rgba_w = width;
-            actual_rgba_h = height;
+            actual_rgba_w = encode_width;
+            actual_rgba_h = encode_height;
 
-            // Create VPP context at encode resolution (output size).
-            // Input BGRX surface is larger but VPP handles scaling via regions.
+            // Create VPP context at encode resolution (no scaling needed).
             status = c.vaCreateContext(
                 va_display,
                 shared.vpp_config,
@@ -888,7 +887,7 @@ pub const VideoEncoder = struct {
         self.source_height = height;
         self.frame_count = 0;
 
-        // Recreate VPP resources at source resolution (VPP does scaling on GPU)
+        // Recreate VPP resources at encode resolution
         if (self.shared.has_vpp) vpp_blk: {
             var rgba_attribs = [_]c.VASurfaceAttrib{
                 .{
@@ -897,15 +896,15 @@ pub const VideoEncoder = struct {
                     .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = @as(c_int, @bitCast(@as(u32, c.VA_FOURCC_BGRX))) } },
                 },
             };
-            status = c.vaCreateSurfaces(va_display, c.VA_RT_FORMAT_RGB32, width, height, @ptrCast(&self.rgba_surface), 1, &rgba_attribs, 1);
+            status = c.vaCreateSurfaces(va_display, c.VA_RT_FORMAT_RGB32, encode_width, encode_height, @ptrCast(&self.rgba_surface), 1, &rgba_attribs, 1);
             if (status != c.VA_STATUS_SUCCESS) break :vpp_blk;
             status = c.vaCreateContext(va_display, self.shared.vpp_config, @intCast(encode_width), @intCast(encode_height), c.VA_PROGRESSIVE, @ptrCast(&self.rgba_surface), 1, &self.vpp_context);
             if (status != c.VA_STATUS_SUCCESS) {
                 _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
                 break :vpp_blk;
             }
-            self.rgba_width = width;
-            self.rgba_height = height;
+            self.rgba_width = encode_width;
+            self.rgba_height = encode_height;
             self.has_vpp = true;
         }
 
@@ -923,14 +922,16 @@ pub const VideoEncoder = struct {
         return self.uploadFrameCpu(rgba_data);
     }
 
-    /// GPU path: CPU does R↔B byte swap (RGBA→BGRX) at source resolution,
-    /// then VPP does both downscale and NV12 conversion on GPU.
+    /// GPU path: CPU does R↔B swap + nearest-neighbor downscale to BGRX at
+    /// encode resolution (2.3M pixels), then VPP converts BGRX→NV12 on GPU.
     fn uploadFrameGpu(self: *VideoEncoder, rgba_data: []const u8) VaError!void {
         const va_display = self.shared.va_display;
+        const dst_width = self.width;
+        const dst_height = self.height;
         const src_width = self.source_width;
         const src_height = self.source_height;
 
-        // Derive image from BGRX surface (source resolution) for direct memory write
+        // Derive image from BGRX surface (encode resolution) for direct memory write
         var image: c.VAImage = undefined;
         var status = c.vaDeriveImage(va_display, self.rgba_surface, &image);
         if (status != c.VA_STATUS_SUCCESS) {
@@ -947,22 +948,30 @@ pub const VideoEncoder = struct {
         const pitch = image.pitches[0];
         const offset = image.offsets[0];
 
-        // R↔B byte swap only (no downscaling). Read/write u32 words.
-        // GL gives RGBA (R=byte0), VA-API wants BGRX (B=byte0).
-        // Swap: 0xAABBGGRR → 0xFFRRGGBB
+        // R↔B swap + nearest-neighbor downscale in one pass.
+        // Only iterates over dst pixels (2.3M) not src pixels (11.6M).
         const src_pixels: [*]align(1) const u32 = @ptrCast(rgba_data.ptr);
         const dst_pixels: [*]align(1) u32 = @ptrCast(mapped + offset);
         const dst_stride_px = @as(usize, pitch) / 4;
         const src_stride_px = @as(usize, src_width);
 
+        // Fixed-point 16.16 scale factors
+        const fp_shift = 16;
+        const fp_scale_x = (@as(u64, src_width) << fp_shift) / @as(u64, dst_width);
+        const fp_scale_y = (@as(u64, src_height) << fp_shift) / @as(u64, dst_height);
+        const src_max_x = src_width - 1;
+        const src_max_y = src_height - 1;
+
         var y: u32 = 0;
-        while (y < src_height) : (y += 1) {
-            const src_row = @as(usize, y) * src_stride_px;
+        while (y < dst_height) : (y += 1) {
+            const sy: u32 = @intCast(@min(@as(u64, y) * fp_scale_y >> fp_shift, src_max_y));
+            const src_row = @as(usize, sy) * src_stride_px;
             const dst_row = @as(usize, y) * dst_stride_px;
             var x: u32 = 0;
-            while (x < src_width) : (x += 1) {
-                const px = src_pixels[src_row + x];
-                // Swap R and B channels: RGBA→BGRA, set alpha to 0xFF for X
+            while (x < dst_width) : (x += 1) {
+                const sx: u32 = @intCast(@min(@as(u64, x) * fp_scale_x >> fp_shift, src_max_x));
+                const px = src_pixels[src_row + sx];
+                // Swap R↔B: RGBA 0xAABBGGRR → BGRX 0xFFRRGGBB
                 const r = px & 0xFF;
                 const g = (px >> 8) & 0xFF;
                 const b = (px >> 16) & 0xFF;
@@ -973,23 +982,9 @@ pub const VideoEncoder = struct {
         status = c.vaUnmapBuffer(va_display, image.buf);
         if (status != c.VA_STATUS_SUCCESS) return error.VaMapFailed;
 
-        // VPP: downscale BGRX (source res) → NV12 (encode res) on GPU.
-        var src_region = c.VARectangle{
-            .x = 0,
-            .y = 0,
-            .width = @intCast(src_width),
-            .height = @intCast(src_height),
-        };
-        var dst_region = c.VARectangle{
-            .x = 0,
-            .y = 0,
-            .width = @intCast(self.width),
-            .height = @intCast(self.height),
-        };
+        // VPP: convert BGRX → NV12 on GPU (same resolution, no scaling).
         var pipeline_param = std.mem.zeroes(c.VAProcPipelineParameterBuffer);
         pipeline_param.surface = self.rgba_surface;
-        pipeline_param.surface_region = &src_region;
-        pipeline_param.output_region = &dst_region;
         pipeline_param.surface_color_standard = c.VAProcColorStandardNone;
         pipeline_param.output_color_standard = c.VAProcColorStandardBT601;
 
