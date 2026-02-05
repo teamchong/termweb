@@ -376,15 +376,13 @@
 
     ws.onopen = () => {
       setStatus('connected');
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        if (_serverId !== null) {
-          sendConnectPanel(_serverId);
-        } else if (_splitInfo) {
-          sendSplitPanel();
-        } else {
-          sendCreatePanel();
-        }
-      }));
+      if (_serverId !== null) {
+        sendConnectPanel(_serverId);
+      } else if (_splitInfo) {
+        sendSplitPanel();
+      } else {
+        sendCreatePanel();
+      }
     };
 
     ws.onmessage = (event) => {
@@ -417,19 +415,16 @@
 
     connectTimeoutId = setTimeout(() => {
       connectTimeoutId = null;
-      if (destroyed) return;
-      requestAnimationFrame(() => {
-        if (destroyed || !panelEl) return;
-        const rect = panelEl.getBoundingClientRect();
-        const width = Math.floor(rect.width);
-        const height = Math.floor(rect.height);
-        if (width > 0 && height > 0) {
-          lastReportedWidth = width;
-          lastReportedHeight = height;
-          sendResizeBinary(width, height);
-        }
-      });
-    }, TIMING.RESIZE_DELAY_AFTER_CONNECT);
+      if (destroyed || !panelEl) return;
+      const rect = panelEl.getBoundingClientRect();
+      const width = Math.floor(rect.width);
+      const height = Math.floor(rect.height);
+      if (width > 0 && height > 0) {
+        lastReportedWidth = width;
+        lastReportedHeight = height;
+        sendResizeBinary(width, height);
+      }
+    }, 0);
   }
 
   function sendCreatePanel(): void {

@@ -99,6 +99,7 @@ export class SplitContainer {
     let startPos = 0;
     let startRatio = 0;
     let containerSize = 0;
+    let rafPending = false;
 
     const onMouseDown = (e: MouseEvent) => {
       e.preventDefault();
@@ -135,7 +136,14 @@ export class SplitContainer {
       const deltaRatio = delta / availableSize;
 
       this.ratio = Math.max(SPLIT.MIN_RATIO, Math.min(SPLIT.MAX_RATIO, startRatio + deltaRatio));
-      this.applyRatio();
+      // Throttle DOM writes to once per animation frame
+      if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(() => {
+          rafPending = false;
+          this.applyRatio();
+        });
+      }
     };
 
     const onMouseUp = () => {

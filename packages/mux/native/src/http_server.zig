@@ -71,6 +71,7 @@ pub const HttpServer = struct {
     allocator: Allocator,
     running: std.atomic.Value(bool),
     stopped: std.atomic.Value(bool),
+    active_connections: std.atomic.Value(u32),
     panel_ws_port: u16,
     control_ws_port: u16,
     file_ws_port: u16,
@@ -88,10 +89,11 @@ pub const HttpServer = struct {
 
         const addr = try net.Address.parseIp4(address, port);
         server.* = .{
-            .listener = try addr.listen(.{ .reuse_address = true, .force_nonblocking = true }),
+            .listener = try addr.listen(.{ .reuse_address = true }),
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
             .stopped = std.atomic.Value(bool).init(false),
+            .active_connections = std.atomic.Value(u32).init(0),
             .panel_ws_port = 0,
             .control_ws_port = 0,
             .file_ws_port = 0,
@@ -128,6 +130,13 @@ pub const HttpServer = struct {
 
     pub fn deinit(self: *HttpServer) void {
         self.stop();
+        // Wait for all active HTTP connection threads to finish
+        var wait_count: u32 = 0;
+        while (self.active_connections.load(.acquire) > 0) {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            wait_count += 1;
+            if (wait_count > 200) break; // 2s timeout
+        }
         self.allocator.destroy(self);
     }
 
@@ -144,16 +153,8 @@ pub const HttpServer = struct {
         std.debug.print("HTTP server listening on port {}\n", .{self.listener.listen_address.getPort()});
 
         while (self.running.load(.acquire)) {
-            const conn = self.listener.accept() catch |err| {
-                // Check running flag first - exit immediately if stopped
-                if (!self.running.load(.acquire)) break;
-                if (err == error.WouldBlock) {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
-                    continue;
-                }
-                // Other errors (including from closed listener) - exit
-                break;
-            };
+            // Blocking accept — stop() closes listener to unblock
+            const conn = self.listener.accept() catch break;
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn.stream }) catch {
                 conn.stream.close();
@@ -164,6 +165,9 @@ pub const HttpServer = struct {
     }
 
     fn handleConnection(self: *HttpServer, stream: net.Stream) void {
+        _ = self.active_connections.fetchAdd(1, .acq_rel);
+        defer _ = self.active_connections.fetchSub(1, .acq_rel);
+
         // Set read timeout so we don't block forever during shutdown
         setReadTimeout(stream.handle, 1000); // 1 second timeout
 

@@ -57,6 +57,16 @@ const header_buffer_size = 4096;
 /// Prevents blocking on slow/unresponsive clients.
 const write_timeout_ms = 1000;
 
+/// Configure socket for low-latency interactive use.
+/// Disables Nagle's algorithm and enables keepalive for long-lived connections.
+fn setSocketOptions(fd: posix.socket_t) void {
+    // TCP_NODELAY: disable Nagle's algorithm — send small packets immediately
+    // Critical for keyboard input latency (otherwise 40-200ms delay)
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    // SO_KEEPALIVE: detect dead connections through NAT/firewalls
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1))) catch {};
+}
+
 // Set socket read timeout for blocking I/O with periodic wakeup
 fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
     const tv = posix.timeval{
@@ -372,61 +382,35 @@ pub const Connection = struct {
     /// For binary frames with zstd enabled: [compression_flag:u8][data...].
     /// compression_flag: 0x00 = uncompressed, 0x01 = zstd compressed.
     pub fn writeFrame(self: *Connection, opcode: Opcode, payload: []const u8) !void {
-        // For binary frames with zstd enabled, add compression flag prefix
-        var final_payload: []const u8 = payload;
-        var compressed_buf: ?[]u8 = null;
-        defer if (compressed_buf) |buf| self.allocator.free(buf);
-
         if (opcode == .binary and self.zstd_enabled) {
-            // Only try compression for payloads > 64 bytes
+            // Try compression for payloads > 64 bytes
             if (payload.len > 64) {
                 if (self.compressor) |*comp| {
                     if (comp.compress(payload)) |compressed| {
-                        // Only use compression if it actually reduces size
+                        defer self.allocator.free(compressed);
                         if (compressed.len + 1 < payload.len) {
-                            // Build compressed payload: [0x01][compressed_data]
-                            const with_flag = self.allocator.alloc(u8, compressed.len + 1) catch {
-                                self.allocator.free(compressed);
-                                // Fall through to send uncompressed with flag
-                                return self.sendUncompressedWithFlag(payload);
-                            };
-                            with_flag[0] = 0x01; // zstd compressed flag
-                            @memcpy(with_flag[1..], compressed);
-                            self.allocator.free(compressed);
-                            compressed_buf = with_flag;
-                            final_payload = with_flag;
-                        } else {
-                            self.allocator.free(compressed);
-                            // Compression didn't help, send uncompressed with flag
-                            return self.sendUncompressedWithFlag(payload);
+                            // Send compressed: [0x01][compressed_data] via writev (zero-alloc)
+                            const flag = [_]u8{0x01};
+                            return self.writeFrameRawParts(.binary, &flag, compressed);
                         }
-                    } else |_| {
-                        // Compression failed, send uncompressed with flag
-                        return self.sendUncompressedWithFlag(payload);
-                    }
-                } else {
-                    // No compressor, send uncompressed with flag
-                    return self.sendUncompressedWithFlag(payload);
+                    } else |_| {}
                 }
-            } else {
-                // Small payload, skip compression but still add flag byte
-                return self.sendUncompressedWithFlag(payload);
             }
+            // Uncompressed: [0x00][payload] via writev (zero-alloc)
+            return self.sendUncompressedWithFlag(payload);
         }
 
-        try self.writeFrameRaw(opcode, final_payload, false);
+        try self.writeFrameRaw(opcode, payload, false);
     }
 
-    /// Helper: send binary data with uncompressed flag prefix.
+    /// Helper: send binary data with uncompressed flag prefix (zero-alloc via writev).
     fn sendUncompressedWithFlag(self: *Connection, payload: []const u8) !void {
-        const with_flag = try self.allocator.alloc(u8, payload.len + 1);
-        defer self.allocator.free(with_flag);
-        with_flag[0] = 0x00; // uncompressed flag
-        @memcpy(with_flag[1..], payload);
-        try self.writeFrameRaw(.binary, with_flag, false);
+        const flag = [_]u8{0x00};
+        try self.writeFrameRawParts(.binary, &flag, payload);
     }
 
     /// Write raw WebSocket frame without compression processing.
+    /// Uses writev to send header+payload in a single syscall.
     fn writeFrameRaw(self: *Connection, opcode: Opcode, payload: []const u8, _: bool) !void {
         var header: [10]u8 = undefined;
         var header_len: usize = 2;
@@ -445,8 +429,89 @@ pub const Connection = struct {
             header_len = 10;
         }
 
-        _ = try self.stream.write(header[0..header_len]);
-        _ = try self.stream.write(payload);
+        // Empty payload (e.g. close frame): single write, no writev needed
+        if (payload.len == 0) {
+            _ = self.stream.write(header[0..header_len]) catch return error.BrokenPipe;
+            return;
+        }
+
+        var iovecs = [_]posix.iovec_const{
+            .{ .base = &header, .len = header_len },
+            .{ .base = payload.ptr, .len = payload.len },
+        };
+        var total = header_len + payload.len;
+        while (total > 0) {
+            const written = posix.writev(self.stream.handle, &iovecs) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return error.BrokenPipe,
+            };
+            if (written == 0) return error.BrokenPipe;
+            total -= written;
+            // Advance iovecs past written bytes
+            var remaining = written;
+            for (&iovecs) |*iov| {
+                if (remaining == 0) break;
+                if (remaining >= iov.len) {
+                    remaining -= iov.len;
+                    iov.base = iov.base + iov.len;
+                    iov.len = 0;
+                } else {
+                    iov.base = iov.base + remaining;
+                    iov.len -= remaining;
+                    remaining = 0;
+                }
+            }
+        }
+    }
+
+    /// Write WebSocket frame with a prefix + payload (3 iovecs, zero-alloc).
+    /// Used for compression flag byte + data without concatenation.
+    pub fn writeFrameRawParts(self: *Connection, opcode: Opcode, prefix: []const u8, payload: []const u8) !void {
+        var header: [10]u8 = undefined;
+        var header_len: usize = 2;
+        const total_payload = prefix.len + payload.len;
+
+        header[0] = 0x80 | @as(u8, @intFromEnum(opcode));
+
+        if (total_payload < 126) {
+            header[1] = @intCast(total_payload);
+        } else if (total_payload < 65536) {
+            header[1] = 126;
+            std.mem.writeInt(u16, header[2..4], @intCast(total_payload), .big);
+            header_len = 4;
+        } else {
+            header[1] = 127;
+            std.mem.writeInt(u64, header[2..10], total_payload, .big);
+            header_len = 10;
+        }
+
+        var iovecs = [_]posix.iovec_const{
+            .{ .base = &header, .len = header_len },
+            .{ .base = prefix.ptr, .len = prefix.len },
+            .{ .base = payload.ptr, .len = payload.len },
+        };
+        var total = header_len + total_payload;
+        while (total > 0) {
+            const written = posix.writev(self.stream.handle, &iovecs) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return error.BrokenPipe,
+            };
+            if (written == 0) return error.BrokenPipe;
+            total -= written;
+            var remaining = written;
+            for (&iovecs) |*iov| {
+                if (remaining == 0) break;
+                if (remaining >= iov.len) {
+                    remaining -= iov.len;
+                    iov.base = iov.base + iov.len;
+                    iov.len = 0;
+                } else {
+                    iov.base = iov.base + remaining;
+                    iov.len -= remaining;
+                    remaining = 0;
+                }
+            }
+        }
     }
 
     /// Send binary data.
@@ -480,6 +545,7 @@ pub const Server = struct {
     listener: net.Server,
     allocator: Allocator,
     running: std.atomic.Value(bool),
+    stopped: std.atomic.Value(bool),
     active_connections: std.atomic.Value(u32), // Track active connection threads
     enable_zstd: bool,
     /// Called when a new WebSocket connection is established.
@@ -503,9 +569,10 @@ pub const Server = struct {
 
         const addr = try net.Address.parseIp4(address, port);
         server.* = .{
-            .listener = try addr.listen(.{ .reuse_address = true, .force_nonblocking = true }),
+            .listener = try addr.listen(.{ .reuse_address = true }),
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
+            .stopped = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(u32).init(0),
             .enable_zstd = enable_zstd,
             .on_connect = null,
@@ -517,7 +584,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.stop();
+        self.stop(); // Also closes listener
         // Wait for all active connection threads to finish
         var wait_count: u32 = 0;
         while (self.active_connections.load(.acquire) > 0) {
@@ -526,7 +593,6 @@ pub const Server = struct {
             // Timeout after 2 seconds to avoid hanging forever
             if (wait_count > 200) break;
         }
-        self.listener.deinit();
         self.allocator.destroy(self);
     }
 
@@ -543,7 +609,10 @@ pub const Server = struct {
     }
 
     pub fn stop(self: *Server) void {
+        if (self.stopped.swap(true, .acq_rel)) return;
         self.running.store(false, .release);
+        // Close listener to unblock the accept() call in run()
+        self.listener.deinit();
     }
 
     // Accept one connection and handle it (blocking)
@@ -553,7 +622,8 @@ pub const Server = struct {
         const conn = try self.allocator.create(Connection);
         conn.* = Connection.init(stream.stream, self.allocator);
 
-        // Set socket timeouts for blocking I/O
+        // Configure socket for low-latency interactive use
+        setSocketOptions(stream.stream.handle);
         setReadTimeout(stream.stream.handle, 100); // 100ms wakeup for shutdown check
         setWriteTimeout(stream.stream.handle, write_timeout_ms);
 
@@ -598,20 +668,14 @@ pub const Server = struct {
         self.allocator.destroy(conn);
     }
 
-    // Run server loop (blocking)
+    /// Run server loop. Blocks until stop() is called (which closes listener to unblock accept).
     pub fn run(self: *Server) !void {
         self.running.store(true, .release);
 
         while (self.running.load(.acquire)) {
-            const conn = self.acceptOne() catch |err| {
-                if (err == error.WouldBlock) {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
-                    continue;
-                }
-                continue;
-            };
+            // Blocking accept — stop() closes listener to unblock
+            const conn = self.acceptOne() catch break;
 
-            // Handle in thread
             const thread = Thread.spawn(.{}, handleConnectionThread, .{ self, conn }) catch {
                 conn.deinit();
                 self.allocator.destroy(conn);
@@ -630,10 +694,14 @@ pub const Server = struct {
     // Handle a WebSocket upgrade from an HTTP server
     // The stream and pre-read request are passed from the HTTP handler
     pub fn handleUpgrade(self: *Server, stream: net.Stream, request: []const u8) void {
+        // Reject upgrades during shutdown to avoid use-after-free
+        if (!self.running.load(.acquire)) return;
+
         const conn = self.allocator.create(Connection) catch return;
         conn.* = Connection.init(stream, self.allocator);
 
-        // Set socket timeouts for blocking I/O
+        // Configure socket for low-latency interactive use
+        setSocketOptions(stream.handle);
         setReadTimeout(stream.handle, 100); // 100ms wakeup for shutdown check
         setWriteTimeout(stream.handle, write_timeout_ms);
 

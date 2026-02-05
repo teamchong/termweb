@@ -30,15 +30,42 @@ export async function initZstd(wasmPath = '/zstd.wasm'): Promise<void> {
     try {
       const response = await fetch(wasmPath);
       const bytes = await response.arrayBuffer();
-      const { instance } = await WebAssembly.instantiate(bytes, {
-        wasi_snapshot_preview1: {
-          // Stubs for WASI imports (zstd doesn't use I/O)
-          fd_write: () => 0,
-          fd_close: () => 0,
-          fd_seek: () => 0,
-          proc_exit: () => {},
+
+      // WASI stubs — zstd WASM is built with wasi-libc which requires these
+      // imports, but none are actually called at runtime (no I/O, no args).
+      // Functions that write to memory pointers must zero them out.
+      let mem: WebAssembly.Memory | null = null;
+      const wasi_stubs = {
+        args_sizes_get: (argc_ptr: number, buf_size_ptr: number) => {
+          const v = new DataView(mem!.buffer);
+          v.setUint32(argc_ptr, 0, true);
+          v.setUint32(buf_size_ptr, 0, true);
+          return 0;
         },
+        args_get: () => 0,
+        environ_sizes_get: (count_ptr: number, buf_size_ptr: number) => {
+          const v = new DataView(mem!.buffer);
+          v.setUint32(count_ptr, 0, true);
+          v.setUint32(buf_size_ptr, 0, true);
+          return 0;
+        },
+        environ_get: () => 0,
+        clock_time_get: () => 0,
+        fd_close: () => 0,
+        fd_fdstat_get: () => 0,
+        fd_prestat_get: () => 8, // EBADF — no preopened dirs
+        fd_prestat_dir_name: () => 8,
+        fd_read: () => 0,
+        fd_seek: () => 0,
+        fd_write: () => 0,
+        proc_exit: () => {},
+        random_get: () => 0,
+      };
+
+      const { instance } = await WebAssembly.instantiate(bytes, {
+        wasi_snapshot_preview1: wasi_stubs,
       });
+      mem = instance.exports.memory as WebAssembly.Memory;
       wasm = instance.exports as unknown as ZstdExports;
     } catch (err) {
       // Reset so a retry is possible

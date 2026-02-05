@@ -19,6 +19,7 @@ const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
 const auth = @import("auth.zig");
+const WakeSignal = @import("wake_signal.zig").WakeSignal;
 
 
 // Debug logging to stderr
@@ -243,6 +244,13 @@ pub const Tab = struct {
         return list;
     }
 
+    /// Collect panel IDs into a fixed-size stack buffer (zero-alloc).
+    pub fn collectPanelIdsInto(self: *const Tab, buf: []u32) usize {
+        var count: usize = 0;
+        collectPanelIdsStack(self.root, buf, &count);
+        return count;
+    }
+
     fn collectPanelIds(allocator: std.mem.Allocator, node: *const SplitNode, list: *std.ArrayListUnmanaged(u32)) !void {
         if (node.panel_id) |pid| {
             try list.append(allocator, pid);
@@ -253,6 +261,17 @@ pub const Tab = struct {
         if (node.second) |second| {
             try collectPanelIds(allocator, second, list);
         }
+    }
+
+    fn collectPanelIdsStack(node: *const SplitNode, buf: []u32, count: *usize) void {
+        if (node.panel_id) |pid| {
+            if (count.* < buf.len) {
+                buf[count.*] = pid;
+                count.* += 1;
+            }
+        }
+        if (node.first) |first| collectPanelIdsStack(first, buf, count);
+        if (node.second) |second| collectPanelIdsStack(second, buf, count);
     }
 };
 
@@ -528,6 +547,7 @@ const Panel = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     input_queue: std.ArrayList(InputEvent),
+    has_pending_input: std.atomic.Value(bool),
     title: []const u8,  // Last known title
     pwd: []const u8,    // Last known working directory
     inspector_subscribed: bool,
@@ -634,6 +654,7 @@ const Panel = struct {
             .allocator = allocator,
             .mutex = .{},
             .input_queue = .{},
+            .has_pending_input = std.atomic.Value(bool).init(false),
             .title = &.{},
             .pwd = &.{},
             .inspector_subscribed = false,
@@ -875,9 +896,9 @@ const Panel = struct {
         return .{ .data = result.?.data, .is_keyframe = result.?.is_keyframe };
     }
 
-    // Check if there's queued input (non-locking for quick check)
+    /// Check if there's queued input (lock-free atomic check).
     fn hasQueuedInput(self: *Panel) bool {
-        return self.input_queue.items.len > 0;
+        return self.has_pending_input.load(.acquire);
     }
 
     // Process queued input events (must be called from main thread)
@@ -895,6 +916,7 @@ const Panel = struct {
         const events_count = @min(count, events_buf.len);
         @memcpy(events_buf[0..events_count], items[0..events_count]);
         self.input_queue.clearRetainingCapacity();
+        self.has_pending_input.store(false, .release);
         self.mutex.unlock();
 
         for (events_buf[0..events_count]) |*event| {
@@ -1472,8 +1494,9 @@ const Server = struct {
     quick_terminal_open: bool,  // Whether quick terminal is open
     inspector_open: bool,  // Whether inspector is open
     shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
+    wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
 
-    var global_server: ?*Server = null;
+    var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
 
     fn init(allocator: std.mem.Allocator, http_port: u16, control_port: u16, panel_port: u16) !*Server {
         const server = try allocator.create(Server);
@@ -1541,6 +1564,7 @@ const Server = struct {
                     break :blk null;
                 };
             } else {},
+            .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -1552,7 +1576,7 @@ const Server = struct {
             server.initial_cwd_allocated = false;
         }
 
-        global_server = server;
+        global_server.store(server, .release);
         return server;
     }
 
@@ -1624,7 +1648,7 @@ const Server = struct {
         self.running.store(false, .release);
 
         // Clear global_server first to prevent callbacks from accessing it during shutdown
-        global_server = null;
+        global_server.store(null, .release);
 
         // Shut down WebSocket servers first and wait for all connection threads to finish
         // This must happen BEFORE destroying panels to avoid use-after-free
@@ -1656,6 +1680,7 @@ const Server = struct {
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
         if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
         // Free shared VA-API context (after all panels/encoders are destroyed)
+        self.wake_signal.deinit();
         if (is_linux) {
             if (self.shared_va_ctx) |*ctx| ctx.deinit();
         }
@@ -1765,7 +1790,7 @@ const Server = struct {
     // --- Control WebSocket callbacks---
 
     fn onControlConnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
         self.control_connections.append(self.allocator, conn) catch {};
@@ -1785,7 +1810,7 @@ const Server = struct {
 
     fn onControlMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
         _ = is_binary;
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
         if (data.len == 0) return;
 
         const msg_type = data[0];
@@ -1799,7 +1824,7 @@ const Server = struct {
     }
 
     fn onControlDisconnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
         for (self.control_connections.items, 0..) |ctrl_conn, i| {
@@ -1821,7 +1846,7 @@ const Server = struct {
     }
 
     fn onPanelMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
         _ = is_binary;
 
         if (conn.user_data) |ud| {
@@ -1872,6 +1897,8 @@ const Server = struct {
             }
 
             panel.handleMessage(data);
+            panel.has_pending_input.store(true, .release);
+            self.wake_signal.notify();
         } else {
             // Not connected to panel yet - handle connect/create commands
             if (data.len == 0) return;
@@ -1923,6 +1950,7 @@ const Server = struct {
                         .kind = kind,
                     }) catch {};
                     self.mutex.unlock();
+                    self.wake_signal.notify();
                 },
                 .split_panel => {
                     // Split existing panel: [msg_type:u8][parent_id:u32][dir_byte:u8][width:u16][height:u16][scale_x100:u16]
@@ -1945,6 +1973,7 @@ const Server = struct {
                         .scale = scale,
                     }) catch {};
                     self.mutex.unlock();
+                    self.wake_signal.notify();
                 },
                 else => {},
             }
@@ -1952,7 +1981,7 @@ const Server = struct {
     }
 
     fn onPanelDisconnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
         if (self.panel_connections.fetchRemove(conn)) |entry| {
@@ -1995,6 +2024,7 @@ const Server = struct {
             self.mutex.lock();
             self.pending_destroys.append(self.allocator, .{ .id = panel_id }) catch {};
             self.mutex.unlock();
+            self.wake_signal.notify();
         } else if (msg_type == 0x82) { // resize_panel
             if (data.len < 9) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
@@ -2003,6 +2033,7 @@ const Server = struct {
             self.mutex.lock();
             self.pending_resizes.append(self.allocator, .{ .id = panel_id, .width = width, .height = height }) catch {};
             self.mutex.unlock();
+            self.wake_signal.notify();
         } else if (msg_type == 0x83) { // focus_panel
             if (data.len < 5) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
@@ -2306,6 +2337,19 @@ const Server = struct {
         }
     }
 
+    /// Max connections for stack-based snapshot (avoids heap allocation during broadcast).
+    const max_broadcast_conns = 16;
+
+    /// Copy control connection list under mutex so sends can happen without holding it.
+    /// Caller provides stack buffer; returned slice points into it.
+    fn snapshotControlConns(self: *Server, buf: *[max_broadcast_conns]*ws.Connection) []const *ws.Connection {
+        self.mutex.lock();
+        const count = @min(self.control_connections.items.len, max_broadcast_conns);
+        @memcpy(buf[0..count], self.control_connections.items[0..count]);
+        self.mutex.unlock();
+        return buf[0..count];
+    }
+
     fn broadcastInspectorUpdates(self: *Server) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2402,10 +2446,9 @@ const Server = struct {
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_created);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(&buf) catch {};
         }
     }
@@ -2416,10 +2459,9 @@ const Server = struct {
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_closed);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(&buf) catch {};
         }
     }
@@ -2433,16 +2475,18 @@ const Server = struct {
         buf[5] = title_len;
         @memcpy(buf[6..][0..title_len], title[0..title_len]);
 
+        // Lock once: update panel data + copy connection list, then unlock before sending
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
         self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Store title in panel for reconnects
         if (self.panels.get(panel_id)) |panel| {
             if (panel.title.len > 0) self.allocator.free(panel.title);
             panel.title = self.allocator.dupe(u8, title) catch &.{};
         }
+        const count = @min(self.control_connections.items.len, max_broadcast_conns);
+        @memcpy(conn_buf[0..count], self.control_connections.items[0..count]);
+        self.mutex.unlock();
 
-        for (self.control_connections.items) |conn| {
+        for (conn_buf[0..count]) |conn| {
             conn.sendBinary(buf[0 .. 6 + title_len]) catch {};
         }
     }
@@ -2453,10 +2497,9 @@ const Server = struct {
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_bell);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(&buf) catch {};
         }
     }
@@ -2470,16 +2513,18 @@ const Server = struct {
         std.mem.writeInt(u16, buf[5..7], pwd_len, .little);
         @memcpy(buf[7..][0..pwd_len], pwd[0..pwd_len]);
 
+        // Lock once: update panel data + copy connection list, then unlock before sending
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
         self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Store pwd in panel for reconnects
         if (self.panels.get(panel_id)) |panel| {
             if (panel.pwd.len > 0) self.allocator.free(panel.pwd);
             panel.pwd = self.allocator.dupe(u8, pwd) catch &.{};
         }
+        const count = @min(self.control_connections.items.len, max_broadcast_conns);
+        @memcpy(conn_buf[0..count], self.control_connections.items[0..count]);
+        self.mutex.unlock();
 
-        for (self.control_connections.items) |conn| {
+        for (conn_buf[0..count]) |conn| {
             conn.sendBinary(buf[0 .. 7 + pwd_len]) catch {};
         }
     }
@@ -2497,38 +2542,39 @@ const Server = struct {
         std.mem.writeInt(u16, buf[6 + title_len ..][0..2], body_len, .little);
         @memcpy(buf[8 + title_len ..][0..body_len], body[0..body_len]);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(buf[0..total_len]) catch {};
         }
     }
 
     fn broadcastLayoutUpdate(self: *Server) void {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+
         self.mutex.lock();
         const layout_json = self.layout.toJson(self.allocator) catch {
             self.mutex.unlock();
             return;
         };
+        const count = @min(self.control_connections.items.len, max_broadcast_conns);
+        @memcpy(conn_buf[0..count], self.control_connections.items[0..count]);
+        self.mutex.unlock();
+
         defer self.allocator.free(layout_json);
 
         // Binary: [type:u8][layout_len:u16][layout_json...] = 3 + layout.len bytes
         const layout_len: u16 = @min(@as(u16, @intCast(@min(layout_json.len, 65535))), 65535);
-        const msg_buf = self.allocator.alloc(u8, 3 + layout_len) catch {
-            self.mutex.unlock();
-            return;
-        };
+        const msg_buf = self.allocator.alloc(u8, 3 + layout_len) catch return;
         defer self.allocator.free(msg_buf);
 
         msg_buf[0] = @intFromEnum(BinaryCtrlMsg.layout_update);
         std.mem.writeInt(u16, msg_buf[1..3], layout_len, .little);
         @memcpy(msg_buf[3..][0..layout_len], layout_json[0..layout_len]);
 
-        for (self.control_connections.items) |conn| {
+        for (conn_buf[0..count]) |conn| {
             conn.sendBinary(msg_buf) catch {};
         }
-        self.mutex.unlock();
     }
 
     fn broadcastOverviewState(self: *Server) void {
@@ -2537,10 +2583,9 @@ const Server = struct {
         buf[0] = @intFromEnum(BinaryCtrlMsg.overview_state);
         buf[1] = if (self.overview_open) 1 else 0;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(&buf) catch {};
         }
     }
@@ -2561,10 +2606,9 @@ const Server = struct {
         buf[0] = @intFromEnum(BinaryCtrlMsg.quick_terminal_state);
         buf[1] = if (self.quick_terminal_open) 1 else 0;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(&buf) catch {};
         }
     }
@@ -2585,10 +2629,9 @@ const Server = struct {
         buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state_open);
         buf[1] = if (self.inspector_open) 1 else 0;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(&buf) catch {};
         }
     }
@@ -2613,10 +2656,9 @@ const Server = struct {
         std.mem.writeInt(u32, msg_buf[1..5], data_len, .little);
         @memcpy(msg_buf[5..][0..data_len], text[0..data_len]);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.control_connections.items) |conn| {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
             conn.sendBinary(msg_buf) catch {};
         }
     }
@@ -2652,7 +2694,7 @@ const Server = struct {
     // --- File WebSocket callbacks---
 
     fn onFileConnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
         self.file_connections.append(self.allocator, conn) catch {};
@@ -2662,7 +2704,7 @@ const Server = struct {
     }
 
     fn onFileMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
         if (!is_binary or data.len == 0) return;
 
         const msg_type = data[0];
@@ -2678,7 +2720,7 @@ const Server = struct {
     }
 
     fn onFileDisconnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
         // Remove from file connections
@@ -2696,7 +2738,7 @@ const Server = struct {
     // --- Preview WebSocket callbacks---
 
     fn onPreviewConnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2724,7 +2766,7 @@ const Server = struct {
     }
 
     fn onPreviewDisconnect(conn: *ws.Connection) void {
-        const self = global_server orelse return;
+        const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2744,17 +2786,12 @@ const Server = struct {
     fn sendPreviewFrame(self: *Server, panel_id: u32, frame_data: []const u8) void {
         if (self.preview_connections.items.len == 0) return;
 
-        // Build message: [panel_id (u32 LE), frame_data...]
-        const msg_len = 4 + frame_data.len;
-        const msg = self.allocator.alloc(u8, msg_len) catch return;
-        defer self.allocator.free(msg);
+        // Send [panel_id:u32 LE][frame_data...] via writev (zero-alloc)
+        var id_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &id_buf, panel_id, .little);
 
-        std.mem.writeInt(u32, msg[0..4], panel_id, .little);
-        @memcpy(msg[4..], frame_data);
-
-        // Send to all preview clients
         for (self.preview_connections.items) |conn| {
-            conn.sendBinary(msg) catch {};
+            conn.writeFrameRawParts(.binary, &id_buf, frame_data) catch {};
         }
     }
 
@@ -3181,7 +3218,6 @@ const Server = struct {
     fn runRenderLoop(self: *Server) void {
         const target_fps: u64 = 30;
         const frame_time_ns: u64 = std.time.ns_per_s / target_fps;
-        const input_interval_ns: u64 = 8 * std.time.ns_per_ms; // Process input every 8ms
 
         var last_frame: i128 = 0;
 
@@ -3264,14 +3300,7 @@ const Server = struct {
                 if (active_tab_id) |atid| {
                     for (self.layout.tabs.items) |tab| {
                         if (tab.id == atid) {
-                            var panel_ids = tab.getAllPanelIds(self.allocator) catch break;
-                            defer panel_ids.deinit(self.allocator);
-                            for (panel_ids.items) |pid| {
-                                if (active_panel_count < active_panel_ids_buf.len) {
-                                    active_panel_ids_buf[active_panel_count] = pid;
-                                    active_panel_count += 1;
-                                }
-                            }
+                            active_panel_count = tab.collectPanelIdsInto(&active_panel_ids_buf);
                             break;
                         }
                     }
@@ -3406,26 +3435,12 @@ const Server = struct {
             }
 
 
-            // Sleep until next frame/input interval
+            // Wait until next frame or input event (whichever comes first)
             const elapsed: u64 = @intCast(std.time.nanoTimestamp() - now);
-            // Use frame_time_ns for lower CPU when no panels are streaming
-            var sleep_time = frame_time_ns;
-
-            // Check if any panel needs frequent updates (has input queued or is streaming)
-            var needs_fast_poll = false;
-            for (panels_buf[0..panels_count]) |panel| {
-                if (panel.streaming.load(.acquire) or panel.hasQueuedInput()) {
-                    needs_fast_poll = true;
-                    break;
-                }
-            }
-
-            if (needs_fast_poll) {
-                sleep_time = input_interval_ns;
-            }
-
-            if (elapsed < sleep_time) {
-                std.Thread.sleep(sleep_time - elapsed);
+            const remaining = if (elapsed < frame_time_ns) frame_time_ns - elapsed else 0;
+            if (remaining > 0) {
+                // Block until input arrives or frame timer expires
+                _ = self.wake_signal.waitTimeout(remaining);
             }
         }
     }
@@ -3634,7 +3649,7 @@ fn wakeupCallback(userdata: ?*anyopaque) callconv(.c) void {
 
 fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) callconv(.c) bool {
     _ = app;
-    const self = Server.global_server orelse return false;
+    const self = Server.global_server.load(.acquire) orelse return false;
 
     switch (action.tag) {
         c.GHOSTTY_ACTION_SET_TITLE => {
@@ -3733,7 +3748,7 @@ fn readClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_e
     // userdata is the Panel pointer (set via surface_config.userdata)
     const panel: *Panel = @ptrCast(@alignCast(userdata orelse return));
 
-    const self = Server.global_server orelse return;
+    const self = Server.global_server.load(.acquire) orelse return;
 
     // Only handle selection clipboard
     if (clipboard == c.GHOSTTY_CLIPBOARD_SELECTION) {
@@ -3762,7 +3777,7 @@ fn writeClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_
     _ = userdata;
     _ = protected;
 
-    const self = Server.global_server orelse return;
+    const self = Server.global_server.load(.acquire) orelse return;
     if (count == 0 or content == null) return;
 
     // Get the text/plain content
@@ -3797,12 +3812,13 @@ fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c)
     _ = needs_confirm;
     // userdata is the Panel pointer (set via surface_config.userdata)
     const panel: *Panel = @ptrCast(@alignCast(userdata orelse return));
-    const self = Server.global_server orelse return;
+    const self = Server.global_server.load(.acquire) orelse return;
 
     // Queue the panel for destruction on main thread
     self.mutex.lock();
     self.pending_destroys.append(self.allocator, .{ .id = panel.id }) catch {};
     self.mutex.unlock();
+    self.wake_signal.notify();
 }
 
 
@@ -3841,7 +3857,7 @@ fn handleSigint(_: c_int) callconv(.c) void {
         std.posix.exit(1);
     }
     // First Ctrl+C - graceful shutdown
-    if (Server.global_server) |server| {
+    if (Server.global_server.load(.acquire)) |server| {
         server.running.store(false, .release);
         // Also stop child servers so their connection handlers exit
         server.http_server.stop();

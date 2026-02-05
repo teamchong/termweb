@@ -26,8 +26,6 @@ export const TIMING = {
   WS_RECONNECT_MAX: 30000,
   /** Bell flash duration */
   BELL_FLASH_DURATION: 150,
-  /** Resize send delay after connect */
-  RESIZE_DELAY_AFTER_CONNECT: 100,
   /** Stats overlay update interval */
   STATS_UPDATE_INTERVAL: 500,
   /** Buffer stats report interval */
