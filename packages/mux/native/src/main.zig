@@ -3398,6 +3398,7 @@ const Server = struct {
 
                         // Read pixels from OpenGL framebuffer
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
+
                         if (read_ok) {
                             // Pass explicit dimensions to ensure encoder matches frame size
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {

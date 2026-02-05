@@ -176,8 +176,13 @@
       return;
     }
 
-    if (lastDecodeStart > 0) {
-      decodeLatencies.push(performance.now() - lastDecodeStart);
+    // Measure actual decode queue latency using frame timestamp roundtrip
+    // (timestamp was set to performance.now()*1000 at submit time)
+    const submitTimeUs = frame.timestamp;
+    const nowUs = performance.now() * 1000;
+    const decodeMs = (nowUs - submitTimeUs) / 1000;
+    if (decodeMs > 0 && decodeMs < 10000) {
+      decodeLatencies.push(decodeMs);
     }
 
     if (canvasEl && (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight)) {
@@ -277,6 +282,17 @@
       gotFirstKeyframe = true;
     }
 
+    // Drop P-frames when decode queue is too deep (reduces pipeline latency).
+    // Threshold must be high enough to accommodate hardware decoder internal buffer.
+    if (!isKeyframe && pendingDecode > 10) {
+      requestKeyframe();
+      return;
+    }
+
+    if (isKeyframe) {
+      keyframeRequested = false;
+    }
+
     decodeFrame(frameData, isKeyframe);
     checkBufferHealth();
   }
@@ -284,10 +300,10 @@
   function decodeFrame(data: Uint8Array, isKeyframe: boolean): void {
     if (!decoder || decoder.state !== 'configured') return;
 
-    const timestamp = frameCount * (1000000 / PANEL.ASSUMED_FPS);
+    // Use real time as timestamp so we can measure decode latency in onFrame()
+    const timestamp = performance.now() * 1000; // microseconds
     frameCount++;
     pendingDecode++;
-    lastDecodeStart = performance.now();
 
     try {
       const chunk = new EncodedVideoChunk({
@@ -315,6 +331,15 @@
       sendBufferStats(health, receivedFps);
       lastBufferReport = now;
     }
+  }
+
+  let keyframeRequested = false;
+
+  function requestKeyframe(): void {
+    if (keyframeRequested || !isWsOpen()) return;
+    keyframeRequested = true;
+    const buf = new Uint8Array([ClientMsg.REQUEST_KEYFRAME]);
+    ws!.send(buf);
   }
 
   function sendBufferStats(health: number, fps: number): void {

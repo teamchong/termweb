@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 // VA-API C imports (base types only, not encoder structs with bitfield unions)
 const c = @cImport({
     @cInclude("va/va.h");
+    @cInclude("va/va_vpp.h");
     @cInclude("va/va_drm.h");
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
@@ -28,6 +29,7 @@ const VAProfileH264Main: c_int = 6;
 const VAProfileH264High: c_int = 7;
 const VAProfileH264ConstrainedBaseline: c_int = 18;
 const VAEntrypointEncSlice: c_int = 6;
+
 
 // Buffer types (from va.h VABufferType enum)
 const VAEncCodedBufferType: c_int = 21;
@@ -208,6 +210,8 @@ pub const SharedVaContext = struct {
     drm_fd: c_int,
     va_display: c.VADisplay,
     va_config: c.VAConfigID,
+    vpp_config: c.VAConfigID,
+    has_vpp: bool,
 
     /// Initialize the shared VA-API context (open DRM, vaInitialize, create config).
     /// Call once at server startup. All VideoEncoders share this context.
@@ -267,14 +271,39 @@ pub const SharedVaContext = struct {
             return error.H264NotSupported;
         }
 
+        // Try to create VPP config for GPU color space conversion (RGBA→NV12)
+        var vpp_config: c.VAConfigID = 0;
+        var has_vpp = false;
+        var vpp_attrib = c.VAConfigAttrib{
+            .type = c.VAConfigAttribRTFormat,
+            .value = 0,
+        };
+        status = c.vaGetConfigAttributes(va_display, c.VAProfileNone, c.VAEntrypointVideoProc, &vpp_attrib, 1);
+        if (status == c.VA_STATUS_SUCCESS and vpp_attrib.value != 0) {
+            var vpp_attribs = [_]c.VAConfigAttrib{
+                .{ .type = c.VAConfigAttribRTFormat, .value = c.VA_RT_FORMAT_YUV420 },
+            };
+            status = c.vaCreateConfig(va_display, c.VAProfileNone, c.VAEntrypointVideoProc, &vpp_attribs, 1, &vpp_config);
+            if (status == c.VA_STATUS_SUCCESS) {
+                has_vpp = true;
+                std.debug.print("VAAPI: VPP enabled (GPU color conversion)\n", .{});
+            }
+        }
+        if (!has_vpp) {
+            std.debug.print("VAAPI: VPP not available, using CPU color conversion\n", .{});
+        }
+
         return .{
             .drm_fd = drm_fd,
             .va_display = va_display,
             .va_config = config,
+            .vpp_config = vpp_config,
+            .has_vpp = has_vpp,
         };
     }
 
     pub fn deinit(self: *SharedVaContext) void {
+        if (self.has_vpp) _ = c.vaDestroyConfig(self.va_display, self.vpp_config);
         _ = c.vaDestroyConfig(self.va_display, self.va_config);
         _ = c.vaTerminate(self.va_display);
         _ = c.close(self.drm_fd);
@@ -317,8 +346,15 @@ pub const VideoEncoder = struct {
     pps_data: [64]u8,
     pps_len: usize,
 
+    // VPP (GPU color conversion + scaling) resources
+    vpp_context: c.VAContextID,
+    rgba_surface: c.VASurfaceID,
+    rgba_width: u32, // RGBA surface dimensions (source-aligned, may differ from encode dims)
+    rgba_height: u32,
+    has_vpp: bool,
+
     const MAX_OUTPUT_SIZE = 4 * 1024 * 1024; // 4MB max per frame
-    const MAX_PIXELS: u64 = 4096 * 2304; // H.264 Level 5.1 max (covers 4K)
+    const MAX_PIXELS: u64 = 2048 * 2048; // Reduced for fast encode
 
     // Quality presets - FPS fixed at 30, only bitrate varies
     const QUALITY_PRESETS = [_]struct { bitrate: u32, fps: u32 }{
@@ -329,24 +365,38 @@ pub const VideoEncoder = struct {
         .{ .bitrate = 8_000_000, .fps = 30 }, // Level 4: Max (8 Mbps)
     };
 
+    /// Maximum dimension for a single axis. Capped at 2048 for fast encode —
+    /// terminal text is still sharp and H.264 artifacts dominate at any higher resolution.
+    const MAX_DIM: u32 = 2048;
+
     fn calcAlignedDimensions(width: u32, height: u32) struct { w: u32, h: u32 } {
         // VA-API hardware encoders require 16-pixel aligned surfaces.
-        // We align the destination but handle stride differences in uploadFrame.
-        const pixels: u64 = @as(u64, width) * @as(u64, height);
-        if (pixels <= MAX_PIXELS) {
-            // Round to 16-pixel alignment (required by H.264 hardware encoders)
-            return .{
-                .w = (width + 15) & ~@as(u32, 15),
-                .h = (height + 15) & ~@as(u32, 15),
-            };
+        // We also enforce per-dimension caps (GPU H.264 encode typically maxes at 4096).
+        var w = width;
+        var h = height;
+
+        // Enforce per-dimension limit first
+        if (w > MAX_DIM or h > MAX_DIM) {
+            const scale_w = @as(f64, @floatFromInt(MAX_DIM)) / @as(f64, @floatFromInt(w));
+            const scale_h = @as(f64, @floatFromInt(MAX_DIM)) / @as(f64, @floatFromInt(h));
+            const scale = @min(scale_w, scale_h);
+            w = @intFromFloat(@as(f64, @floatFromInt(w)) * scale);
+            h = @intFromFloat(@as(f64, @floatFromInt(h)) * scale);
         }
-        const scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(pixels)));
-        var new_w: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
-        var new_h: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * scale);
-        // Round to 16-pixel alignment
-        new_w = (new_w + 15) & ~@as(u32, 15);
-        new_h = (new_h + 15) & ~@as(u32, 15);
-        return .{ .w = new_w, .h = new_h };
+
+        // Also enforce total pixel count
+        const pixels: u64 = @as(u64, w) * @as(u64, h);
+        if (pixels > MAX_PIXELS) {
+            const scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(pixels)));
+            w = @intFromFloat(@as(f64, @floatFromInt(w)) * scale);
+            h = @intFromFloat(@as(f64, @floatFromInt(h)) * scale);
+        }
+
+        // Round to 16-pixel alignment (required by H.264 hardware encoders)
+        return .{
+            .w = (w + 15) & ~@as(u32, 15),
+            .h = (h + 15) & ~@as(u32, 15),
+        };
     }
 
     // Bitstream writer for NAL unit generation
@@ -558,6 +608,12 @@ pub const VideoEncoder = struct {
     /// The shared context owns the DRM fd, VA display, and VA config.
     /// This encoder only creates surfaces + encoding context (~20-50ms vs ~400ms).
     pub fn initWithShared(allocator: std.mem.Allocator, shared: *SharedVaContext, width: u32, height: u32) CreateError!*VideoEncoder {
+        // Reject zero dimensions — VA-API cannot create context for 0x0
+        if (width == 0 or height == 0) {
+            std.debug.print("ENCODER: rejecting zero dimensions {}x{}\n", .{ width, height });
+            return error.VaContextFailed;
+        }
+
         const encoder = try allocator.create(VideoEncoder);
         errdefer allocator.destroy(encoder);
 
@@ -567,6 +623,8 @@ pub const VideoEncoder = struct {
         const scaled = calcAlignedDimensions(width, height);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
+
+        std.debug.print("ENCODER: init {}x{} -> encode {}x{}\n", .{ width, height, encode_width, encode_height });
 
         const va_display = shared.va_display;
 
@@ -625,6 +683,61 @@ pub const VideoEncoder = struct {
             return error.VaBufferFailed;
         }
 
+        // Set up VPP (GPU color conversion BGRX→NV12) if available.
+        // BGRX surface at encode resolution — CPU does R↔B swap + downscale,
+        // VPP only converts BGRX→NV12 on GPU (no scaling, fast).
+        var vpp_context: c.VAContextID = 0;
+        var rgba_surface: c.VASurfaceID = c.VA_INVALID_SURFACE;
+        var actual_rgba_w: u32 = 0;
+        var actual_rgba_h: u32 = 0;
+        const has_vpp = shared.has_vpp;
+        if (has_vpp) vpp_blk: {
+            // Create BGRX surface at encode resolution (universally supported format)
+            var rgba_attribs = [_]c.VASurfaceAttrib{
+                .{
+                    .type = c.VASurfaceAttribPixelFormat,
+                    .flags = c.VA_SURFACE_ATTRIB_SETTABLE,
+                    .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = @as(c_int, @bitCast(@as(u32, c.VA_FOURCC_BGRX))) } },
+                },
+            };
+            status = c.vaCreateSurfaces(
+                va_display,
+                c.VA_RT_FORMAT_RGB32,
+                encode_width,
+                encode_height,
+                @ptrCast(&rgba_surface),
+                1,
+                &rgba_attribs,
+                1,
+            );
+            if (status != c.VA_STATUS_SUCCESS) {
+                std.debug.print("ENCODER: VPP BGRX surface failed: {}, falling back to CPU\n", .{status});
+                break :vpp_blk;
+            }
+            actual_rgba_w = encode_width;
+            actual_rgba_h = encode_height;
+
+            // Create VPP context at encode resolution (no scaling needed)
+            status = c.vaCreateContext(
+                va_display,
+                shared.vpp_config,
+                @intCast(encode_width),
+                @intCast(encode_height),
+                c.VA_PROGRESSIVE,
+                @ptrCast(&rgba_surface),
+                1,
+                &vpp_context,
+            );
+            if (status != c.VA_STATUS_SUCCESS) {
+                std.debug.print("ENCODER: VPP context failed: {}, falling back to CPU\n", .{status});
+                _ = c.vaDestroySurfaces(va_display, @ptrCast(&rgba_surface), 1);
+                rgba_surface = c.VA_INVALID_SURFACE;
+                actual_rgba_w = 0;
+                actual_rgba_h = 0;
+                break :vpp_blk;
+            }
+        }
+
         encoder.* = .{
             .width = encode_width,
             .height = encode_height,
@@ -648,6 +761,11 @@ pub const VideoEncoder = struct {
             .sps_len = 0,
             .pps_data = undefined,
             .pps_len = 0,
+            .vpp_context = vpp_context,
+            .rgba_surface = rgba_surface,
+            .rgba_width = actual_rgba_w,
+            .rgba_height = actual_rgba_h,
+            .has_vpp = has_vpp and rgba_surface != c.VA_INVALID_SURFACE,
         };
 
         // Generate SPS/PPS for H264High profile
@@ -659,12 +777,14 @@ pub const VideoEncoder = struct {
 
     pub fn deinit(self: *VideoEncoder) void {
         const va_display = self.shared.va_display;
+        if (self.has_vpp) {
+            _ = c.vaDestroyContext(va_display, self.vpp_context);
+            _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
+        }
         var surfaces = [_]c.VASurfaceID{ self.src_surface, self.ref_surface, self.recon_surface };
         _ = vaDestroyBuffer(va_display, self.coded_buf);
         _ = c.vaDestroyContext(va_display, self.va_context);
         _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
-        // Shared context (drm_fd, va_display, va_config) is NOT freed here -
-        // it's owned by the Server and outlives individual encoders.
         self.allocator.free(self.output_buffer);
         self.allocator.destroy(self);
     }
@@ -695,6 +815,13 @@ pub const VideoEncoder = struct {
         const encode_height = scaled.h;
 
         const va_display = self.shared.va_display;
+
+        // Destroy old VPP resources
+        if (self.has_vpp) {
+            _ = c.vaDestroyContext(va_display, self.vpp_context);
+            _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
+            self.has_vpp = false;
+        }
 
         // Destroy old surfaces
         var old_surfaces = [_]c.VASurfaceID{ self.src_surface, self.ref_surface, self.recon_surface };
@@ -757,164 +884,242 @@ pub const VideoEncoder = struct {
         self.source_height = height;
         self.frame_count = 0;
 
+        // Recreate VPP resources at new encode resolution
+        if (self.shared.has_vpp) vpp_blk: {
+            var rgba_attribs = [_]c.VASurfaceAttrib{
+                .{
+                    .type = c.VASurfaceAttribPixelFormat,
+                    .flags = c.VA_SURFACE_ATTRIB_SETTABLE,
+                    .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = @as(c_int, @bitCast(@as(u32, c.VA_FOURCC_BGRX))) } },
+                },
+            };
+            status = c.vaCreateSurfaces(va_display, c.VA_RT_FORMAT_RGB32, encode_width, encode_height, @ptrCast(&self.rgba_surface), 1, &rgba_attribs, 1);
+            if (status != c.VA_STATUS_SUCCESS) break :vpp_blk;
+            status = c.vaCreateContext(va_display, self.shared.vpp_config, @intCast(encode_width), @intCast(encode_height), c.VA_PROGRESSIVE, @ptrCast(&self.rgba_surface), 1, &self.vpp_context);
+            if (status != c.VA_STATUS_SUCCESS) {
+                _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
+                break :vpp_blk;
+            }
+            self.rgba_width = encode_width;
+            self.rgba_height = encode_height;
+            self.has_vpp = true;
+        }
+
         // Regenerate SPS/PPS for new dimensions
         self.generateSPS();
         self.generatePPS();
     }
 
-    /// Convert RGBA to NV12 and upload to VA surface using vaCreateImage + vaPutImage
+    /// Upload RGBA frame to VA-API NV12 surface.
+    /// Uses GPU VPP color conversion when available, falls back to CPU.
     fn uploadFrame(self: *VideoEncoder, rgba_data: []const u8) VaError!void {
+        if (self.has_vpp) {
+            return self.uploadFrameGpu(rgba_data);
+        }
+        return self.uploadFrameCpu(rgba_data);
+    }
+
+    /// GPU path: CPU does R↔B swap + nearest-neighbor downscale to BGRX surface
+    /// at encode resolution, then VPP converts BGRX→NV12 on GPU (no scaling).
+    fn uploadFrameGpu(self: *VideoEncoder, rgba_data: []const u8) VaError!void {
         const va_display = self.shared.va_display;
         const dst_width = self.width;
         const dst_height = self.height;
         const src_width = self.source_width;
         const src_height = self.source_height;
 
-        // Get supported image formats
-        var formats: [64]c.VAImageFormat = undefined;
-        var actual_formats: c_int = 0;
-        var status = c.vaQueryImageFormats(va_display, &formats, &actual_formats);
-        if (status != c.VA_STATUS_SUCCESS) {
-            std.debug.print("VAAPI: vaQueryImageFormats failed: {}\n", .{status});
-            return error.VaImageFailed;
-        }
-
-        // Find NV12 format
-        var nv12_format: ?c.VAImageFormat = null;
-        const num_to_check: usize = @min(@as(usize, @intCast(actual_formats)), 64);
-        for (formats[0..num_to_check]) |fmt| {
-            if (fmt.fourcc == 0x3231564e) { // "NV12"
-                nv12_format = fmt;
-                break;
-            }
-        }
-
-        if (nv12_format == null) {
-            std.debug.print("VAAPI: NV12 format not supported\n", .{});
-            return error.VaImageFailed;
-        }
-
-        // Create an image
+        // Derive image from BGRX surface for direct memory write
         var image: c.VAImage = undefined;
-        status = c.vaCreateImage(va_display, &nv12_format.?, @intCast(dst_width), @intCast(dst_height), &image);
+        var status = c.vaDeriveImage(va_display, self.rgba_surface, &image);
         if (status != c.VA_STATUS_SUCCESS) {
-            std.debug.print("VAAPI: vaCreateImage failed: {}\n", .{status});
-            return error.VaImageFailed;
+            std.debug.print("ENCODER: vaDeriveImage failed: {}, falling back to CPU\n", .{status});
+            return self.uploadFrameCpu(rgba_data);
         }
         defer _ = c.vaDestroyImage(va_display, image.image_id);
 
-        // Map the image buffer
         var mapped_ptr: ?*anyopaque = null;
         status = c.vaMapBuffer(va_display, image.buf, &mapped_ptr);
-        if (status != c.VA_STATUS_SUCCESS) {
-            std.debug.print("VAAPI: vaMapBuffer failed: status={}\n", .{status});
-            return error.VaMapFailed;
-        }
+        if (status != c.VA_STATUS_SUCCESS) return error.VaMapFailed;
 
         const mapped: [*]u8 = @ptrCast(mapped_ptr);
+        const pitch = image.pitches[0];
+        const offset = image.offsets[0];
 
-        // Convert RGBA to NV12
-        // NV12 has Y plane followed by interleaved UV plane
-        const y_offset = image.offsets[0];
-        const uv_offset = image.offsets[1];
-        const y_pitch = image.pitches[0]; // Hardware stride (may be > dst_width due to alignment)
-        const uv_pitch = image.pitches[1];
+        // R↔B swap + 2x2 box-filter downscale from source to encode resolution.
+        // Uses fixed-point 16.16 integer math to avoid per-pixel float conversions.
+        // Reads source as u32 words and uses bitmasked extraction for speed.
+        const src_pixels: [*]align(1) const u32 = @ptrCast(rgba_data.ptr);
+        const src_stride_px = @as(usize, src_width); // stride in pixels (u32 words)
+        const dst_pixels: [*]align(1) u32 = @ptrCast(mapped + offset);
+        const dst_stride_px = @as(usize, pitch) / 4; // pitch in pixels (u32 words)
 
-        // 1:1 copy from source to destination with padding (no scaling/stretching)
-        // Source: tightly packed at src_width x src_height
-        // Destination: aligned surface with y_pitch stride, dst_width x dst_height
-        // Copy source pixels directly, fill padding with black (Y=16, U=V=128)
+        // Fixed-point 16.16 scale factors
+        const fp_shift = 16;
+        const fp_scale_x = (@as(u64, src_width) << fp_shift) / @as(u64, dst_width);
+        const fp_scale_y = (@as(u64, src_height) << fp_shift) / @as(u64, dst_height);
+        const src_max_x = src_width - 1;
+        const src_max_y = src_height - 1;
+
         var y: u32 = 0;
         while (y < dst_height) : (y += 1) {
+            const sy: u32 = @intCast(@min(@as(u64, y) * fp_scale_y >> fp_shift, src_max_y));
+            const sy1: u32 = @min(sy + 1, src_max_y);
+            const row0 = @as(usize, sy) * src_stride_px;
+            const row1 = @as(usize, sy1) * src_stride_px;
+            const dst_row = @as(usize, y) * dst_stride_px;
+
             var x: u32 = 0;
+            while (x < dst_width) : (x += 1) {
+                const sx: u32 = @intCast(@min(@as(u64, x) * fp_scale_x >> fp_shift, src_max_x));
+                const sx1: u32 = @min(sx + 1, src_max_x);
 
-            // If this row is beyond source height, fill entire row with black
-            if (y >= src_height) {
-                while (x < dst_width) : (x += 1) {
-                    mapped[y_offset + y * y_pitch + x] = 16; // Black in Y
-                }
-                continue;
+                // Read 4 source pixels as u32 (RGBA byte order from GL)
+                const p00 = src_pixels[row0 + sx];
+                const p01 = src_pixels[row0 + sx1];
+                const p10 = src_pixels[row1 + sx];
+                const p11 = src_pixels[row1 + sx1];
+
+                // Average each channel via bitmask extraction
+                const r = ((p00 & 0xFF) + (p01 & 0xFF) + (p10 & 0xFF) + (p11 & 0xFF) + 2) >> 2;
+                const g = (((p00 >> 8) & 0xFF) + ((p01 >> 8) & 0xFF) + ((p10 >> 8) & 0xFF) + ((p11 >> 8) & 0xFF) + 2) >> 2;
+                const b = (((p00 >> 16) & 0xFF) + ((p01 >> 16) & 0xFF) + ((p10 >> 16) & 0xFF) + ((p11 >> 16) & 0xFF) + 2) >> 2;
+
+                // Write BGRX as single u32: 0xFF_RR_GG_BB
+                dst_pixels[dst_row + x] = b | (g << 8) | (r << 16) | 0xFF000000;
             }
+        }
 
-            // Copy source pixels 1:1 (no scaling)
-            while (x < src_width and x < dst_width) : (x += 1) {
-                const src_idx = (y * src_width + x) * 4;
+        status = c.vaUnmapBuffer(va_display, image.buf);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaMapFailed;
 
+        // VPP: convert BGRX → NV12 on GPU (no scaling, same resolution).
+        var pipeline_param = std.mem.zeroes(c.VAProcPipelineParameterBuffer);
+        pipeline_param.surface = self.rgba_surface;
+        pipeline_param.surface_color_standard = c.VAProcColorStandardNone;
+        pipeline_param.output_color_standard = c.VAProcColorStandardBT601;
+
+        var pipeline_buf: c.VABufferID = 0;
+        status = vaCreateBuffer(
+            va_display,
+            self.vpp_context,
+            c.VAProcPipelineParameterBufferType,
+            @sizeOf(c.VAProcPipelineParameterBuffer),
+            1,
+            &pipeline_param,
+            &pipeline_buf,
+        );
+        if (status != c.VA_STATUS_SUCCESS) {
+            std.debug.print("ENCODER: VPP buffer failed: {}\n", .{status});
+            return self.uploadFrameCpu(rgba_data);
+        }
+        defer _ = vaDestroyBuffer(va_display, pipeline_buf);
+
+        status = vaBeginPicture(va_display, self.vpp_context, self.src_surface);
+        if (status != c.VA_STATUS_SUCCESS) return self.uploadFrameCpu(rgba_data);
+
+        var bufs = [_]c.VABufferID{pipeline_buf};
+        status = vaRenderPicture(va_display, self.vpp_context, &bufs, 1);
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = vaEndPicture(va_display, self.vpp_context);
+            return self.uploadFrameCpu(rgba_data);
+        }
+
+        status = vaEndPicture(va_display, self.vpp_context);
+        if (status != c.VA_STATUS_SUCCESS) return self.uploadFrameCpu(rgba_data);
+
+        // Sync VPP output before encoding
+        status = c.vaSyncSurface(va_display, self.src_surface);
+        if (status != c.VA_STATUS_SUCCESS) return self.uploadFrameCpu(rgba_data);
+    }
+
+    /// CPU fallback: RGBA → NV12 conversion with nearest-neighbor downscaling.
+    fn uploadFrameCpu(self: *VideoEncoder, rgba_data: []const u8) VaError!void {
+        const va_display = self.shared.va_display;
+        const dst_width = self.width;
+        const dst_height = self.height;
+        const src_width = self.source_width;
+        const src_height = self.source_height;
+
+        // Scale factors for downscaling
+        const scale_x = @as(f64, @floatFromInt(src_width)) / @as(f64, @floatFromInt(dst_width));
+        const scale_y = @as(f64, @floatFromInt(src_height)) / @as(f64, @floatFromInt(dst_height));
+
+        // Derive image from surface for direct access (avoid vaCreateImage + vaPutImage overhead)
+        var image: c.VAImage = undefined;
+        var status = c.vaDeriveImage(va_display, self.src_surface, &image);
+        var use_derive = true;
+        if (status != c.VA_STATUS_SUCCESS) {
+            // Fall back to vaCreateImage + vaPutImage
+            use_derive = false;
+            var formats: [64]c.VAImageFormat = undefined;
+            var actual_formats: c_int = 0;
+            status = c.vaQueryImageFormats(va_display, &formats, &actual_formats);
+            if (status != c.VA_STATUS_SUCCESS) return error.VaImageFailed;
+
+            var nv12_format: ?c.VAImageFormat = null;
+            const num: usize = @min(@as(usize, @intCast(actual_formats)), 64);
+            for (formats[0..num]) |fmt| {
+                if (fmt.fourcc == 0x3231564e) { // "NV12"
+                    nv12_format = fmt;
+                    break;
+                }
+            }
+            if (nv12_format == null) return error.VaImageFailed;
+            status = c.vaCreateImage(va_display, &nv12_format.?, @intCast(dst_width), @intCast(dst_height), &image);
+            if (status != c.VA_STATUS_SUCCESS) return error.VaImageFailed;
+        }
+        defer _ = c.vaDestroyImage(va_display, image.image_id);
+
+        var mapped_ptr: ?*anyopaque = null;
+        status = c.vaMapBuffer(va_display, image.buf, &mapped_ptr);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaMapFailed;
+
+        const mapped: [*]u8 = @ptrCast(mapped_ptr);
+        const y_offset = image.offsets[0];
+        const uv_offset = image.offsets[1];
+        const y_pitch = image.pitches[0];
+        const uv_pitch = image.pitches[1];
+
+        // Y plane with downscaling
+        var y: u32 = 0;
+        while (y < dst_height) : (y += 1) {
+            const src_y = @min(@as(u32, @intFromFloat(@as(f64, @floatFromInt(y)) * scale_y)), src_height - 1);
+            var x: u32 = 0;
+            while (x < dst_width) : (x += 1) {
+                const src_x = @min(@as(u32, @intFromFloat(@as(f64, @floatFromInt(x)) * scale_x)), src_width - 1);
+                const src_idx = (src_y * src_width + src_x) * 4;
                 const r = @as(u32, rgba_data[src_idx]);
                 const g = @as(u32, rgba_data[src_idx + 1]);
                 const b = @as(u32, rgba_data[src_idx + 2]);
-
-                // RGB to Y (BT.601)
-                const y_val: u8 = @intCast(@min(255, 16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)));
-                mapped[y_offset + y * y_pitch + x] = y_val;
-            }
-
-            // Fill padding columns with black (Y=16)
-            while (x < dst_width) : (x += 1) {
-                mapped[y_offset + y * y_pitch + x] = 16; // Black in Y
+                mapped[y_offset + y * y_pitch + x] = @intCast(@min(255, 16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)));
             }
         }
 
-        // UV plane (half resolution, interleaved)
-        // For 4:2:0 chroma, use ceiling division to handle odd dimensions
-        // e.g., src_width=961 needs 481 UV columns, not 480
-        const src_uv_width = (src_width + 1) / 2;
-        const src_uv_height = (src_height + 1) / 2;
+        // UV plane with downscaling
         const dst_uv_width = dst_width / 2;
         const dst_uv_height = dst_height / 2;
-
         y = 0;
         while (y < dst_uv_height) : (y += 1) {
+            const src_y = @min(@as(u32, @intFromFloat(@as(f64, @floatFromInt(y * 2)) * scale_y)), src_height - 1);
             var x: u32 = 0;
-            const src_y = y * 2;
-
-            // If this UV row is beyond source height, fill entire row with neutral
-            if (y >= src_uv_height) {
-                while (x < dst_uv_width) : (x += 1) {
-                    mapped[uv_offset + y * uv_pitch + x * 2] = 128; // Neutral U
-                    mapped[uv_offset + y * uv_pitch + x * 2 + 1] = 128; // Neutral V
-                }
-                continue;
-            }
-
-            // Copy source pixels 1:1
-            // Clamp src_x to valid range for odd widths
-            while (x < src_uv_width and x < dst_uv_width) : (x += 1) {
-                const src_x = @min(x * 2, src_width - 1);
-                const clamped_src_y = @min(src_y, src_height - 1);
-                const src_idx = (clamped_src_y * src_width + src_x) * 4;
-
+            while (x < dst_uv_width) : (x += 1) {
+                const src_x = @min(@as(u32, @intFromFloat(@as(f64, @floatFromInt(x * 2)) * scale_x)), src_width - 1);
+                const src_idx = (src_y * src_width + src_x) * 4;
                 const r = @as(i32, @intCast(rgba_data[src_idx]));
                 const g = @as(i32, @intCast(rgba_data[src_idx + 1]));
                 const b = @as(i32, @intCast(rgba_data[src_idx + 2]));
-
-                // RGB to U,V (BT.601)
-                const u_val: u8 = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8))))));
-                const v_val: u8 = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((112 * r - 94 * g - 18 * b + 128) >> 8))))));
-
-                mapped[uv_offset + y * uv_pitch + x * 2] = u_val;
-                mapped[uv_offset + y * uv_pitch + x * 2 + 1] = v_val;
-            }
-
-            // Fill padding with neutral chroma (U=V=128)
-            while (x < dst_uv_width) : (x += 1) {
-                mapped[uv_offset + y * uv_pitch + x * 2] = 128; // Neutral U
-                mapped[uv_offset + y * uv_pitch + x * 2 + 1] = 128; // Neutral V
+                mapped[uv_offset + y * uv_pitch + x * 2] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8))))));
+                mapped[uv_offset + y * uv_pitch + x * 2 + 1] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((112 * r - 94 * g - 18 * b + 128) >> 8))))));
             }
         }
 
-        // Unmap the buffer before putting the image
         status = c.vaUnmapBuffer(va_display, image.buf);
-        if (status != c.VA_STATUS_SUCCESS) {
-            std.debug.print("VAAPI: vaUnmapBuffer failed: {}\n", .{status});
-            return error.VaMapFailed;
-        }
+        if (status != c.VA_STATUS_SUCCESS) return error.VaMapFailed;
 
-        // Put the image to the surface
-        status = c.vaPutImage(va_display, self.src_surface, image.image_id, 0, 0, @intCast(dst_width), @intCast(dst_height), 0, 0, @intCast(dst_width), @intCast(dst_height));
-        if (status != c.VA_STATUS_SUCCESS) {
-            std.debug.print("VAAPI: vaPutImage failed: {}\n", .{status});
-            return error.VaImageFailed;
+        // If we used vaCreateImage (not derive), need vaPutImage to transfer
+        if (!use_derive) {
+            status = c.vaPutImage(va_display, self.src_surface, image.image_id, 0, 0, @intCast(dst_width), @intCast(dst_height), 0, 0, @intCast(dst_width), @intCast(dst_height));
+            if (status != c.VA_STATUS_SUCCESS) return error.VaImageFailed;
         }
     }
 
