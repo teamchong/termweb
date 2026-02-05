@@ -718,7 +718,7 @@ index 000000000..31423962a
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..310aaef15 100644
+index dcf8a6357..6c52da424 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -800,7 +800,22 @@ index dcf8a6357..310aaef15 100644
          // Remove ourselves from the list of known surfaces in the app.
          self.app.core_app.deleteSurface(self);
  
-@@ -781,6 +811,15 @@ pub const Surface = struct {
+@@ -756,6 +786,14 @@ pub const Surface = struct {
+     }
+ 
+     pub fn draw(self: *Surface) void {
++        // On Linux with headless EGL, set viewport before each draw to prevent
++        // viewport state leak between surfaces sharing the same GL context.
++        // OpenGL.surfaceSize() reads GL_VIEWPORT to determine dimensions,
++        // so we must set it to THIS surface's size before rendering.
++        if (comptime builtin.target.os.tag == .linux) {
++            const egl_headless = @import("egl_headless.zig");
++            egl_headless.setViewportSize(self.size.width, self.size.height);
++        }
+         self.core_surface.draw() catch |err| {
+             log.err("error in draw err={}", .{err});
+             return;
+@@ -781,6 +819,15 @@ pub const Surface = struct {
      }
  
      pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -816,7 +831,7 @@ index dcf8a6357..310aaef15 100644
          // Runtimes sometimes generate superfluous resize events even
          // if the size did not actually change (SwiftUI). We check
          // that the size actually changed from what we last recorded
-@@ -2204,4 +2243,44 @@ pub const CAPI = struct {
+@@ -2204,4 +2251,44 @@ pub const CAPI = struct {
              }
          }
      };
