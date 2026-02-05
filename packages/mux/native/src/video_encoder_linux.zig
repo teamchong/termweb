@@ -238,6 +238,11 @@ pub const VideoEncoder = struct {
     pps_data: [64]u8,
     pps_len: usize,
 
+    // Pipeline state for async encoding
+    // We submit frame N and read frame N-1's output, avoiding sync stalls
+    pending_frame: bool,
+    pending_is_keyframe: bool,
+
     const MAX_OUTPUT_SIZE = 2 * 1024 * 1024; // 2MB max per frame
     const MAX_PIXELS: u64 = 1920 * 1080; // ~2MP, roughly 1080p
 
@@ -637,6 +642,8 @@ pub const VideoEncoder = struct {
             .sps_len = 0,
             .pps_data = undefined,
             .pps_len = 0,
+            .pending_frame = false,
+            .pending_is_keyframe = false,
         };
 
         // Generate SPS/PPS for H264High profile
@@ -748,6 +755,9 @@ pub const VideoEncoder = struct {
         self.source_width = width;
         self.source_height = height;
         self.frame_count = 0;
+        // Reset pipeline state - discard any pending frame on resize
+        self.pending_frame = false;
+        self.pending_is_keyframe = false;
 
         // Regenerate SPS/PPS for new dimensions
         self.generateSPS();
@@ -811,26 +821,44 @@ pub const VideoEncoder = struct {
         const y_pitch = image.pitches[0]; // Hardware stride (may be > dst_width due to alignment)
         const uv_pitch = image.pitches[1];
 
-        // 1:1 copy from source to destination with padding (no scaling/stretching)
+        // Scale source to destination using nearest-neighbor sampling
+        // When src > dst, we need to downsample; when src < dst, we copy and pad
         // Source: tightly packed at src_width x src_height
         // Destination: aligned surface with y_pitch stride, dst_width x dst_height
-        // Copy source pixels directly, fill padding with black (Y=16, U=V=128)
+        const needs_scale = (src_width > dst_width) or (src_height > dst_height);
+
         var y: u32 = 0;
         while (y < dst_height) : (y += 1) {
+            // Map destination Y to source Y (nearest neighbor)
+            const src_y: u32 = if (needs_scale)
+                @intFromFloat(@as(f64, @floatFromInt(y)) * @as(f64, @floatFromInt(src_height)) / @as(f64, @floatFromInt(dst_height)))
+            else
+                y;
+
             var x: u32 = 0;
 
-            // If this row is beyond source height, fill entire row with black
-            if (y >= src_height) {
+            // If source row is beyond source height, fill with black
+            if (src_y >= src_height) {
                 while (x < dst_width) : (x += 1) {
                     mapped[y_offset + y * y_pitch + x] = 16; // Black in Y
                 }
                 continue;
             }
 
-            // Copy source pixels 1:1 (no scaling)
-            while (x < src_width and x < dst_width) : (x += 1) {
-                const src_idx = (y * src_width + x) * 4;
+            // Sample source pixels (scaled or 1:1)
+            const copy_width = if (needs_scale) dst_width else @min(src_width, dst_width);
+            while (x < copy_width) : (x += 1) {
+                const src_x: u32 = if (needs_scale)
+                    @intFromFloat(@as(f64, @floatFromInt(x)) * @as(f64, @floatFromInt(src_width)) / @as(f64, @floatFromInt(dst_width)))
+                else
+                    x;
 
+                if (src_x >= src_width) {
+                    mapped[y_offset + y * y_pitch + x] = 16; // Black
+                    continue;
+                }
+
+                const src_idx = (src_y * src_width + src_x) * 4;
                 const r = @as(u32, rgba_data[src_idx]);
                 const g = @as(u32, rgba_data[src_idx + 1]);
                 const b = @as(u32, rgba_data[src_idx + 2]);
@@ -847,20 +875,23 @@ pub const VideoEncoder = struct {
         }
 
         // UV plane (half resolution, interleaved)
-        // For 4:2:0 chroma, use ceiling division to handle odd dimensions
-        // e.g., src_width=961 needs 481 UV columns, not 480
-        const src_uv_width = (src_width + 1) / 2;
-        const src_uv_height = (src_height + 1) / 2;
+        // Scale UV plane similarly to Y plane, using nearest neighbor
         const dst_uv_width = dst_width / 2;
         const dst_uv_height = dst_height / 2;
 
         y = 0;
         while (y < dst_uv_height) : (y += 1) {
-            var x: u32 = 0;
-            const src_y = y * 2;
+            // Map destination UV Y to source Y (at full resolution, then sample 2x2 block)
+            const dst_full_y = y * 2;
+            const src_full_y: u32 = if (needs_scale)
+                @intFromFloat(@as(f64, @floatFromInt(dst_full_y)) * @as(f64, @floatFromInt(src_height)) / @as(f64, @floatFromInt(dst_height)))
+            else
+                dst_full_y;
 
-            // If this UV row is beyond source height, fill entire row with neutral
-            if (y >= src_uv_height) {
+            var x: u32 = 0;
+
+            // If source row is beyond source height, fill with neutral
+            if (src_full_y >= src_height) {
                 while (x < dst_uv_width) : (x += 1) {
                     mapped[uv_offset + y * uv_pitch + x * 2] = 128; // Neutral U
                     mapped[uv_offset + y * uv_pitch + x * 2 + 1] = 128; // Neutral V
@@ -868,12 +899,23 @@ pub const VideoEncoder = struct {
                 continue;
             }
 
-            // Copy source pixels 1:1
-            // Clamp src_x to valid range for odd widths
-            while (x < src_uv_width and x < dst_uv_width) : (x += 1) {
-                const src_x = @min(x * 2, src_width - 1);
-                const clamped_src_y = @min(src_y, src_height - 1);
-                const src_idx = (clamped_src_y * src_width + src_x) * 4;
+            // Sample UV from source (scaled or 1:1)
+            while (x < dst_uv_width) : (x += 1) {
+                const dst_full_x = x * 2;
+                const src_full_x: u32 = if (needs_scale)
+                    @intFromFloat(@as(f64, @floatFromInt(dst_full_x)) * @as(f64, @floatFromInt(src_width)) / @as(f64, @floatFromInt(dst_width)))
+                else
+                    dst_full_x;
+
+                if (src_full_x >= src_width) {
+                    mapped[uv_offset + y * uv_pitch + x * 2] = 128; // Neutral U
+                    mapped[uv_offset + y * uv_pitch + x * 2 + 1] = 128; // Neutral V
+                    continue;
+                }
+
+                const clamped_src_x = @min(src_full_x, src_width - 1);
+                const clamped_src_y = @min(src_full_y, src_height - 1);
+                const src_idx = (clamped_src_y * src_width + clamped_src_x) * 4;
 
                 const r = @as(i32, @intCast(rgba_data[src_idx]));
                 const g = @as(i32, @intCast(rgba_data[src_idx + 1]));
@@ -885,12 +927,6 @@ pub const VideoEncoder = struct {
 
                 mapped[uv_offset + y * uv_pitch + x * 2] = u_val;
                 mapped[uv_offset + y * uv_pitch + x * 2 + 1] = v_val;
-            }
-
-            // Fill padding with neutral chroma (U=V=128)
-            while (x < dst_uv_width) : (x += 1) {
-                mapped[uv_offset + y * uv_pitch + x * 2] = 128; // Neutral U
-                mapped[uv_offset + y * uv_pitch + x * 2 + 1] = 128; // Neutral V
             }
         }
 
@@ -916,7 +952,8 @@ pub const VideoEncoder = struct {
     }
 
     /// Encode RGBA frame to H.264 with explicit dimensions
-    /// Auto-resizes encoder if frame dimensions don't match current source dimensions.
+    /// Uses pipelined encoding: submits frame N and returns frame N-1's output.
+    /// This avoids blocking on the current frame's GPU encoding.
     pub fn encodeWithDimensions(self: *VideoEncoder, rgba_data: []const u8, force_keyframe: bool, width: ?u32, height: ?u32) VaError!?EncodeResult {
         // Auto-resize if explicit dimensions provided and differ from source
         if (width != null and height != null) {
@@ -930,6 +967,60 @@ pub const VideoEncoder = struct {
             }
         }
 
+        // Result from PREVIOUS frame (if any)
+        var result: ?EncodeResult = null;
+
+        // If we have a pending frame from last call, sync and read it now
+        // The GPU has had a full frame time to complete encoding
+        if (self.pending_frame) {
+            // Sync the surface that was encoded last frame (now ref_surface after swap)
+            var status = c.vaSyncSurface(self.va_display, self.ref_surface);
+            if (status != c.VA_STATUS_SUCCESS) return error.VaSyncFailed;
+
+            // Map coded buffer to get H.264 data from previous frame
+            var coded_seg_ptr: ?*anyopaque = null;
+            status = c.vaMapBuffer(self.va_display, self.coded_buf, &coded_seg_ptr);
+            if (status != c.VA_STATUS_SUCCESS) return error.VaMapCodedFailed;
+
+            // Copy encoded data with SPS/PPS for keyframes
+            self.output_len = 0;
+
+            // For keyframes (IDR), prepend SPS and PPS NAL units
+            if (self.pending_is_keyframe) {
+                @memcpy(self.output_buffer[0..self.sps_len], self.sps_data[0..self.sps_len]);
+                self.output_len = self.sps_len;
+                @memcpy(self.output_buffer[self.output_len..][0..self.pps_len], self.pps_data[0..self.pps_len]);
+                self.output_len += self.pps_len;
+            }
+
+            // Copy VA-API encoded slice data
+            if (coded_seg_ptr) |ptr| {
+                const coded_seg: *VACodedBufferSegment = @ptrCast(@alignCast(ptr));
+                var current_seg: ?*VACodedBufferSegment = coded_seg;
+                while (current_seg) |seg| {
+                    const seg_size = seg.size;
+                    if (self.output_len + seg_size <= self.output_buffer.len) {
+                        if (seg.buf) |buf| {
+                            const src_data: [*]const u8 = @ptrCast(buf);
+                            @memcpy(self.output_buffer[self.output_len..][0..seg_size], src_data[0..seg_size]);
+                            self.output_len += seg_size;
+                        }
+                    }
+                    current_seg = seg.next;
+                }
+            }
+
+            _ = c.vaUnmapBuffer(self.va_display, self.coded_buf);
+
+            if (self.output_len > 0) {
+                result = EncodeResult{
+                    .data = self.output_buffer[0..self.output_len],
+                    .is_keyframe = self.pending_is_keyframe,
+                };
+            }
+        }
+
+        // Now submit the CURRENT frame to encoder (non-blocking)
         const is_keyframe = force_keyframe or (self.frame_count == 0) or
             (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
 
@@ -1092,48 +1183,10 @@ pub const VideoEncoder = struct {
             return error.VaRenderFailed;
         }
 
-        // End picture
+        // End picture - this kicks off async encoding, does NOT wait
         status = vaEndPicture(self.va_display, self.va_context);
         if (status != c.VA_STATUS_SUCCESS) {
             return error.VaEndPictureFailed;
-        }
-
-        // Sync src surface (where encoding happens)
-        status = c.vaSyncSurface(self.va_display, self.src_surface);
-        if (status != c.VA_STATUS_SUCCESS) return error.VaSyncFailed;
-
-        // Map coded buffer to get H.264 data
-        var coded_seg_ptr: ?*anyopaque = null;
-        status = c.vaMapBuffer(self.va_display, self.coded_buf, &coded_seg_ptr);
-        if (status != c.VA_STATUS_SUCCESS) return error.VaMapCodedFailed;
-        defer _ = c.vaUnmapBuffer(self.va_display, self.coded_buf);
-
-        // Copy encoded data with SPS/PPS for keyframes
-        self.output_len = 0;
-
-        // For keyframes (IDR), prepend SPS and PPS NAL units
-        if (is_keyframe) {
-            @memcpy(self.output_buffer[0..self.sps_len], self.sps_data[0..self.sps_len]);
-            self.output_len = self.sps_len;
-            @memcpy(self.output_buffer[self.output_len..][0..self.pps_len], self.pps_data[0..self.pps_len]);
-            self.output_len += self.pps_len;
-        }
-
-        // Copy VA-API encoded slice data
-        if (coded_seg_ptr) |ptr| {
-            const coded_seg: *VACodedBufferSegment = @ptrCast(@alignCast(ptr));
-            var current_seg: ?*VACodedBufferSegment = coded_seg;
-            while (current_seg) |seg| {
-                const seg_size = seg.size;
-                if (self.output_len + seg_size <= self.output_buffer.len) {
-                    if (seg.buf) |buf| {
-                        const src_data: [*]const u8 = @ptrCast(buf);
-                        @memcpy(self.output_buffer[self.output_len..][0..seg_size], src_data[0..seg_size]);
-                        self.output_len += seg_size;
-                    }
-                }
-                current_seg = seg.next;
-            }
         }
 
         // Swap surfaces: current frame becomes reference for next P-frame
@@ -1141,16 +1194,14 @@ pub const VideoEncoder = struct {
         self.ref_surface = self.src_surface;
         self.src_surface = tmp;
 
+        // Mark this frame as pending - we'll read its output on NEXT encode call
+        self.pending_frame = true;
+        self.pending_is_keyframe = is_keyframe;
+
         self.frame_count += 1;
 
-        if (self.output_len == 0) {
-            return null;
-        }
-
-        return EncodeResult{
-            .data = self.output_buffer[0..self.output_len],
-            .is_keyframe = is_keyframe,
-        };
+        // Return PREVIOUS frame's result (or null if this was first frame)
+        return result;
     }
 
     pub fn canEncodeDirectly(self: *VideoEncoder) bool {
