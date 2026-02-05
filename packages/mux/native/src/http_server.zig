@@ -68,6 +68,7 @@ pub const HttpServer = struct {
     listener: net.Server,
     allocator: Allocator,
     running: std.atomic.Value(bool),
+    stopped: std.atomic.Value(bool),
     panel_ws_port: u16,
     control_ws_port: u16,
     file_ws_port: u16,
@@ -88,6 +89,7 @@ pub const HttpServer = struct {
             .listener = try addr.listen(.{ .reuse_address = true, .force_nonblocking = true }),
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
+            .stopped = std.atomic.Value(bool).init(false),
             .panel_ws_port = 0,
             .control_ws_port = 0,
             .file_ws_port = 0,
@@ -124,12 +126,15 @@ pub const HttpServer = struct {
 
     pub fn deinit(self: *HttpServer) void {
         self.stop();
-        self.listener.deinit();
         self.allocator.destroy(self);
     }
 
     pub fn stop(self: *HttpServer) void {
+        // Only stop once (use stopped flag since running starts as false)
+        if (self.stopped.swap(true, .acq_rel)) return;
         self.running.store(false, .release);
+        // Close listener to interrupt accept() and wake up the server thread
+        self.listener.deinit();
     }
 
     pub fn run(self: *HttpServer) !void {
@@ -138,11 +143,14 @@ pub const HttpServer = struct {
 
         while (self.running.load(.acquire)) {
             const conn = self.listener.accept() catch |err| {
+                // Check running flag first - exit immediately if stopped
+                if (!self.running.load(.acquire)) break;
                 if (err == error.WouldBlock) {
                     std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
                 }
-                continue;
+                // Other errors (including from closed listener) - exit
+                break;
             };
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn.stream }) catch {
