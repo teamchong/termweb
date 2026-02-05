@@ -12,6 +12,7 @@
 //! - File transfer: Compressed file upload/download with hashing
 //!
 const std = @import("std");
+const builtin = @import("builtin");
 const net = std.net;
 const posix = std.posix;
 const Thread = std.Thread;
@@ -547,6 +548,8 @@ pub const Server = struct {
     running: std.atomic.Value(bool),
     stopped: std.atomic.Value(bool),
     active_connections: std.atomic.Value(u32), // Track active connection threads
+    shutdown_fd: posix.fd_t, // Read end: polled by connection threads for shutdown signal
+    shutdown_write_fd: posix.fd_t, // Write end: signaled by stop() to wake all threads
     enable_zstd: bool,
     /// Called when a new WebSocket connection is established.
     on_connect: ?OnConnectFn,
@@ -567,6 +570,18 @@ pub const Server = struct {
         const server = try allocator.create(Server);
         errdefer allocator.destroy(server);
 
+        var shutdown_fd: posix.fd_t = undefined;
+        var shutdown_write_fd: posix.fd_t = undefined;
+        if (comptime builtin.os.tag == .linux) {
+            const efd = try posix.eventfd(0, std.os.linux.EFD.NONBLOCK | std.os.linux.EFD.CLOEXEC);
+            shutdown_fd = efd;
+            shutdown_write_fd = efd;
+        } else {
+            const fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+            shutdown_fd = fds[0];
+            shutdown_write_fd = fds[1];
+        }
+
         const addr = try net.Address.parseIp4(address, port);
         server.* = .{
             .listener = try addr.listen(.{ .reuse_address = true }),
@@ -574,6 +589,8 @@ pub const Server = struct {
             .running = std.atomic.Value(bool).init(false),
             .stopped = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(u32).init(0),
+            .shutdown_fd = shutdown_fd,
+            .shutdown_write_fd = shutdown_write_fd,
             .enable_zstd = enable_zstd,
             .on_connect = null,
             .on_message = null,
@@ -584,14 +601,18 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.stop(); // Also closes listener
+        self.stop(); // Also closes listener and signals shutdown fd
         // Wait for all active connection threads to finish
         var wait_count: u32 = 0;
         while (self.active_connections.load(.acquire) > 0) {
             std.Thread.sleep(10 * std.time.ns_per_ms);
             wait_count += 1;
-            // Timeout after 2 seconds to avoid hanging forever
-            if (wait_count > 200) break;
+            if (wait_count > 100) break; // 1s timeout (threads should exit immediately)
+        }
+        // Close shutdown fds
+        posix.close(self.shutdown_fd);
+        if (self.shutdown_write_fd != self.shutdown_fd) {
+            posix.close(self.shutdown_write_fd);
         }
         self.allocator.destroy(self);
     }
@@ -611,7 +632,17 @@ pub const Server = struct {
     pub fn stop(self: *Server) void {
         if (self.stopped.swap(true, .acq_rel)) return;
         self.running.store(false, .release);
-        // Close listener to unblock the accept() call in run()
+        // Signal shutdown fd to wake all connection threads blocked in poll()
+        // This is async-signal-safe (just a write syscall)
+        if (comptime builtin.os.tag == .linux) {
+            const val: u64 = 1;
+            _ = posix.write(self.shutdown_write_fd, std.mem.asBytes(&val)) catch {};
+        } else {
+            _ = posix.write(self.shutdown_write_fd, &[_]u8{1}) catch {};
+        }
+        // shutdown() interrupts blocked accept() in another thread reliably on Linux
+        // (close() alone is NOT guaranteed to unblock accept on Linux)
+        posix.shutdown(self.listener.stream.handle, .both) catch {};
         self.listener.deinit();
     }
 
@@ -635,9 +666,24 @@ pub const Server = struct {
         return conn;
     }
 
+    /// Wait for data on socket or shutdown signal. Returns true if socket has data.
+    fn waitForData(self: *Server, socket_fd: posix.socket_t) bool {
+        var fds = [_]posix.pollfd{
+            .{ .fd = socket_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = self.shutdown_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, 1000) catch return false; // 1s fallback timeout
+        if (ready == 0) return false; // timeout
+        if (fds[1].revents & posix.POLL.IN != 0) return false; // shutdown signaled
+        return (fds[0].revents & posix.POLL.IN != 0);
+    }
+
     // Handle connection messages in a loop
     pub fn handleConnection(self: *Server, conn: *Connection) void {
         while (conn.is_open and self.running.load(.acquire)) {
+            // Wait for data or shutdown — replaces blocking read with SO_RCVTIMEO
+            if (!self.waitForData(conn.stream.handle)) continue;
+
             const frame = conn.readFrame() catch break;
 
             // readFrame returns null on timeout - just continue to check running flag

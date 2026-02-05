@@ -144,7 +144,9 @@ pub const HttpServer = struct {
         // Only stop once (use stopped flag since running starts as false)
         if (self.stopped.swap(true, .acq_rel)) return;
         self.running.store(false, .release);
-        // Close listener to interrupt accept() and wake up the server thread
+        // shutdown() interrupts blocked accept() in another thread reliably on Linux
+        // (close() alone is NOT guaranteed to unblock accept on Linux)
+        posix.shutdown(self.listener.stream.handle, .both) catch {};
         self.listener.deinit();
     }
 

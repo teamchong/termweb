@@ -3435,11 +3435,12 @@ const Server = struct {
             }
 
 
-            // Wait until next frame or input event (whichever comes first)
-            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - now);
-            const remaining = if (elapsed < frame_time_ns) frame_time_ns - elapsed else 0;
+            // Wait until next frame is due or input arrives (whichever comes first)
+            // Use last_frame as anchor so we wake at the correct time regardless
+            // of when we entered this iteration (e.g. woken early by input signal)
+            const since_last: u64 = @intCast(std.time.nanoTimestamp() - last_frame);
+            const remaining = if (since_last < frame_time_ns) frame_time_ns - since_last else 0;
             if (remaining > 0) {
-                // Block until input arrives or frame timer expires
                 _ = self.wake_signal.waitTimeout(remaining);
             }
         }
@@ -3859,7 +3860,9 @@ fn handleSigint(_: c_int) callconv(.c) void {
     // First Ctrl+C - graceful shutdown
     if (Server.global_server.load(.acquire)) |server| {
         server.running.store(false, .release);
-        // Also stop child servers so their connection handlers exit
+        // Wake the render loop so it exits immediately
+        server.wake_signal.notify();
+        // Stop all servers — signals their shutdown fds to wake connection threads
         server.http_server.stop();
         server.panel_ws_server.stop();
         server.control_ws_server.stop();
