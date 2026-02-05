@@ -412,6 +412,75 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // WASM zstd module for browser-side compression
+    {
+        const wasm_target = b.resolveTargetQuery(.{
+            .cpu_arch = .wasm32,
+            .os_tag = .wasi,
+        });
+        const wasm = b.addExecutable(.{
+            .name = "zstd",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("packages/mux/wasm/zstd_wasm.zig"),
+                .target = wasm_target,
+                .optimize = .ReleaseSmall,
+                .link_libc = true,
+            }),
+        });
+        wasm.entry = .disabled;
+        wasm.root_module.export_symbol_names = &.{
+            "zstd_alloc",
+            "zstd_free",
+            "zstd_compress",
+            "zstd_decompress",
+            "zstd_compress_bound",
+            "zstd_frame_content_size",
+        };
+
+        const wasm_zstd_flags = &[_][]const u8{ "-O2", "-DZSTD_DISABLE_ASM", "-fno-sanitize=undefined" };
+
+        // zstd common sources
+        for ([_][]const u8{
+            "vendor/zstd/lib/common/debug.c",
+            "vendor/zstd/lib/common/entropy_common.c",
+            "vendor/zstd/lib/common/error_private.c",
+            "vendor/zstd/lib/common/fse_decompress.c",
+            "vendor/zstd/lib/common/pool.c",
+            "vendor/zstd/lib/common/threading.c",
+            "vendor/zstd/lib/common/zstd_common.c",
+            "vendor/zstd/lib/common/xxhash.c",
+            // compress
+            "vendor/zstd/lib/compress/fse_compress.c",
+            "vendor/zstd/lib/compress/hist.c",
+            "vendor/zstd/lib/compress/huf_compress.c",
+            "vendor/zstd/lib/compress/zstd_compress.c",
+            "vendor/zstd/lib/compress/zstd_compress_literals.c",
+            "vendor/zstd/lib/compress/zstd_compress_sequences.c",
+            "vendor/zstd/lib/compress/zstd_compress_superblock.c",
+            "vendor/zstd/lib/compress/zstd_double_fast.c",
+            "vendor/zstd/lib/compress/zstd_fast.c",
+            "vendor/zstd/lib/compress/zstd_lazy.c",
+            "vendor/zstd/lib/compress/zstd_ldm.c",
+            "vendor/zstd/lib/compress/zstd_opt.c",
+            "vendor/zstd/lib/compress/zstd_preSplit.c",
+            "vendor/zstd/lib/compress/zstdmt_compress.c",
+            // decompress
+            "vendor/zstd/lib/decompress/huf_decompress.c",
+            "vendor/zstd/lib/decompress/zstd_ddict.c",
+            "vendor/zstd/lib/decompress/zstd_decompress.c",
+            "vendor/zstd/lib/decompress/zstd_decompress_block.c",
+        }) |src| {
+            wasm.addCSourceFile(.{ .file = b.path(src), .flags = wasm_zstd_flags });
+        }
+        wasm.addIncludePath(b.path("vendor/zstd/lib"));
+
+        const wasm_step = b.step("wasm", "Build zstd WASM module for browser");
+        // Output to web directory so assets.zig can @embedFile it
+        wasm_step.dependOn(&b.addInstallArtifact(wasm, .{
+            .dest_dir = .{ .override = .{ .custom = "../packages/mux/web" } },
+        }).step);
+    }
 }
 
 /// Read version from package.json (single source of truth)

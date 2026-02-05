@@ -1,14 +1,12 @@
 // File transfer protocol and handlers
 // Uses zstd compression via WASM worker pool
 
-import { CompressionPool, getCompressionPool, destroyCompressionPool } from './compression-pool';
-import { initZstd, compressZstd, decompressZstd } from './zstd-wasm';
+import { getCompressionPool } from './compression-pool';
 import { TransferMsgType } from './protocol';
-import { getWsUrl, sharedTextEncoder, sharedTextDecoder, collectStreamChunks } from './utils';
+import { getWsUrl, sharedTextEncoder, sharedTextDecoder } from './utils';
 import {
   WS_PATHS,
   FILE_TRANSFER,
-  ZSTD_WASM_PATH,
   PROTO_HEADER,
   PROTO_SIZE,
   PROTO_FILE_LIST,
@@ -66,27 +64,13 @@ export class FileTransferHandler {
   private ws: WebSocket | null = null;
   private activeTransfers = new Map<number, TransferState>();
   private chunkSize = FILE_TRANSFER.CHUNK_SIZE;
-  private compressionPool: CompressionPool | null = null;
-  private zstdInitialized = false;
-  private useZstd = true; // Use zstd compression (negotiated with server)
+  private compressionPool = getCompressionPool();
 
   onTransferComplete?: (transferId: number, totalBytes: number) => void;
   onTransferError?: (transferId: number, error: string) => void;
   onDryRunReport?: (transferId: number, report: DryRunReport) => void;
 
   async connect(): Promise<void> {
-    // Initialize zstd WASM and compression pool
-    try {
-      await initZstd(ZSTD_WASM_PATH);
-      this.zstdInitialized = true;
-      this.compressionPool = getCompressionPool();
-      console.log('zstd compression initialized');
-    } catch (err) {
-      console.warn('Failed to initialize zstd, falling back to deflate:', err);
-      this.useZstd = false;
-    }
-
-    // Add X-Compression header to signal zstd support
     this.ws = new WebSocket(getWsUrl(WS_PATHS.FILE));
     this.ws.binaryType = 'arraybuffer';
 
@@ -548,40 +532,17 @@ export class FileTransferHandler {
   }
 
   private async compress(data: Uint8Array): Promise<Uint8Array> {
-    // Use zstd compression if available
-    if (this.useZstd && this.compressionPool) {
-      try {
-        return await this.compressionPool.compress(data, FILE_TRANSFER.COMPRESSION_LEVEL);
-      } catch (err) {
-        console.warn('zstd compression failed, sending uncompressed:', err);
-      }
+    if (this.compressionPool) {
+      return await this.compressionPool.compress(data, FILE_TRANSFER.COMPRESSION_LEVEL);
     }
-
-    // Send uncompressed - server detects by checking zstd magic bytes
     return data;
   }
 
   private async decompress(data: Uint8Array): Promise<Uint8Array> {
-    // Use zstd decompression if available
-    if (this.useZstd && this.compressionPool) {
-      try {
-        return await this.compressionPool.decompress(data);
-      } catch (err) {
-        console.warn('zstd decompression failed, falling back to deflate:', err);
-      }
+    if (this.compressionPool) {
+      return await this.compressionPool.decompress(data);
     }
-
-    // Fall back to built-in deflate
-    try {
-      const ds = new DecompressionStream('deflate-raw');
-      const writer = ds.writable.getWriter();
-      // Ensure data is backed by regular ArrayBuffer (not SharedArrayBuffer)
-      writer.write(new Uint8Array(data));
-      await writer.close();
-      return collectStreamChunks(ds.readable);
-    } catch (err) {
-      throw new Error(`Decompression failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    throw new Error('Decompression unavailable: zstd WASM not initialized');
   }
 
   private saveFile(path: string, data: Uint8Array): boolean {

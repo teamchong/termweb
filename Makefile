@@ -1,12 +1,12 @@
 # Termweb Makefile
 
-.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean vendor-reset vendor-patch vendor-sync vendor-build-ghostty vendor-generate-patch
+.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean wasm vendor-reset vendor-patch vendor-sync vendor-build-ghostty vendor-generate-patch
 
 # Default: build everything (JS must be bundled before Zig embeds it)
 all: build-all
 
-# Build main termweb CLI (requires mux-web first for embedding)
-build: vendor-sync mux-web
+# Build main termweb CLI (requires wasm + mux-web first for embedding)
+build: vendor-sync wasm mux-web
 	zig build
 
 # Run main termweb CLI
@@ -33,9 +33,14 @@ mux-deps:
 	@echo "Installing mux web dependencies..."
 	cd packages/mux/web && bun install
 
+# Build zstd WASM module for browser-side compression
+wasm:
+	@echo "Building zstd WASM module..."
+	zig build wasm
+	@echo "WASM built: packages/mux/wasm/zstd.wasm"
+
 # Build mux web client (TypeScript -> bundled JS)
 # Requires: bun (https://bun.sh)
-# Note: Uses fzstd (pure JS) for zstd decompression in browser
 mux-web: mux-deps
 	@echo "Building mux web client..."
 	cd packages/mux/web && bun run build
@@ -70,7 +75,7 @@ mux-run:
 
 # Clean mux build artifacts
 mux-clean:
-	rm -f packages/mux/web/client.js
+	rm -f packages/mux/web/client.js packages/mux/web/zstd.wasm packages/mux/wasm/zstd.wasm
 	rm -rf packages/mux/native/zig-out packages/mux/native/zig-cache
 
 # =============================================================================

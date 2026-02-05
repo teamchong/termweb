@@ -1,23 +1,25 @@
-// zstd compression wrapper for browser
-// Uses fzstd (a pure JavaScript implementation) for decompression
-// and falls back to built-in CompressionStream for compression fallback
-//
-// Note: Building zstd from C source for WASM is complex due to standard library dependencies.
-// For production use, consider using a pre-built WASM module like @aspect-dev/zstd-wasm
-// or zstd-codec from npm.
+// zstd compression/decompression via Zig WASM module
+// Both compress and decompress are available (no JS fallback needed)
 
-// fzstd is a fast pure JavaScript zstd decompressor
-// For now, we'll use a simple implementation with dynamic import support
+interface ZstdExports {
+  memory: WebAssembly.Memory;
+  zstd_alloc(size: number): number;
+  zstd_free(ptr: number, size: number): void;
+  zstd_compress(dst: number, dstCap: number, src: number, srcSize: number, level: number): number;
+  zstd_decompress(dst: number, dstCap: number, src: number, srcSize: number): number;
+  zstd_compress_bound(srcSize: number): number;
+  zstd_frame_content_size(src: number, srcSize: number): number;
+}
 
-let zstdModule: typeof import('fzstd') | null = null;
+let wasm: ZstdExports | null = null;
 let initPromise: Promise<void> | null = null;
 
 /**
- * Initialize the zstd module
- * Attempts to dynamically import fzstd for decompression support
+ * Initialize the zstd WASM module.
+ * Loads zstd.wasm from the server and instantiates it.
  */
-export async function initZstd(_wasmPath?: string): Promise<void> {
-  if (zstdModule) return;
+export async function initZstd(wasmPath = '/zstd.wasm'): Promise<void> {
+  if (wasm) return;
 
   if (initPromise) {
     await initPromise;
@@ -26,12 +28,22 @@ export async function initZstd(_wasmPath?: string): Promise<void> {
 
   initPromise = (async () => {
     try {
-      // Try to dynamically import fzstd
-      zstdModule = await import('fzstd');
+      const response = await fetch(wasmPath);
+      const bytes = await response.arrayBuffer();
+      const { instance } = await WebAssembly.instantiate(bytes, {
+        wasi_snapshot_preview1: {
+          // Stubs for WASI imports (zstd doesn't use I/O)
+          fd_write: () => 0,
+          fd_close: () => 0,
+          fd_seek: () => 0,
+          proc_exit: () => {},
+        },
+      });
+      wasm = instance.exports as unknown as ZstdExports;
     } catch (err) {
-      // fzstd not available - fall back to native compression
-      console.warn('fzstd not available, using native compression fallback');
-      zstdModule = null;
+      // Reset so a retry is possible
+      initPromise = null;
+      throw err;
     }
   })();
 
@@ -39,61 +51,65 @@ export async function initZstd(_wasmPath?: string): Promise<void> {
 }
 
 /**
- * Check if zstd module is initialized
+ * Compress data using zstd WASM
  */
-export function isZstdInitialized(): boolean {
-  return zstdModule !== null;
-}
+export function compressZstd(data: Uint8Array, level = 3): Uint8Array {
+  if (!wasm) throw new Error('zstd WASM not initialized. Call initZstd() first.');
 
-/**
- * Compress data using zstd
- * Note: Since fzstd is decompress-only, compression uses DeflateRaw fallback
- * wrapped in a zstd-compatible format marker
- * @param data - Data to compress
- * @param level - Compression level (ignored, uses default deflate level)
- * @returns Compressed data
- */
-export function compressZstd(data: Uint8Array, _level = 3): Uint8Array {
-  // Since fzstd is decompress-only, we can't use zstd for compression
-  // For the browser-to-server direction, we'll use a simple marker format
-  // that the server can detect and handle appropriately
-  //
-  // For full zstd compression support, use a WASM module like:
-  // - @aspect-dev/zstd-wasm
-  // - zstd-codec
-  // - @aspect-dev/zstd-wasm
-  throw new Error('zstd compression not available in browser. Server should send zstd-compressed data, browser decompresses.');
-}
+  const srcSize = data.length;
+  const dstCap = wasm.zstd_compress_bound(srcSize);
 
-/**
- * Decompress zstd-compressed data using fzstd
- * @param data - Compressed data
- * @param _maxDecompressedSize - Maximum expected decompressed size (for safety)
- * @returns Decompressed data
- */
-export function decompressZstd(data: Uint8Array, _maxDecompressedSize = 16 * 1024 * 1024): Uint8Array {
-  if (!zstdModule) {
-    throw new Error('zstd module not initialized. Call initZstd() first.');
+  const srcPtr = wasm.zstd_alloc(srcSize);
+  const dstPtr = wasm.zstd_alloc(dstCap);
+  if (srcPtr === 0 || dstPtr === 0) {
+    if (srcPtr) wasm.zstd_free(srcPtr, srcSize);
+    if (dstPtr) wasm.zstd_free(dstPtr, dstCap);
+    throw new Error('zstd WASM alloc failed');
   }
 
-  return zstdModule.decompress(data);
+  try {
+    new Uint8Array(wasm.memory.buffer, srcPtr, srcSize).set(data);
+    const compressedSize = wasm.zstd_compress(dstPtr, dstCap, srcPtr, srcSize, level);
+    if (compressedSize === 0) throw new Error('zstd compression failed');
+    return new Uint8Array(wasm.memory.buffer.slice(dstPtr, dstPtr + compressedSize));
+  } finally {
+    wasm.zstd_free(srcPtr, srcSize);
+    wasm.zstd_free(dstPtr, dstCap);
+  }
 }
 
 /**
- * Get the maximum compressed size for a given input size
- * Note: Without full zstd library, this is an approximation
+ * Decompress zstd-compressed data using WASM
  */
-export function compressBoundZstd(srcSize: number): number {
-  // zstd worst case is about input + 12.5% + a constant
-  return srcSize + (srcSize >> 3) + 512;
-}
+export function decompressZstd(data: Uint8Array, maxDecompressedSize = 16 * 1024 * 1024): Uint8Array {
+  if (!wasm) throw new Error('zstd WASM not initialized. Call initZstd() first.');
 
-/**
- * Get the decompressed size from a compressed frame (if available)
- * Returns 0 if the size is unknown or cannot be determined
- */
-export function getFrameContentSizeZstd(_data: Uint8Array): number {
-  // fzstd handles this internally during decompression
-  // Return 0 to indicate unknown (will allocate dynamically)
-  return 0;
+  const srcSize = data.length;
+
+  // Try to get frame content size for precise allocation
+  const srcPtr = wasm.zstd_alloc(srcSize);
+  if (srcPtr === 0) throw new Error('zstd WASM alloc failed');
+
+  new Uint8Array(wasm.memory.buffer, srcPtr, srcSize).set(data);
+
+  let dstCap = wasm.zstd_frame_content_size(srcPtr, srcSize);
+  if (dstCap === 0 || dstCap > maxDecompressedSize) {
+    // Unknown size or too large - use conservative estimate
+    dstCap = Math.min(srcSize * 8, maxDecompressedSize);
+  }
+
+  const dstPtr = wasm.zstd_alloc(dstCap);
+  if (dstPtr === 0) {
+    wasm.zstd_free(srcPtr, srcSize);
+    throw new Error('zstd WASM alloc failed');
+  }
+
+  try {
+    const decompressedSize = wasm.zstd_decompress(dstPtr, dstCap, srcPtr, srcSize);
+    if (decompressedSize === 0) throw new Error('zstd decompression failed');
+    return new Uint8Array(wasm.memory.buffer.slice(dstPtr, dstPtr + decompressedSize));
+  } finally {
+    wasm.zstd_free(srcPtr, srcSize);
+    wasm.zstd_free(dstPtr, dstCap);
+  }
 }

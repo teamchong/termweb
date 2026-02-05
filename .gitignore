@@ -19,6 +19,10 @@ termweb_input.log
 # Test files
 test_*
 
+# Build artifacts
+packages/mux/web/zstd.wasm
+packages/mux/wasm/zstd.wasm
+
 # npm binaries (downloaded during install)
 binaries/
 node_modules/

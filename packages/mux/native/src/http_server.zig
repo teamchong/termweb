@@ -1,7 +1,7 @@
 //! HTTP server for embedded web assets and WebSocket upgrades.
 //!
-//! Serves the termweb web client (index.html, client.js) from embedded assets
-//! compiled into the binary. Also provides:
+//! Serves the termweb web client (index.html, client.js, zstd.wasm) from embedded
+//! assets compiled into the binary. Also provides:
 //! - `/config` endpoint for terminal configuration (colors, fonts)
 //! - WebSocket upgrade handling for panel, control, file, and preview endpoints
 //! - COOP/COEP headers for SharedArrayBuffer support in Web Workers
@@ -9,6 +9,7 @@
 //! The server runs on a single port and routes requests based on path:
 //! - `/` or `/index.html` → embedded HTML
 //! - `/client.js` → embedded JavaScript bundle
+//! - `/zstd.wasm` → embedded zstd WASM module for browser compression
 //! - `/config` → JSON terminal configuration from ghostty
 //! - `/ws/*` → WebSocket upgrade to appropriate handler
 //!
@@ -42,10 +43,11 @@ const c = if (is_macos) @cImport({
     }
 };
 
-// Embedded web assets (~140KB total) - from web_assets module
+// Embedded web assets - from web_assets module
 const web_assets = @import("web_assets");
 const embedded_index_html = web_assets.index_html;
 const embedded_client_js = web_assets.client_js;
+const embedded_zstd_wasm = web_assets.zstd_wasm;
 
 // COOP/COEP headers for SharedArrayBuffer support (required for Web Workers with shared memory)
 const cross_origin_headers = "Cross-Origin-Opener-Policy: same-origin\r\n" ++
@@ -256,6 +258,8 @@ pub const HttpServer = struct {
             embedded_index_html
         else if (std.mem.eql(u8, clean_path, "/client.js"))
             embedded_client_js
+        else if (std.mem.eql(u8, clean_path, "/zstd.wasm"))
+            embedded_zstd_wasm
         else {
             self.sendError(stream, 404, "Not Found");
             return;
@@ -343,6 +347,7 @@ pub const HttpServer = struct {
         if (std.mem.endsWith(u8, path, ".png")) return "image/png";
         if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
         if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+        if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
         return "application/octet-stream";
     }
 };

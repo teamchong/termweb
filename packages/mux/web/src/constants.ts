@@ -12,7 +12,6 @@ export const WS_PATHS = {
 } as const;
 
 export const CONFIG_ENDPOINT = '/config';
-export const ZSTD_WASM_PATH = '/zstd.wasm';
 
 // ============================================================================
 // Timing Constants (milliseconds)
