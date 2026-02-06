@@ -1486,8 +1486,14 @@ pub const Viewer = struct {
     fn stopInputThread(self: *Viewer) void {
         self.input_thread_running.store(false, .release);
         if (self.input_thread) |thread| {
+            // Set stdin to non-blocking so the input thread's read() unblocks
+            const O_NONBLOCK: usize = if (comptime builtin.os.tag == .macos) 0x0004 else 0x800;
+            const flags = std.posix.fcntl(self.input.fd, std.posix.F.GETFL, 0) catch 0;
+            _ = std.posix.fcntl(self.input.fd, std.posix.F.SETFL, flags | O_NONBLOCK) catch {};
             thread.join();
             self.input_thread = null;
+            // Restore blocking mode (terminal restore may need it)
+            _ = std.posix.fcntl(self.input.fd, std.posix.F.SETFL, flags) catch {};
         }
     }
 
