@@ -4,6 +4,7 @@
   import type { PanelStatus } from '../stores/types';
   import { getWsUrl, sharedTextEncoder, CircularBuffer, throttle } from '../utils';
   import { PANEL, TIMING, WS_PATHS, UI, NAL, MODIFIER, WHEEL_MODE, STATS_THRESHOLD } from '../constants';
+  import { initWebGPURenderer, type WebGPUFrameRenderer } from '../webgpu-renderer';
 
   // ============================================================================
   // Props
@@ -84,6 +85,7 @@
   let gotFirstKeyframe = false;
   let frameCount = 0;
   let ctx: CanvasRenderingContext2D | null = null;
+  let gpuRenderer: WebGPUFrameRenderer | null = null;
   let lastReportedWidth = 0;
   let lastReportedHeight = 0;
   let resizeObserver: ResizeObserver | null = null;
@@ -177,7 +179,7 @@
   function onFrame(frame: VideoFrame): void {
     pendingDecode--;
 
-    if (destroyed || !ctx) {
+    if (destroyed || (!ctx && !gpuRenderer)) {
       frame.close();
       return;
     }
@@ -196,7 +198,11 @@
       canvasEl.height = frame.displayHeight;
     }
 
-    ctx.drawImage(frame, 0, 0);
+    if (gpuRenderer) {
+      gpuRenderer.renderFrame(frame);
+    } else {
+      ctx!.drawImage(frame, 0, 0);
+    }
     frame.close();
 
     // Hide loading
@@ -832,7 +838,17 @@
 
   onMount(() => {
     if (canvasEl) {
-      ctx = canvasEl.getContext('2d', { desynchronized: true, alpha: false });
+      if (navigator.gpu) {
+        initWebGPURenderer(canvasEl).then((renderer) => {
+          if (renderer && !destroyed) {
+            gpuRenderer = renderer;
+          } else if (!destroyed && canvasEl) {
+            ctx = canvasEl.getContext('2d', { desynchronized: true, alpha: false });
+          }
+        });
+      } else {
+        ctx = canvasEl.getContext('2d', { desynchronized: true, alpha: false });
+      }
     }
 
     // Initialize throttled mouse move
@@ -892,6 +908,12 @@
     if (decoder) {
       decoder.close();
       decoder = null;
+    }
+
+    // Cleanup WebGPU renderer
+    if (gpuRenderer) {
+      gpuRenderer.dispose();
+      gpuRenderer = null;
     }
 
     // Clear circular buffers
