@@ -350,6 +350,7 @@ pub const Layout = struct {
     pub fn splitPanel(self: *Layout, panel_id: u32, direction: SplitDirection, new_panel_id: u32) !void {
         const tab = self.findTabByPanel(panel_id) orelse return error.PanelNotFound;
         try splitNode(self.allocator, tab.root, panel_id, direction, new_panel_id);
+        self.active_panel_id = new_panel_id;
     }
 
     fn splitNode(allocator: std.mem.Allocator, node: *SplitNode, panel_id: u32, direction: SplitDirection, new_panel_id: u32) !void {
@@ -624,11 +625,10 @@ const Panel = struct {
         if (surface == null) return error.SurfaceCreationFailed;
         errdefer c.ghostty_surface_free(surface);
 
-        // All surfaces start unfocused. The render loop sets focus on the
-        // active panel each frame so the correct panel gets a blinking cursor
-        // and inactive panels show a hollow block (matching ghostty behavior).
-        c.ghostty_surface_set_focus(surface, false);
         // Tell ghostty the surface is visible (not occluded) so it renders properly
+        // Note: we skip ghostty_surface_set_focus here — Surface.draw() syncs
+        // renderer.focused from core_surface.focused every frame, and the render
+        // loop manages focus transitions via set_focus_light.
         c.ghostty_surface_set_occlusion(surface, true);
 
         // Set size in pixels
@@ -1501,7 +1501,7 @@ const Server = struct {
     inspector_open: bool,  // Whether inspector is open
     shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
     wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
-    last_focused_panel_id: ?u32 = null,  // Track focus transitions to avoid per-frame set_focus calls
+    render_immediately: std.atomic.Value(bool),  // Bypass frame timing for instant response to focus/input
 
     var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
 
@@ -1572,6 +1572,7 @@ const Server = struct {
                 };
             } else {},
             .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
+            .render_immediately = std.atomic.Value(bool).init(false),
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -1914,6 +1915,7 @@ const Server = struct {
 
             panel.handleMessage(data);
             panel.has_pending_input.store(true, .release);
+            self.render_immediately.store(true, .release);
             self.wake_signal.notify();
         } else {
             // Not connected to panel yet - handle connect/create commands
@@ -2073,6 +2075,8 @@ const Server = struct {
                 }
             }
             self.mutex.unlock();
+            self.render_immediately.store(true, .release);
+            self.wake_signal.notify();
         } else if (msg_type == 0x88) { // view_action
             if (data.len < 6) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
@@ -3081,6 +3085,8 @@ const Server = struct {
             if (req.kind == .regular) {
                 self.broadcastLayoutUpdate();
             }
+            // Trigger immediate render so the new panel's focus state appears instantly
+            self.render_immediately.store(true, .release);
 
             // Linux only: Send initial title since shell integration may not be configured
             // macOS works fine without this as ghostty auto-injects shell integration
@@ -3219,6 +3225,7 @@ const Server = struct {
 
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
+            self.render_immediately.store(true, .release);
 
             // Resume parent panel streaming (will get keyframe on next frame)
             // Note: If parent will be resized, resizeInternal sets force_keyframe
@@ -3232,8 +3239,12 @@ const Server = struct {
 
     // Main render loop
     fn runRenderLoop(self: *Server) void {
-        const target_fps: u64 = 30;
-        const frame_time_ns: u64 = std.time.ns_per_s / target_fps;
+        // Burst FPS: temporarily increase to 60fps after input/focus for snappy response,
+        // then drop to 30fps when idle to save CPU and encoding resources.
+        const normal_frame_time_ns: u64 = std.time.ns_per_s / 30; // 33.3ms
+        const burst_frame_time_ns: u64 = std.time.ns_per_s / 60;  // 16.7ms
+        const burst_duration: u32 = 90; // ~1.5s at 60fps
+        var burst_remaining: u32 = 0;
 
         var last_frame: i128 = 0;
 
@@ -3280,11 +3291,15 @@ const Server = struct {
                 panel.processInputQueue();
             }
 
-            // Only capture and send frames at target fps
+            // Only capture and send frames at target fps (burst or normal)
+            const immediate = self.render_immediately.swap(false, .acq_rel);
+            if (immediate and burst_remaining == 0) burst_remaining = burst_duration;
+            const frame_time_ns = if (burst_remaining > 0) burst_frame_time_ns else normal_frame_time_ns;
             const now = std.time.nanoTimestamp();
             const since_last_frame: u64 = @intCast(now - last_frame);
-            if (since_last_frame >= frame_time_ns) {
+            if (since_last_frame >= frame_time_ns or immediate) {
                 last_frame = now;
+                if (burst_remaining > 0) burst_remaining -= 1;
 
                 frame_blocks += 1;
 
@@ -3357,29 +3372,12 @@ const Server = struct {
                 }
                 self.mutex.unlock();
 
-                // Update focus state only on transitions (not every frame).
-                // ghostty_surface_set_focus triggers mailbox pushes and key
-                // release processing, so calling it per-frame causes delay.
-                if (focused_panel_id != self.last_focused_panel_id) {
-                    // Unfocus the previously focused panel
-                    if (self.last_focused_panel_id) |old_id| {
-                        for (frame_panels_buf[0..frame_panels_count]) |p| {
-                            if (p.id == old_id) {
-                                c.ghostty_surface_set_focus(p.surface, false);
-                                break;
-                            }
-                        }
-                    }
-                    // Focus the newly active panel
-                    if (focused_panel_id) |new_id| {
-                        for (frame_panels_buf[0..frame_panels_count]) |p| {
-                            if (p.id == new_id) {
-                                c.ghostty_surface_set_focus(p.surface, true);
-                                break;
-                            }
-                        }
-                    }
-                    self.last_focused_panel_id = focused_panel_id;
+                // Set headless focus flag on each panel — a single bool write
+                // with zero ghostty API overhead. Surface.draw() reads this
+                // flag and syncs it to core_surface.focused and renderer.focused.
+                for (frame_panels_buf[0..frame_panels_count]) |panel| {
+                    const should_focus = if (focused_panel_id) |fid| panel.id == fid else false;
+                    c.ghostty_surface_set_headless_focus(panel.surface, should_focus);
                 }
 
                 // Process each panel WITHOUT holding the server mutex
@@ -3497,8 +3495,9 @@ const Server = struct {
             // Use last_frame as anchor so we wake at the correct time regardless
             // of when we entered this iteration (e.g. woken early by input signal)
             crash_phase.store(0, .monotonic); // idle/sleeping
+            const current_frame_time = if (burst_remaining > 0) burst_frame_time_ns else normal_frame_time_ns;
             const since_last: u64 = @intCast(std.time.nanoTimestamp() - last_frame);
-            const remaining = if (since_last < frame_time_ns) frame_time_ns - since_last else 0;
+            const remaining = if (since_last < current_frame_time) current_frame_time - since_last else 0;
             if (remaining > 0) {
                 _ = self.wake_signal.waitTimeout(remaining);
                 // Process input immediately after waking from sleep — don't wait

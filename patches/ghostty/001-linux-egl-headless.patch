@@ -1,5 +1,5 @@
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 3d3973084..e04c2fabe 100644
+index 3d3973084..804a7998d 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
 @@ -38,6 +38,7 @@ typedef enum {
@@ -27,7 +27,15 @@ index 3d3973084..e04c2fabe 100644
  } ghostty_platform_u;
  
  typedef enum {
-@@ -1146,6 +1154,11 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
+@@ -1066,6 +1074,7 @@ void ghostty_surface_refresh(ghostty_surface_t);
+ void ghostty_surface_draw(ghostty_surface_t);
+ void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ void ghostty_surface_set_focus(ghostty_surface_t, bool);
++void ghostty_surface_set_headless_focus(ghostty_surface_t, bool);
+ void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+ void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+ ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+@@ -1146,6 +1155,11 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
  bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
  #endif
  
@@ -718,7 +726,7 @@ index 000000000..31423962a
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..fa1dc56d3 100644
+index dcf8a6357..bc2e380bc 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -786,10 +794,15 @@ index dcf8a6357..fa1dc56d3 100644
  };
  
  pub const EnvVar = extern struct {
-@@ -414,6 +437,13 @@ pub const Surface = struct {
+@@ -414,6 +437,18 @@ pub const Surface = struct {
      cursor_pos: apprt.CursorPos,
      inspector: ?*Inspector = null,
  
++    /// Headless focus state. Set directly by the app thread to control
++    /// which surface shows the active cursor. Synced to core_surface.focused
++    /// and renderer.focused in draw() without any mailbox or mutex overhead.
++    headless_focused: bool = true,
++
 +    /// Cursor blink state for headless mode. When must_draw_from_app_thread
 +    /// is true, the renderer thread's blink timer cannot drive rendering
 +    /// (its renderCallback is a no-op). Instead, we toggle the blink state
@@ -800,7 +813,7 @@ index dcf8a6357..fa1dc56d3 100644
      /// The current title of the surface. The embedded apprt saves this so
      /// that getTitle works without the implementer needing to save it.
      title: ?[:0]const u8 = null,
-@@ -590,6 +620,13 @@ pub const Surface = struct {
+@@ -590,6 +625,13 @@ pub const Surface = struct {
          // Free our title
          if (self.title) |v| self.app.core_app.alloc.free(v);
  
@@ -814,7 +827,7 @@ index dcf8a6357..fa1dc56d3 100644
          // Remove ourselves from the list of known surfaces in the app.
          self.app.core_app.deleteSurface(self);
  
-@@ -756,6 +793,47 @@ pub const Surface = struct {
+@@ -756,6 +798,54 @@ pub const Surface = struct {
      }
  
      pub fn draw(self: *Surface) void {
@@ -830,17 +843,24 @@ index dcf8a6357..fa1dc56d3 100644
 +        // thread as drawFrame. The renderer thread skips updateFrame to avoid
 +        // a data race on terminal_state (heap corruption / double free).
 +        if (comptime App.must_draw_from_app_thread) {
-+            // Sync renderer focus state directly from the core surface.
-+            // The renderer thread's mailbox delivery is unreliable in headless
-+            // mode (focusCallback doesn't call wakeup.notify), so we set it
-+            // here on the app thread where updateFrame/drawFrame actually run.
-+            self.core_surface.renderer.focused = self.core_surface.focused;
++            // Sync focus state from the headless_focused flag (set directly
++            // by the app without any ghostty API overhead). This drives both
++            // the renderer's cursor style and the blink timer.
++            const was_focused = self.core_surface.focused;
++            self.core_surface.focused = self.headless_focused;
++            self.core_surface.renderer.focused = self.headless_focused;
++
++            // Reset blink on focus gain so cursor is immediately visible.
++            if (self.headless_focused and !was_focused) {
++                self.blink_counter = 0;
++                self.cursor_blink_visible = true;
++            }
 +
 +            // Toggle cursor blink on the app thread. The renderer thread's
 +            // blink timer cannot drive rendering in headless mode because
 +            // renderCallback is a no-op. 18 frames ≈ 600ms at 30fps.
-+            // Only blink when focused — unfocused surfaces show hollow block.
-+            if (self.core_surface.focused) {
++            // Only blink when focused — unfocused surfaces show solid block.
++            if (self.headless_focused) {
 +                const blink_interval = 18;
 +                self.blink_counter += 1;
 +                if (self.blink_counter >= blink_interval) {
@@ -862,7 +882,7 @@ index dcf8a6357..fa1dc56d3 100644
          self.core_surface.draw() catch |err| {
              log.err("error in draw err={}", .{err});
              return;
-@@ -781,6 +859,15 @@ pub const Surface = struct {
+@@ -781,6 +871,15 @@ pub const Surface = struct {
      }
  
      pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -878,7 +898,21 @@ index dcf8a6357..fa1dc56d3 100644
          // Runtimes sometimes generate superfluous resize events even
          // if the size did not actually change (SwiftUI). We check
          // that the size actually changed from what we last recorded
-@@ -2204,4 +2291,44 @@ pub const CAPI = struct {
+@@ -1708,6 +1807,13 @@ pub const CAPI = struct {
+         surface.focusCallback(focused);
+     }
+ 
++    /// Set headless focus state. This is a zero-overhead flag write —
++    /// no mailbox push, no mutex, no key release processing. The flag
++    /// is synced to core_surface.focused and renderer.focused in draw().
++    export fn ghostty_surface_set_headless_focus(surface: *Surface, focused: bool) void {
++        surface.headless_focused = focused;
++    }
++
+     /// Update the occlusion state of a surface.
+     export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
+         surface.occlusionCallback(visible);
+@@ -2204,4 +2310,44 @@ pub const CAPI = struct {
              }
          }
      };
