@@ -144,12 +144,23 @@ export function throttle<T extends (...args: never[]) => void>(
   fn: T,
   limit: number
 ): (...args: Parameters<T>) => void {
-  let inThrottle = false;
+  let pending: Parameters<T> | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   return (...args: Parameters<T>) => {
-    if (!inThrottle) {
+    if (timer === null) {
+      // Leading edge: fire immediately
       fn(...args);
-      inThrottle = true;
-      setTimeout(() => (inThrottle = false), limit);
+      timer = setTimeout(() => {
+        // Trailing edge: fire latest queued args if any
+        if (pending !== null) {
+          fn(...pending);
+          pending = null;
+        }
+        timer = null;
+      }, limit);
+    } else {
+      // During throttle window: save latest args
+      pending = args;
     }
   };
 }
