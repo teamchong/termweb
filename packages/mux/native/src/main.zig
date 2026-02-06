@@ -3327,6 +3327,18 @@ const Server = struct {
             const now = std.time.nanoTimestamp();
             const since_last_frame: u64 = @intCast(now - last_frame);
             if (since_last_frame >= frame_time_ns) {
+                // Log if frame gap is >100ms (expecting ~33ms) — catches sleep overshoot
+                // or pre-frame work (processPending*, input) taking too long
+                const gap_threshold_ns: u64 = 100 * std.time.ns_per_ms;
+                if (since_last_frame > gap_threshold_ns and last_frame > 0) {
+                    if (perf_log) |f| {
+                        var gap_buf: [128]u8 = undefined;
+                        const gap_line = std.fmt.bufPrint(&gap_buf, "GAP {d}ms between frames\n", .{
+                            since_last_frame / std.time.ns_per_ms,
+                        }) catch "";
+                        _ = f.write(gap_line) catch {};
+                    }
+                }
                 last_frame = now;
 
                 frame_blocks += 1;
@@ -3435,6 +3447,7 @@ const Server = struct {
                 for (frame_panels_buf[0..frame_panels_count], frame_panels_streaming[0..frame_panels_count]) |panel, is_streaming| {
 
                     frames_attempted += 1;
+                    const t_frame_start = std.time.nanoTimestamp();
 
                     // Scoped autorelease pool for ALL ObjC/Metal objects created during this panel's frame (macOS only)
                     const draw_pool = if (comptime is_macos) objc_autoreleasePoolPush() else null;
@@ -3444,10 +3457,15 @@ const Server = struct {
                     crash_phase.store(5, .monotonic); // ghostty_surface_draw
                     const t_tick = std.time.nanoTimestamp();
                     panel.tick();
-                    perf_tick_ns += @intCast(std.time.nanoTimestamp() - t_tick);
+                    const tick_elapsed: u64 = @intCast(std.time.nanoTimestamp() - t_tick);
+                    perf_tick_ns += tick_elapsed;
 
                     // Platform-specific frame capture
                     var frame_data: ?[]const u8 = null;
+                    var read_elapsed: u64 = 0;
+                    var enc_elapsed: u64 = 0;
+                    var was_keyframe = false;
+                    var send_failed = false;
 
                     if (comptime is_macos) {
                         if (panel.getIOSurface()) |iosurface| {
@@ -3493,11 +3511,14 @@ const Server = struct {
                         // Wait a few frames for ghostty to render initial content
                         if (panel.ticks_since_connect < 3) continue;
 
+                        was_keyframe = panel.force_keyframe;
+
                         // Read pixels from OpenGL framebuffer
                         crash_phase.store(6, .monotonic); // ghostty_surface_read_pixels
                         const t_read = std.time.nanoTimestamp();
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
-                        perf_read_ns += @intCast(std.time.nanoTimestamp() - t_read);
+                        read_elapsed = @intCast(std.time.nanoTimestamp() - t_read);
+                        perf_read_ns += read_elapsed;
 
                         if (read_ok) {
                             // Pass explicit dimensions to ensure encoder matches frame size
@@ -3507,7 +3528,8 @@ const Server = struct {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
                             }
-                            perf_encode_ns += @intCast(std.time.nanoTimestamp() - t_enc);
+                            enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
+                            perf_encode_ns += enc_elapsed;
                         }
                     }
 
@@ -3521,6 +3543,7 @@ const Server = struct {
                                 // Force keyframe so browser can recover on next successful send.
                                 panel.force_keyframe = true;
                                 frames_dropped += 1;
+                                send_failed = true;
                             }
                         }
 
@@ -3535,6 +3558,25 @@ const Server = struct {
                         // Send to preview clients (if any)
                         if (send_preview) {
                             self.sendPreviewFrame(panel.id, data);
+                        }
+                    }
+
+                    // Spike detection: log immediately if any single frame exceeds 50ms
+                    const frame_total_ns: u64 = @intCast(std.time.nanoTimestamp() - t_frame_start);
+                    const spike_threshold_ns: u64 = 50 * std.time.ns_per_ms;
+                    if (frame_total_ns > spike_threshold_ns) {
+                        if (perf_log) |f| {
+                            var spike_buf: [256]u8 = undefined;
+                            const spike_line = std.fmt.bufPrint(&spike_buf, "SPIKE panel={d} total={d}ms tick={d}ms read={d}ms enc={d}ms keyframe={} send_fail={}\n", .{
+                                panel.id,
+                                frame_total_ns / std.time.ns_per_ms,
+                                tick_elapsed / std.time.ns_per_ms,
+                                read_elapsed / std.time.ns_per_ms,
+                                enc_elapsed / std.time.ns_per_ms,
+                                was_keyframe,
+                                send_failed,
+                            }) catch "";
+                            _ = f.write(spike_line) catch {};
                         }
                     }
 
