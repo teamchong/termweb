@@ -1,6 +1,7 @@
 /// CDP Event handlers for the viewer.
 /// Handles Chrome DevTools Protocol events like navigation, downloads, console messages.
 const std = @import("std");
+const builtin = @import("builtin");
 const cdp = @import("../chrome/cdp_client.zig");
 const screenshot_api = @import("../chrome/screenshot.zig");
 const download_mod = @import("../chrome/download.zig");
@@ -231,11 +232,20 @@ pub fn handleDownloadWillBegin(viewer: anytype, payload: []const u8) !void {
     if (download_mod.parseDownloadWillBegin(payload)) |info| {
         viewer.log("[DOWNLOAD] guid={s} filename={s}\n", .{ info.guid, info.suggested_filename });
 
-        try viewer.download_manager.handleDownloadWillBegin(
-            info.guid,
-            info.url,
-            info.suggested_filename,
-        );
+        if (comptime builtin.os.tag == .linux) {
+            // On Linux: register the download without blocking on GUI picker.
+            // File will auto-save to ~/Downloads/ when download completes.
+            try viewer.download_manager.handleDownloadWillBeginAsync(
+                info.guid, info.url, info.suggested_filename,
+            );
+        } else {
+            // macOS: use native osascript file picker (works without display server)
+            try viewer.download_manager.handleDownloadWillBegin(
+                info.guid,
+                info.url,
+                info.suggested_filename,
+            );
+        }
     }
 }
 
@@ -245,6 +255,20 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
         viewer.log("[DOWNLOAD] progress: guid={s} state={s} {d}/{d} bytes\n", .{
             info.guid, info.state, info.received_bytes, info.total_bytes,
         });
+
+        // On Linux: capture filename before handleDownloadProgress removes the download,
+        // so we can notify the user where the file was saved
+        var notify_filename_buf: [256]u8 = undefined;
+        var notify_filename_len: usize = 0;
+        if (comptime builtin.os.tag == .linux) {
+            if (std.mem.eql(u8, info.state, "completed")) {
+                if (viewer.download_manager.downloads.get(info.guid)) |dl| {
+                    notify_filename_len = @min(dl.suggested_filename.len, 256);
+                    @memcpy(notify_filename_buf[0..notify_filename_len], dl.suggested_filename[0..notify_filename_len]);
+                }
+            }
+        }
+
         try viewer.download_manager.handleDownloadProgress(
             info.guid,
             info.state,
@@ -252,8 +276,21 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
             info.total_bytes,
         );
 
-        if (std.mem.eql(u8, info.state, "completed") or std.mem.eql(u8, info.state, "canceled")) {
-            viewer.log("[DOWNLOAD] {s}\n", .{info.state});
+        if (std.mem.eql(u8, info.state, "completed")) {
+            viewer.log("[DOWNLOAD] completed\n", .{});
+            // On Linux: notify viewer with the save path (file was auto-saved to ~/Downloads/)
+            if (comptime builtin.os.tag == .linux) {
+                if (notify_filename_len > 0) {
+                    const home = std.posix.getenv("HOME") orelse "/tmp";
+                    var path_buf: [512]u8 = undefined;
+                    const save_path = std.fmt.bufPrint(&path_buf, "{s}/Downloads/{s}", .{
+                        home, notify_filename_buf[0..notify_filename_len],
+                    }) catch notify_filename_buf[0..notify_filename_len];
+                    viewer.notifyDownloadComplete(save_path);
+                }
+            }
+        } else if (std.mem.eql(u8, info.state, "canceled")) {
+            viewer.log("[DOWNLOAD] canceled\n", .{});
         }
     }
 }

@@ -84,6 +84,15 @@ const PendingTabAdd = struct {
     ready: std.atomic.Value(bool), // Set AFTER all other fields are written
 };
 
+/// Pending download notification - signals main loop to show "Saved to ..." in toolbar
+/// CDP thread sets this when a download completes, main loop shows the notification
+/// Uses atomic ready flag to ensure safe cross-thread access
+const PendingDownloadNotify = struct {
+    path: [512]u8,
+    path_len: u16,
+    ready: std.atomic.Value(bool), // Set AFTER all other fields are written
+};
+
 // Use helper functions from viewer module
 const envVarTruthy = viewer_helpers.envVarTruthy;
 const isNaturalScrollEnabled = viewer_helpers.isNaturalScrollEnabled;
@@ -161,6 +170,8 @@ pub const Viewer = struct {
     single_tab_mode: bool, // --single-tab flag - navigate in same tab instead of opening new tabs
     pending_tab_switch: ?usize, // Deferred tab switch (processed in main loop to avoid re-entrancy)
     pending_tab_add: PendingTabAdd, // Deferred tab add (uses atomic ready flag)
+    pending_download_notify: PendingDownloadNotify, // Deferred download completion notification
+    download_notify_time: i128, // When notification was shown (0 = none active)
 
     // Mouse cursor tracking (pixel coordinates)
     mouse_x: u16,
@@ -355,6 +366,12 @@ pub const Viewer = struct {
                 .auto_switch = false,
                 .ready = std.atomic.Value(bool).init(false),
             },
+            .pending_download_notify = .{
+                .path = undefined,
+                .path_len = 0,
+                .ready = std.atomic.Value(bool).init(false),
+            },
+            .download_notify_time = 0,
             .mouse_x = 0,
             .mouse_y = 0,
             .mouse_visible = false,
@@ -473,6 +490,18 @@ pub const Viewer = struct {
 
         // Release fence ensures all writes above are visible before setting ready
         self.pending_tab_add.ready.store(true, .release);
+    }
+
+    /// Notify main loop that a download completed and was saved to the given path.
+    /// CDP thread calls this, main loop shows a brief notification in the toolbar.
+    /// Uses release/acquire ordering to ensure data is visible before ready flag.
+    pub fn notifyDownloadComplete(self: *Viewer, save_path: []const u8) void {
+        const p_len: u16 = @intCast(@min(save_path.len, 512));
+        @memcpy(self.pending_download_notify.path[0..p_len], save_path[0..p_len]);
+        self.pending_download_notify.path_len = p_len;
+
+        // Release fence ensures all writes above are visible before setting ready
+        self.pending_download_notify.ready.store(true, .release);
     }
 
     /// Enable single-tab mode (navigate in same tab instead of opening new tabs)
@@ -882,6 +911,36 @@ pub const Viewer = struct {
                 viewer_mod.switchToTab(self, tab_index) catch |err| {
                     self.log("[TABS] Deferred switchToTab failed: {}\n", .{err});
                 };
+            }
+
+            // Process pending download notification (deferred from CDP thread)
+            if (self.pending_download_notify.ready.load(.acquire)) {
+                self.pending_download_notify.ready.store(false, .release);
+                const save_path = self.pending_download_notify.path[0..self.pending_download_notify.path_len];
+                self.log("[DOWNLOAD] Saved to: {s}\n", .{save_path});
+
+                // Show "Saved: {path}" in toolbar briefly
+                if (self.toolbar_renderer) |*renderer| {
+                    var notify_buf: [540]u8 = undefined;
+                    const notify_msg = std.fmt.bufPrint(&notify_buf, "Saved: {s}", .{save_path}) catch save_path;
+                    renderer.setUrl(notify_msg);
+                    self.requestToolbarRender();
+                    self.ui_dirty = true;
+                    self.download_notify_time = std.time.nanoTimestamp();
+                }
+            }
+
+            // Clear download notification after 3 seconds, restore original URL
+            if (self.download_notify_time > 0) {
+                const elapsed = std.time.nanoTimestamp() - self.download_notify_time;
+                if (elapsed > 3 * std.time.ns_per_s) {
+                    self.download_notify_time = 0;
+                    if (self.toolbar_renderer) |*renderer| {
+                        renderer.setUrl(self.current_url);
+                        self.requestToolbarRender();
+                        self.ui_dirty = true;
+                    }
+                }
             }
 
             // Process deferred nav state update (moved from CDP thread to avoid blocking)

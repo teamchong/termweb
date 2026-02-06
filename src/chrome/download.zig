@@ -57,6 +57,29 @@ pub const DownloadManager = struct {
         self.save_paths.deinit();
     }
 
+    /// Register download tracking without blocking on file picker.
+    /// Used on Linux where the save path prompt is shown in the viewer toolbar.
+    pub fn handleDownloadWillBeginAsync(
+        self: *DownloadManager,
+        guid: []const u8,
+        url: []const u8,
+        suggested_filename: []const u8,
+    ) !void {
+        const guid_copy = try self.allocator.dupe(u8, guid);
+        const url_copy = try self.allocator.dupe(u8, url);
+        const filename_copy = try self.allocator.dupe(u8, suggested_filename);
+
+        try self.downloads.put(guid_copy, .{
+            .guid = guid_copy,
+            .url = url_copy,
+            .suggested_filename = filename_copy,
+            .state = .in_progress,
+            .received_bytes = 0,
+            .total_bytes = 0,
+        });
+        // save_path will be set later by the viewer's download prompt
+    }
+
     /// Handle downloadWillBegin - show save dialog, track download
     pub fn handleDownloadWillBegin(
         self: *DownloadManager,
@@ -110,12 +133,29 @@ pub const DownloadManager = struct {
                 ) catch return;
                 defer self.allocator.free(source_path);
 
-                // Copy to user's chosen location (if they picked one)
+                // Copy to user's chosen location, or fallback to ~/Downloads/
                 if (self.save_paths.fetchRemove(guid)) |entry| {
                     const save_path = entry.value;
                     defer self.allocator.free(save_path);
                     defer self.allocator.free(entry.key);
                     copyFile(source_path, save_path) catch {};
+                } else {
+                    // No save path set — fallback to ~/Downloads/{filename}
+                    if (self.downloads.get(guid)) |dl| {
+                        const home = std.posix.getenv("HOME") orelse "/tmp";
+                        const fallback = std.fmt.allocPrint(self.allocator, "{s}/Downloads/{s}", .{ home, dl.suggested_filename }) catch null;
+                        if (fallback) |fb_path| {
+                            defer self.allocator.free(fb_path);
+                            // Ensure ~/Downloads/ exists
+                            if (std.mem.lastIndexOfScalar(u8, fb_path, '/')) |sep| {
+                                std.fs.makeDirAbsolute(fb_path[0..sep]) catch |err| switch (err) {
+                                    error.PathAlreadyExists => {},
+                                    else => {},
+                                };
+                            }
+                            copyFile(source_path, fb_path) catch {};
+                        }
+                    }
                 }
                 // Delete temp file
                 std.fs.deleteFileAbsolute(source_path) catch {};
