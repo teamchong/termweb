@@ -417,6 +417,10 @@ export class MuxClient {
       const tabId = this.findTabIdForPanel(panel);
       if (tabId) {
         tabs.updateTab(tabId, { title });
+        // Update browser title when the active tab's title changes
+        if (tabId === get(activeTabIdStore)) {
+          document.title = title || '👻';
+        }
       }
     }
   }
@@ -500,6 +504,7 @@ export class MuxClient {
       activeTabIdStore.set(null);
       activePanelId.set(null);
       this.currentActivePanel = null;
+      document.title = '👻';
     }
   }
 
@@ -617,6 +622,9 @@ export class MuxClient {
         activeTabIdStore.set(tabId);
         this.tabHistory = this.tabHistory.filter(id => id !== tabId);
         this.tabHistory.push(tabId);
+        // Update browser title to match the new active tab
+        const tabInfo = tabs.get(tabId);
+        document.title = tabInfo?.title || '👻';
       }
 
       // Notify server so it persists the active panel/tab

@@ -6,7 +6,7 @@
   import Menu, { type MenuItem } from './components/Menu.svelte';
   import QuickTerminal from './components/QuickTerminal.svelte';
   import TabOverview from './components/TabOverview.svelte';
-  import { tabs, activeTabId } from './stores/index';
+  import { tabs, activeTabId, activeTab } from './stores/index';
   import { connectionStatus, initialLayoutLoaded, initMuxClient, type MuxClient } from './services/mux';
 
   // MuxClient instance
@@ -499,7 +499,7 @@
   <!-- Titlebar -->
   <div id="titlebar" class:hidden={isFullscreen}>
     <div id="title-left">
-      <span id="app-title">👻</span>
+      <span id="app-title">{$activeTab?.title || '👻'}</span>
     </div>
     <div id="title-right">
       <!-- svelte-ignore a11y_click_events_have_key_events -->

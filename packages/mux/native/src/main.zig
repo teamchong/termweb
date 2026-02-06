@@ -43,6 +43,7 @@ const c = if (is_macos) @cImport({
     @cInclude("IOSurface/IOSurfaceRef.h");
 }) else @cImport({
     @cInclude("ghostty.h");
+    @cInclude("execinfo.h");
 });
 
 // IOSurface types/stubs for cross-platform code (actual calls guarded by is_macos)
@@ -935,6 +936,9 @@ const Panel = struct {
                     c.ghostty_surface_mouse_pos(self.surface, pos.x, pos.y, pos.mods);
                 },
                 .mouse_button => |btn| {
+                    // Send position first, then button event.
+                    // ghostty_surface_mouse_button may trigger selection/clipboard
+                    // operations internally.
                     _ = c.ghostty_surface_mouse_button(self.surface, btn.state, btn.button, btn.mods);
                 },
                 .mouse_scroll => |scroll| {
@@ -3236,7 +3240,9 @@ const Server = struct {
             defer if (comptime is_macos) objc_autoreleasePoolPop(pool);
 
             // Process pending panel creations/destructions/resizes/splits (NSWindow/ghostty must be on main thread)
+            crash_phase.store(1, .monotonic); // processPendingPanels
             self.processPendingPanels();
+            crash_phase.store(2, .monotonic); // processPendingDestroys
             self.processPendingDestroys();
             self.processPendingResizes();
             self.processPendingSplits();
@@ -3257,6 +3263,7 @@ const Server = struct {
             self.mutex.unlock();
 
             // Process input (fast - no rendering)
+            crash_phase.store(3, .monotonic); // processInputQueue
             for (panels_buf[0..panels_count]) |panel| {
                 panel.processInputQueue();
             }
@@ -3282,6 +3289,7 @@ const Server = struct {
                 const send_preview = has_preview_clients and (needs_immediate or frame_blocks % 6 == 0);
 
                 // Tick ghostty to render content to IOSurface
+                crash_phase.store(4, .monotonic); // ghostty_app_tick
                 self.tick();
 
                 var frames_sent: u32 = 0;
@@ -3347,6 +3355,7 @@ const Server = struct {
                     defer if (comptime is_macos) objc_autoreleasePoolPop(draw_pool);
 
                     // Render panel content to IOSurface
+                    crash_phase.store(5, .monotonic); // ghostty_surface_draw
                     panel.tick();
 
                     // Platform-specific frame capture
@@ -3397,10 +3406,12 @@ const Server = struct {
                         if (panel.ticks_since_connect < 3) continue;
 
                         // Read pixels from OpenGL framebuffer
+                        crash_phase.store(6, .monotonic); // ghostty_surface_read_pixels
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
 
                         if (read_ok) {
                             // Pass explicit dimensions to ensure encoder matches frame size
+                            crash_phase.store(7, .monotonic); // video encoder
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
@@ -3439,6 +3450,7 @@ const Server = struct {
             // Wait until next frame is due or input arrives (whichever comes first)
             // Use last_frame as anchor so we wake at the correct time regardless
             // of when we entered this iteration (e.g. woken early by input signal)
+            crash_phase.store(0, .monotonic); // idle/sleeping
             const since_last: u64 = @intCast(std.time.nanoTimestamp() - last_frame);
             const remaining = if (since_last < frame_time_ns) frame_time_ns - since_last else 0;
             if (remaining > 0) {
@@ -3463,6 +3475,15 @@ const Server = struct {
 
         // Run render loop in main thread
         self.runRenderLoop();
+
+        // Render loop exited (Ctrl+C or error) — stop all servers to unblock
+        // their threads. This is done here instead of the signal handler because
+        // .stop() calls allocator/deinit operations that are not signal-safe.
+        self.http_server.stop();
+        self.panel_ws_server.stop();
+        self.control_ws_server.stop();
+        self.file_ws_server.stop();
+        self.preview_ws_server.stop();
 
         // Wait for HTTP thread to finish
         http_thread.join();
@@ -3769,10 +3790,10 @@ fn readClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_e
 }
 
 fn confirmReadClipboardCallback(userdata: ?*anyopaque, data: [*c]const u8, context: ?*anyopaque, request: c.ghostty_clipboard_request_e) callconv(.c) void {
-    _ = userdata;
-    _ = data;
-    _ = context;
     _ = request;
+    // Complete the clipboard request to prevent ghostty internal state leak.
+    const panel: *Panel = @ptrCast(@alignCast(userdata orelse return));
+    c.ghostty_surface_complete_clipboard_request(panel.surface, data orelse "", context, true);
 }
 
 fn writeClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_e, content: [*c]const c.ghostty_clipboard_content_s, count: usize, protected: bool) callconv(.c) void {
@@ -3851,6 +3872,52 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 }
 
 
+// Crash diagnostics: atomic phase tracker (zero-overhead, read by signal handler)
+var crash_phase = std.atomic.Value(u32).init(0);
+// Phase values:
+// 0 = idle/sleeping
+// 1 = processPendingPanels
+// 2 = processPendingDestroys
+// 3 = processInputQueue
+// 4 = ghostty_app_tick
+// 5 = ghostty_surface_draw
+// 6 = ghostty_surface_read_pixels
+// 7 = video encoder
+// 8 = sendFrame
+
+const phase_names = [_][]const u8{
+    "idle/sleeping",
+    "processPendingPanels",
+    "processPendingDestroys",
+    "processInputQueue",
+    "ghostty_app_tick",
+    "ghostty_surface_draw",
+    "ghostty_surface_read_pixels",
+    "video encoder",
+    "sendFrame",
+};
+
+fn handleSigabrt(_: c_int) callconv(.c) void {
+    // Report which phase was active
+    const phase = crash_phase.load(.monotonic);
+    _ = std.posix.write(2, "\n=== CRASH: double free or corruption ===\n") catch {};
+    _ = std.posix.write(2, "Phase: ") catch {};
+    if (phase < phase_names.len) {
+        _ = std.posix.write(2, phase_names[phase]) catch {};
+    } else {
+        _ = std.posix.write(2, "unknown") catch {};
+    }
+    _ = std.posix.write(2, "\n") catch {};
+
+    // Signal-safe backtrace dump to stderr (fd 2)
+    var addrs: [64]?*anyopaque = undefined;
+    const n = c.backtrace(&addrs, 64);
+    _ = std.posix.write(2, "=== backtrace ===\n") catch {};
+    c.backtrace_symbols_fd(&addrs, n, 2);
+    _ = std.posix.write(2, "=== end backtrace ===\n") catch {};
+    std.posix.exit(134);
+}
+
 var sigint_received = std.atomic.Value(bool).init(false);
 
 fn handleSigint(_: c_int) callconv(.c) void {
@@ -3858,19 +3925,13 @@ fn handleSigint(_: c_int) callconv(.c) void {
         // Second Ctrl+C - force exit immediately
         std.posix.exit(1);
     }
-    // First Ctrl+C - graceful shutdown
+    // First Ctrl+C - graceful shutdown (signal-safe: only atomics + write + syscalls)
     if (Server.global_server.load(.acquire)) |server| {
         server.running.store(false, .release);
-        // Wake the render loop so it exits immediately
         server.wake_signal.notify();
-        // Stop all servers — signals their shutdown fds to wake connection threads
-        server.http_server.stop();
-        server.panel_ws_server.stop();
-        server.control_ws_server.stop();
-        server.file_ws_server.stop();
-        server.preview_ws_server.stop();
     }
-    std.debug.print("\nShutting down...\n", .{});
+    // std.debug.print is NOT signal-safe, use raw write instead
+    _ = std.posix.write(2, "\nShutting down...\n") catch {};
 }
 
 // WebSocket upgrade callbacks for HTTP server
@@ -3903,6 +3964,14 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16) !void {
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
+
+    // Setup SIGABRT handler to capture crash backtraces
+    const abrt_act = std.posix.Sigaction{
+        .handler = .{ .handler = handleSigabrt },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.ABRT, &abrt_act, null);
 
     std.debug.print("termweb mux server starting...\n", .{});
 

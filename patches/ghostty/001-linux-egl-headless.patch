@@ -718,7 +718,7 @@ index 000000000..31423962a
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..6c52da424 100644
+index dcf8a6357..d4c407f4f 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -800,7 +800,7 @@ index dcf8a6357..6c52da424 100644
          // Remove ourselves from the list of known surfaces in the app.
          self.app.core_app.deleteSurface(self);
  
-@@ -756,6 +786,14 @@ pub const Surface = struct {
+@@ -756,6 +786,25 @@ pub const Surface = struct {
      }
  
      pub fn draw(self: *Surface) void {
@@ -812,10 +812,21 @@ index dcf8a6357..6c52da424 100644
 +            const egl_headless = @import("egl_headless.zig");
 +            egl_headless.setViewportSize(self.size.width, self.size.height);
 +        }
++        // When must_draw_from_app_thread, updateFrame must run on the same
++        // thread as drawFrame. The renderer thread skips updateFrame to avoid
++        // a data race on terminal_state (heap corruption / double free).
++        if (comptime App.must_draw_from_app_thread) {
++            self.core_surface.renderer.updateFrame(
++                &self.core_surface.renderer_state,
++                true, // cursor visible (blink handled separately)
++            ) catch |err| {
++                log.warn("error in updateFrame err={}", .{err});
++            };
++        }
          self.core_surface.draw() catch |err| {
              log.err("error in draw err={}", .{err});
              return;
-@@ -781,6 +819,15 @@ pub const Surface = struct {
+@@ -781,6 +830,15 @@ pub const Surface = struct {
      }
  
      pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -831,7 +842,7 @@ index dcf8a6357..6c52da424 100644
          // Runtimes sometimes generate superfluous resize events even
          // if the size did not actually change (SwiftUI). We check
          // that the size actually changed from what we last recorded
-@@ -2204,4 +2251,44 @@ pub const CAPI = struct {
+@@ -2204,4 +2262,44 @@ pub const CAPI = struct {
              }
          }
      };
@@ -922,3 +933,30 @@ index 4b01da0c5..8d5edd8f4 100644
          },
      }
  }
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index c6217fcd1..88eef61a0 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -608,12 +608,16 @@ fn renderCallback(
+         return .disarm;
+     };
+ 
+-    // Update our frame data
+-    t.renderer.updateFrame(
+-        t.state,
+-        t.flags.cursor_blink_visible,
+-    ) catch |err|
+-        log.warn("error rendering err={}", .{err});
++    // When must_draw_from_app_thread is true, both updateFrame and drawFrame
++    // happen on the app thread (in Surface.draw) to avoid a data race on
++    // terminal_state that causes heap corruption. Skip updateFrame here.
++    if (!must_draw_from_app_thread) {
++        t.renderer.updateFrame(
++            t.state,
++            t.flags.cursor_blink_visible,
++        ) catch |err|
++            log.warn("error rendering err={}", .{err});
++    }
+ 
+     // Draw
+     t.drawFrame(false);
