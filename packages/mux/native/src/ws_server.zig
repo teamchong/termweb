@@ -332,8 +332,8 @@ pub const Connection = struct {
 
         var total_read: usize = 0;
         while (total_read < payload.len) {
-            const read = self.stream.read(payload[total_read..]) catch break;
-            if (read == 0) break;
+            const read = self.stream.read(payload[total_read..]) catch return error.BrokenPipe;
+            if (read == 0) return error.BrokenPipe; // Connection closed mid-frame
             total_read += read;
         }
 
@@ -440,10 +440,16 @@ pub const Connection = struct {
             .{ .base = &header, .len = header_len },
             .{ .base = payload.ptr, .len = payload.len },
         };
-        var total = header_len + payload.len;
+        const original_total = header_len + payload.len;
+        var total = original_total;
         while (total > 0) {
             const written = posix.writev(self.stream.handle, &iovecs) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock, // Drop frame, don't block render loop
+                error.WouldBlock => {
+                    if (total == original_total) return error.WouldBlock; // Nothing written yet — safe to drop
+                    // Partial frame in TCP buffer — close to prevent protocol corruption
+                    self.is_open = false;
+                    return error.BrokenPipe;
+                },
                 else => return error.BrokenPipe,
             };
             if (written == 0) return error.BrokenPipe;
@@ -491,10 +497,15 @@ pub const Connection = struct {
             .{ .base = prefix.ptr, .len = prefix.len },
             .{ .base = payload.ptr, .len = payload.len },
         };
-        var total = header_len + total_payload;
+        const original_total = header_len + total_payload;
+        var total = original_total;
         while (total > 0) {
             const written = posix.writev(self.stream.handle, &iovecs) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock, // Drop frame, don't block render loop
+                error.WouldBlock => {
+                    if (total == original_total) return error.WouldBlock;
+                    self.is_open = false;
+                    return error.BrokenPipe;
+                },
                 else => return error.BrokenPipe,
             };
             if (written == 0) return error.BrokenPipe;
@@ -551,6 +562,7 @@ pub const Server = struct {
     shutdown_fd: posix.fd_t, // Read end: polled by connection threads for shutdown signal
     shutdown_write_fd: posix.fd_t, // Write end: signaled by stop() to wake all threads
     enable_zstd: bool,
+    send_timeout_ms: u32, // Per-connection write timeout (0 = non-blocking for droppable frames)
     /// Called when a new WebSocket connection is established.
     on_connect: ?OnConnectFn,
     /// Called when a message is received. Args: connection, payload, is_binary.
@@ -592,6 +604,7 @@ pub const Server = struct {
             .shutdown_fd = shutdown_fd,
             .shutdown_write_fd = shutdown_write_fd,
             .enable_zstd = enable_zstd,
+            .send_timeout_ms = write_timeout_ms,
             .on_connect = null,
             .on_message = null,
             .on_disconnect = null,
@@ -656,7 +669,7 @@ pub const Server = struct {
         // Configure socket for low-latency interactive use
         setSocketOptions(stream.stream.handle);
         setReadTimeout(stream.stream.handle, 100); // 100ms wakeup for shutdown check
-        setWriteTimeout(stream.stream.handle, write_timeout_ms);
+        setWriteTimeout(stream.stream.handle, self.send_timeout_ms);
 
         // Perform handshake (with or without zstd based on server config)
         try conn.acceptHandshakeWithOptions(self.enable_zstd);
@@ -749,7 +762,7 @@ pub const Server = struct {
         // Configure socket for low-latency interactive use
         setSocketOptions(stream.handle);
         setReadTimeout(stream.handle, 100); // 100ms wakeup for shutdown check
-        setWriteTimeout(stream.handle, write_timeout_ms);
+        setWriteTimeout(stream.handle, self.send_timeout_ms);
 
         // Complete WebSocket handshake with pre-read request
         conn.acceptHandshakeFromRequest(request, self.enable_zstd) catch {

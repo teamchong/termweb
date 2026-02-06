@@ -980,17 +980,16 @@ const Panel = struct {
     }
 
     // Send frame over WebSocket if connected.
-    // Snapshot connection under lock, send outside to avoid blocking input handlers.
+    // Mutex held during send to prevent UAF (WS handler could destroy conn).
+    // Safe because sends are non-blocking (WouldBlock returns immediately).
     fn sendFrame(self: *Panel, data: []const u8) !void {
-        const conn = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.connection) |cn| {
-                if (cn.is_open) break :blk cn;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.connection) |conn| {
+            if (conn.is_open) {
+                conn.sendBinary(data) catch {};
             }
-            return;
-        };
-        try conn.sendBinary(data);
+        }
     }
 
     // Convert browser mods to ghostty mods
@@ -1520,7 +1519,9 @@ const Server = struct {
         control_ws.setCallbacks(onControlConnect, onControlMessage, onControlDisconnect);
 
         // Create panel WebSocket server (for pixel streams - no deflate, video is pre-compressed)
+        // Short write timeout: video frames are droppable, don't block render loop
         const panel_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
+        panel_ws.send_timeout_ms = 10; // 10ms — drop frame rather than stall
         panel_ws.setCallbacks(onPanelConnect, onPanelMessage, onPanelDisconnect);
 
         // Create file WebSocket server (for file transfers - uses zstd compression)
@@ -1528,7 +1529,9 @@ const Server = struct {
         file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
 
         // Create preview WebSocket server (for tab overview thumbnails - no deflate, video is pre-compressed)
+        // Short write timeout: preview frames are droppable
         const preview_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", 0);
+        preview_ws.send_timeout_ms = 10;
         preview_ws.setCallbacks(onPreviewConnect, onPreviewMessage, onPreviewDisconnect);
 
         // Initialize auth state
