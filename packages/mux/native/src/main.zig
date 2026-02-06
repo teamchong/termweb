@@ -979,18 +979,18 @@ const Panel = struct {
         return getIOSurfaceFromView(self.nsview);
     }
 
-    // Send frame over WebSocket if connected
+    // Send frame over WebSocket if connected.
+    // Snapshot connection under lock, send outside to avoid blocking input handlers.
     fn sendFrame(self: *Panel, data: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.connection) |conn| {
-            if (conn.is_open) {
-                try conn.sendBinary(data);
-            } else {
+        const conn = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.connection) |cn| {
+                if (cn.is_open) break :blk cn;
             }
-        } else {
-        }
+            return;
+        };
+        try conn.sendBinary(data);
     }
 
     // Convert browser mods to ghostty mods
@@ -2803,15 +2803,28 @@ const Server = struct {
         std.debug.print("Preview client disconnected\n", .{});
     }
 
-    // Send frame to all preview clients with panel_id prefix
+    // Send frame to all preview clients with panel_id prefix.
+    // Snapshot connections under lock to avoid race with disconnect handlers.
     fn sendPreviewFrame(self: *Server, panel_id: u32, frame_data: []const u8) void {
-        if (self.preview_connections.items.len == 0) return;
+        var conns_buf: [16]*ws.Connection = undefined;
+        var conns_count: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.preview_connections.items) |conn| {
+                if (conns_count < conns_buf.len) {
+                    conns_buf[conns_count] = conn;
+                    conns_count += 1;
+                }
+            }
+        }
+        if (conns_count == 0) return;
 
         // Send [panel_id:u32 LE][frame_data...] via writev (zero-alloc)
         var id_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &id_buf, panel_id, .little);
 
-        for (self.preview_connections.items) |conn| {
+        for (conns_buf[0..conns_count]) |conn| {
             conn.writeFrameRawParts(.binary, &id_buf, frame_data) catch {};
         }
     }
@@ -3135,11 +3148,14 @@ const Server = struct {
                 }
                 if (conn_to_remove) |conn| {
                     _ = self.panel_connections.remove(conn);
-                    conn.sendClose() catch {};
                 }
 
                 self.mutex.unlock();
 
+                // Send close and deinit outside mutex to avoid blocking render loop
+                if (conn_to_remove) |conn| {
+                    conn.sendClose() catch {};
+                }
                 panel.deinit();
 
                 // Notify clients
