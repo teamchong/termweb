@@ -163,7 +163,13 @@
       output: (frame) => onFrame(frame),
       error: (e) => {
         console.error('Decoder error:', e);
-        setStatus('error');
+        pendingDecode = 0;
+        if (decoder && decoder.state !== 'closed') {
+          decoder.reset();
+          decoderConfigured = false;
+          gotFirstKeyframe = false;
+        }
+        requestKeyframe();
       },
     });
   }
@@ -264,7 +270,7 @@
             decoder.reset();
             gotFirstKeyframe = false;
           }
-          decoder.configure({ codec, optimizeForLatency: true });
+          decoder.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
           decoderConfigured = true;
           lastCodec = codec;
         } catch (e) {
@@ -283,8 +289,8 @@
     }
 
     // Drop P-frames when decode queue is too deep (reduces pipeline latency).
-    // Threshold must be high enough to accommodate hardware decoder internal buffer.
-    if (!isKeyframe && pendingDecode > 10) {
+    // Use decoder.decodeQueueSize (browser-tracked, accurate) instead of manual counter.
+    if (!isKeyframe && decoder && decoder.decodeQueueSize > 2) {
       requestKeyframe();
       return;
     }
@@ -826,7 +832,7 @@
 
   onMount(() => {
     if (canvasEl) {
-      ctx = canvasEl.getContext('2d');
+      ctx = canvasEl.getContext('2d', { desynchronized: true, alpha: false });
     }
 
     // Initialize throttled mouse move

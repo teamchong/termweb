@@ -981,13 +981,13 @@ const Panel = struct {
 
     // Send frame over WebSocket if connected.
     // Mutex held during send to prevent UAF (WS handler could destroy conn).
-    // Safe because sends are non-blocking (WouldBlock returns immediately).
+    // Propagates errors (e.g. WouldBlock) so caller can force a keyframe on drop.
     fn sendFrame(self: *Panel, data: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.connection) |conn| {
             if (conn.is_open) {
-                conn.sendBinary(data) catch {};
+                try conn.sendBinary(data);
             }
         }
     }
@@ -2683,7 +2683,15 @@ const Server = struct {
         var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
         const conns = self.snapshotControlConns(&conn_buf);
         for (conns) |conn| {
-            conn.sendBinary(msg_buf) catch {};
+            // Clipboard is a critical user action — retry once on WouldBlock.
+            // Control WS has 1s timeout so WouldBlock is rare, but can happen
+            // if the send buffer is momentarily full from other broadcasts.
+            conn.sendBinary(msg_buf) catch |err| {
+                if (err == error.WouldBlock) {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    conn.sendBinary(msg_buf) catch {};
+                }
+            };
         }
     }
 
@@ -2828,7 +2836,7 @@ const Server = struct {
         std.mem.writeInt(u32, &id_buf, panel_id, .little);
 
         for (conns_buf[0..conns_count]) |conn| {
-            conn.writeFrameRawParts(.binary, &id_buf, frame_data) catch {};
+            conn.sendBinaryParts(&id_buf, frame_data) catch {};
         }
     }
 
@@ -3269,6 +3277,7 @@ const Server = struct {
         // DEBUG: FPS counter
         var fps_counter: u32 = 0;
         var fps_attempts: u32 = 0;
+        var fps_dropped: u32 = 0;
         var frame_blocks: u32 = 0;
         var fps_timer: i128 = std.time.nanoTimestamp();
 
@@ -3342,6 +3351,7 @@ const Server = struct {
 
                 var frames_sent: u32 = 0;
                 var frames_attempted: u32 = 0;
+                var frames_dropped: u32 = 0;
 
                 // Collect panels to process (release mutex before heavy encode work)
                 var frame_panels_buf: [64]*Panel = undefined;
@@ -3392,6 +3402,21 @@ const Server = struct {
                     }
                 }
                 self.mutex.unlock();
+
+                // Move focused panel to front so it gets encoded first.
+                // Reduces input latency for the active panel by ~15ms per
+                // additional panel (avoids waiting for other panels to encode).
+                if (focused_panel_id) |fid| {
+                    if (frame_panels_count < 2) {} else for (frame_panels_buf[1..frame_panels_count], frame_panels_streaming[1..frame_panels_count], 1..) |panel, streaming, i| {
+                        if (panel.id == fid) {
+                            frame_panels_buf[i] = frame_panels_buf[0];
+                            frame_panels_buf[0] = panel;
+                            frame_panels_streaming[i] = frame_panels_streaming[0];
+                            frame_panels_streaming[0] = streaming;
+                            break;
+                        }
+                    }
+                }
 
                 // Set headless focus flag on each panel — a single bool write
                 // with zero ghostty API overhead. Surface.draw() reads this
@@ -3489,8 +3514,14 @@ const Server = struct {
                     // Send frame to panel connection (if streaming)
                     if (frame_data) |data| {
                         if (is_streaming) {
-                            panel.sendFrame(data) catch {};
-                            frames_sent += 1;
+                            if (panel.sendFrame(data)) {
+                                frames_sent += 1;
+                            } else |_| {
+                                // Frame dropped (WouldBlock / TCP buffer full).
+                                // Force keyframe so browser can recover on next successful send.
+                                panel.force_keyframe = true;
+                                frames_dropped += 1;
+                            }
                         }
 
                         // Track input-to-frame-send latency
@@ -3511,6 +3542,7 @@ const Server = struct {
 
                 fps_counter += frames_sent;
                 fps_attempts += frames_attempted;
+                fps_dropped += frames_dropped;
 
                 // Reset FPS counters every second and log performance
                 const fps_elapsed = std.time.nanoTimestamp() - fps_timer;
@@ -3522,7 +3554,11 @@ const Server = struct {
                                 std.fmt.bufPrint(buf[256..], " input_latency={d}us", .{perf_input_latency_us}) catch ""
                             else
                                 "";
-                            const line = std.fmt.bufPrint(&buf, "{d}fps sent/{d} attempted | app_tick={d}ms tick={d}ms read={d}ms enc={d}ms | panels={d}{s}\n", .{
+                            const dropped_str = if (fps_dropped > 0)
+                                std.fmt.bufPrint(buf[384..], " dropped={d}", .{fps_dropped}) catch ""
+                            else
+                                "";
+                            const line = std.fmt.bufPrint(buf[0..256], "{d}fps sent/{d} attempted | app_tick={d}ms tick={d}ms read={d}ms enc={d}ms | panels={d}{s}{s}\n", .{
                                 fps_counter,
                                 fps_attempts,
                                 app_tick_ns / std.time.ns_per_ms,
@@ -3531,12 +3567,14 @@ const Server = struct {
                                 perf_encode_ns / std.time.ns_per_ms,
                                 frame_panels_count,
                                 latency_str,
+                                dropped_str,
                             }) catch "";
                             _ = f.write(line) catch {};
                         }
                     }
                     fps_counter = 0;
                     fps_attempts = 0;
+                    fps_dropped = 0;
                     frame_blocks = 0;
                     fps_timer = std.time.nanoTimestamp();
                 }
