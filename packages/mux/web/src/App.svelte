@@ -537,14 +537,14 @@
 
     {#if !isLoading && !hasTabs}
       <div id="panels-empty" class="visible">
-        <h2>No Open Tabs</h2>
+        <h2>Welcome to Termweb</h2>
         <div class="shortcuts">
           <button type="button" class="shortcut" onclick={handleNewTab}>
             <span>New Tab</span><kbd>⌘/</kbd>
           </button>
-          <div class="shortcut"><span>Split Right</span><kbd>⌘D</kbd></div>
-          <div class="shortcut"><span>Split Down</span><kbd>⌘⇧D</kbd></div>
-          <div class="shortcut"><span>Command Palette</span><kbd>⌘⇧P</kbd></div>
+          <button type="button" class="shortcut" onclick={() => commandPaletteOpen = true}>
+            <span>Command Palette</span><kbd>⌘⇧P</kbd>
+          </button>
         </div>
       </div>
     {/if}

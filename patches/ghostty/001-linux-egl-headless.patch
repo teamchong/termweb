@@ -718,7 +718,7 @@ index 000000000..31423962a
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..d4c407f4f 100644
+index dcf8a6357..fa1dc56d3 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -786,7 +786,21 @@ index dcf8a6357..d4c407f4f 100644
  };
  
  pub const EnvVar = extern struct {
-@@ -590,6 +613,13 @@ pub const Surface = struct {
+@@ -414,6 +437,13 @@ pub const Surface = struct {
+     cursor_pos: apprt.CursorPos,
+     inspector: ?*Inspector = null,
+ 
++    /// Cursor blink state for headless mode. When must_draw_from_app_thread
++    /// is true, the renderer thread's blink timer cannot drive rendering
++    /// (its renderCallback is a no-op). Instead, we toggle the blink state
++    /// directly on the app thread using a frame counter.
++    blink_counter: u16 = 0,
++    cursor_blink_visible: bool = true,
++
+     /// The current title of the surface. The embedded apprt saves this so
+     /// that getTitle works without the implementer needing to save it.
+     title: ?[:0]const u8 = null,
+@@ -590,6 +620,13 @@ pub const Surface = struct {
          // Free our title
          if (self.title) |v| self.app.core_app.alloc.free(v);
  
@@ -800,7 +814,7 @@ index dcf8a6357..d4c407f4f 100644
          // Remove ourselves from the list of known surfaces in the app.
          self.app.core_app.deleteSurface(self);
  
-@@ -756,6 +786,25 @@ pub const Surface = struct {
+@@ -756,6 +793,47 @@ pub const Surface = struct {
      }
  
      pub fn draw(self: *Surface) void {
@@ -816,9 +830,31 @@ index dcf8a6357..d4c407f4f 100644
 +        // thread as drawFrame. The renderer thread skips updateFrame to avoid
 +        // a data race on terminal_state (heap corruption / double free).
 +        if (comptime App.must_draw_from_app_thread) {
++            // Sync renderer focus state directly from the core surface.
++            // The renderer thread's mailbox delivery is unreliable in headless
++            // mode (focusCallback doesn't call wakeup.notify), so we set it
++            // here on the app thread where updateFrame/drawFrame actually run.
++            self.core_surface.renderer.focused = self.core_surface.focused;
++
++            // Toggle cursor blink on the app thread. The renderer thread's
++            // blink timer cannot drive rendering in headless mode because
++            // renderCallback is a no-op. 18 frames ≈ 600ms at 30fps.
++            // Only blink when focused — unfocused surfaces show hollow block.
++            if (self.core_surface.focused) {
++                const blink_interval = 18;
++                self.blink_counter += 1;
++                if (self.blink_counter >= blink_interval) {
++                    self.blink_counter = 0;
++                    self.cursor_blink_visible = !self.cursor_blink_visible;
++                }
++            } else {
++                self.blink_counter = 0;
++                self.cursor_blink_visible = true;
++            }
++
 +            self.core_surface.renderer.updateFrame(
 +                &self.core_surface.renderer_state,
-+                true, // cursor visible (blink handled separately)
++                self.cursor_blink_visible,
 +            ) catch |err| {
 +                log.warn("error in updateFrame err={}", .{err});
 +            };
@@ -826,7 +862,7 @@ index dcf8a6357..d4c407f4f 100644
          self.core_surface.draw() catch |err| {
              log.err("error in draw err={}", .{err});
              return;
-@@ -781,6 +830,15 @@ pub const Surface = struct {
+@@ -781,6 +859,15 @@ pub const Surface = struct {
      }
  
      pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -842,7 +878,7 @@ index dcf8a6357..d4c407f4f 100644
          // Runtimes sometimes generate superfluous resize events even
          // if the size did not actually change (SwiftUI). We check
          // that the size actually changed from what we last recorded
-@@ -2204,4 +2262,44 @@ pub const CAPI = struct {
+@@ -2204,4 +2291,44 @@ pub const CAPI = struct {
              }
          }
      };
@@ -887,6 +923,83 @@ index dcf8a6357..d4c407f4f 100644
 +        }
 +    }
  };
+diff --git a/src/font/sprite/draw/special.zig b/src/font/sprite/draw/special.zig
+index 8cad9ceba..671f347c2 100644
+--- a/src/font/sprite/draw/special.zig
++++ b/src/font/sprite/draw/special.zig
+@@ -289,11 +289,15 @@ pub fn cursor_rect(
+     _ = cp;
+     _ = metrics;
+ 
++    // Shorten cursor by 1px top + 1px bottom to avoid bottom-row clipping
++    // in headless/video rendering and give a cleaner visual separation.
++    const trim: u32 = 1;
++    const h = height -| (trim * 2);
+     canvas.rect(.{
+         .x = 0,
+-        .y = 0,
++        .y = @intCast(trim),
+         .width = @intCast(width),
+-        .height = @intCast(height),
++        .height = @intCast(h),
+     }, .on);
+ }
+ 
+@@ -306,19 +310,25 @@ pub fn cursor_hollow_rect(
+ ) !void {
+     _ = cp;
+ 
++    // Shorten cursor by 1px top + 1px bottom to avoid bottom-row clipping
++    // in headless/video rendering and give a cleaner visual separation.
++    const trim: u32 = 1;
++    const h = height -| (trim * 2);
++    const t = metrics.cursor_thickness;
++
+     // We fill the entire rect and then hollow out the inside, this isn't very
+     // efficient but it doesn't need to be and it's the easiest way to write it.
+     canvas.rect(.{
+         .x = 0,
+-        .y = 0,
++        .y = @intCast(trim),
+         .width = @intCast(width),
+-        .height = @intCast(height),
++        .height = @intCast(h),
+     }, .on);
+     canvas.rect(.{
+-        .x = @intCast(metrics.cursor_thickness),
+-        .y = @intCast(metrics.cursor_thickness),
+-        .width = @intCast(width -| metrics.cursor_thickness * 2),
+-        .height = @intCast(height -| metrics.cursor_thickness * 2),
++        .x = @intCast(t),
++        .y = @intCast(trim + t),
++        .width = @intCast(width -| t * 2),
++        .height = @intCast(h -| t * 2),
+     }, .off);
+ }
+ 
+@@ -332,6 +342,10 @@ pub fn cursor_bar(
+     _ = cp;
+     _ = width;
+ 
++    // Shorten cursor by 1px top + 1px bottom to match other cursor styles.
++    const trim: u32 = 1;
++    const h = height -| (trim * 2);
++
+     // We place the bar cursor half of its thickness over the left edge of the
+     // cell, so that it sits centered between characters, not biased to a side.
+     //
+@@ -339,9 +353,9 @@ pub fn cursor_bar(
+     // 1px cursor shifted left a pixel looks better than having it not shifted.
+     canvas.rect(.{
+         .x = -@as(i32, @intCast((metrics.cursor_thickness + 1) / 2)),
+-        .y = 0,
++        .y = @intCast(trim),
+         .width = @intCast(metrics.cursor_thickness),
+-        .height = @intCast(height),
++        .height = @intCast(h),
+     }, .on);
+ }
+ 
 diff --git a/src/renderer/OpenGL.zig b/src/renderer/OpenGL.zig
 index 4b01da0c5..8d5edd8f4 100644
 --- a/src/renderer/OpenGL.zig
@@ -934,10 +1047,10 @@ index 4b01da0c5..8d5edd8f4 100644
      }
  }
 diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
-index c6217fcd1..88eef61a0 100644
+index c6217fcd1..e803de701 100644
 --- a/src/renderer/Thread.zig
 +++ b/src/renderer/Thread.zig
-@@ -608,12 +608,16 @@ fn renderCallback(
+@@ -608,15 +608,19 @@ fn renderCallback(
          return .disarm;
      };
  
@@ -947,16 +1060,39 @@ index c6217fcd1..88eef61a0 100644
 -        t.flags.cursor_blink_visible,
 -    ) catch |err|
 -        log.warn("error rendering err={}", .{err});
+-
+-    // Draw
+-    t.drawFrame(false);
 +    // When must_draw_from_app_thread is true, both updateFrame and drawFrame
 +    // happen on the app thread (in Surface.draw) to avoid a data race on
-+    // terminal_state that causes heap corruption. Skip updateFrame here.
++    // terminal_state that causes heap corruption. Skip both here.
 +    if (!must_draw_from_app_thread) {
 +        t.renderer.updateFrame(
 +            t.state,
 +            t.flags.cursor_blink_visible,
 +        ) catch |err|
 +            log.warn("error rendering err={}", .{err});
++
++        // Draw
++        t.drawFrame(false);
 +    }
  
-     // Draw
-     t.drawFrame(false);
+     return .disarm;
+ }
+diff --git a/src/renderer/cursor.zig b/src/renderer/cursor.zig
+index bfa92f31d..88bc81ed5 100644
+--- a/src/renderer/cursor.zig
++++ b/src/renderer/cursor.zig
+@@ -55,9 +55,9 @@ pub fn style(
+     // If the cursor is explicitly not visible by terminal mode, we don't render.
+     if (!state.cursor.visible) return null;
+ 
+-    // If we're not focused, our cursor is always visible so that
+-    // we can show the hollow box.
+-    if (!opts.focused) return .block_hollow;
++    // If we're not focused, show a solid block cursor so that inactive
++    // split panes display a filled rectangle (matching expected behavior).
++    if (!opts.focused) return .block;
+ 
+     // If the cursor is blinking and our blink state is not visible,
+     // then we don't show the cursor.

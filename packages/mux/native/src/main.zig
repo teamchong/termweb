@@ -624,8 +624,10 @@ const Panel = struct {
         if (surface == null) return error.SurfaceCreationFailed;
         errdefer c.ghostty_surface_free(surface);
 
-        // Focus the surface so it accepts input
-        c.ghostty_surface_set_focus(surface, true);
+        // All surfaces start unfocused. The render loop sets focus on the
+        // active panel each frame so the correct panel gets a blinking cursor
+        // and inactive panels show a hollow block (matching ghostty behavior).
+        c.ghostty_surface_set_focus(surface, false);
         // Tell ghostty the surface is visible (not occluded) so it renders properly
         c.ghostty_surface_set_occlusion(surface, true);
 
@@ -1499,6 +1501,7 @@ const Server = struct {
     inspector_open: bool,  // Whether inspector is open
     shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
     wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
+    last_focused_panel_id: ?u32 = null,  // Track focus transitions to avoid per-frame set_focus calls
 
     var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
 
@@ -1594,8 +1597,17 @@ const Server = struct {
         const init_result = c.ghostty_init(0, null);
         if (init_result != c.GHOSTTY_SUCCESS) return error.GhosttyInitFailed;
 
-        // Load user's ghostty config (~/.config/ghostty/config)
+        // Load ghostty config: termweb defaults first, then user overrides
         const config = c.ghostty_config_new();
+
+        // Write termweb defaults to temp file (user's ghostty config overrides these)
+        const defaults_path = "/tmp/termweb-ghostty-defaults.conf";
+        if (std.fs.cwd().createFile(defaults_path, .{})) |f| {
+            defer f.close();
+            f.writeAll("cursor-style = bar\ncursor-style-blink = true\n") catch {};
+            c.ghostty_config_load_file(config, defaults_path);
+        } else |_| {}
+
         c.ghostty_config_load_default_files(config);
         c.ghostty_config_finalize(config);
 
@@ -3301,7 +3313,8 @@ const Server = struct {
                 var frame_panels_count: usize = 0;
                 self.mutex.lock();
 
-                // Determine which panels are in the active tab
+                // Determine which panel is focused and which are in the active tab
+                const focused_panel_id = self.layout.active_panel_id;
                 const active_tab_id = self.layout.getActiveTabId();
                 var active_panel_ids_buf: [64]u32 = undefined;
                 var active_panel_count: usize = 0;
@@ -3343,6 +3356,31 @@ const Server = struct {
                     }
                 }
                 self.mutex.unlock();
+
+                // Update focus state only on transitions (not every frame).
+                // ghostty_surface_set_focus triggers mailbox pushes and key
+                // release processing, so calling it per-frame causes delay.
+                if (focused_panel_id != self.last_focused_panel_id) {
+                    // Unfocus the previously focused panel
+                    if (self.last_focused_panel_id) |old_id| {
+                        for (frame_panels_buf[0..frame_panels_count]) |p| {
+                            if (p.id == old_id) {
+                                c.ghostty_surface_set_focus(p.surface, false);
+                                break;
+                            }
+                        }
+                    }
+                    // Focus the newly active panel
+                    if (focused_panel_id) |new_id| {
+                        for (frame_panels_buf[0..frame_panels_count]) |p| {
+                            if (p.id == new_id) {
+                                c.ghostty_surface_set_focus(p.surface, true);
+                                break;
+                            }
+                        }
+                    }
+                    self.last_focused_panel_id = focused_panel_id;
+                }
 
                 // Process each panel WITHOUT holding the server mutex
                 // This prevents mutex starvation when encoding takes 100+ms per panel
@@ -3431,6 +3469,7 @@ const Server = struct {
                             self.sendPreviewFrame(panel.id, data);
                         }
                     }
+
                 }
 
                 fps_counter += frames_sent;
@@ -3447,6 +3486,13 @@ const Server = struct {
             }
 
 
+            // Process input again after frame work — input that arrived during
+            // encoding gets dispatched to ghostty immediately instead of waiting
+            // for the next loop iteration (~33ms worst case → ~0ms).
+            for (panels_buf[0..panels_count]) |panel| {
+                if (panel.hasQueuedInput()) panel.processInputQueue();
+            }
+
             // Wait until next frame is due or input arrives (whichever comes first)
             // Use last_frame as anchor so we wake at the correct time regardless
             // of when we entered this iteration (e.g. woken early by input signal)
@@ -3455,6 +3501,11 @@ const Server = struct {
             const remaining = if (since_last < frame_time_ns) frame_time_ns - since_last else 0;
             if (remaining > 0) {
                 _ = self.wake_signal.waitTimeout(remaining);
+                // Process input immediately after waking from sleep — don't wait
+                // for the next full loop iteration to handle the keystroke.
+                for (panels_buf[0..panels_count]) |panel| {
+                    if (panel.hasQueuedInput()) panel.processInputQueue();
+                }
             }
         }
     }
