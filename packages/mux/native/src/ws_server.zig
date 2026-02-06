@@ -443,7 +443,7 @@ pub const Connection = struct {
         var total = header_len + payload.len;
         while (total > 0) {
             const written = posix.writev(self.stream.handle, &iovecs) catch |err| switch (err) {
-                error.WouldBlock => continue,
+                error.WouldBlock => return error.WouldBlock, // Drop frame, don't block render loop
                 else => return error.BrokenPipe,
             };
             if (written == 0) return error.BrokenPipe;
@@ -494,7 +494,7 @@ pub const Connection = struct {
         var total = header_len + total_payload;
         while (total > 0) {
             const written = posix.writev(self.stream.handle, &iovecs) catch |err| switch (err) {
-                error.WouldBlock => continue,
+                error.WouldBlock => return error.WouldBlock, // Drop frame, don't block render loop
                 else => return error.BrokenPipe,
             };
             if (written == 0) return error.BrokenPipe;

@@ -550,6 +550,7 @@ const Panel = struct {
     mutex: std.Thread.Mutex,
     input_queue: std.ArrayList(InputEvent),
     has_pending_input: std.atomic.Value(bool),
+    last_input_time: std.atomic.Value(i64),  // Timestamp of last input for latency tracking (truncated ns)
     title: []const u8,  // Last known title
     pwd: []const u8,    // Last known working directory
     inspector_subscribed: bool,
@@ -658,6 +659,7 @@ const Panel = struct {
             .mutex = .{},
             .input_queue = .{},
             .has_pending_input = std.atomic.Value(bool).init(false),
+            .last_input_time = std.atomic.Value(i64).init(0),
             .title = &.{},
             .pwd = &.{},
             .inspector_subscribed = false,
@@ -1501,7 +1503,6 @@ const Server = struct {
     inspector_open: bool,  // Whether inspector is open
     shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
     wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
-    render_immediately: std.atomic.Value(bool),  // Bypass frame timing for instant response to focus/input
 
     var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
 
@@ -1572,7 +1573,6 @@ const Server = struct {
                 };
             } else {},
             .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
-            .render_immediately = std.atomic.Value(bool).init(false),
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -1915,7 +1915,8 @@ const Server = struct {
 
             panel.handleMessage(data);
             panel.has_pending_input.store(true, .release);
-            self.render_immediately.store(true, .release);
+            panel.last_input_time.store(@truncate(std.time.nanoTimestamp()), .release);
+
             self.wake_signal.notify();
         } else {
             // Not connected to panel yet - handle connect/create commands
@@ -2075,7 +2076,7 @@ const Server = struct {
                 }
             }
             self.mutex.unlock();
-            self.render_immediately.store(true, .release);
+
             self.wake_signal.notify();
         } else if (msg_type == 0x88) { // view_action
             if (data.len < 6) return;
@@ -3086,7 +3087,7 @@ const Server = struct {
                 self.broadcastLayoutUpdate();
             }
             // Trigger immediate render so the new panel's focus state appears instantly
-            self.render_immediately.store(true, .release);
+
 
             // Linux only: Send initial title since shell integration may not be configured
             // macOS works fine without this as ghostty auto-injects shell integration
@@ -3225,7 +3226,7 @@ const Server = struct {
 
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
-            self.render_immediately.store(true, .release);
+
 
             // Resume parent panel streaming (will get keyframe on next frame)
             // Note: If parent will be resized, resizeInternal sets force_keyframe
@@ -3239,12 +3240,10 @@ const Server = struct {
 
     // Main render loop
     fn runRenderLoop(self: *Server) void {
-        // Burst FPS: temporarily increase to 60fps after input/focus for snappy response,
-        // then drop to 30fps when idle to save CPU and encoding resources.
-        const normal_frame_time_ns: u64 = std.time.ns_per_s / 30; // 33.3ms
-        const burst_frame_time_ns: u64 = std.time.ns_per_s / 60;  // 16.7ms
-        const burst_duration: u32 = 90; // ~1.5s at 60fps
-        var burst_remaining: u32 = 0;
+        // Adaptive frame timing: render immediately on input for snappy response,
+        // but keep steady 30fps otherwise. Burst mode not used because H.264
+        // encoding at ~15ms/panel/frame can't sustain 60fps with multiple panels.
+        const frame_time_ns: u64 = std.time.ns_per_s / 30; // 33.3ms
 
         var last_frame: i128 = 0;
 
@@ -3254,7 +3253,12 @@ const Server = struct {
         var frame_blocks: u32 = 0;
         var fps_timer: i128 = std.time.nanoTimestamp();
 
+        // Open perf log file (append mode, create if not exists)
+        const perf_log = std.fs.cwd().createFile("/tmp/termweb-perf.log", .{ .truncate = true }) catch null;
+        defer if (perf_log) |f| f.close();
+
         std.debug.print("Render loop started, running={}\n", .{self.running.load(.acquire)});
+        if (perf_log != null) std.debug.print("PERF log: /tmp/termweb-perf.log\n", .{});
 
         while (self.running.load(.acquire)) {
 
@@ -3291,15 +3295,11 @@ const Server = struct {
                 panel.processInputQueue();
             }
 
-            // Only capture and send frames at target fps (burst or normal)
-            const immediate = self.render_immediately.swap(false, .acq_rel);
-            if (immediate and burst_remaining == 0) burst_remaining = burst_duration;
-            const frame_time_ns = if (burst_remaining > 0) burst_frame_time_ns else normal_frame_time_ns;
+            // Capture and send frames at target fps
             const now = std.time.nanoTimestamp();
             const since_last_frame: u64 = @intCast(now - last_frame);
-            if (since_last_frame >= frame_time_ns or immediate) {
+            if (since_last_frame >= frame_time_ns) {
                 last_frame = now;
-                if (burst_remaining > 0) burst_remaining -= 1;
 
                 frame_blocks += 1;
 
@@ -3317,7 +3317,9 @@ const Server = struct {
 
                 // Tick ghostty to render content to IOSurface
                 crash_phase.store(4, .monotonic); // ghostty_app_tick
+                const t_app_tick = std.time.nanoTimestamp();
                 self.tick();
+                const app_tick_ns: u64 = @intCast(std.time.nanoTimestamp() - t_app_tick);
 
                 var frames_sent: u32 = 0;
                 var frames_attempted: u32 = 0;
@@ -3382,6 +3384,10 @@ const Server = struct {
 
                 // Process each panel WITHOUT holding the server mutex
                 // This prevents mutex starvation when encoding takes 100+ms per panel
+                var perf_tick_ns: u64 = 0;
+                var perf_read_ns: u64 = 0;
+                var perf_encode_ns: u64 = 0;
+                var perf_input_latency_us: i64 = 0; // Latest input-to-frame-send latency
                 for (frame_panels_buf[0..frame_panels_count], frame_panels_streaming[0..frame_panels_count]) |panel, is_streaming| {
 
                     frames_attempted += 1;
@@ -3392,7 +3398,9 @@ const Server = struct {
 
                     // Render panel content to IOSurface
                     crash_phase.store(5, .monotonic); // ghostty_surface_draw
+                    const t_tick = std.time.nanoTimestamp();
                     panel.tick();
+                    perf_tick_ns += @intCast(std.time.nanoTimestamp() - t_tick);
 
                     // Platform-specific frame capture
                     var frame_data: ?[]const u8 = null;
@@ -3443,15 +3451,19 @@ const Server = struct {
 
                         // Read pixels from OpenGL framebuffer
                         crash_phase.store(6, .monotonic); // ghostty_surface_read_pixels
+                        const t_read = std.time.nanoTimestamp();
                         const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
+                        perf_read_ns += @intCast(std.time.nanoTimestamp() - t_read);
 
                         if (read_ok) {
                             // Pass explicit dimensions to ensure encoder matches frame size
                             crash_phase.store(7, .monotonic); // video encoder
+                            const t_enc = std.time.nanoTimestamp();
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
                             }
+                            perf_encode_ns += @intCast(std.time.nanoTimestamp() - t_enc);
                         }
                     }
 
@@ -3460,6 +3472,14 @@ const Server = struct {
                         if (is_streaming) {
                             panel.sendFrame(data) catch {};
                             frames_sent += 1;
+                        }
+
+                        // Track input-to-frame-send latency
+                        const input_ts = panel.last_input_time.swap(0, .acq_rel);
+                        if (input_ts > 0) {
+                            const now_trunc: i64 = @truncate(std.time.nanoTimestamp());
+                            const latency = now_trunc - input_ts;
+                            if (latency > 0) perf_input_latency_us = @intCast(@divFloor(latency, std.time.ns_per_us));
                         }
 
                         // Send to preview clients (if any)
@@ -3473,9 +3493,29 @@ const Server = struct {
                 fps_counter += frames_sent;
                 fps_attempts += frames_attempted;
 
-                // Reset FPS counters every second (no spam)
+                // Reset FPS counters every second and log performance
                 const fps_elapsed = std.time.nanoTimestamp() - fps_timer;
                 if (fps_elapsed >= std.time.ns_per_s) {
+                    if (fps_attempts > 0) {
+                        if (perf_log) |f| {
+                            var buf: [512]u8 = undefined;
+                            const latency_str = if (perf_input_latency_us > 0)
+                                std.fmt.bufPrint(buf[256..], " input_latency={d}us", .{perf_input_latency_us}) catch ""
+                            else
+                                "";
+                            const line = std.fmt.bufPrint(&buf, "{d}fps sent/{d} attempted | app_tick={d}ms tick={d}ms read={d}ms enc={d}ms | panels={d}{s}\n", .{
+                                fps_counter,
+                                fps_attempts,
+                                app_tick_ns / std.time.ns_per_ms,
+                                perf_tick_ns / std.time.ns_per_ms,
+                                perf_read_ns / std.time.ns_per_ms,
+                                perf_encode_ns / std.time.ns_per_ms,
+                                frame_panels_count,
+                                latency_str,
+                            }) catch "";
+                            _ = f.write(line) catch {};
+                        }
+                    }
                     fps_counter = 0;
                     fps_attempts = 0;
                     frame_blocks = 0;
@@ -3495,9 +3535,8 @@ const Server = struct {
             // Use last_frame as anchor so we wake at the correct time regardless
             // of when we entered this iteration (e.g. woken early by input signal)
             crash_phase.store(0, .monotonic); // idle/sleeping
-            const current_frame_time = if (burst_remaining > 0) burst_frame_time_ns else normal_frame_time_ns;
             const since_last: u64 = @intCast(std.time.nanoTimestamp() - last_frame);
-            const remaining = if (since_last < current_frame_time) current_frame_time - since_last else 0;
+            const remaining = if (since_last < frame_time_ns) frame_time_ns - since_last else 0;
             if (remaining > 0) {
                 _ = self.wake_signal.waitTimeout(remaining);
                 // Process input immediately after waking from sleep — don't wait
