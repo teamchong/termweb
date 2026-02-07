@@ -64,11 +64,8 @@
     { label: 'Close Window', action: '_close_window', shortcut: '⌘⇧.', icon: '⊠', disabled: !hasTabs },
   ]);
 
-  // Edit menu: Undo/Redo, Copy, Paste, Select All
+  // Edit menu: Copy, Paste, Select All
   let editMenuItems = $derived<MenuItem[]>([
-    { label: 'Undo', action: 'undo', icon: '↩', disabled: !hasTabs },
-    { label: 'Redo', action: 'redo', icon: '↪', disabled: !hasTabs },
-    { separator: true },
     { label: 'Copy', action: 'copy_to_clipboard', shortcut: '⌘C', icon: '⧉', disabled: !hasTabs },
     { label: 'Paste', action: 'paste_from_clipboard', shortcut: '⌘V', icon: '📋', disabled: !hasTabs },
     { label: 'Paste Selection', action: 'paste_from_selection', shortcut: '⌘⇧V', icon: '📄', disabled: !hasTabs },
@@ -424,8 +421,11 @@
       handleCommand('_zoom_split');
       return;
     } else if (e.metaKey && e.shiftKey) {
-      // Cmd+Shift+arrow keys for split selection
-      if (key === 'arrowup') {
+      if (key === 'v') {
+        e.preventDefault();
+        handleCommand('paste_from_selection');
+        return;
+      } else if (key === 'arrowup') {
         e.preventDefault();
         handleCommand('_select_split_up');
         return;
@@ -466,6 +466,18 @@
       if (tabIndex < tabArray.length) {
         muxClient?.selectTab(tabArray[tabIndex].id);
       }
+      return;
+    } else if (e.metaKey && key === 'c' && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      handleCommand('copy_to_clipboard');
+      return;
+    } else if (e.metaKey && key === 'v' && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      handleCommand('paste_from_clipboard');
+      return;
+    } else if (e.metaKey && key === 'a' && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      handleCommand('select_all');
       return;
     }
 

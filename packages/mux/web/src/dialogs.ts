@@ -72,8 +72,6 @@ const cachedCommands: Command[] = [
   { title: 'Equalize Splits', action: 'equalize_splits', description: 'Make all splits equal size', requiresPanel: true },
 
   // Terminal Control (require active panel)
-  { title: 'Redo', action: 'redo', description: 'Redo last action', requiresPanel: true },
-  { title: 'Undo', action: 'undo', description: 'Undo last action', requiresPanel: true },
   { title: 'Reset Terminal', action: 'reset', description: 'Reset terminal state', requiresPanel: true },
   { title: 'Toggle Fullscreen', action: 'toggle_fullscreen', description: 'Toggle fullscreen mode', shortcut: '⌃⌘F' },
   { title: 'Toggle Secure Input', action: 'toggle_secure_input', description: 'Toggle secure input mode' },
