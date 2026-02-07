@@ -67,6 +67,7 @@
   let renderedFrames = $state(0);
   let lastStatsUpdate = $state(0);
 
+
   // ============================================================================
   // DOM References
   // ============================================================================
@@ -81,6 +82,7 @@
   // ============================================================================
 
   let ws: WebSocket | null = null;
+  let controlWsSend: ((msg: ArrayBuffer | ArrayBufferView) => void) | null = null;
   let decoder: VideoDecoder | null = null;
   let snapshotCanvas: HTMLCanvasElement | undefined;
   let snapshotCtx: CanvasRenderingContext2D | null = null;
@@ -90,7 +92,6 @@
   let lastCodec: string | null = null;
   let gotFirstKeyframe = false;
   let frameCount = 0;
-  let ctx: CanvasRenderingContext2D | null = null;
   let gpuRenderer: WebGPUFrameRenderer | null = null;
   let lastReportedWidth = 0;
   let lastReportedHeight = 0;
@@ -148,12 +149,31 @@
     inspectorState ? `${inspectorState.cell_width ?? 0}px × ${inspectorState.cell_height ?? 0}px` : ''
   );
 
+  // Cursor overlay position computed from frame-space pixel coords + object-fit scaling
   // ============================================================================
   // WebSocket Helpers
   // ============================================================================
 
   function isWsOpen(): boolean {
     return ws !== null && ws.readyState === WebSocket.OPEN;
+  }
+
+  /** Check if any send path is available (panel WS or control WS) */
+  function canSendInput(): boolean {
+    return controlWsSend !== null || isWsOpen();
+  }
+
+  /** Send input via control WS (coworker mode) or panel WS (admin mode) */
+  function sendInput(buf: ArrayBuffer | ArrayBufferView): void {
+    if (controlWsSend) {
+      controlWsSend(buf);
+    } else if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(buf);
+    }
+  }
+
+  export function setControlWsSend(fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null): void {
+    controlWsSend = fn;
   }
 
   function setStatus(newStatus: PanelStatus): void {
@@ -185,7 +205,7 @@
   function onFrame(frame: VideoFrame): void {
     pendingDecode--;
 
-    if (destroyed || (!ctx && !gpuRenderer)) {
+    if (destroyed || !gpuRenderer) {
       frame.close();
       return;
     }
@@ -204,11 +224,7 @@
       canvasEl.height = frame.displayHeight;
     }
 
-    if (gpuRenderer) {
-      gpuRenderer.renderFrame(frame);
-    } else {
-      ctx!.drawImage(frame, 0, 0);
-    }
+    gpuRenderer.renderFrame(frame);
 
     // Update snapshot for tab overview (throttled, before frame.close())
     const now = performance.now();
@@ -466,7 +482,7 @@
   function sendConnectPanel(panelId: number): void {
     if (!isWsOpen()) return;
 
-    // Include client_id so server can verify main client: [0x20][panel_id:u32][client_id:u32]
+    // Include client_id for future role-based access: [0x20][panel_id:u32][client_id:u32]
     const clientId = get(ui).clientId;
     const buf = new ArrayBuffer(9);
     const view = new DataView(buf);
@@ -580,7 +596,7 @@
   }
 
   export function sendKeyInput(e: KeyboardEvent, action: number): void {
-    if (!isWsOpen()) return;
+    if (!canSendInput()) return;
 
     const codeBytes = sharedTextEncoder.encode(e.code);
     const text = (e.key.length === 1) ? e.key : '';
@@ -595,7 +611,7 @@
     view.set(codeBytes, 4);
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
-    ws!.send(buf);
+    sendInput(buf);
   }
 
   function handleMouseDown(e: MouseEvent): void {
@@ -609,7 +625,7 @@
   }
 
   function handleMouseMove(e: MouseEvent): void {
-    if (!isWsOpen() || !canvasEl) return;
+    if (!canSendInput() || !canvasEl) return;
 
     const rect = canvasEl.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -620,17 +636,17 @@
   }
 
   function sendMouseMoveInternal(x: number, y: number, mods: number): void {
-    if (!isWsOpen()) return;
+    if (!canSendInput()) return;
 
     mouseMoveView.setUint8(0, ClientMsg.MOUSE_MOVE);
     mouseMoveView.setFloat64(1, x, true);
     mouseMoveView.setFloat64(9, y, true);
     mouseMoveView.setUint8(17, mods);
-    ws!.send(mouseMoveBuffer);
+    sendInput(mouseMoveBuffer);
   }
 
   function sendMouseButton(e: MouseEvent, pressed: boolean): void {
-    if (!isWsOpen() || !canvasEl) return;
+    if (!canSendInput() || !canvasEl) return;
 
     const rect = canvasEl.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -642,12 +658,12 @@
     mouseButtonView.setUint8(17, e.button);
     mouseButtonView.setUint8(18, pressed ? 1 : 0);
     mouseButtonView.setUint8(19, getModifiers(e));
-    ws!.send(mouseButtonBuffer);
+    sendInput(mouseButtonBuffer);
   }
 
   function handleWheel(e: WheelEvent): void {
     e.preventDefault();
-    if (!isWsOpen() || !canvasEl) return;
+    if (!canSendInput() || !canvasEl) return;
 
     const rect = canvasEl.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -669,7 +685,7 @@
     wheelView.setFloat64(17, dx, true);
     wheelView.setFloat64(25, dy, true);
     wheelView.setUint8(33, getModifiers(e));
-    ws!.send(wheelBuffer);
+    sendInput(wheelBuffer);
   }
 
   function handleContextMenu(e: Event): void {
@@ -838,14 +854,14 @@
   }
 
   export function sendTextInput(text: string): void {
-    if (!isWsOpen()) return;
+    if (!canSendInput()) return;
 
     const textBytes = sharedTextEncoder.encode(text);
     const buf = new ArrayBuffer(1 + textBytes.length);
     const view = new Uint8Array(buf);
     view[0] = ClientMsg.TEXT_INPUT;
     view.set(textBytes, 1);
-    ws!.send(buf);
+    sendInput(buf);
   }
 
   export function getStatus(): PanelStatus {
@@ -861,24 +877,36 @@
     onPwdChange?.(newPwd);
   }
 
+  export function updateCursorState(_x: number, _y: number, _w: number, _h: number, _style: number, _visible: boolean): void {
+    // No-op: cursor is rendered by Ghostty in the H.264 frame (blink disabled).
+    // CSS overlay removed to avoid double cursor.
+  }
+
   // ============================================================================
   // Lifecycle
   // ============================================================================
 
   onMount(() => {
-    if (canvasEl) {
-      if (navigator.gpu) {
-        initWebGPURenderer(canvasEl).then((renderer) => {
-          if (renderer && !destroyed) {
-            gpuRenderer = renderer;
-          } else if (!destroyed && canvasEl) {
-            ctx = canvasEl.getContext('2d', { desynchronized: true, alpha: false });
-          }
-        });
-      } else {
-        ctx = canvasEl.getContext('2d', { desynchronized: true, alpha: false });
-      }
+    if (!canvasEl || !navigator.gpu) {
+      setStatus('error');
+      console.error('WebGPU is required but not available in this browser.');
+      return;
     }
+
+    initWebGPURenderer(canvasEl).then((renderer) => {
+      if (destroyed) return;
+      if (!renderer) {
+        setStatus('error');
+        console.error('WebGPU renderer initialization failed.');
+        return;
+      }
+      gpuRenderer = renderer;
+      // Decoder starts AFTER renderer is ready so no frames are dropped.
+      // Without cursor blink, the first keyframe may be the only one sent
+      // until content changes — dropping it means permanent "Loading...".
+      initDecoder();
+      requestKeyframe();
+    });
 
     // Initialize throttled mouse move
     throttledSendMouseMove = throttle((x: number, y: number, mods: number) => {
@@ -904,9 +932,6 @@
       });
       resizeObserver.observe(panelEl);
     }
-
-    // Initialize decoder
-    initDecoder();
 
     // Document click handler for dock menu
     document.addEventListener('click', handleDocumentClick);

@@ -27,6 +27,12 @@ export interface TabInfo {
   panelIds: string[];
 }
 
+export interface ConnectedClient {
+  clientId: number;
+  role: number;
+  sessionId: string;
+}
+
 export interface UIState {
   quickTerminalOpen: boolean;
   quickTerminalPanelId: string | null;
@@ -35,4 +41,8 @@ export interface UIState {
   commandPaletteOpen: boolean;
   isMainClient: boolean;
   clientId: number;
+  isAdmin: boolean;
+  sessionId: string | null;
+  panelAssignments: Map<number, string>;
+  connectedClients: ConnectedClient[];
 }

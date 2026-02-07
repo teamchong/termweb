@@ -12,12 +12,16 @@ import {
 // ============================================================================
 
 /**
- * Build WebSocket URL from path - auto-detects ws/wss based on page protocol
+ * Build WebSocket URL from path - auto-detects ws/wss based on page protocol.
+ * Forwards ?token= query parameter from page URL to WebSocket URL for auth.
  */
 export function getWsUrl(path: string): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host;
-  return `${protocol}//${host}${path}`;
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get('token');
+  const query = token ? `?token=${encodeURIComponent(token)}` : '';
+  return `${protocol}//${host}${path}${query}`;
 }
 
 // ============================================================================

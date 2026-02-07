@@ -34,6 +34,10 @@ export const BinaryCtrlMsg = {
   SET_QUICK_TERMINAL: 0x8A,  // Set quick terminal open/closed state
   SET_INSPECTOR: 0x8B,  // Set inspector open/closed state
   SET_CLIPBOARD: 0x8C,  // Send clipboard text to server: [panel_id:u32][len:u32][text...]
+  // Multiplayer messages
+  ASSIGN_PANEL: 0x84,     // Admin assigns panel to session: [panel_id:u32][session_id_len:u8][session_id:...]
+  UNASSIGN_PANEL: 0x85,   // Admin unassigns panel: [panel_id:u32]
+  PANEL_INPUT: 0x86,      // Coworker input to assigned panel: [panel_id:u32][input_msg...]
   // Auth messages
   GET_AUTH_STATE: 0x90,
   SET_PASSWORD: 0x91,

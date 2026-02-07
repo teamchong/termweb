@@ -1,5 +1,5 @@
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 3d3973084..804a7998d 100644
+index 3d3973084..7dd686ea7 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
 @@ -38,6 +38,7 @@ typedef enum {
@@ -35,13 +35,15 @@ index 3d3973084..804a7998d 100644
  void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
  void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
  ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
-@@ -1146,6 +1155,11 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
+@@ -1146,6 +1155,13 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
  bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
  #endif
  
 +#ifdef __linux__
 +// Read pixels from the OpenGL framebuffer (for video encoding)
 +bool ghostty_surface_read_pixels(ghostty_surface_t, uint8_t*, size_t);
++// Get cursor position, style, and visibility for frontend rendering
++void ghostty_surface_cursor_info(ghostty_surface_t, uint16_t*, uint16_t*, uint8_t*, uint8_t*);
 +#endif
 +
  // APIs I'd like to get rid of eventually but are still needed for now.
@@ -727,7 +729,7 @@ index 000000000..c68a974d3
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..bc2e380bc 100644
+index dcf8a6357..ff5a7215f 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -913,13 +915,33 @@ index dcf8a6357..bc2e380bc 100644
      /// Update the occlusion state of a surface.
      export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
          surface.occlusionCallback(visible);
-@@ -2204,4 +2310,44 @@ pub const CAPI = struct {
+@@ -2204,4 +2310,64 @@ pub const CAPI = struct {
              }
          }
      };
 +
 +    // Linux-only C APIs
 +    const Linux = struct {
++        /// Get cursor position, style, and visibility for headless rendering.
++        /// Returns cursor info in terminal cell coordinates.
++        /// Caller must hold renderer_state.mutex (or call from same thread after draw).
++        export fn ghostty_surface_cursor_info(
++            ptr: *Surface,
++            out_col: *u16,
++            out_row: *u16,
++            out_style: *u8,
++            out_visible: *u8,
++        ) void {
++            ptr.core_surface.renderer_state.mutex.lock();
++            defer ptr.core_surface.renderer_state.mutex.unlock();
++            const t = ptr.core_surface.renderer_state.terminal;
++            const screen = t.screens.active;
++            out_col.* = @intCast(screen.cursor.x);
++            out_row.* = @intCast(screen.cursor.y);
++            out_style.* = @intFromEnum(screen.cursor.cursor_style);
++            out_visible.* = if (t.modes.get(.cursor_visible)) 1 else 0;
++        }
++
 +        /// Read pixels from the OpenGL framebuffer for video encoding
 +        export fn ghostty_surface_read_pixels(ptr: *Surface, buffer: [*]u8, buffer_len: usize) bool {
 +            const width = ptr.size.width;

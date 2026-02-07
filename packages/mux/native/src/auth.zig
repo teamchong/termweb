@@ -608,6 +608,21 @@ pub fn getRoleFromRequest(auth_state: *AuthState, token: ?[]const u8) Role {
     return .none;
 }
 
+/// Resolve a token to its session ID. Returns the session ID if the token
+/// matches a session's editor or viewer token, or null otherwise.
+pub fn getSessionIdForToken(auth_state: *AuthState, token: []const u8) ?[]const u8 {
+    if (token.len < 4) return null;
+    var iter = auth_state.sessions.valueIterator();
+    while (iter.next()) |session| {
+        if (std.mem.eql(u8, &session.editor_token, token) or
+            std.mem.eql(u8, &session.viewer_token, token))
+        {
+            return session.id;
+        }
+    }
+    return null;
+}
+
 pub fn extractTokenFromQuery(uri: []const u8) ?[]const u8 {
     // Look for ?token= or &token=
     const token_param = "token=";

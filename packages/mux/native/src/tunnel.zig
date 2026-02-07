@@ -429,6 +429,10 @@ pub const Tunnel = struct {
                 carry_len = leftover;
             }
         }
+
+        // Pipe closed (subprocess exited) — signal url_ready so waitForUrl
+        // unblocks immediately instead of waiting the full timeout.
+        self.url_ready.set();
     }
 
     /// Print relevant tunnel output lines to the user.

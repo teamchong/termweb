@@ -12,7 +12,7 @@ import type { AppConfig, LayoutData, LayoutNode, LayoutTab } from '../types';
 import type { PanelStatus } from '../stores/types';
 import { applyColors, generateId, getWsUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
 import { TIMING, WS_PATHS, CONFIG_ENDPOINT, SERVER_MSG, UI } from '../constants';
-import { BinaryCtrlMsg } from '../protocol';
+import { BinaryCtrlMsg, Role } from '../protocol';
 
 // Extended panel interface with all methods
 interface PanelInstance extends PanelLike {
@@ -25,12 +25,14 @@ interface PanelInstance extends PanelLike {
   show: () => void;
   sendKeyInput: (e: KeyboardEvent, action: number) => void;
   sendTextInput: (text: string) => void;
+  setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
   decodePreviewFrame: (frameData: Uint8Array) => void;
   handleInspectorState: (state: unknown) => void;
   getStatus: () => PanelStatus;
   getPwd: () => string;
   setPwd: (pwd: string) => void;
   getSnapshotCanvas: () => HTMLCanvasElement | undefined;
+  updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean) => void;
 }
 
 // Type guard for validating LayoutData structure from server
@@ -332,14 +334,25 @@ export class MuxClient {
           navigator.clipboard.writeText(text).catch(console.error);
           break;
         }
-        case SERVER_MSG.AUTH_STATE:
+        case SERVER_MSG.AUTH_STATE: {
+          const role = view.getUint8(1);
           authState.set({
-            role: view.getUint8(1),
+            role,
             authRequired: view.getUint8(2) === 1,
             hasPassword: view.getUint8(3) === 1,
             passkeyCount: view.getUint8(4),
           });
+          // Update UI isAdmin flag
+          const isAdmin = role === Role.ADMIN;
+          ui.update(s => ({ ...s, isAdmin }));
+          // Auto-switch mode based on role
+          if (isAdmin) {
+            this.enterMainMode();
+          } else if (role === Role.EDITOR || role === Role.VIEWER) {
+            this.enterViewerMode();
+          }
           break;
+        }
         case SERVER_MSG.OVERVIEW_STATE:
           ui.update(s => ({ ...s, overviewOpen: view.getUint8(1) === 1 }));
           break;
@@ -351,11 +364,71 @@ export class MuxClient {
           const isMain = view.getUint8(1) === 1;
           const clientId = view.getUint32(2, true);
           ui.update(s => ({ ...s, isMainClient: isMain, clientId }));
-          if (isMain) {
+          // Switch viewer/main mode based on role
+          const currentAuth = get(authState);
+          if (currentAuth.role === Role.ADMIN) {
             this.enterMainMode();
-          } else {
+          } else if (currentAuth.role === Role.EDITOR || currentAuth.role === Role.VIEWER) {
             this.enterViewerMode();
           }
+          break;
+        }
+        case SERVER_MSG.PANEL_ASSIGNMENT: {
+          // [0x11][panel_id:u32][session_id_len:u8][session_id:...]
+          if (data.byteLength < 6) break;
+          const panelId = view.getUint32(1, true);
+          const sidLen = view.getUint8(5);
+          const sessionId = sidLen > 0
+            ? sharedTextDecoder.decode(bytes.slice(6, 6 + sidLen))
+            : '';
+          ui.update(s => {
+            const assignments = new Map(s.panelAssignments);
+            if (sessionId) {
+              assignments.set(panelId, sessionId);
+            } else {
+              assignments.delete(panelId);
+            }
+            return { ...s, panelAssignments: assignments };
+          });
+          // Wire/unwire coworker input based on assignment
+          this.updateCoworkerInput(panelId, sessionId);
+          break;
+        }
+        case SERVER_MSG.SESSION_IDENTITY: {
+          // [0x13][session_id_len:u8][session_id:...]
+          if (data.byteLength < 2) break;
+          const sidLen = view.getUint8(1);
+          const mySessionId = sidLen > 0
+            ? sharedTextDecoder.decode(bytes.slice(2, 2 + sidLen))
+            : null;
+          ui.update(s => ({ ...s, sessionId: mySessionId }));
+          // Re-evaluate coworker input for all assigned panels
+          if (mySessionId) {
+            const currentAssignments = get(ui).panelAssignments;
+            for (const [pid, sid] of currentAssignments) {
+              this.updateCoworkerInput(pid, sid);
+            }
+          }
+          break;
+        }
+        case SERVER_MSG.CLIENT_LIST: {
+          // [0x12][count:u8][{client_id:u32, role:u8, session_id_len:u8, session_id:...}*]
+          if (data.byteLength < 2) break;
+          const count = view.getUint8(1);
+          const clients: Array<{clientId: number; role: number; sessionId: string}> = [];
+          let offset = 2;
+          for (let i = 0; i < count; i++) {
+            if (offset + 6 > data.byteLength) break;
+            const cid = view.getUint32(offset, true); offset += 4;
+            const role = view.getUint8(offset); offset += 1;
+            const sidLen = view.getUint8(offset); offset += 1;
+            const sid = sidLen > 0
+              ? sharedTextDecoder.decode(bytes.slice(offset, offset + sidLen))
+              : '';
+            offset += sidLen;
+            clients.push({ clientId: cid, role, sessionId: sid });
+          }
+          ui.update(s => ({ ...s, connectedClients: clients }));
           break;
         }
       }
@@ -579,6 +652,7 @@ export class MuxClient {
       show: () => void;
       sendKeyInput: (e: KeyboardEvent, action: number) => void;
       sendTextInput: (text: string) => void;
+      setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
       decodePreviewFrame: (frameData: Uint8Array) => void;
       handleInspectorState: (state: unknown) => void;
       getStatus: () => PanelStatus;
@@ -586,6 +660,7 @@ export class MuxClient {
       setPwd: (pwd: string) => void;
       getCanvas: () => HTMLCanvasElement | undefined;
       getSnapshotCanvas: () => HTMLCanvasElement | undefined;
+      updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean) => void;
     };
 
     const panel: PanelInstance = {
@@ -606,12 +681,14 @@ export class MuxClient {
       show: () => comp.show(),
       sendKeyInput: (e, a) => comp.sendKeyInput(e, a),
       sendTextInput: (t) => comp.sendTextInput(t),
+      setControlWsSend: (fn) => comp.setControlWsSend(fn),
       decodePreviewFrame: (f) => comp.decodePreviewFrame(f),
       handleInspectorState: (s) => comp.handleInspectorState(s),
       getStatus: () => comp.getStatus(),
       getPwd: () => comp.getPwd(),
       setPwd: (p) => comp.setPwd(p),
       getSnapshotCanvas: () => comp.getSnapshotCanvas(),
+      updateCursorState: (x, y, w, h, s, v) => comp.updateCursorState(x, y, w, h, s, v),
     };
 
     this.panelInstances.set(panelId, panel);
@@ -1054,6 +1131,70 @@ export class MuxClient {
     data[4] = actionBytes.length;
     data.set(actionBytes, 5);
     this.sendControlMessage(BinaryCtrlMsg.VIEW_ACTION, data);
+  }
+
+  // --- Multiplayer: Pane Assignment ---
+
+  /** Admin assigns a panel to a session */
+  assignPanel(serverId: number, sessionId: string): void {
+    const sidBytes = sharedTextEncoder.encode(sessionId);
+    const data = new Uint8Array(4 + 1 + sidBytes.length);
+    const view = new DataView(data.buffer);
+    view.setUint32(0, serverId, true);
+    data[4] = sidBytes.length;
+    data.set(sidBytes, 5);
+    this.sendControlMessage(BinaryCtrlMsg.ASSIGN_PANEL, data);
+  }
+
+  /** Admin unassigns a panel */
+  unassignPanel(serverId: number): void {
+    const data = new Uint8Array(4);
+    const view = new DataView(data.buffer);
+    view.setUint32(0, serverId, true);
+    this.sendControlMessage(BinaryCtrlMsg.UNASSIGN_PANEL, data);
+  }
+
+  /** Send input to assigned panel via control WS (coworker mode) */
+  private sendPanelInputViaControl(serverId: number, inputMsg: ArrayBuffer | ArrayBufferView): void {
+    if (!this.isControlWsOpen()) return;
+    const inputBytes = inputMsg instanceof ArrayBuffer
+      ? new Uint8Array(inputMsg)
+      : new Uint8Array(inputMsg.buffer, inputMsg.byteOffset, inputMsg.byteLength);
+    const msg = new Uint8Array(1 + 4 + inputBytes.length);
+    msg[0] = BinaryCtrlMsg.PANEL_INPUT;
+    const view = new DataView(msg.buffer);
+    view.setUint32(1, serverId, true);
+    msg.set(inputBytes, 5);
+    this.controlWs!.send(msg);
+  }
+
+  /** Wire up coworker input for a panel */
+  private setupCoworkerInput(panel: PanelInstance, serverId: number): void {
+    panel.setControlWsSend((msg) => {
+      this.sendPanelInputViaControl(serverId, msg);
+    });
+  }
+
+  /** Remove coworker input from a panel */
+  private clearCoworkerInput(panel: PanelInstance): void {
+    panel.setControlWsSend(null);
+  }
+
+  /** Called when PANEL_ASSIGNMENT is received — wire/unwire coworker input */
+  private updateCoworkerInput(panelId: number, sessionId: string): void {
+    const panel = this.panelsByServerId.get(panelId);
+    if (!panel) return;
+
+    const currentAuth = get(authState);
+    // Admin uses panel WS directly, no control WS routing needed
+    if (currentAuth.role === Role.ADMIN) return;
+
+    const uiState = get(ui);
+    if (sessionId && sessionId === uiState.sessionId && currentAuth.role === Role.EDITOR) {
+      this.setupCoworkerInput(panel, panelId);
+    } else {
+      this.clearCoworkerInput(panel);
+    }
   }
 
   getActivePanel(): PanelInstance | null {

@@ -106,6 +106,10 @@ export const ui = writable<UIState>({
   commandPaletteOpen: false,
   isMainClient: false,
   clientId: 0,
+  isAdmin: false,
+  sessionId: null,
+  panelAssignments: new Map(),
+  connectedClients: [],
 });
 
 // Convenience functions for UI state

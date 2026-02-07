@@ -162,6 +162,10 @@ pub const BinaryCtrlMsg = enum(u8) {
     overview_state = 0x0E,  // Overview open/closed state
     quick_terminal_state = 0x0F,  // Quick terminal open/closed state
     main_client_state = 0x10,  // Main client election: [type:u8][is_main:u8][client_id:u32] = 6 bytes
+    panel_assignment = 0x11,  // Multiplayer: panel assigned/unassigned [type:u8][panel_id:u32][session_id_len:u8][session_id:...]
+    client_list = 0x12,  // Multiplayer: connected clients list [type:u8][count:u8][{client_id:u32, role:u8, session_id_len:u8, session_id:...}*]
+    session_identity = 0x13,  // Multiplayer: your session identity [type:u8][session_id_len:u8][session_id:...]
+    // 0x14 reserved for future cursor_state
     inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
 
     // Auth/Session Server → Client (0x0A-0x0F)
@@ -173,6 +177,9 @@ pub const BinaryCtrlMsg = enum(u8) {
     close_panel = 0x81,
     resize_panel = 0x82,
     focus_panel = 0x83,
+    assign_panel = 0x84,    // Multiplayer: admin assigns panel to session [type:u8][panel_id:u32][session_id_len:u8][session_id:...]
+    unassign_panel = 0x85,  // Multiplayer: admin unassigns panel [type:u8][panel_id:u32]
+    panel_input = 0x86,     // Multiplayer: coworker sends input to assigned panel [type:u8][panel_id:u32][input_msg...]
     view_action = 0x88,
     set_overview = 0x89,  // Set overview open/closed state
     set_quick_terminal = 0x8A,  // Set quick terminal open/closed state
@@ -563,8 +570,14 @@ const Panel = struct {
     last_frame_time: i64, // For FPS control
     last_tick_time: i128, // For rate limiting panel.tick()
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
+    consecutive_unchanged: u32, // Consecutive frames with no pixel change (for adaptive frame rate)
 
     const TARGET_FPS: i64 = 30; // 30 FPS for video
+    /// After this many consecutive unchanged frames, reduce tick rate to save CPU/GPU.
+    /// At 30 FPS, 30 unchanged frames ≈ 1 second of idle.
+    const IDLE_THRESHOLD: u32 = 30;
+    /// When idle, only tick every Nth cycle (effectively ~3 FPS for cursor/spinner checks)
+    const IDLE_DIVISOR: u32 = 10;
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
 
     fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, kind: PanelKind) !*Panel {
@@ -673,6 +686,7 @@ const Panel = struct {
             .last_frame_time = 0,
             .last_tick_time = 0,
             .ticks_since_connect = 0,
+            .consecutive_unchanged = 0,
         };
 
         return panel;
@@ -696,6 +710,7 @@ const Panel = struct {
             self.streaming.store(true, .release);
             self.force_keyframe = true;
             self.ticks_since_connect = 0; // Reset so ghostty can render before we read pixels
+            self.consecutive_unchanged = 0; // Exit adaptive idle mode for new connection
         } else {
             self.streaming.store(false, .release);
         }
@@ -1480,6 +1495,9 @@ const Server = struct {
     control_connections: std.ArrayList(*ws.Connection),
     connection_roles: std.AutoHashMap(*ws.Connection, auth.Role),  // Track connection roles
     control_client_ids: std.AutoHashMap(*ws.Connection, u32),  // Track client IDs per control connection
+    // Multiplayer: pane assignment state
+    panel_assignments: std.AutoHashMap(u32, []const u8),  // panel_id → session_id
+    connection_sessions: std.AutoHashMap(*ws.Connection, []const u8),  // conn → session_id (cached)
     main_client_id: u32,       // ID of current main client (0 = none)
     next_client_id: u32,       // Counter for assigning client IDs
     layout: Layout,
@@ -1553,6 +1571,8 @@ const Server = struct {
             .control_connections = .{},
             .connection_roles = std.AutoHashMap(*ws.Connection, auth.Role).init(allocator),
             .control_client_ids = std.AutoHashMap(*ws.Connection, u32).init(allocator),
+            .panel_assignments = std.AutoHashMap(u32, []const u8).init(allocator),
+            .connection_sessions = std.AutoHashMap(*ws.Connection, []const u8).init(allocator),
             .main_client_id = 0,
             .next_client_id = 1,
             .layout = Layout.init(allocator),
@@ -1620,7 +1640,7 @@ const Server = struct {
         const defaults_path = "/tmp/termweb-ghostty-defaults.conf";
         if (std.fs.cwd().createFile(defaults_path, .{})) |f| {
             defer f.close();
-            f.writeAll("cursor-style = bar\ncursor-style-blink = true\n") catch {};
+            f.writeAll("cursor-style = bar\ncursor-style-blink = false\n") catch {};
             c.ghostty_config_load_file(config, defaults_path);
         } else |_| {}
 
@@ -1844,6 +1864,20 @@ const Server = struct {
         }
         self.mutex.unlock();
 
+        // Resolve token → session_id and cache for multiplayer
+        if (conn.request_uri) |uri| {
+            if (auth.extractTokenFromQuery(uri)) |token| {
+                if (auth.getSessionIdForToken(self.auth_state, token)) |session_id| {
+                    const duped = self.allocator.dupe(u8, session_id) catch null;
+                    if (duped) |s| {
+                        self.mutex.lock();
+                        self.connection_sessions.put(conn, s) catch {};
+                        self.mutex.unlock();
+                    }
+                }
+            }
+        }
+
         // Send auth state first (so client knows its role)
         self.sendAuthState(conn);
 
@@ -1858,6 +1892,15 @@ const Server = struct {
         self.sendOverviewState(conn);
         self.sendQuickTerminalState(conn);
         self.sendInspectorOpenState(conn);
+
+        // Send session identity (so client knows its own session_id)
+        self.sendSessionIdentity(conn);
+
+        // Send current panel assignments to newly connected client
+        self.sendAllPanelAssignments(conn);
+
+        // Send client list to admin(s)
+        self.sendClientListToAdmins();
 
         // If new main elected, broadcast so existing clients update
         if (is_new_main) {
@@ -1915,10 +1958,18 @@ const Server = struct {
 
         // Remove connection role
         _ = self.connection_roles.remove(conn);
+
+        // Remove cached session for this connection
+        if (self.connection_sessions.fetchRemove(conn)) |entry| {
+            self.allocator.free(entry.value);
+        }
         self.mutex.unlock();
 
         // Broadcast new main client state outside mutex
         if (need_broadcast) self.broadcastMainClientState();
+
+        // Update admin's client list
+        self.sendClientListToAdmins();
     }
 
     // --- Panel WebSocket callbacks---
@@ -1993,18 +2044,6 @@ const Server = struct {
                     // Connect to existing panel: [msg_type:u8][panel_id:u32][client_id:u32]?
                     if (data.len >= 5) {
                         const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                        // Optional client_id check (9 bytes = new protocol with client_id)
-                        if (data.len >= 9) {
-                            const client_id = std.mem.readInt(u32, data[5..9], .little);
-                            self.mutex.lock();
-                            const is_main = client_id == self.main_client_id;
-                            self.mutex.unlock();
-                            if (!is_main) {
-                                // Non-main client tried to connect to panel — reject
-                                conn.sendClose() catch {};
-                                return;
-                            }
-                        }
                         self.mutex.lock();
                         if (self.panels.get(panel_id)) |panel| {
                             panel.setConnection(conn);
@@ -2110,10 +2149,21 @@ const Server = struct {
     // --- Control message handling---
 
 
-    fn handleBinaryControlMessageFromClient(self: *Server, _: *ws.Connection, data: []const u8) void {
+    fn handleBinaryControlMessageFromClient(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len < 1) return;
 
         const msg_type = data[0];
+        if (msg_type == 0x84) { // assign_panel
+            self.handleAssignPanel(conn, data);
+            return;
+        } else if (msg_type == 0x85) { // unassign_panel
+            self.handleUnassignPanel(conn, data);
+            return;
+        } else if (msg_type == 0x86) { // panel_input
+            self.handlePanelInput(conn, data);
+            return;
+        }
+
         if (msg_type == 0x81) { // close_panel
             if (data.len < 5) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
@@ -2438,7 +2488,7 @@ const Server = struct {
         const msg_type = data[0];
         switch (msg_type) {
             // Client control messages
-            0x81, 0x82, 0x83, 0x88, 0x89, 0x8A, 0x8B => {
+            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x88, 0x89, 0x8A, 0x8B => {
                 self.handleBinaryControlMessageFromClient(conn, data);
             },
             else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
@@ -2807,6 +2857,221 @@ const Server = struct {
                     conn.sendBinary(msg_buf) catch {};
                 }
             };
+        }
+    }
+
+    // --- Multiplayer: Pane Assignment ---
+
+    /// Admin assigns a panel to a session. Only admin role can call this.
+    fn handleAssignPanel(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        // [0x84][panel_id:u32][session_id_len:u8][session_id:...]
+        if (data.len < 6) return;
+        const role = self.getConnectionRole(conn);
+        if (role != .admin) return;
+
+        const panel_id = std.mem.readInt(u32, data[1..5], .little);
+        const sid_len = data[5];
+        if (data.len < 6 + sid_len) return;
+        const session_id = data[6..][0..sid_len];
+
+        self.mutex.lock();
+        // Free old assignment if exists
+        if (self.panel_assignments.fetchRemove(panel_id)) |old| {
+            self.allocator.free(old.value);
+        }
+        // Store new assignment
+        const duped = self.allocator.dupe(u8, session_id) catch {
+            self.mutex.unlock();
+            return;
+        };
+        self.panel_assignments.put(panel_id, duped) catch {
+            self.allocator.free(duped);
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+
+        self.broadcastPanelAssignment(panel_id, session_id);
+    }
+
+    /// Admin unassigns a panel.
+    fn handleUnassignPanel(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        // [0x85][panel_id:u32]
+        if (data.len < 5) return;
+        const role = self.getConnectionRole(conn);
+        if (role != .admin) return;
+
+        const panel_id = std.mem.readInt(u32, data[1..5], .little);
+
+        self.mutex.lock();
+        if (self.panel_assignments.fetchRemove(panel_id)) |old| {
+            self.allocator.free(old.value);
+        }
+        self.mutex.unlock();
+
+        // Broadcast with empty session_id to indicate unassignment
+        self.broadcastPanelAssignment(panel_id, "");
+    }
+
+    /// Coworker sends input to their assigned panel via control WS.
+    fn handlePanelInput(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        // [0x86][panel_id:u32][input_msg...]
+        if (data.len < 6) return; // Need at least type + panel_id + 1 byte input
+
+        const role = self.getConnectionRole(conn);
+        // Must be at least editor
+        if (role != .admin and role != .editor) return;
+
+        const panel_id = std.mem.readInt(u32, data[1..5], .little);
+        const input_msg = data[5..];
+
+        // Validate: sender's session must match panel assignment
+        self.mutex.lock();
+        const sender_session = self.connection_sessions.get(conn);
+        const assigned_session = self.panel_assignments.get(panel_id);
+
+        // Admin can always send input; editors must be assigned
+        if (role != .admin) {
+            if (sender_session == null or assigned_session == null) {
+                self.mutex.unlock();
+                return;
+            }
+            if (!std.mem.eql(u8, sender_session.?, assigned_session.?)) {
+                self.mutex.unlock();
+                return;
+            }
+        }
+
+        // Route input to the panel
+        if (self.panels.get(panel_id)) |panel| {
+            self.mutex.unlock();
+            panel.handleMessage(input_msg);
+            panel.has_pending_input.store(true, .release);
+            panel.last_input_time.store(@truncate(std.time.nanoTimestamp()), .release);
+            self.wake_signal.notify();
+        } else {
+            self.mutex.unlock();
+        }
+    }
+
+    /// Broadcast panel assignment change to all control clients.
+    fn broadcastPanelAssignment(self: *Server, panel_id: u32, session_id: []const u8) void {
+        // [0x11][panel_id:u32][session_id_len:u8][session_id:...]
+        const sid_len: u8 = @intCast(@min(session_id.len, 255));
+        var buf: [262]u8 = undefined; // 1 + 4 + 1 + 256
+        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_assignment);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        buf[5] = sid_len;
+        if (sid_len > 0) {
+            @memcpy(buf[6..][0..sid_len], session_id[0..sid_len]);
+        }
+
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |c_conn| {
+            c_conn.sendBinary(buf[0 .. 6 + sid_len]) catch {};
+        }
+    }
+
+    /// Send all current panel assignments to a specific client.
+    fn sendAllPanelAssignments(self: *Server, conn: *ws.Connection) void {
+        self.mutex.lock();
+        const count = self.panel_assignments.count();
+        if (count == 0) {
+            self.mutex.unlock();
+            return;
+        }
+
+        // Send individual PANEL_ASSIGNMENT messages for each assignment
+        var it = self.panel_assignments.iterator();
+        while (it.next()) |entry| {
+            const panel_id = entry.key_ptr.*;
+            const session_id = entry.value_ptr.*;
+            const sid_len: u8 = @intCast(@min(session_id.len, 255));
+
+            var buf: [262]u8 = undefined;
+            buf[0] = @intFromEnum(BinaryCtrlMsg.panel_assignment);
+            std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+            buf[5] = sid_len;
+            if (sid_len > 0) {
+                @memcpy(buf[6..][0..sid_len], session_id[0..sid_len]);
+            }
+            conn.sendBinary(buf[0 .. 6 + sid_len]) catch {};
+        }
+        self.mutex.unlock();
+    }
+
+    /// Send this client's session identity (resolved from token).
+    fn sendSessionIdentity(self: *Server, conn: *ws.Connection) void {
+        self.mutex.lock();
+        const session_id = self.connection_sessions.get(conn) orelse "";
+        self.mutex.unlock();
+
+        // [0x13][session_id_len:u8][session_id:...]
+        const sid_len: u8 = @intCast(@min(session_id.len, 255));
+        var buf: [258]u8 = undefined; // 1 + 1 + 256
+        buf[0] = @intFromEnum(BinaryCtrlMsg.session_identity);
+        buf[1] = sid_len;
+        if (sid_len > 0) {
+            @memcpy(buf[2..][0..sid_len], session_id[0..sid_len]);
+        }
+        conn.sendBinary(buf[0 .. 2 + sid_len]) catch {};
+    }
+
+    /// Send connected client list to all admin connections.
+    fn sendClientListToAdmins(self: *Server) void {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        var role_buf: [max_broadcast_conns]auth.Role = undefined;
+        var count: usize = 0;
+
+        self.mutex.lock();
+
+        // First, build the client list message
+        // [0x12][count:u8][{client_id:u32, role:u8, session_id_len:u8, session_id:...}*]
+        var msg_buf: std.ArrayListUnmanaged(u8) = .{};
+        msg_buf.append(self.allocator, @intFromEnum(BinaryCtrlMsg.client_list)) catch {
+            self.mutex.unlock();
+            return;
+        };
+
+        const client_count: u8 = @intCast(@min(self.control_connections.items.len, 255));
+        msg_buf.append(self.allocator, client_count) catch {
+            msg_buf.deinit(self.allocator);
+            self.mutex.unlock();
+            return;
+        };
+
+        for (self.control_connections.items) |ctrl_conn| {
+            const cid = self.control_client_ids.get(ctrl_conn) orelse 0;
+            const crole = self.getConnectionRole(ctrl_conn);
+            const csession = self.connection_sessions.get(ctrl_conn) orelse "";
+
+            msg_buf.writer(self.allocator).writeInt(u32, cid, .little) catch break;
+            msg_buf.append(self.allocator, @intFromEnum(crole)) catch break;
+            const sid_len: u8 = @intCast(@min(csession.len, 255));
+            msg_buf.append(self.allocator, sid_len) catch break;
+            if (sid_len > 0) {
+                msg_buf.appendSlice(self.allocator, csession[0..sid_len]) catch break;
+            }
+        }
+
+        // Snapshot admin connections
+        for (self.control_connections.items) |ctrl_conn| {
+            if (count >= max_broadcast_conns) break;
+            const crole = self.getConnectionRole(ctrl_conn);
+            conn_buf[count] = ctrl_conn;
+            role_buf[count] = crole;
+            count += 1;
+        }
+        self.mutex.unlock();
+
+        defer msg_buf.deinit(self.allocator);
+
+        // Send only to admins
+        for (conn_buf[0..count], role_buf[0..count]) |c_conn, crole| {
+            if (crole == .admin) {
+                c_conn.sendBinary(msg_buf.items) catch {};
+            }
         }
     }
 
@@ -3263,6 +3528,12 @@ const Server = struct {
                 // Remove from layout
                 self.layout.removePanel(req.id);
 
+                // Remove panel assignment if any
+                const had_assignment = if (self.panel_assignments.fetchRemove(req.id)) |old| blk: {
+                    self.allocator.free(old.value);
+                    break :blk true;
+                } else false;
+
                 // Find and close the panel's WebSocket connection
                 var conn_to_remove: ?*ws.Connection = null;
                 var it = self.panel_connections.iterator();
@@ -3286,6 +3557,11 @@ const Server = struct {
 
                 // Notify clients
                 self.broadcastPanelClosed(req.id);
+
+                // Broadcast unassignment if panel was assigned
+                if (had_assignment) {
+                    self.broadcastPanelAssignment(req.id, "");
+                }
 
                 // Broadcast updated layout
                 self.broadcastLayoutUpdate();
@@ -3400,8 +3676,13 @@ const Server = struct {
         const perf_log = std.fs.cwd().createFile("/tmp/termweb-perf.log", .{ .truncate = true }) catch null;
         defer if (perf_log) |f| f.close();
 
+        // Debug log for tracing new panel frame delivery
+        const dbg_log = std.fs.cwd().createFile("/tmp/termweb-panel-debug.log", .{ .truncate = true }) catch null;
+        defer if (dbg_log) |f| f.close();
+
         std.debug.print("Render loop started, running={}\n", .{self.running.load(.acquire)});
         if (perf_log != null) std.debug.print("PERF log: /tmp/termweb-perf.log\n", .{});
+        if (dbg_log != null) std.debug.print("DEBUG log: /tmp/termweb-panel-debug.log\n", .{});
 
         while (self.running.load(.acquire)) {
 
@@ -3518,6 +3799,17 @@ const Server = struct {
                         in_active = true;
                     }
 
+                    // Debug: trace new panels (first 10 ticks)
+                    if (panel.ticks_since_connect < 10) {
+                        if (dbg_log) |f| {
+                            var dbg_buf: [256]u8 = undefined;
+                            const dbg_line = std.fmt.bufPrint(&dbg_buf, "COLLECT panel={d} tick={d} streaming={} in_active={} send_preview={} force_kf={} consec_unch={d}\n", .{
+                                panel.id, panel.ticks_since_connect, is_streaming, in_active, send_preview, panel.force_keyframe, panel.consecutive_unchanged,
+                            }) catch "";
+                            _ = f.write(dbg_line) catch {};
+                        }
+                    }
+
                     // Skip panels not in active tab (unless preview needs them)
                     if (!in_active and !send_preview) continue;
                     if (!is_streaming and !send_preview) continue;
@@ -3564,6 +3856,19 @@ const Server = struct {
                     frames_attempted += 1;
                     const t_frame_start = std.time.nanoTimestamp();
 
+                    // Adaptive frame rate: when idle for both macOS and Linux,
+                    // skip expensive draw+readpixels to save CPU/GPU.
+                    // Input or force_keyframe (reconnection) resets immediately.
+                    if (panel.consecutive_unchanged >= Panel.IDLE_THRESHOLD and
+                        !panel.force_keyframe and
+                        !panel.has_pending_input.load(.acquire))
+                    {
+                        if (panel.consecutive_unchanged % Panel.IDLE_DIVISOR != 0) {
+                            panel.consecutive_unchanged += 1;
+                            continue;
+                        }
+                    }
+
                     // Scoped autorelease pool for ALL ObjC/Metal objects created during this panel's frame (macOS only)
                     const draw_pool = if (comptime is_macos) objc_autoreleasePoolPush() else null;
                     defer if (comptime is_macos) objc_autoreleasePoolPop(draw_pool);
@@ -3586,7 +3891,11 @@ const Server = struct {
                         if (panel.getIOSurface()) |iosurface| {
                             // BGRA copy path - skip encode if surface unchanged
                             const changed = panel.captureFromIOSurface(iosurface) catch continue;
-                            if (!changed) continue;
+                            if (!changed) {
+                                panel.consecutive_unchanged += 1;
+                                continue;
+                            }
+                            panel.consecutive_unchanged = 0;
 
                             if (panel.prepareFrame() catch null) |result| {
                                 frame_data = result.data;
@@ -3613,7 +3922,16 @@ const Server = struct {
                             }
                         }
 
-                        if (panel.video_encoder == null or panel.bgra_buffer == null) continue;
+                        if (panel.video_encoder == null or panel.bgra_buffer == null) {
+                            if (panel.ticks_since_connect < 10) {
+                                if (dbg_log) |f| {
+                                    var dbg_buf: [128]u8 = undefined;
+                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "NO_ENCODER panel={d} tick={d} enc={} buf={}\n", .{ panel.id, panel.ticks_since_connect, panel.video_encoder != null, panel.bgra_buffer != null }) catch "";
+                                    _ = f.write(dbg_line) catch {};
+                                }
+                            }
+                            continue;
+                        }
 
                         // Resize encoder if dimensions changed
                         if (pixel_width != panel.video_encoder.?.source_width or pixel_height != panel.video_encoder.?.source_height) {
@@ -3625,7 +3943,14 @@ const Server = struct {
                         }
 
                         // Wait a few frames for ghostty to render initial content
-                        if (panel.ticks_since_connect < 3) continue;
+                        if (panel.ticks_since_connect < 3) {
+                            if (dbg_log) |f| {
+                                var dbg_buf: [128]u8 = undefined;
+                                const dbg_line = std.fmt.bufPrint(&dbg_buf, "SKIP_EARLY panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
+                                _ = f.write(dbg_line) catch {};
+                            }
+                            continue;
+                        }
 
                         was_keyframe = panel.force_keyframe;
 
@@ -3640,8 +3965,17 @@ const Server = struct {
                             // Frame skip: hash the pixel buffer and skip encoding if unchanged
                             const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
                             if (frame_hash == panel.last_frame_hash and !panel.force_keyframe) {
-                                continue; // Frame unchanged, skip encode
+                                panel.consecutive_unchanged += 1;
+                                if (panel.ticks_since_connect < 10) {
+                                    if (dbg_log) |f| {
+                                        var dbg_buf: [128]u8 = undefined;
+                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "HASH_SKIP panel={d} tick={d} hash={x}\n", .{ panel.id, panel.ticks_since_connect, frame_hash }) catch "";
+                                        _ = f.write(dbg_line) catch {};
+                                    }
+                                }
+                                continue;
                             }
+                            panel.consecutive_unchanged = 0;
                             panel.last_frame_hash = frame_hash;
 
                             // Pass explicit dimensions to ensure encoder matches frame size
@@ -3650,9 +3984,32 @@ const Server = struct {
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
+                                if (panel.ticks_since_connect < 10) {
+                                    if (dbg_log) |f| {
+                                        var dbg_buf: [128]u8 = undefined;
+                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "ENCODED panel={d} tick={d} kf={} size={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len }) catch "";
+                                        _ = f.write(dbg_line) catch {};
+                                    }
+                                }
+                            } else {
+                                if (panel.ticks_since_connect < 10) {
+                                    if (dbg_log) |f| {
+                                        var dbg_buf: [128]u8 = undefined;
+                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "ENCODE_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
+                                        _ = f.write(dbg_line) catch {};
+                                    }
+                                }
                             }
                             enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
                             perf_encode_ns += enc_elapsed;
+                        } else {
+                            if (panel.ticks_since_connect < 10) {
+                                if (dbg_log) |f| {
+                                    var dbg_buf: [128]u8 = undefined;
+                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "READ_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
+                                    _ = f.write(dbg_line) catch {};
+                                }
+                            }
                         }
                     }
 
@@ -3661,12 +4018,34 @@ const Server = struct {
                         if (is_streaming) {
                             if (panel.sendFrame(data)) {
                                 frames_sent += 1;
+                                if (panel.ticks_since_connect < 10) {
+                                    if (dbg_log) |f| {
+                                        var dbg_buf: [128]u8 = undefined;
+                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "SENT panel={d} tick={d} size={d}\n", .{ panel.id, panel.ticks_since_connect, data.len }) catch "";
+                                        _ = f.write(dbg_line) catch {};
+                                    }
+                                }
                             } else |_| {
                                 // Frame dropped (WouldBlock / TCP buffer full).
                                 // Force keyframe so browser can recover on next successful send.
                                 panel.force_keyframe = true;
                                 frames_dropped += 1;
                                 send_failed = true;
+                                if (panel.ticks_since_connect < 10) {
+                                    if (dbg_log) |f| {
+                                        var dbg_buf: [128]u8 = undefined;
+                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "SEND_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
+                                        _ = f.write(dbg_line) catch {};
+                                    }
+                                }
+                            }
+                        } else {
+                            if (panel.ticks_since_connect < 10) {
+                                if (dbg_log) |f| {
+                                    var dbg_buf: [128]u8 = undefined;
+                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "NOT_STREAMING panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
+                                    _ = f.write(dbg_line) catch {};
+                                }
                             }
                         }
 
@@ -4352,7 +4731,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
                         tunnel_mod.printQrCode(allocator, url);
                     }
                 } else {
-                    std.debug.print("  Tunnel:  waiting for URL (check provider logs)\n", .{});
+                    std.debug.print("  Tunnel:  failed (see errors above)\n", .{});
                 }
             }
         }

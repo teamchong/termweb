@@ -247,6 +247,12 @@ export const SERVER_MSG = {
   QUICK_TERMINAL_STATE: 0x0F,
   /** Main client election state */
   MAIN_CLIENT_STATE: 0x10,
+  /** Multiplayer: panel assignment change */
+  PANEL_ASSIGNMENT: 0x11,
+  /** Multiplayer: connected clients list (admin only) */
+  CLIENT_LIST: 0x12,
+  /** Multiplayer: your session identity */
+  SESSION_IDENTITY: 0x13,
 } as const;
 
 // ============================================================================
