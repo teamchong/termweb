@@ -89,7 +89,6 @@ sudo apt-get install intel-media-va-driver
 | `Cmd+Shift+F` | Toggle Full Screen |
 | `Cmd+U` | Upload Files |
 | `Cmd+Shift+S` | Download Files |
-| `Alt+Cmd+I` | Toggle Inspector |
 
 ## Other Commands
 
