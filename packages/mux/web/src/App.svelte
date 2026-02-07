@@ -69,10 +69,10 @@
     { label: 'Undo', action: 'undo', icon: '↩', disabled: !hasTabs },
     { label: 'Redo', action: 'redo', icon: '↪', disabled: !hasTabs },
     { separator: true },
-    { label: 'Copy', action: 'copy', shortcut: '⌘C', icon: '⧉', disabled: !hasTabs },
-    { label: 'Paste', action: 'paste', shortcut: '⌘V', icon: '📋', disabled: !hasTabs },
-    { label: 'Paste Selection', action: 'paste-selection', shortcut: '⌘⇧V', icon: '📄', disabled: !hasTabs },
-    { label: 'Select All', action: 'select-all', shortcut: '⌘A', icon: '▣', disabled: !hasTabs },
+    { label: 'Copy', action: 'copy_to_clipboard', shortcut: '⌘C', icon: '⧉', disabled: !hasTabs },
+    { label: 'Paste', action: 'paste_from_clipboard', shortcut: '⌘V', icon: '📋', disabled: !hasTabs },
+    { label: 'Paste Selection', action: 'paste_from_selection', shortcut: '⌘⇧V', icon: '📄', disabled: !hasTabs },
+    { label: 'Select All', action: 'select_all', shortcut: '⌘A', icon: '▣', disabled: !hasTabs },
   ]);
 
   // View menu: Show All Tabs, Font, Command Palette, Change Title, Quick Terminal, Inspector
@@ -295,6 +295,14 @@
       case '_resize_split_left':
       case '_resize_split_right':
         // TODO: implement split navigation in muxClient
+        break;
+      case 'paste_from_clipboard':
+        navigator.clipboard.readText().then(text => {
+          if (text && muxClient) {
+            muxClient.sendClipboard(text);
+            muxClient.sendViewAction('paste_from_clipboard');
+          }
+        }).catch(() => {});
         break;
       case '_sessions':
         muxClient?.showSessionsDialog();
@@ -762,7 +770,7 @@
     background: #333;
     padding: 3px 6px;
     border-radius: 3px;
-    font-family: ui-monospace, monospace;
+    font-family: Inter, "Source Code Pro", Roboto, Verdana, system-ui, sans-serif;
     font-size: 11px;
     color: #888;
     margin-left: 24px;

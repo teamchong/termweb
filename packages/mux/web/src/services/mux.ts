@@ -910,15 +910,27 @@ export class MuxClient {
     this.sendControlMessage(BinaryCtrlMsg.CLOSE_PANEL, data);
   }
 
+  sendClipboard(text: string): void {
+    const panel = this.currentActivePanel;
+    if (!panel || panel.serverId === null) return;
+    const textBytes = sharedTextEncoder.encode(text);
+    const data = new Uint8Array(4 + 4 + textBytes.length);
+    const view = new DataView(data.buffer);
+    view.setUint32(0, panel.serverId, true);
+    view.setUint32(4, textBytes.length, true);
+    data.set(textBytes, 8);
+    this.sendControlMessage(BinaryCtrlMsg.SET_CLIPBOARD, data);
+  }
+
   sendViewAction(action: string): void {
     const panel = this.currentActivePanel;
     if (!panel || panel.serverId === null) return;
     const actionBytes = sharedTextEncoder.encode(action);
-    const data = new Uint8Array(4 + 2 + actionBytes.length);
+    const data = new Uint8Array(4 + 1 + actionBytes.length);
     const view = new DataView(data.buffer);
     view.setUint32(0, panel.serverId, true);
-    view.setUint16(4, actionBytes.length, true);
-    data.set(actionBytes, 6);
+    data[4] = actionBytes.length;
+    data.set(actionBytes, 5);
     this.sendControlMessage(BinaryCtrlMsg.VIEW_ACTION, data);
   }
 

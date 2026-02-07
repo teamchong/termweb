@@ -33,6 +33,7 @@ export const BinaryCtrlMsg = {
   SET_OVERVIEW: 0x89,  // Set overview open/closed state
   SET_QUICK_TERMINAL: 0x8A,  // Set quick terminal open/closed state
   SET_INSPECTOR: 0x8B,  // Set inspector open/closed state
+  SET_CLIPBOARD: 0x8C,  // Send clipboard text to server: [panel_id:u32][len:u32][text...]
   // Auth messages
   GET_AUTH_STATE: 0x90,
   SET_PASSWORD: 0x91,

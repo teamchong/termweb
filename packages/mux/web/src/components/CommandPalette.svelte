@@ -10,6 +10,7 @@
 
   let { open = false, onClose, onExecute }: Props = $props();
 
+
   // State
   let filter = $state('');
   let selectedIndex = $state(0);
@@ -258,8 +259,9 @@
     background: rgba(128, 128, 128, 0.2);
     padding: 2px 6px;
     border-radius: 3px;
-    font-family: ui-monospace, monospace;
+    font-family: Inter, "Source Code Pro", Roboto, Verdana, system-ui, sans-serif;
   }
+
 
   .command-empty {
     padding: 20px 16px;

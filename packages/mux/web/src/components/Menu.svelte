@@ -19,6 +19,7 @@
 
   let { label, items, onAction }: Props = $props();
 
+
   let open = $state(false);
   let openSubmenu = $state<string | null>(null);
 
@@ -218,6 +219,7 @@
     color: var(--text-dim);
     font-size: 11px;
     margin-left: 16px;
+    font-family: Inter, "Source Code Pro", Roboto, Verdana, system-ui, sans-serif;
   }
 
   .menu-separator {
@@ -299,6 +301,7 @@
       font-size: 14px;
       padding-left: 12px;
       letter-spacing: 1px;
+      font-family: Inter, "Source Code Pro", Roboto, Verdana, system-ui, sans-serif;
     }
 
     .menu-icon {

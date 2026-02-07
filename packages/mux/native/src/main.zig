@@ -1495,6 +1495,7 @@ const Server = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     selection_clipboard: ?[]u8,  // Selection clipboard buffer
+    standard_clipboard: ?[]u8,  // Standard clipboard buffer (from browser paste)
     initial_cwd: []const u8,  // CWD where termweb was started
     initial_cwd_allocated: bool,  // Whether initial_cwd was allocated (vs static "/")
     overview_open: bool,  // Whether tab overview is currently open
@@ -1564,6 +1565,7 @@ const Server = struct {
             .allocator = allocator,
             .mutex = .{},
             .selection_clipboard = null,
+            .standard_clipboard = null,
             .initial_cwd = undefined,
             .initial_cwd_allocated = false,
             .overview_open = false,
@@ -1698,6 +1700,7 @@ const Server = struct {
         self.preview_connections.deinit(self.allocator);
         self.connection_roles.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
+        if (self.standard_clipboard) |clip| self.allocator.free(clip);
         if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
         // Free shared VA-API context (after all panels/encoders are destroyed)
         self.wake_signal.deinit();
@@ -2113,6 +2116,16 @@ const Server = struct {
             self.inspector_open = data[1] != 0;
             self.mutex.unlock();
             self.broadcastInspectorOpenState();
+        } else if (msg_type == 0x8C) { // set_clipboard
+            // [0x8C][panel_id:u32][len:u32][text...]
+            if (data.len < 9) return;
+            const text_len = std.mem.readInt(u32, data[5..9], .little);
+            if (data.len < 9 + text_len) return;
+            const text = data[9..][0..text_len];
+            self.mutex.lock();
+            if (self.standard_clipboard) |old| self.allocator.free(old);
+            self.standard_clipboard = self.allocator.dupe(u8, text) catch null;
+            self.mutex.unlock();
         } else {
             std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type});
         }
@@ -3961,7 +3974,6 @@ fn readClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_e
 
     const self = Server.global_server.load(.acquire) orelse return;
 
-    // Only handle selection clipboard
     if (clipboard == c.GHOSTTY_CLIPBOARD_SELECTION) {
         self.mutex.lock();
         const selection = self.selection_clipboard;
@@ -3971,9 +3983,18 @@ fn readClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_e
             c.ghostty_surface_complete_clipboard_request(panel.surface, sel_text.ptr, context, true);
             return;
         }
+    } else if (clipboard == c.GHOSTTY_CLIPBOARD_STANDARD) {
+        self.mutex.lock();
+        const standard = self.standard_clipboard;
+        self.mutex.unlock();
+
+        if (standard) |std_text| {
+            c.ghostty_surface_complete_clipboard_request(panel.surface, std_text.ptr, context, true);
+            return;
+        }
     }
 
-    // Complete with empty string if no selection
+    // Complete with empty string if no clipboard data
     c.ghostty_surface_complete_clipboard_request(panel.surface, "", context, true);
 }
 

@@ -132,7 +132,7 @@
   .tab .hotkey {
     font-size: 10px;
     color: var(--text-dim);
-    font-family: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+    font-family: Inter, "Source Code Pro", Roboto, Verdana, system-ui, sans-serif;
     flex-shrink: 0;
     opacity: 0.5;
     margin-left: 4px;
