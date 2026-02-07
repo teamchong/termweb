@@ -20,6 +20,7 @@ const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
 const auth = @import("auth.zig");
 const WakeSignal = @import("wake_signal.zig").WakeSignal;
+pub const tunnel_mod = @import("tunnel.zig");
 
 
 // Debug logging to stderr
@@ -160,6 +161,7 @@ pub const BinaryCtrlMsg = enum(u8) {
     panel_notification = 0x0D,
     overview_state = 0x0E,  // Overview open/closed state
     quick_terminal_state = 0x0F,  // Quick terminal open/closed state
+    main_client_state = 0x10,  // Main client election: [type:u8][is_main:u8][client_id:u32] = 6 bytes
     inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
 
     // Auth/Session Server → Client (0x0A-0x0F)
@@ -557,6 +559,7 @@ const Panel = struct {
     inspector_tab: [16]u8,
     inspector_tab_len: u8,
     last_iosurface_seed: u32, // For detecting IOSurface/SharedMemory changes
+    last_frame_hash: u64, // For detecting unchanged frames on Linux
     last_frame_time: i64, // For FPS control
     last_tick_time: i128, // For rate limiting panel.tick()
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
@@ -666,6 +669,7 @@ const Panel = struct {
             .inspector_tab = undefined,
             .inspector_tab_len = 0,
             .last_iosurface_seed = 0,
+            .last_frame_hash = 0,
             .last_frame_time = 0,
             .last_tick_time = 0,
             .ticks_since_connect = 0,
@@ -1475,6 +1479,9 @@ const Server = struct {
     panel_connections: std.AutoHashMap(*ws.Connection, *Panel),
     control_connections: std.ArrayList(*ws.Connection),
     connection_roles: std.AutoHashMap(*ws.Connection, auth.Role),  // Track connection roles
+    control_client_ids: std.AutoHashMap(*ws.Connection, u32),  // Track client IDs per control connection
+    main_client_id: u32,       // ID of current main client (0 = none)
+    next_client_id: u32,       // Counter for assigning client IDs
     layout: Layout,
     pending_panels: std.ArrayList(PanelRequest),
     pending_destroys: std.ArrayList(PanelDestroyRequest),
@@ -1545,6 +1552,9 @@ const Server = struct {
             .panel_connections = std.AutoHashMap(*ws.Connection, *Panel).init(allocator),
             .control_connections = .{},
             .connection_roles = std.AutoHashMap(*ws.Connection, auth.Role).init(allocator),
+            .control_client_ids = std.AutoHashMap(*ws.Connection, u32).init(allocator),
+            .main_client_id = 0,
+            .next_client_id = 1,
             .layout = Layout.init(allocator),
             .pending_panels = .{},
             .pending_destroys = .{},
@@ -1699,6 +1709,7 @@ const Server = struct {
         self.file_connections.deinit(self.allocator);
         self.preview_connections.deinit(self.allocator);
         self.connection_roles.deinit();
+        self.control_client_ids.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
         if (self.standard_clipboard) |clip| self.allocator.free(clip);
         if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
@@ -1815,12 +1826,30 @@ const Server = struct {
     fn onControlConnect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
 
+        var is_new_main = false;
+        var client_id: u32 = 0;
+
         self.mutex.lock();
         self.control_connections.append(self.allocator, conn) catch {};
+
+        // Assign client ID
+        client_id = self.next_client_id;
+        self.next_client_id += 1;
+        self.control_client_ids.put(conn, client_id) catch {};
+
+        // Elect main client if none exists
+        if (self.main_client_id == 0) {
+            self.main_client_id = client_id;
+            is_new_main = true;
+        }
         self.mutex.unlock();
 
         // Send auth state first (so client knows its role)
         self.sendAuthState(conn);
+
+        // Send main client state before panel list so client knows its role
+        // before creating panels (prevents non-main from connecting panel WS)
+        self.sendMainClientState(conn, client_id);
 
         // Send current panel list
         self.sendPanelList(conn);
@@ -1829,6 +1858,11 @@ const Server = struct {
         self.sendOverviewState(conn);
         self.sendQuickTerminalState(conn);
         self.sendInspectorOpenState(conn);
+
+        // If new main elected, broadcast so existing clients update
+        if (is_new_main) {
+            self.broadcastMainClientState();
+        }
     }
 
     fn onControlMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
@@ -1849,6 +1883,8 @@ const Server = struct {
     fn onControlDisconnect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
 
+        var need_broadcast = false;
+
         self.mutex.lock();
         for (self.control_connections.items, 0..) |ctrl_conn, i| {
             if (ctrl_conn == conn) {
@@ -1857,9 +1893,32 @@ const Server = struct {
             }
         }
 
+        // Get client ID before removing
+        const disconnected_id = self.control_client_ids.get(conn) orelse 0;
+        _ = self.control_client_ids.remove(conn);
+
+        // Re-elect if main disconnected
+        if (disconnected_id > 0 and disconnected_id == self.main_client_id) {
+            if (self.control_connections.items.len > 0) {
+                // Promote first remaining connection
+                const new_main_conn = self.control_connections.items[0];
+                if (self.control_client_ids.get(new_main_conn)) |new_id| {
+                    self.main_client_id = new_id;
+                } else {
+                    self.main_client_id = 0;
+                }
+            } else {
+                self.main_client_id = 0; // No clients
+            }
+            need_broadcast = true;
+        }
+
         // Remove connection role
         _ = self.connection_roles.remove(conn);
         self.mutex.unlock();
+
+        // Broadcast new main client state outside mutex
+        if (need_broadcast) self.broadcastMainClientState();
     }
 
     // --- Panel WebSocket callbacks---
@@ -1931,9 +1990,21 @@ const Server = struct {
 
             switch (msg_type) {
                 .connect_panel => {
-                    // Connect to existing panel: [msg_type:u8][panel_id:u32]
+                    // Connect to existing panel: [msg_type:u8][panel_id:u32][client_id:u32]?
                     if (data.len >= 5) {
                         const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                        // Optional client_id check (9 bytes = new protocol with client_id)
+                        if (data.len >= 9) {
+                            const client_id = std.mem.readInt(u32, data[5..9], .little);
+                            self.mutex.lock();
+                            const is_main = client_id == self.main_client_id;
+                            self.mutex.unlock();
+                            if (!is_main) {
+                                // Non-main client tried to connect to panel — reject
+                                conn.sendClose() catch {};
+                                return;
+                            }
+                        }
                         self.mutex.lock();
                         if (self.panels.get(panel_id)) |panel| {
                             panel.setConnection(conn);
@@ -2611,6 +2682,37 @@ const Server = struct {
 
         for (conn_buf[0..count]) |conn| {
             conn.sendBinary(msg_buf) catch {};
+        }
+    }
+
+    fn sendMainClientState(self: *Server, conn: *ws.Connection, client_id: u32) void {
+        // Binary: [type:u8][is_main:u8][client_id:u32] = 6 bytes
+        var buf: [6]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.main_client_state);
+        self.mutex.lock();
+        buf[1] = if (self.main_client_id == client_id) 1 else 0;
+        std.mem.writeInt(u32, buf[2..6], client_id, .little);
+        self.mutex.unlock();
+        conn.sendBinary(&buf) catch {};
+    }
+
+    fn broadcastMainClientState(self: *Server) void {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        var id_buf: [max_broadcast_conns]u32 = undefined;
+        var count: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.control_connections.items) |conn| {
+                if (count < max_broadcast_conns) {
+                    conn_buf[count] = conn;
+                    id_buf[count] = self.control_client_ids.get(conn) orelse 0;
+                    count += 1;
+                }
+            }
+        }
+        for (conn_buf[0..count], id_buf[0..count]) |conn, cid| {
+            self.sendMainClientState(conn, cid);
         }
     }
 
@@ -3482,8 +3584,9 @@ const Server = struct {
 
                     if (comptime is_macos) {
                         if (panel.getIOSurface()) |iosurface| {
-                            // BGRA copy path - faster than direct IOSurface encoding
-                            _ = panel.captureFromIOSurface(iosurface) catch continue;
+                            // BGRA copy path - skip encode if surface unchanged
+                            const changed = panel.captureFromIOSurface(iosurface) catch continue;
+                            if (!changed) continue;
 
                             if (panel.prepareFrame() catch null) |result| {
                                 frame_data = result.data;
@@ -3534,6 +3637,13 @@ const Server = struct {
                         perf_read_ns += read_elapsed;
 
                         if (read_ok) {
+                            // Frame skip: hash the pixel buffer and skip encoding if unchanged
+                            const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
+                            if (frame_hash == panel.last_frame_hash and !panel.force_keyframe) {
+                                continue; // Frame unchanged, skip encode
+                            }
+                            panel.last_frame_hash = frame_hash;
+
                             // Pass explicit dimensions to ensure encoder matches frame size
                             crash_phase.store(7, .monotonic); // video encoder
                             const t_enc = std.time.nanoTimestamp();
@@ -4059,6 +4169,7 @@ fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c)
 
 const Args = struct {
     http_port: u16 = 8080,
+    mode: tunnel_mod.Mode = .interactive,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -4074,6 +4185,14 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             if (arg_it.next()) |val| {
                 args.http_port = std.fmt.parseInt(u16, val, 10) catch 8080;
             }
+        } else if (std.mem.eql(u8, arg, "--local")) {
+            args.mode = .local;
+        } else if (std.mem.eql(u8, arg, "--cloudflare")) {
+            args.mode = .{ .tunnel = .cloudflare };
+        } else if (std.mem.eql(u8, arg, "--ngrok")) {
+            args.mode = .{ .tunnel = .ngrok };
+        } else if (std.mem.eql(u8, arg, "--tailscale")) {
+            args.mode = .{ .tunnel = .tailscale };
         }
     }
 
@@ -4165,7 +4284,7 @@ fn onPreviewWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*
 }
 
 /// Run mux server - can be called from CLI or standalone
-pub fn run(allocator: std.mem.Allocator, http_port: u16) !void {
+pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) !void {
     // Setup SIGINT handler for graceful shutdown
     const act = std.posix.Sigaction{
         .handler = .{ .handler = handleSigint },
@@ -4198,11 +4317,58 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16) !void {
         server,
     );
 
-    std.debug.print("  HTTP + WebSocket:  http://localhost:{}\n", .{http_port});
-    std.debug.print("  Web assets:        embedded (~140KB)\n", .{});
+    // Resolve connection mode: interactive shows a picker, others are direct
+    const chosen_provider: ?tunnel_mod.Provider = switch (mode) {
+        .interactive => tunnel_mod.promptConnectionMode(),
+        .local => null,
+        .tunnel => |p| p,
+    };
+
+    // Start tunnel if a provider was selected
+    var tunnel: ?*tunnel_mod.Tunnel = null;
+    if (chosen_provider) |provider| {
+        if (!tunnel_mod.binaryExists(provider.binary())) {
+            std.debug.print("'{s}' is not installed.\n", .{provider.binary()});
+            std.debug.print("Continuing with local-only access.\n", .{});
+        } else {
+            std.debug.print("Starting {s}...\n", .{provider.label()});
+            tunnel = tunnel_mod.Tunnel.start(allocator, provider, http_port) catch |err| blk: {
+                std.debug.print("Tunnel failed to start: {}\n", .{err});
+                std.debug.print("Continuing with local-only access.\n", .{});
+                break :blk null;
+            };
+            if (tunnel) |t| {
+                if (t.waitForUrl(15 * std.time.ns_per_s)) {
+                    if (t.getUrl()) |url| {
+                        std.debug.print("  Tunnel:  {s}\n", .{url});
+                        tunnel_mod.printQrCode(allocator, url);
+                    }
+                } else {
+                    std.debug.print("  Tunnel:  waiting for URL (check provider logs)\n", .{});
+                }
+            }
+        }
+    }
+
+    // Show LAN URL (useful for same-network access)
+    const lan_url = tunnel_mod.getLanUrl(allocator, http_port);
+    defer if (lan_url) |u| allocator.free(u);
+    if (lan_url) |url| {
+        std.debug.print("  LAN:     {s}\n", .{url});
+        // Show QR for LAN URL if no tunnel QR was shown
+        if (tunnel == null) {
+            tunnel_mod.printQrCode(allocator, url);
+        }
+    }
+
+    std.debug.print("  Local:   http://localhost:{}\n", .{http_port});
     std.debug.print("\nServer initialized, waiting for connections...\n", .{});
 
     try server.run();
+
+    if (tunnel) |t| {
+        t.stop();
+    }
 }
 
 pub fn main() !void {
@@ -4211,5 +4377,5 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const args = try parseArgs(allocator);
-    try run(allocator, args.http_port);
+    try run(allocator, args.http_port, args.mode);
 }

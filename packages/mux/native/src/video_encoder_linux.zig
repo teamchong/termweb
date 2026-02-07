@@ -330,6 +330,8 @@ pub const VideoEncoder = struct {
     src_surface: c.VASurfaceID,
     ref_surface: c.VASurfaceID,
     recon_surface: c.VASurfaceID,
+
+    // Coded buffer for encoder output
     coded_buf: c.VABufferID,
 
     // Output buffer
@@ -669,7 +671,7 @@ pub const VideoEncoder = struct {
         }
         errdefer _ = c.vaDestroyContext(va_display, va_context);
 
-        // Create coded buffer for output
+        // Create coded buffer for encoder output
         var coded_buf: c.VABufferID = 0;
         status = vaCreateBuffer(
             va_display,
@@ -759,7 +761,7 @@ pub const VideoEncoder = struct {
             .current_bitrate = 5_000_000,
             .target_fps = 30,
             .quality_level = 3,
-            .keyframe_interval = 120, // keyframe every 4 seconds at 30fps
+            .keyframe_interval = 600, // keyframe every 20 seconds at 30fps
             .sps_data = undefined,
             .sps_len = 0,
             .pps_data = undefined,
@@ -826,7 +828,7 @@ pub const VideoEncoder = struct {
             self.has_vpp = false;
         }
 
-        // Destroy old surfaces
+        // Destroy old resources
         var old_surfaces = [_]c.VASurfaceID{ self.src_surface, self.ref_surface, self.recon_surface };
         _ = vaDestroyBuffer(va_display, self.coded_buf);
         _ = c.vaDestroyContext(va_display, self.va_context);
@@ -862,7 +864,7 @@ pub const VideoEncoder = struct {
             return error.VaContextFailed;
         }
 
-        // Create new coded buffer
+        // Create new double-buffered coded buffers
         status = vaCreateBuffer(
             va_display,
             self.va_context,
@@ -948,34 +950,50 @@ pub const VideoEncoder = struct {
         const pitch = image.pitches[0];
         const offset = image.offsets[0];
 
-        // R↔B swap + nearest-neighbor downscale in one pass.
-        // Only iterates over dst pixels (2.3M) not src pixels (11.6M).
+        // Source is BGRA from glReadPixels (Intel native format), destination is BGRX.
+        // No R↔B swap needed — BGRA layout matches BGRX (alpha byte becomes X).
         const src_pixels: [*]align(1) const u32 = @ptrCast(rgba_data.ptr);
         const dst_pixels: [*]align(1) u32 = @ptrCast(mapped + offset);
         const dst_stride_px = @as(usize, pitch) / 4;
         const src_stride_px = @as(usize, src_width);
 
-        // Fixed-point 16.16 scale factors
-        const fp_shift = 16;
-        const fp_scale_x = (@as(u64, src_width) << fp_shift) / @as(u64, dst_width);
-        const fp_scale_y = (@as(u64, src_height) << fp_shift) / @as(u64, dst_height);
-        const src_max_x = src_width - 1;
-        const src_max_y = src_height - 1;
+        // Fast path: no downscale needed (common case)
+        if (src_width == dst_width and src_height <= dst_height) {
+            var y: u32 = 0;
+            while (y < src_height) : (y += 1) {
+                const src_row = @as(usize, y) * src_stride_px;
+                const dst_row = @as(usize, y) * dst_stride_px;
+                // Direct copy — BGRA pixels to BGRX surface (alpha=X, ignored)
+                @memcpy(
+                    @as([*]u8, @ptrCast(&dst_pixels[dst_row]))[0 .. dst_width * 4],
+                    @as([*]const u8, @ptrCast(&src_pixels[src_row]))[0 .. dst_width * 4],
+                );
+            }
+            // Pad remaining rows (16-pixel alignment padding) with black
+            var y2: u32 = src_height;
+            while (y2 < dst_height) : (y2 += 1) {
+                const dst_row = @as(usize, y2) * dst_stride_px;
+                @memset(@as([*]u8, @ptrCast(&dst_pixels[dst_row]))[0 .. dst_width * 4], 0);
+            }
+        } else {
+            // Downscale path with nearest-neighbor sampling
+            const fp_shift = 16;
+            const fp_scale_x = (@as(u64, src_width) << fp_shift) / @as(u64, dst_width);
+            const fp_scale_y = (@as(u64, src_height) << fp_shift) / @as(u64, dst_height);
+            const src_max_x = src_width - 1;
+            const src_max_y = src_height - 1;
 
-        var y: u32 = 0;
-        while (y < dst_height) : (y += 1) {
-            const sy: u32 = @intCast(@min(@as(u64, y) * fp_scale_y >> fp_shift, src_max_y));
-            const src_row = @as(usize, sy) * src_stride_px;
-            const dst_row = @as(usize, y) * dst_stride_px;
-            var x: u32 = 0;
-            while (x < dst_width) : (x += 1) {
-                const sx: u32 = @intCast(@min(@as(u64, x) * fp_scale_x >> fp_shift, src_max_x));
-                const px = src_pixels[src_row + sx];
-                // Swap R↔B: RGBA 0xAABBGGRR → BGRX 0xFFRRGGBB
-                const r = px & 0xFF;
-                const g = (px >> 8) & 0xFF;
-                const b = (px >> 16) & 0xFF;
-                dst_pixels[dst_row + x] = b | (g << 8) | (r << 16) | 0xFF000000;
+            var y: u32 = 0;
+            while (y < dst_height) : (y += 1) {
+                const sy: u32 = @intCast(@min(@as(u64, y) * fp_scale_y >> fp_shift, src_max_y));
+                const src_row = @as(usize, sy) * src_stride_px;
+                const dst_row = @as(usize, y) * dst_stride_px;
+                var x: u32 = 0;
+                while (x < dst_width) : (x += 1) {
+                    const sx: u32 = @intCast(@min(@as(u64, x) * fp_scale_x >> fp_shift, src_max_x));
+                    // Direct copy — no R↔B swap needed (BGRA→BGRX)
+                    dst_pixels[dst_row + x] = src_pixels[src_row + sx] | 0xFF000000;
+                }
             }
         }
 
@@ -1017,7 +1035,9 @@ pub const VideoEncoder = struct {
         status = vaEndPicture(va_display, self.vpp_context);
         if (status != c.VA_STATUS_SUCCESS) return self.uploadFrameCpu(rgba_data);
 
-        // Sync VPP output before encoding
+        // Sync VPP output — cross-context synchronization is NOT implicit in VA-API.
+        // The VPP context and encoder context are separate, so we must explicitly
+        // wait for VPP to finish writing to src_surface before the encoder reads it.
         status = c.vaSyncSurface(va_display, self.src_surface);
         if (status != c.VA_STATUS_SUCCESS) return self.uploadFrameCpu(rgba_data);
     }
@@ -1070,7 +1090,7 @@ pub const VideoEncoder = struct {
         const y_pitch = image.pitches[0];
         const uv_pitch = image.pitches[1];
 
-        // Y plane with downscaling
+        // Y plane with downscaling (input is BGRA: byte 0=B, 1=G, 2=R, 3=A)
         var y: u32 = 0;
         while (y < dst_height) : (y += 1) {
             const src_y = @min(@as(u32, @intFromFloat(@as(f64, @floatFromInt(y)) * scale_y)), src_height - 1);
@@ -1078,14 +1098,14 @@ pub const VideoEncoder = struct {
             while (x < dst_width) : (x += 1) {
                 const src_x = @min(@as(u32, @intFromFloat(@as(f64, @floatFromInt(x)) * scale_x)), src_width - 1);
                 const src_idx = (src_y * src_width + src_x) * 4;
-                const r = @as(u32, rgba_data[src_idx]);
+                const b = @as(u32, rgba_data[src_idx]);
                 const g = @as(u32, rgba_data[src_idx + 1]);
-                const b = @as(u32, rgba_data[src_idx + 2]);
+                const r = @as(u32, rgba_data[src_idx + 2]);
                 mapped[y_offset + y * y_pitch + x] = @intCast(@min(255, 16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)));
             }
         }
 
-        // UV plane with downscaling
+        // UV plane with downscaling (input is BGRA: byte 0=B, 1=G, 2=R, 3=A)
         const dst_uv_width = dst_width / 2;
         const dst_uv_height = dst_height / 2;
         y = 0;
@@ -1095,9 +1115,9 @@ pub const VideoEncoder = struct {
             while (x < dst_uv_width) : (x += 1) {
                 const src_x = @min(@as(u32, @intFromFloat(@as(f64, @floatFromInt(x * 2)) * scale_x)), src_width - 1);
                 const src_idx = (src_y * src_width + src_x) * 4;
-                const r = @as(i32, @intCast(rgba_data[src_idx]));
+                const b = @as(i32, @intCast(rgba_data[src_idx]));
                 const g = @as(i32, @intCast(rgba_data[src_idx + 1]));
-                const b = @as(i32, @intCast(rgba_data[src_idx + 2]));
+                const r = @as(i32, @intCast(rgba_data[src_idx + 2]));
                 mapped[uv_offset + y * uv_pitch + x * 2] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8))))));
                 mapped[uv_offset + y * uv_pitch + x * 2 + 1] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((112 * r - 94 * g - 18 * b + 128) >> 8))))));
             }
@@ -1119,10 +1139,13 @@ pub const VideoEncoder = struct {
         return self.encodeWithDimensions(rgba_data, force_keyframe, null, null);
     }
 
-    /// Encode RGBA frame to H.264 with explicit dimensions
-    /// Auto-resizes encoder if frame dimensions don't match current source dimensions.
+    /// Encode BGRA frame to H.264 with explicit dimensions.
+    /// Synchronous: upload, encode, sync, read output all in one call.
+    /// No pipeline latency — the frame you encode is the frame you get back.
     pub fn encodeWithDimensions(self: *VideoEncoder, rgba_data: []const u8, force_keyframe: bool, width: ?u32, height: ?u32) VaError!?EncodeResult {
         const va_display = self.shared.va_display;
+        const t0 = std.time.nanoTimestamp();
+
         // Auto-resize if explicit dimensions provided and differ from source
         if (width != null and height != null) {
             const w = width.?;
@@ -1138,19 +1161,20 @@ pub const VideoEncoder = struct {
         const is_keyframe = force_keyframe or (self.frame_count == 0) or
             (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
 
-        // Upload RGBA data to VA surface
+        // Upload frame (CPU copy + VPP color conversion)
         try self.uploadFrame(rgba_data);
+        const t1 = std.time.nanoTimestamp();
 
-        // Begin picture - use src_surface as both input and reconstruction target
+        // Submit encode to GPU
         var status = vaBeginPicture(va_display, self.va_context, self.src_surface);
         if (status != c.VA_STATUS_SUCCESS) {
             return error.VaBeginPictureFailed;
         }
 
-        // Create sequence parameter buffer (using raw byte buffer to avoid bitfield union issues)
+        // Create sequence parameter buffer
         var seq_param: [SEQ_PARAM_SIZE]u8 = std.mem.zeroes([SEQ_PARAM_SIZE]u8);
         writeU8(&seq_param, SEQ_seq_parameter_set_id, 0);
-        writeU8(&seq_param, SEQ_level_idc, 52); // Level 5.2 for large frame support
+        writeU8(&seq_param, SEQ_level_idc, 52);
         writeU32(&seq_param, SEQ_intra_period, self.keyframe_interval);
         writeU32(&seq_param, SEQ_intra_idr_period, self.keyframe_interval);
         writeU32(&seq_param, SEQ_ip_period, 1);
@@ -1158,13 +1182,6 @@ pub const VideoEncoder = struct {
         writeU32(&seq_param, SEQ_max_num_ref_frames, 1);
         writeU16(&seq_param, SEQ_picture_width_in_mbs, @intCast(self.width / 16));
         writeU16(&seq_param, SEQ_picture_height_in_mbs, @intCast(self.height / 16));
-        // seq_fields bitfield for Main/High profile:
-        // bits 0-1: chroma_format_idc = 1
-        // bit 2: frame_mbs_only_flag = 1
-        // bit 5: direct_8x8_inference_flag = 1 (for B-frame direct mode, even if not used)
-        // bits 6-9: log2_max_frame_num_minus4 = 0
-        // bits 10-11: pic_order_cnt_type = 0
-        // bits 12-15: log2_max_pic_order_cnt_lsb_minus4 = 4
         writeU32(&seq_param, SEQ_seq_fields, 0x4025);
         writeU32(&seq_param, SEQ_time_scale, 60);
         writeU32(&seq_param, SEQ_num_units_in_tick, 1);
@@ -1188,31 +1205,20 @@ pub const VideoEncoder = struct {
 
         // Create picture parameter buffer
         var pic_param: [PIC_PARAM_SIZE]u8 = std.mem.zeroes([PIC_PARAM_SIZE]u8);
-        // CurrPic (VAPictureH264 at offset 0) - must match vaBeginPicture surface
         writeU32(&pic_param, PIC_CurrPic + PICH264_picture_id, self.src_surface);
         writeI32(&pic_param, PIC_CurrPic + PICH264_TopFieldOrderCnt, @intCast(self.frame_count * 2));
-        // coded_buf
         writeU32(&pic_param, PIC_coded_buf, self.coded_buf);
         writeU8(&pic_param, PIC_pic_parameter_set_id, 0);
         writeU8(&pic_param, PIC_seq_parameter_set_id, 0);
-        // frame_num: 0 for IDR, increments for P-frames (mod max_frame_num)
         writeU16(&pic_param, PIC_frame_num, if (is_keyframe) 0 else @intCast(@mod(self.frame_count, 16)));
-        // Lower QP = higher quality. 14 minimizes ringing artifacts around text.
-        // Default H.264 is 26, but terminals need sharp text, not smooth video.
         writeU8(&pic_param, PIC_pic_init_qp, 20);
         writeU8(&pic_param, PIC_num_ref_idx_l0_active_minus1, 0);
-        // pic_fields bits: idr_pic_flag(0), reference_pic_flag(1), entropy_coding_mode_flag(2)
-        // For CAVLC: entropy_coding_mode_flag = 0
-        // IDR: idr=1, ref=1, entropy=0 → 0x03
-        // P:   idr=0, ref=1, entropy=0 → 0x02
         writeU32(&pic_param, PIC_pic_fields, if (is_keyframe) 0x03 else 0x02);
 
-        // Reference pictures
         if (!is_keyframe) {
             writeU32(&pic_param, PIC_ReferenceFrames + PICH264_picture_id, self.ref_surface);
             writeU32(&pic_param, PIC_ReferenceFrames + PICH264_flags, VA_PICTURE_H264_SHORT_TERM_REFERENCE);
         }
-        // Mark rest as invalid
         var i: usize = if (is_keyframe) 0 else 1;
         while (i < 16) : (i += 1) {
             const ref_offset = PIC_ReferenceFrames + i * PICTURE_H264_SIZE;
@@ -1241,28 +1247,24 @@ pub const VideoEncoder = struct {
         var slice_param: [SLICE_PARAM_SIZE]u8 = std.mem.zeroes([SLICE_PARAM_SIZE]u8);
         writeU32(&slice_param, SLICE_macroblock_address, 0);
         writeU32(&slice_param, SLICE_num_macroblocks, (self.width / 16) * (self.height / 16));
-        writeU32(&slice_param, SLICE_macroblock_info, c.VA_INVALID_ID); // No macroblock info buffer
-        writeU8(&slice_param, SLICE_slice_type, if (is_keyframe) 2 else 0); // I=2, P=0
+        writeU32(&slice_param, SLICE_macroblock_info, c.VA_INVALID_ID);
+        writeU8(&slice_param, SLICE_slice_type, if (is_keyframe) 2 else 0);
         writeU8(&slice_param, SLICE_pic_parameter_set_id, 0);
         writeU16(&slice_param, SLICE_idr_pic_id, if (is_keyframe) @intCast(@mod(self.frame_count, 256)) else 0);
         writeU16(&slice_param, SLICE_pic_order_cnt_lsb, @intCast(@mod(self.frame_count * 2, 256)));
         writeU8(&slice_param, SLICE_num_ref_idx_l0_active_minus1, 0);
         writeU8(&slice_param, SLICE_num_ref_idx_l1_active_minus1, 0);
 
-        // Initialize RefPicList0 and RefPicList1 - all entries must be marked invalid
         var j: usize = 0;
         while (j < 32) : (j += 1) {
-            // RefPicList0[j]
             const ref0_offset = SLICE_RefPicList0 + j * PICTURE_H264_SIZE;
             writeU32(&slice_param, ref0_offset + PICH264_picture_id, c.VA_INVALID_SURFACE);
             writeU32(&slice_param, ref0_offset + PICH264_flags, VA_PICTURE_H264_INVALID);
-            // RefPicList1[j]
             const ref1_offset = SLICE_RefPicList1 + j * PICTURE_H264_SIZE;
             writeU32(&slice_param, ref1_offset + PICH264_picture_id, c.VA_INVALID_SURFACE);
             writeU32(&slice_param, ref1_offset + PICH264_flags, VA_PICTURE_H264_INVALID);
         }
 
-        // For P-frames, set up reference in RefPicList0[0]
         if (!is_keyframe) {
             writeU32(&slice_param, SLICE_RefPicList0 + PICH264_picture_id, self.ref_surface);
             writeU32(&slice_param, SLICE_RefPicList0 + PICH264_flags, VA_PICTURE_H264_SHORT_TERM_REFERENCE);
@@ -1271,8 +1273,6 @@ pub const VideoEncoder = struct {
         writeU8(&slice_param, SLICE_cabac_init_idc, 0);
         writeI8(&slice_param, SLICE_slice_qp_delta, -4);
         writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 0);
-        // Increase deblocking strength to reduce ringing/glow around sharp text edges.
-        // Range: -6 to +6, positive = stronger deblocking.
         writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 3);
         writeI8(&slice_param, SLICE_slice_beta_offset_div2, 3);
 
@@ -1293,7 +1293,6 @@ pub const VideoEncoder = struct {
         }
         defer _ = vaDestroyBuffer(va_display, slice_buf);
 
-        // Render all buffers
         var render_bufs = [_]c.VABufferID{ seq_buf, pic_buf, slice_buf };
         status = vaRenderPicture(va_display, self.va_context, &render_bufs, 3);
         if (status != c.VA_STATUS_SUCCESS) {
@@ -1301,26 +1300,22 @@ pub const VideoEncoder = struct {
             return error.VaRenderFailed;
         }
 
-        // End picture
         status = vaEndPicture(va_display, self.va_context);
         if (status != c.VA_STATUS_SUCCESS) {
             return error.VaEndPictureFailed;
         }
 
-        // Sync src surface (where encoding happens)
+        // Sync — wait for GPU encode to complete
         status = c.vaSyncSurface(va_display, self.src_surface);
         if (status != c.VA_STATUS_SUCCESS) return error.VaSyncFailed;
+        const t2 = std.time.nanoTimestamp();
 
-        // Map coded buffer to get H.264 data
+        // Read encoded output
         var coded_seg_ptr: ?*anyopaque = null;
         status = c.vaMapBuffer(va_display, self.coded_buf, &coded_seg_ptr);
         if (status != c.VA_STATUS_SUCCESS) return error.VaMapCodedFailed;
-        defer _ = c.vaUnmapBuffer(va_display, self.coded_buf);
 
-        // Copy encoded data with SPS/PPS for keyframes
         self.output_len = 0;
-
-        // For keyframes (IDR), prepend SPS and PPS NAL units
         if (is_keyframe) {
             @memcpy(self.output_buffer[0..self.sps_len], self.sps_data[0..self.sps_len]);
             self.output_len = self.sps_len;
@@ -1328,7 +1323,6 @@ pub const VideoEncoder = struct {
             self.output_len += self.pps_len;
         }
 
-        // Copy VA-API encoded slice data
         if (coded_seg_ptr) |ptr| {
             const coded_seg: *VACodedBufferSegment = @ptrCast(@alignCast(ptr));
             var current_seg: ?*VACodedBufferSegment = coded_seg;
@@ -1345,21 +1339,27 @@ pub const VideoEncoder = struct {
             }
         }
 
-        // Swap surfaces: current frame becomes reference for next P-frame
+        _ = c.vaUnmapBuffer(va_display, self.coded_buf);
+
+        // Swap surfaces for reference frame tracking
         const tmp = self.ref_surface;
         self.ref_surface = self.src_surface;
         self.src_surface = tmp;
-
         self.frame_count += 1;
 
-        if (self.output_len == 0) {
-            return null;
+        // Log timing breakdown every 30 frames (~1s)
+        if (@mod(self.frame_count, 30) == 0) {
+            const ns = std.time.ns_per_ms;
+            logEncTiming(0, @divFloor(t1 - t0, ns), @divFloor(t2 - t1, ns), self.width, self.height);
         }
 
-        return EncodeResult{
-            .data = self.output_buffer[0..self.output_len],
-            .is_keyframe = is_keyframe,
-        };
+        if (self.output_len > 0) {
+            return EncodeResult{
+                .data = self.output_buffer[0..self.output_len],
+                .is_keyframe = is_keyframe,
+            };
+        }
+        return null;
     }
 
     pub fn canEncodeDirectly(self: *VideoEncoder) bool {
@@ -1373,5 +1373,17 @@ pub const VideoEncoder = struct {
         _ = iosurface_ptr;
         _ = force_keyframe;
         return error.NotSupported;
+    }
+
+    fn logEncTiming(sync_ms: i128, upload_ms: i128, submit_ms: i128, w: u32, h: u32) void {
+        const f = std.fs.openFileAbsolute("/tmp/termweb-enc.log", .{ .mode = .write_only }) catch
+            std.fs.createFileAbsolute("/tmp/termweb-enc.log", .{}) catch return;
+        defer f.close();
+        f.seekFromEnd(0) catch return;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "sync={d}ms upload={d}ms submit={d}ms total={d}ms {d}x{d}\n", .{
+            sync_ms, upload_ms, submit_ms, sync_ms + upload_ms + submit_ms, w, h,
+        }) catch return;
+        _ = f.write(line) catch {};
     }
 };

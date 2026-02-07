@@ -1,6 +1,8 @@
 <script lang="ts">
   import { tabs, activeTabId } from '../stores/index';
   import type { MuxClient } from '../services/mux';
+  import { PANEL } from '../constants';
+  import { NAL } from '../constants';
 
   interface Props {
     open?: boolean;
@@ -20,45 +22,53 @@
   // Preview dimensions
   let previewWidth = $state(0);
   let previewHeight = $state(0);
-  let scale = $state(0);
 
   // Keyboard navigation - selected index (-1 = new tab button)
   let selectedIndex = $state(0);
 
-  // Track moved tab elements for restoration
-  let movedTabs: Array<{ tabId: string; element: HTMLElement; wrapper: HTMLElement }> = [];
+  // Canvas refs keyed by panelServerId
+  let canvasRefs = $state<Record<number, HTMLCanvasElement | undefined>>({});
+
+  // Per-panel decoders for live preview
+  let panelDecoders = new Map<number, VideoDecoder>();
+  let panelContexts = new Map<number, CanvasRenderingContext2D>();
+  let panelDecoderConfigured = new Map<number, boolean>();
+  let panelLastCodec = new Map<number, string>();
+  let panelGotFirstKeyframe = new Map<number, boolean>();
+
+  // Tab → panel server IDs mapping
+  let tabPanelMap = $state(new Map<string, number[]>());
+
+  // Snapshot fallbacks for initial display
+  let snapshots = $state(new Map<string, string>());
 
   function handleSelectTab(id: string) {
-    restoreTabElements();
+    closeOverview();
     onSelectTab?.(id);
-    onClose?.();
   }
 
   function handleCloseTab(e: MouseEvent, id: string) {
     e.stopPropagation();
-    // Remove from movedTabs before closing
-    const idx = movedTabs.findIndex(t => t.tabId === id);
-    if (idx !== -1) {
-      movedTabs.splice(idx, 1);
-    }
     onCloseTab?.(id);
     // Close overview if no tabs remain
     if ($tabs.size <= 1) {
-      restoreTabElements();
-      onClose?.();
+      closeOverview();
     }
   }
 
   function handleNewTab() {
-    restoreTabElements();
+    closeOverview();
     onNewTab?.();
+  }
+
+  function closeOverview() {
+    stopLivePreview();
     onClose?.();
   }
 
   function handleOverlayClick(e: MouseEvent) {
     if (e.target === e.currentTarget) {
-      restoreTabElements();
-      onClose?.();
+      closeOverview();
     }
   }
 
@@ -69,8 +79,7 @@
       case 'Escape':
         e.preventDefault();
         e.stopPropagation();
-        restoreTabElements();
-        onClose?.();
+        closeOverview();
         break;
       case 'ArrowRight':
       case 'ArrowDown':
@@ -93,74 +102,167 @@
     }
   }
 
-  function restoreTabElements(): void {
-    if (!panelsEl) return;
-    for (const { element, wrapper } of movedTabs) {
-      // Restore original styles
-      element.style.display = '';
-      element.style.position = '';
-      element.style.width = '';
-      element.style.height = '';
-      // Move back to panels container
-      panelsEl.appendChild(element);
-      // Remove the scale wrapper
-      wrapper.remove();
+  function parseNalUnits(data: Uint8Array): Uint8Array[] {
+    const units: Uint8Array[] = [];
+    let start = 0;
+
+    for (let i = 0; i < data.length - 3; i++) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+        if (i > start) {
+          units.push(data.slice(start, i));
+        }
+        start = i + 4;
+        i += 3;
+      }
     }
-    movedTabs = [];
-    // Resume panel rendering
-    muxClient?.resumeAllPanels();
+
+    if (start < data.length) {
+      units.push(data.slice(start));
+    }
+
+    return units;
   }
 
-  function moveTabElementsToOverview(): void {
+  function getCodecFromSps(sps: Uint8Array): string {
+    if (sps.length < 4) return PANEL.DEFAULT_H264_CODEC;
+    const profile = sps[1];
+    const constraints = sps[2];
+    const level = sps[3];
+    return `avc1.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
+  }
+
+  function getOrCreateDecoder(panelId: number): VideoDecoder | null {
+    if (panelDecoders.has(panelId)) return panelDecoders.get(panelId)!;
+
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        const canvas = canvasRefs[panelId];
+        if (!canvas) {
+          frame.close();
+          return;
+        }
+        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+          canvas.width = frame.displayWidth;
+          canvas.height = frame.displayHeight;
+        }
+        let ctx = panelContexts.get(panelId);
+        if (!ctx) {
+          ctx = canvas.getContext('2d', { alpha: false }) ?? undefined;
+          if (ctx) panelContexts.set(panelId, ctx);
+        }
+        if (ctx) {
+          ctx.drawImage(frame, 0, 0);
+        }
+        frame.close();
+      },
+      error: (e) => {
+        console.error(`Overview decoder error for panel ${panelId}:`, e);
+        panelDecoderConfigured.delete(panelId);
+        panelGotFirstKeyframe.delete(panelId);
+      },
+    });
+    panelDecoders.set(panelId, decoder);
+    return decoder;
+  }
+
+  function handlePreviewFrame(panelId: number, frameData: Uint8Array): void {
+    const decoder = getOrCreateDecoder(panelId);
+    if (!decoder) return;
+
+    const nalUnits = parseNalUnits(frameData);
+    let isKeyframe = false;
+    let sps: Uint8Array | null = null;
+
+    for (const nal of nalUnits) {
+      if (nal.length === 0) continue;
+      const nalType = nal[0] & NAL.TYPE_MASK;
+      if (nalType === NAL.TYPE_SPS) sps = nal;
+      else if (nalType === NAL.TYPE_IDR) isKeyframe = true;
+    }
+
+    if (sps) {
+      const codec = getCodecFromSps(sps);
+      const lastCodec = panelLastCodec.get(panelId);
+      const configured = panelDecoderConfigured.get(panelId);
+      if (!configured || codec !== lastCodec) {
+        try {
+          if (configured) {
+            decoder.reset();
+            panelGotFirstKeyframe.delete(panelId);
+          }
+          decoder.configure({ codec, optimizeForLatency: true });
+          panelDecoderConfigured.set(panelId, true);
+          panelLastCodec.set(panelId, codec);
+        } catch (e) {
+          console.error('Overview decoder configure error:', e);
+          return;
+        }
+      }
+    }
+
+    if (!panelDecoderConfigured.get(panelId)) return;
+
+    if (!panelGotFirstKeyframe.get(panelId)) {
+      if (!isKeyframe) return;
+      panelGotFirstKeyframe.set(panelId, true);
+    }
+
+    // Skip frames if decoder is backed up
+    if (!isKeyframe && decoder.decodeQueueSize > 2) return;
+
+    const timestamp = performance.now() * 1000;
+    try {
+      const chunk = new EncodedVideoChunk({
+        type: isKeyframe ? 'key' : 'delta',
+        timestamp,
+        data: frameData,
+      });
+      decoder.decode(chunk);
+    } catch (e) {
+      console.error('Overview decode error:', e);
+    }
+  }
+
+  function startLivePreview(): void {
     if (!muxClient || !panelsEl) return;
 
-    // Pause panel rendering to save server resources
-    muxClient.pauseAllPanels();
-
-    const tabElements = muxClient.getTabElements();
+    // Calculate preview dimensions from panels container
     const rect = panelsEl.getBoundingClientRect();
-
-    // Calculate dimensions
+    if (rect.width === 0 || rect.height === 0) return;
     const aspectRatio = rect.width / rect.height;
     const targetHeight = 200;
-    const targetWidth = Math.round(targetHeight * aspectRatio);
-    scale = Math.min(targetWidth / rect.width, targetHeight / rect.height);
-    previewWidth = rect.width * scale;
-    previewHeight = rect.height * scale;
+    previewWidth = Math.round(targetHeight * aspectRatio);
+    previewHeight = targetHeight;
 
-    movedTabs = [];
+    // Get panel → tab mapping
+    tabPanelMap = muxClient.getTabPanelServerIds();
 
-    for (const [tabId, element] of tabElements) {
-      const contentEl = document.querySelector(`[data-tab-id="${tabId}"] .tab-preview-content`) as HTMLElement;
-      if (!contentEl) continue;
+    // Capture initial snapshots for fallback display
+    snapshots = muxClient.getTabSnapshots();
 
-      // Create scale wrapper
-      const scaleWrapper = document.createElement('div');
-      scaleWrapper.style.cssText = `
-        width: ${rect.width}px;
-        height: ${rect.height}px;
-        transform: scale(${scale});
-        transform-origin: top left;
-        pointer-events: none;
-        position: absolute;
-        top: 0;
-        left: 0;
-      `;
-
-      // Style the tab element for preview
-      element.style.display = 'flex';
-      element.style.position = 'relative';
-      element.style.width = '100%';
-      element.style.height = '100%';
-
-      scaleWrapper.appendChild(element);
-      contentEl.appendChild(scaleWrapper);
-
-      movedTabs.push({ tabId, element, wrapper: scaleWrapper });
-    }
+    // Connect to preview WS with our frame handler
+    muxClient.connectPreview(handlePreviewFrame);
   }
 
-  // Calculate preview dimensions and move elements when open
+  function stopLivePreview(): void {
+    // Close all decoders
+    for (const [, decoder] of panelDecoders) {
+      try {
+        if (decoder.state !== 'closed') decoder.close();
+      } catch { /* ignore */ }
+    }
+    panelDecoders.clear();
+    panelContexts.clear();
+    panelDecoderConfigured.clear();
+    panelLastCodec.clear();
+    panelGotFirstKeyframe.clear();
+    canvasRefs = {};
+
+    // Disconnect preview WS
+    muxClient?.disconnectPreview();
+  }
+
+  // Start live preview when overview opens
   $effect(() => {
     if (open && panelsEl && muxClient) {
       // Reset selection to active tab
@@ -168,8 +270,11 @@
       selectedIndex = activeIndex >= 0 ? activeIndex : 0;
       // Use requestAnimationFrame to ensure DOM is ready
       requestAnimationFrame(() => {
-        moveTabElementsToOverview();
+        startLivePreview();
       });
+      return () => {
+        stopLivePreview();
+      };
     }
   });
 
@@ -196,7 +301,6 @@
           class="tab-preview"
           class:active={$activeTabId === tab.id}
           class:selected={selectedIndex === i}
-          data-tab-id={tab.id}
           style="width: {previewWidth}px;"
           onclick={() => handleSelectTab(tab.id)}
         >
@@ -218,7 +322,20 @@
             class="tab-preview-content"
             style="width: {previewWidth}px; height: {previewHeight}px;"
           >
-            <!-- Tab element will be moved here -->
+            {#if tabPanelMap.has(tab.id)}
+              {#each tabPanelMap.get(tab.id) ?? [] as serverId (serverId)}
+                <canvas
+                  bind:this={canvasRefs[serverId]}
+                  class="tab-preview-canvas"
+                ></canvas>
+              {/each}
+            {:else if snapshots.has(tab.id)}
+              <img
+                src={snapshots.get(tab.id)}
+                alt={tab.title || 'Tab preview'}
+                class="tab-preview-image"
+              />
+            {/if}
           </div>
         </div>
       {/each}
@@ -349,9 +466,23 @@
 
   .tab-preview-content {
     overflow: hidden;
-    position: relative;
     background: var(--bg);
     border-radius: 0 0 12px 12px;
+    position: relative;
+  }
+
+  .tab-preview-canvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+
+  .tab-preview-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
   }
 
   .tab-preview-new {

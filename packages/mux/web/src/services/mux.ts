@@ -30,6 +30,7 @@ interface PanelInstance extends PanelLike {
   getStatus: () => PanelStatus;
   getPwd: () => string;
   setPwd: (pwd: string) => void;
+  getSnapshotCanvas: () => HTMLCanvasElement | undefined;
 }
 
 // Type guard for validating LayoutData structure from server
@@ -92,6 +93,9 @@ export class MuxClient {
   private bellTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
   private panelsEl: HTMLElement | null = null;
   private initialPanelListResolve: (() => void) | null = null;
+  private previewWs: WebSocket | null = null;
+  private previewFrameHandlers = new Map<number, (data: Uint8Array) => void>();
+  private isViewer = false;
 
   constructor() {
     this.fileTransfer = new FileTransferHandler();
@@ -163,6 +167,8 @@ export class MuxClient {
       this.controlWs = null;
     }
     this.fileTransfer.disconnect();
+    this.forceDisconnectPreview();
+    this.previewFrameHandlers.clear();
     for (const panel of this.panelInstances.values()) {
       panel.destroy();
     }
@@ -334,6 +340,24 @@ export class MuxClient {
             passkeyCount: view.getUint8(4),
           });
           break;
+        case SERVER_MSG.OVERVIEW_STATE:
+          ui.update(s => ({ ...s, overviewOpen: view.getUint8(1) === 1 }));
+          break;
+        case SERVER_MSG.QUICK_TERMINAL_STATE:
+          ui.update(s => ({ ...s, quickTerminalOpen: view.getUint8(1) === 1 }));
+          break;
+        case SERVER_MSG.MAIN_CLIENT_STATE: {
+          if (data.byteLength < 6) break;
+          const isMain = view.getUint8(1) === 1;
+          const clientId = view.getUint32(2, true);
+          ui.update(s => ({ ...s, isMainClient: isMain, clientId }));
+          if (isMain) {
+            this.enterMainMode();
+          } else {
+            this.enterViewerMode();
+          }
+          break;
+        }
       }
     } catch (err) {
       console.error('Failed to parse binary message:', err);
@@ -484,6 +508,7 @@ export class MuxClient {
       // Send close message to server (optimistic update - frontend updates immediately)
       if (panel.serverId !== null) {
         this.sendClosePanel(panel.serverId);
+        this.unregisterPreviewHandler(panel.serverId);
         this.panelsByServerId.delete(panel.serverId);
       }
       this.panelInstances.delete(panel.id);
@@ -560,6 +585,7 @@ export class MuxClient {
       getPwd: () => string;
       setPwd: (pwd: string) => void;
       getCanvas: () => HTMLCanvasElement | undefined;
+      getSnapshotCanvas: () => HTMLCanvasElement | undefined;
     };
 
     const panel: PanelInstance = {
@@ -585,6 +611,7 @@ export class MuxClient {
       getStatus: () => comp.getStatus(),
       getPwd: () => comp.getPwd(),
       setPwd: (p) => comp.setPwd(p),
+      getSnapshotCanvas: () => comp.getSnapshotCanvas(),
     };
 
     this.panelInstances.set(panelId, panel);
@@ -592,7 +619,16 @@ export class MuxClient {
       this.panelsByServerId.set(serverId, panel);
     }
     panels.add(createPanelInfo(panelId, serverId, isQuickTerminal));
-    panel.connect();
+    if (this.isViewer) {
+      // In viewer mode, don't connect panel WS - use preview frames instead
+      if (serverId !== null) {
+        this.registerPreviewHandler(serverId, (frameData) => {
+          panel.decodePreviewFrame(frameData);
+        });
+      }
+    } else {
+      panel.connect();
+    }
     return panel;
   }
 
@@ -668,6 +704,7 @@ export class MuxClient {
       // Send close message to server (optimistic update - frontend updates immediately)
       if (panel.serverId !== null) {
         this.sendClosePanel(panel.serverId);
+        this.unregisterPreviewHandler(panel.serverId);
         this.panelsByServerId.delete(panel.serverId);
       }
       tab.root.removePanel(panel);
@@ -894,6 +931,91 @@ export class MuxClient {
     }
   }
 
+  private enterMainMode(): void {
+    if (!this.isViewer) return; // Already main
+    this.isViewer = false;
+    console.log('Entering main mode');
+    this.forceDisconnectPreview();
+    // Connect all panels to panel WS
+    for (const panel of this.panelInstances.values()) {
+      if (panel.serverId != null) {
+        panel.connect();
+      }
+    }
+  }
+
+  private enterViewerMode(): void {
+    if (this.isViewer) return; // Already viewer
+    this.isViewer = true;
+    console.log('Entering viewer mode');
+    // Disconnect all panel WS connections (don't steal from main)
+    for (const panel of this.panelInstances.values()) {
+      panel.hide(); // closes panel WS / pauses stream
+    }
+    // Connect to preview WS for read-only viewing
+    this.connectPreview();
+  }
+
+  private previewOverrideHandler: ((panelId: number, data: Uint8Array) => void) | null = null;
+
+  connectPreview(overrideHandler?: (panelId: number, data: Uint8Array) => void): void {
+    // Update the override handler even if already connected
+    if (overrideHandler) {
+      this.previewOverrideHandler = overrideHandler;
+    }
+    if (this.previewWs && this.previewWs.readyState !== WebSocket.CLOSED) return;
+    const url = getWsUrl(WS_PATHS.PREVIEW);
+    this.previewWs = new WebSocket(url);
+    this.previewWs.binaryType = 'arraybuffer';
+    this.previewWs.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer && e.data.byteLength > 4) {
+        const frameView = new DataView(e.data);
+        const panelId = frameView.getUint32(0, true);
+        const frameData = new Uint8Array(e.data, 4);
+        // Route to override handler (overview) if set
+        if (this.previewOverrideHandler) {
+          this.previewOverrideHandler(panelId, frameData);
+        }
+        // Also route to panel handlers (viewer mode panels)
+        const handler = this.previewFrameHandlers.get(panelId);
+        handler?.(frameData);
+      }
+    };
+    this.previewWs.onclose = () => {
+      this.previewWs = null;
+    };
+  }
+
+  disconnectPreview(): void {
+    this.previewOverrideHandler = null;
+    // Only close the WS if viewer mode doesn't need it
+    if (!this.isViewer && this.previewWs) {
+      this.previewWs.close();
+      this.previewWs = null;
+    }
+  }
+
+  /** Force-close the preview WS regardless of viewer state */
+  private forceDisconnectPreview(): void {
+    this.previewOverrideHandler = null;
+    if (this.previewWs) {
+      this.previewWs.close();
+      this.previewWs = null;
+    }
+  }
+
+  registerPreviewHandler(serverId: number, handler: (data: Uint8Array) => void): void {
+    this.previewFrameHandlers.set(serverId, handler);
+  }
+
+  unregisterPreviewHandler(serverId: number): void {
+    this.previewFrameHandlers.delete(serverId);
+  }
+
+  isViewerMode(): boolean {
+    return this.isViewer;
+  }
+
   sendControlMessage(type: number, data: Uint8Array): void {
     if (this.isControlWsOpen()) {
       const message = new Uint8Array(1 + data.length);
@@ -946,6 +1068,87 @@ export class MuxClient {
     return result;
   }
 
+  getTabSnapshots(): Map<string, string> {
+    const result = new Map<string, string>();
+    const activeId = get(activeTabIdStore);
+
+    // Temporarily show hidden tabs so getBoundingClientRect returns valid positions
+    const hiddenTabs: InternalTabInfo[] = [];
+    for (const [tabId, tab] of this.tabInstances) {
+      if (tabId !== activeId) {
+        tab.element.style.visibility = 'hidden';
+        tab.element.style.display = 'flex';
+        hiddenTabs.push(tab);
+      }
+    }
+
+    // Force layout reflow so positions are computed
+    if (hiddenTabs.length > 0) {
+      document.body.offsetHeight;
+    }
+
+    for (const [tabId, tab] of this.tabInstances) {
+      const tabRect = tab.element.getBoundingClientRect();
+      if (tabRect.width === 0 || tabRect.height === 0) continue;
+
+      const allPanels = tab.root.getAllPanels() as PanelInstance[];
+      const composite = document.createElement('canvas');
+      composite.width = Math.round(tabRect.width);
+      composite.height = Math.round(tabRect.height);
+      const ctx = composite.getContext('2d');
+      if (!ctx) continue;
+
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, composite.width, composite.height);
+
+      for (const panel of allPanels) {
+        // Use snapshot canvas (persists content across hide/show, works with WebGPU)
+        const src = panel.getSnapshotCanvas();
+        if (!src || src.width === 0 || src.height === 0) continue;
+        // Use main canvas element for layout position
+        const mainCanvas = panel.canvas;
+        if (!mainCanvas) continue;
+        const panelRect = mainCanvas.getBoundingClientRect();
+        const x = panelRect.left - tabRect.left;
+        const y = panelRect.top - tabRect.top;
+        try {
+          ctx.drawImage(src, x, y, panelRect.width, panelRect.height);
+        } catch {
+          // Ignore draw errors
+        }
+      }
+
+      try {
+        result.set(tabId, composite.toDataURL('image/png'));
+      } catch {
+        // Ignore toDataURL errors
+      }
+    }
+
+    // Restore hidden tabs
+    for (const tab of hiddenTabs) {
+      tab.element.style.display = '';
+      tab.element.style.visibility = '';
+    }
+
+    return result;
+  }
+
+  getTabPanelServerIds(): Map<string, number[]> {
+    const result = new Map<string, number[]>();
+    for (const [tabId, tab] of this.tabInstances) {
+      const allPanels = tab.root.getAllPanels() as PanelInstance[];
+      const serverIds: number[] = [];
+      for (const panel of allPanels) {
+        if (panel.serverId != null) {
+          serverIds.push(panel.serverId);
+        }
+      }
+      result.set(tabId, serverIds);
+    }
+    return result;
+  }
+
   getPanelsEl(): HTMLElement | null {
     return this.panelsEl;
   }
@@ -960,6 +1163,11 @@ export class MuxClient {
     for (const panel of this.panelInstances.values()) {
       panel.show();
     }
+  }
+
+  setOverviewOpen(open: boolean): void {
+    const data = new Uint8Array([open ? 1 : 0]);
+    this.sendControlMessage(BinaryCtrlMsg.SET_OVERVIEW, data);
   }
 
   toggleQuickTerminal(container: HTMLElement): void {

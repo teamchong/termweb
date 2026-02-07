@@ -407,10 +407,19 @@ fn printHelp() void {
         \\  termweb mux           Start terminal multiplexer server
         \\  termweb help          Show this help
         \\
+        \\Mux options:
+        \\  --port, -p PORT       Set HTTP port (default: 8080)
+        \\  --local               Local only, skip connection picker
+        \\  --cloudflare          Expose via Cloudflare Tunnel
+        \\  --ngrok               Expose via ngrok
+        \\  --tailscale           Expose via Tailscale Funnel
+        \\
         \\Examples:
         \\  termweb open https://example.com
         \\  termweb open https://github.com --profile Default
         \\  termweb mux --port 8080
+        \\  termweb mux --local
+        \\  termweb mux --cloudflare
         \\
         \\Requirements:
         \\  - Chrome or Chromium (set CHROME_BIN if not auto-detected)
@@ -420,8 +429,8 @@ fn printHelp() void {
 }
 
 fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    // Parse port from args (default 8080)
     var http_port: u16 = 8080;
+    var mode: mux.tunnel_mod.Mode = .interactive;
 
     // Skip "termweb" and "mux" args
     const mux_args = if (args.len > 2) args[2..] else &[_][]const u8{};
@@ -433,9 +442,16 @@ fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 http_port = std.fmt.parseInt(u16, mux_args[i + 1], 10) catch 8080;
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--local")) {
+            mode = .local;
+        } else if (std.mem.eql(u8, arg, "--cloudflare")) {
+            mode = .{ .tunnel = .cloudflare };
+        } else if (std.mem.eql(u8, arg, "--ngrok")) {
+            mode = .{ .tunnel = .ngrok };
+        } else if (std.mem.eql(u8, arg, "--tailscale")) {
+            mode = .{ .tunnel = .tailscale };
         }
     }
 
-    // Run mux server directly (integrated into termweb binary)
-    try mux.run(allocator, http_port);
+    try mux.run(allocator, http_port, mode);
 }

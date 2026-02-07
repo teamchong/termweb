@@ -6,7 +6,8 @@
   import Menu, { type MenuItem } from './components/Menu.svelte';
   import QuickTerminal from './components/QuickTerminal.svelte';
   import TabOverview from './components/TabOverview.svelte';
-  import { tabs, activeTabId, activeTab } from './stores/index';
+  import ShareDialog from './components/ShareDialog.svelte';
+  import { tabs, activeTabId, activeTab, ui } from './stores/index';
   import { connectionStatus, initialLayoutLoaded, initMuxClient, type MuxClient } from './services/mux';
 
   // MuxClient instance
@@ -24,11 +25,14 @@
   // Command palette state
   let commandPaletteOpen = $state(false);
 
+  // Share dialog state
+  let shareDialogOpen = $state(false);
+
   // Quick terminal ref
   let quickTerminalRef: QuickTerminal | undefined = $state();
 
-  // Tab overview state
-  let tabOverviewOpen = $state(false);
+  // Tab overview state (synced with server via ui store)
+  let tabOverviewOpen = $derived($ui.overviewOpen);
 
   // Subscribe to connection status
   let status = $derived($connectionStatus);
@@ -139,10 +143,9 @@
     ...windowTabListItems,
   ]);
 
-  // Admin menu (shown only for admin users)
-  let adminMenuItems = $derived<MenuItem[]>([
-    { label: 'Sessions', action: '_sessions', icon: '📂' },
-    { label: 'Access Control', action: '_access_control', icon: '🔐' },
+  // Share menu
+  let shareMenuItems = $derived<MenuItem[]>([
+    { label: 'Share URL', action: '_share_url', icon: '🔗' },
   ]);
 
   // Tab event handlers
@@ -159,7 +162,8 @@
   }
 
   function handleShowAllTabs() {
-    tabOverviewOpen = true;
+    ui.update(s => ({ ...s, overviewOpen: true }));
+    muxClient?.setOverviewOpen(true);
   }
 
   function toggleQuickTerminal() {
@@ -301,11 +305,8 @@
           }
         }).catch(() => {});
         break;
-      case '_sessions':
-        muxClient?.showSessionsDialog();
-        break;
-      case '_access_control':
-        muxClient?.showAccessControlDialog();
+      case '_share_url':
+        shareDialogOpen = true;
         break;
       default:
         // Handle dynamic tab selection from Window Tab List
@@ -530,7 +531,7 @@
         <Menu label="Edit" items={editMenuItems} onAction={handleCommand} />
         <Menu label="View" items={viewMenuItems} onAction={handleCommand} />
         <Menu label="Window" items={windowMenuItems} onAction={handleCommand} />
-        <Menu label="Admin" items={adminMenuItems} onAction={handleCommand} />
+        <Menu label="Share" items={shareMenuItems} onAction={handleCommand} />
       </div>
       <StatusDot {status} />
     </div>
@@ -590,10 +591,16 @@
     open={tabOverviewOpen}
     panelsEl={panelsEl}
     {muxClient}
-    onClose={() => tabOverviewOpen = false}
+    onClose={() => { ui.update(s => ({ ...s, overviewOpen: false })); muxClient?.setOverviewOpen(false); }}
     onSelectTab={handleSelectTab}
     onCloseTab={handleCloseTab}
     onNewTab={handleNewTab}
+  />
+
+  <!-- Share Dialog -->
+  <ShareDialog
+    open={shareDialogOpen}
+    onClose={() => shareDialogOpen = false}
   />
 </div>
 

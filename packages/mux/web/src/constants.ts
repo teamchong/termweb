@@ -9,6 +9,7 @@ export const WS_PATHS = {
   CONTROL: '/ws/control',
   PANEL: '/ws/panel',
   FILE: '/ws/file',
+  PREVIEW: '/ws/preview',
 } as const;
 
 export const CONFIG_ENDPOINT = '/config';
@@ -240,6 +241,12 @@ export const SERVER_MSG = {
   CLIPBOARD: 0x08,
   /** Authentication state */
   AUTH_STATE: 0x0A,
+  /** Overview open/closed state */
+  OVERVIEW_STATE: 0x0E,
+  /** Quick terminal open/closed state */
+  QUICK_TERMINAL_STATE: 0x0F,
+  /** Main client election state */
+  MAIN_CLIENT_STATE: 0x10,
 } as const;
 
 // ============================================================================

@@ -59,6 +59,7 @@ export const AuthResponseType = {
 export const ServerCtrlMsg = {
   OVERVIEW_STATE: 0x0E,  // Overview open/closed state
   QUICK_TERMINAL_STATE: 0x0F,  // Quick terminal open/closed state
+  MAIN_CLIENT_STATE: 0x10,  // Main client election: [type:u8][is_main:u8][client_id:u32]
   INSPECTOR_OPEN_STATE: 0x1E,  // Inspector open/closed state
 } as const;
 

@@ -531,6 +531,12 @@ pub const Connection = struct {
         try self.writeFrame(.binary, data);
     }
 
+    /// Send binary data with prefix + payload (zero-alloc via writev).
+    /// Used for sending [prefix][payload] without allocating a concatenated buffer.
+    pub fn sendBinaryParts(self: *Connection, prefix: []const u8, payload: []const u8) !void {
+        try self.writeFrameRawParts(.binary, prefix, payload);
+    }
+
     /// Send text data.
     pub fn sendText(self: *Connection, data: []const u8) !void {
         try self.writeFrame(.text, data);

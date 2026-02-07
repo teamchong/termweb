@@ -435,8 +435,8 @@ pub const VideoEncoder = struct {
         // BT.709 YCbCr matrix
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_YCbCrMatrix, c.kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2);
 
-        // Keyframe interval (every 120 frames = 4 seconds at 30fps)
-        var interval: c.SInt32 = 120;
+        // Keyframe interval (every 600 frames = 20 seconds at 30fps)
+        var interval: c.SInt32 = 600;
         const keyframe_interval = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &interval);
         if (keyframe_interval != null) {
             _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_MaxKeyFrameInterval, keyframe_interval);

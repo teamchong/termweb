@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import { ClientMsg } from '../protocol';
   import type { PanelStatus } from '../stores/types';
+  import { ui } from '../stores/index';
   import { getWsUrl, sharedTextEncoder, CircularBuffer, throttle } from '../utils';
   import { PANEL, TIMING, WS_PATHS, UI, NAL, MODIFIER, WHEEL_MODE, STATS_THRESHOLD } from '../constants';
   import { initWebGPURenderer, type WebGPUFrameRenderer } from '../webgpu-renderer';
@@ -80,6 +82,10 @@
 
   let ws: WebSocket | null = null;
   let decoder: VideoDecoder | null = null;
+  let snapshotCanvas: HTMLCanvasElement | undefined;
+  let snapshotCtx: CanvasRenderingContext2D | null = null;
+  let lastSnapshotTime = 0;
+  const SNAPSHOT_INTERVAL = 500;
   let decoderConfigured = false;
   let lastCodec: string | null = null;
   let gotFirstKeyframe = false;
@@ -203,6 +209,22 @@
     } else {
       ctx!.drawImage(frame, 0, 0);
     }
+
+    // Update snapshot for tab overview (throttled, before frame.close())
+    const now = performance.now();
+    if (now - lastSnapshotTime > SNAPSHOT_INTERVAL) {
+      lastSnapshotTime = now;
+      if (!snapshotCanvas) {
+        snapshotCanvas = document.createElement('canvas');
+      }
+      if (snapshotCanvas.width !== frame.displayWidth || snapshotCanvas.height !== frame.displayHeight) {
+        snapshotCanvas.width = frame.displayWidth;
+        snapshotCanvas.height = frame.displayHeight;
+        snapshotCtx = snapshotCanvas.getContext('2d');
+      }
+      snapshotCtx?.drawImage(frame, 0, 0);
+    }
+
     frame.close();
 
     // Hide loading
@@ -444,10 +466,13 @@
   function sendConnectPanel(panelId: number): void {
     if (!isWsOpen()) return;
 
-    const buf = new ArrayBuffer(5);
+    // Include client_id so server can verify main client: [0x20][panel_id:u32][client_id:u32]
+    const clientId = get(ui).clientId;
+    const buf = new ArrayBuffer(9);
     const view = new DataView(buf);
     view.setUint8(0, ClientMsg.CONNECT_PANEL);
     view.setUint32(1, panelId, true);
+    view.setUint32(5, clientId, true);
     ws!.send(buf);
 
     connectTimeoutId = setTimeout(() => {
@@ -739,6 +764,10 @@
     return canvasEl;
   }
 
+  export function getSnapshotCanvas(): HTMLCanvasElement | undefined {
+    return snapshotCanvas;
+  }
+
   export function toggleInspector(visible?: boolean): void {
     const newVisible = visible ?? !inspectorVisible;
     if (newVisible) {
@@ -860,7 +889,7 @@
     if (panelEl) {
       resizeObserver = new ResizeObserver(() => {
         requestAnimationFrame(() => {
-          if (!panelEl) return;
+          if (!panelEl || paused) return;
           const rect = panelEl.getBoundingClientRect();
           const width = Math.floor(rect.width);
           const height = Math.floor(rect.height);

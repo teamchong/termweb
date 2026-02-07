@@ -33,4 +33,6 @@ export interface UIState {
   overviewOpen: boolean;
   inspectorOpen: boolean;
   commandPaletteOpen: boolean;
+  isMainClient: boolean;
+  clientId: number;
 }

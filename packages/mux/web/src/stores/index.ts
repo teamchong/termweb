@@ -104,6 +104,8 @@ export const ui = writable<UIState>({
   overviewOpen: false,
   inspectorOpen: false,
   commandPaletteOpen: false,
+  isMainClient: false,
+  clientId: 0,
 });
 
 // Convenience functions for UI state
