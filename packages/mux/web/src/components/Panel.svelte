@@ -93,6 +93,7 @@
   let gotFirstKeyframe = false;
   let frameCount = 0;
   let gpuRenderer: WebGPUFrameRenderer | null = null;
+  let cachedFrame: VideoFrame | null = null;
   let lastReportedWidth = 0;
   let lastReportedHeight = 0;
   let resizeObserver: ResizeObserver | null = null;
@@ -202,29 +203,13 @@
     });
   }
 
-  function onFrame(frame: VideoFrame): void {
-    pendingDecode--;
-
-    if (destroyed || !gpuRenderer) {
-      frame.close();
-      return;
-    }
-
-    // Measure actual decode queue latency using frame timestamp roundtrip
-    // (timestamp was set to performance.now()*1000 at submit time)
-    const submitTimeUs = frame.timestamp;
-    const nowUs = performance.now() * 1000;
-    const decodeMs = (nowUs - submitTimeUs) / 1000;
-    if (decodeMs > 0 && decodeMs < 10000) {
-      decodeLatencies.push(decodeMs);
-    }
-
+  function renderFrame(frame: VideoFrame): void {
     if (canvasEl && (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight)) {
       canvasEl.width = frame.displayWidth;
       canvasEl.height = frame.displayHeight;
     }
 
-    gpuRenderer.renderFrame(frame);
+    gpuRenderer!.renderFrame(frame);
 
     // Update snapshot for tab overview (throttled, before frame.close())
     const now = performance.now();
@@ -251,6 +236,34 @@
 
     renderedFrames++;
     updateStatsOverlay();
+  }
+
+  function onFrame(frame: VideoFrame): void {
+    pendingDecode--;
+
+    if (destroyed) {
+      frame.close();
+      return;
+    }
+
+    // Renderer not ready yet — cache latest frame so it renders instantly
+    // when WebGPU init completes (avoids missing the only keyframe)
+    if (!gpuRenderer) {
+      if (cachedFrame) cachedFrame.close();
+      cachedFrame = frame;
+      return;
+    }
+
+    // Measure actual decode queue latency using frame timestamp roundtrip
+    // (timestamp was set to performance.now()*1000 at submit time)
+    const submitTimeUs = frame.timestamp;
+    const nowUs = performance.now() * 1000;
+    const decodeMs = (nowUs - submitTimeUs) / 1000;
+    if (decodeMs > 0 && decodeMs < 10000) {
+      decodeLatencies.push(decodeMs);
+    }
+
+    renderFrame(frame);
   }
 
   function parseNalUnits(data: Uint8Array): Uint8Array[] {
@@ -893,6 +906,10 @@
       return;
     }
 
+    // Decoder starts immediately so early frames are cached (not dropped).
+    // WebGPU init is async — cached frames render once the renderer is ready.
+    initDecoder();
+
     initWebGPURenderer(canvasEl).then((renderer) => {
       if (destroyed) return;
       if (!renderer) {
@@ -901,11 +918,12 @@
         return;
       }
       gpuRenderer = renderer;
-      // Decoder starts AFTER renderer is ready so no frames are dropped.
-      // Without cursor blink, the first keyframe may be the only one sent
-      // until content changes — dropping it means permanent "Loading...".
-      initDecoder();
-      requestKeyframe();
+
+      // Flush cached frame that arrived before renderer was ready
+      if (cachedFrame) {
+        renderFrame(cachedFrame);
+        cachedFrame = null;
+      }
     });
 
     // Initialize throttled mouse move
@@ -956,6 +974,12 @@
     if (ws) {
       ws.close();
       ws = null;
+    }
+
+    // Cleanup cached frame
+    if (cachedFrame) {
+      cachedFrame.close();
+      cachedFrame = null;
     }
 
     // Cleanup decoder

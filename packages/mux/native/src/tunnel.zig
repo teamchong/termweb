@@ -87,6 +87,7 @@ pub fn detectProvider() ?Provider {
 }
 
 /// Show an interactive connection mode picker. Returns the chosen provider or null for local-only.
+/// Uses raw terminal mode so a single keypress selects the option (no Enter needed).
 pub fn promptConnectionMode() ?Provider {
     std.debug.print("\nConnection mode:\n\n", .{});
     std.debug.print("   1) {s:<23}termweb mux --local\n", .{"Local only"});
@@ -104,19 +105,67 @@ pub fn promptConnectionMode() ?Provider {
 
     std.debug.print("\nChoose [1-4] (default 1): ", .{});
 
+    // Set raw mode: single keypress without Enter
+    const old_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch {
+        // Fallback to line-buffered read if tcgetattr fails (e.g. piped stdin)
+        return promptConnectionModeFallback();
+    };
+    var raw = old_termios;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw) catch {
+        return promptConnectionModeFallback();
+    };
+    defer std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, old_termios) catch {};
+
+    var buf: [1]u8 = undefined;
+    const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return null;
+    if (n == 0) return null;
+
+    const ch = buf[0];
+    // Echo the choice and newline
+    std.debug.print("{c}\n", .{ch});
+
+    // Enter or newline = default (local)
+    if (ch == '\r' or ch == '\n') return null;
+
+    const choice = std.fmt.charToDigit(ch, 10) catch {
+        std.debug.print("Invalid choice, using local only.\n", .{});
+        return null;
+    };
+
+    if (choice == 1 or choice == 0) return null; // local
+    if (choice >= 2 and choice <= 4) {
+        const provider = all_providers[choice - 2];
+        if (!binaryExists(provider.binary())) {
+            std.debug.print("\n'{s}' is not installed. Install it from:\n", .{provider.binary()});
+            printInstallUrl(provider);
+            std.debug.print("Using local only.\n\n", .{});
+            return null;
+        }
+        return provider;
+    }
+
+    std.debug.print("Invalid choice, using local only.\n", .{});
+    return null;
+}
+
+/// Fallback for when terminal raw mode is unavailable (piped stdin, etc.)
+fn promptConnectionModeFallback() ?Provider {
     var buf: [32]u8 = undefined;
     const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return null;
     if (n == 0) return null;
     const input = std.mem.trim(u8, buf[0..n], &[_]u8{ ' ', '\t', '\r', '\n' });
-
-    if (input.len == 0) return null; // default: local
+    if (input.len == 0) return null;
 
     const choice = std.fmt.parseInt(u8, input, 10) catch {
         std.debug.print("Invalid choice, using local only.\n", .{});
         return null;
     };
 
-    if (choice == 1 or choice == 0) return null; // local
+    if (choice == 1 or choice == 0) return null;
     if (choice >= 2 and choice <= 4) {
         const provider = all_providers[choice - 2];
         if (!binaryExists(provider.binary())) {

@@ -1697,6 +1697,7 @@ const Server = struct {
     }
 
     fn deinit(self: *Server) void {
+        std.debug.print("Server.deinit() starting...\n", .{});
         self.running.store(false, .release);
 
         // Clear global_server first to prevent callbacks from accessing it during shutdown
@@ -1704,11 +1705,17 @@ const Server = struct {
 
         // Shut down WebSocket servers first and wait for all connection threads to finish
         // This must happen BEFORE destroying panels to avoid use-after-free
+        std.debug.print("  deinit: HTTP server...\n", .{});
         self.http_server.deinit();
+        std.debug.print("  deinit: panel WS...\n", .{});
         self.panel_ws_server.deinit();
+        std.debug.print("  deinit: control WS...\n", .{});
         self.control_ws_server.deinit();
+        std.debug.print("  deinit: file WS...\n", .{});
         self.file_ws_server.deinit();
+        std.debug.print("  deinit: preview WS...\n", .{});
         self.preview_ws_server.deinit();
+        std.debug.print("  deinit: servers done, cleaning up...\n", .{});
 
         // Now safe to destroy panels since all connection threads have finished
         var panel_it = self.panels.valueIterator();
@@ -4169,14 +4176,21 @@ const Server = struct {
         // Render loop exited (Ctrl+C or error) — stop all servers to unblock
         // their threads. This is done here instead of the signal handler because
         // .stop() calls allocator/deinit operations that are not signal-safe.
+        std.debug.print("Stopping servers...\n", .{});
         self.http_server.stop();
+        std.debug.print("  HTTP stopped, panel WS conns={}\n", .{self.panel_ws_server.active_connections.load(.acquire)});
         self.panel_ws_server.stop();
+        std.debug.print("  Panel WS stopped, control WS conns={}\n", .{self.control_ws_server.active_connections.load(.acquire)});
         self.control_ws_server.stop();
+        std.debug.print("  Control WS stopped, file WS conns={}\n", .{self.file_ws_server.active_connections.load(.acquire)});
         self.file_ws_server.stop();
+        std.debug.print("  File WS stopped, preview conns={}\n", .{self.preview_ws_server.active_connections.load(.acquire)});
         self.preview_ws_server.stop();
+        std.debug.print("  All servers stopped, joining HTTP thread...\n", .{});
 
         // Wait for HTTP thread to finish
         http_thread.join();
+        std.debug.print("  HTTP thread joined\n", .{});
     }
 };
 
