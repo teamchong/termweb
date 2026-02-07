@@ -4247,6 +4247,7 @@ fn handleSigabrt(_: c_int) callconv(.c) void {
 }
 
 var sigint_received = std.atomic.Value(bool).init(false);
+var tunnel_child_pid = std.atomic.Value(i32).init(0);
 
 fn handleSigint(_: c_int) callconv(.c) void {
     if (sigint_received.swap(true, .acq_rel)) {
@@ -4257,6 +4258,11 @@ fn handleSigint(_: c_int) callconv(.c) void {
     if (Server.global_server.load(.acquire)) |server| {
         server.running.store(false, .release);
         server.wake_signal.notify();
+    }
+    // Kill tunnel subprocess immediately (signal-safe: kill is a syscall)
+    const pid = tunnel_child_pid.load(.acquire);
+    if (pid > 0) {
+        std.posix.kill(pid, 9) catch {}; // SIGKILL = 9
     }
     // std.debug.print is NOT signal-safe, use raw write instead
     _ = std.posix.write(2, "\nShutting down...\n") catch {};
@@ -4338,6 +4344,8 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
                 break :blk null;
             };
             if (tunnel) |t| {
+                // Store PID so SIGINT handler can kill it immediately
+                tunnel_child_pid.store(t.process.id, .release);
                 if (t.waitForUrl(15 * std.time.ns_per_s)) {
                     if (t.getUrl()) |url| {
                         std.debug.print("  Tunnel:  {s}\n", .{url});

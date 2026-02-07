@@ -410,16 +410,16 @@ fn printHelp() void {
         \\Mux options:
         \\  --port, -p PORT       Set HTTP port (default: 8080)
         \\  --local               Local only, skip connection picker
+        \\  --tailscale           Expose via Tailscale Funnel
         \\  --cloudflare          Expose via Cloudflare Tunnel
         \\  --ngrok               Expose via ngrok
-        \\  --tailscale           Expose via Tailscale Funnel
         \\
         \\Examples:
         \\  termweb open https://example.com
         \\  termweb open https://github.com --profile Default
         \\  termweb mux --port 8080
         \\  termweb mux --local
-        \\  termweb mux --cloudflare
+        \\  termweb mux --tailscale
         \\
         \\Requirements:
         \\  - Chrome or Chromium (set CHROME_BIN if not auto-detected)
@@ -444,12 +444,12 @@ fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
             }
         } else if (std.mem.eql(u8, arg, "--local")) {
             mode = .local;
+        } else if (std.mem.eql(u8, arg, "--tailscale")) {
+            mode = .{ .tunnel = .tailscale };
         } else if (std.mem.eql(u8, arg, "--cloudflare")) {
             mode = .{ .tunnel = .cloudflare };
         } else if (std.mem.eql(u8, arg, "--ngrok")) {
             mode = .{ .tunnel = .ngrok };
-        } else if (std.mem.eql(u8, arg, "--tailscale")) {
-            mode = .{ .tunnel = .tailscale };
         }
     }
 

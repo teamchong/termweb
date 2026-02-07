@@ -7,31 +7,31 @@
 const std = @import("std");
 
 pub const Provider = enum {
+    tailscale,
     cloudflare,
     ngrok,
-    tailscale,
 
     pub fn binary(self: Provider) []const u8 {
         return switch (self) {
+            .tailscale => "tailscale",
             .cloudflare => "cloudflared",
             .ngrok => "ngrok",
-            .tailscale => "tailscale",
         };
     }
 
     pub fn label(self: Provider) []const u8 {
         return switch (self) {
+            .tailscale => "Tailscale Funnel",
             .cloudflare => "Cloudflare Tunnel",
             .ngrok => "ngrok",
-            .tailscale => "Tailscale Funnel",
         };
     }
 
     pub fn cliFlag(self: Provider) []const u8 {
         return switch (self) {
+            .tailscale => "--tailscale",
             .cloudflare => "--cloudflare",
             .ngrok => "--ngrok",
-            .tailscale => "--tailscale",
         };
     }
 };
@@ -44,7 +44,7 @@ pub const Mode = union(enum) {
 };
 
 /// All providers in display order.
-const all_providers = [_]Provider{ .cloudflare, .ngrok, .tailscale };
+const all_providers = [_]Provider{ .tailscale, .cloudflare, .ngrok };
 
 /// Check if a binary exists in PATH by searching each PATH directory.
 pub fn binaryExists(binary_name: []const u8) bool {
@@ -132,11 +132,56 @@ pub fn promptConnectionMode() ?Provider {
     return null;
 }
 
+/// Get the tailscale funnel URL from `tailscale funnel status`.
+/// Returns an allocated string or null.
+fn getTailscaleStatusUrl(allocator: std.mem.Allocator) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "tailscale", "funnel", "status" },
+    }) catch return null;
+    defer allocator.free(result.stderr);
+    // tailscale funnel status outputs to stdout: "https://hostname.ts.net (tailnet only)\n|-- ..."
+    defer allocator.free(result.stdout);
+    if (result.stdout.len == 0) return null;
+
+    // Parse first line for https:// URL
+    var it = std.mem.splitScalar(u8, result.stdout, '\n');
+    const first_line = it.first();
+    const marker = "https://";
+    const pos = std.mem.indexOf(u8, first_line, marker) orelse return null;
+    const rest = first_line[pos..];
+    // Stop at whitespace or parenthesis
+    const end = for (rest, 0..) |ch, i| {
+        if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n' or ch == '(') break i;
+    } else rest.len;
+    if (end <= marker.len) return null;
+
+    return allocator.dupe(u8, rest[0..end]) catch null;
+}
+
+/// Print a JSON error string, replacing literal \n with real newlines and trimming \r.
+fn printCleanError(provider_name: []const u8, msg: []const u8) void {
+    std.debug.print("  {s}: ", .{provider_name});
+    var i: usize = 0;
+    while (i < msg.len) {
+        if (i + 1 < msg.len and msg[i] == '\\' and msg[i + 1] == 'n') {
+            std.debug.print("\n  {s}  ", .{provider_name});
+            i += 2;
+        } else if (i + 1 < msg.len and msg[i] == '\\' and msg[i + 1] == 'r') {
+            i += 2;
+        } else {
+            std.debug.print("{c}", .{msg[i]});
+            i += 1;
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
 fn printInstallUrl(provider: Provider) void {
     switch (provider) {
+        .tailscale => std.debug.print("  https://tailscale.com/download\n", .{}),
         .cloudflare => std.debug.print("  https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/\n", .{}),
         .ngrok => std.debug.print("  https://ngrok.com/download\n", .{}),
-        .tailscale => std.debug.print("  https://tailscale.com/download\n", .{}),
     }
 }
 
@@ -207,6 +252,7 @@ pub const Tunnel = struct {
     url_len: usize = 0,
     reader_thread: ?std.Thread = null,
     url_ready: std.Thread.ResetEvent = .{},
+    error_shown: bool = false,
 
     /// Spawn a tunnel subprocess for the given provider and port.
     pub fn start(allocator: std.mem.Allocator, provider: Provider, port: u16) !*Tunnel {
@@ -220,6 +266,12 @@ pub const Tunnel = struct {
         var argc: usize = 0;
 
         switch (provider) {
+            .tailscale => {
+                argv[0] = "tailscale";
+                argv[1] = "funnel";
+                argv[2] = port_str;
+                argc = 3;
+            },
             .cloudflare => {
                 argv[0] = "cloudflared";
                 argv[1] = "tunnel";
@@ -238,24 +290,24 @@ pub const Tunnel = struct {
                 argv[6] = "json";
                 argc = 7;
             },
-            .tailscale => {
-                argv[0] = "tailscale";
-                argv[1] = "funnel";
-                argv[2] = port_str;
-                argc = 3;
-            },
         }
 
         var process = std.process.Child.init(argv[0..argc], allocator);
 
+        // Put child in its own process group so Ctrl+C (SIGINT) doesn't reach it.
+        // We kill it explicitly during shutdown instead.
+        process.pgid = 0;
+
         // Only pipe the stream we parse; ignore the other to prevent deadlock.
         // If the unused pipe fills up, the subprocess blocks forever.
         switch (provider) {
-            .cloudflare => {
+            .cloudflare, .tailscale => {
+                // cloudflared outputs URL on stderr; tailscale funnel outputs to stderr too
                 process.stderr_behavior = .Pipe;
                 process.stdout_behavior = .Ignore;
             },
-            .ngrok, .tailscale => {
+            .ngrok => {
+                // ngrok with --log stdout --log-format json outputs JSON to stdout
                 process.stdout_behavior = .Pipe;
                 process.stderr_behavior = .Ignore;
             },
@@ -268,6 +320,19 @@ pub const Tunnel = struct {
             .provider = provider,
             .allocator = allocator,
         };
+
+        // For tailscale, also try getting URL from `tailscale funnel status`
+        // (works even when funnel was already configured as a background service)
+        if (provider == .tailscale) {
+            if (getTailscaleStatusUrl(allocator)) |url| {
+                const len = @min(url.len, tun.public_url.len);
+                @memcpy(tun.public_url[0..len], url[0..len]);
+                tun.url_len = len;
+                tun.url_ready.set();
+                allocator.free(url);
+                // Still spawn the reader thread to drain stderr
+            }
+        }
 
         tun.reader_thread = std.Thread.spawn(.{}, readerThread, .{tun}) catch null;
 
@@ -300,10 +365,12 @@ pub const Tunnel = struct {
     }
 
     /// Reader thread: reads subprocess output line by line, parses URL.
+    /// Also prints error/status lines from the tunnel subprocess so the user
+    /// can see authentication errors, config issues, etc.
     fn readerThread(self: *Tunnel) void {
         const pipe = switch (self.provider) {
-            .cloudflare => self.process.stderr,
-            .ngrok, .tailscale => self.process.stdout,
+            .ngrok => self.process.stdout,
+            .cloudflare, .tailscale => self.process.stderr,
         } orelse return;
 
         const fd = pipe.handle;
@@ -320,29 +387,36 @@ pub const Tunnel = struct {
             for (buf[0..n], 0..) |ch, i| {
                 if (ch == '\n') {
                     // Complete line: carry + buf[data_start..i]
-                    if (self.url_len == 0) {
-                        if (carry_len > 0) {
-                            const remaining = i - data_start;
-                            if (carry_len + remaining <= carry.len) {
-                                @memcpy(carry[carry_len .. carry_len + remaining], buf[data_start..i]);
-                                const line = carry[0 .. carry_len + remaining];
-                                if (self.extractUrl(line)) |url| {
-                                    const len = @min(url.len, self.public_url.len);
-                                    @memcpy(self.public_url[0..len], url[0..len]);
-                                    self.url_len = len;
-                                    self.url_ready.set();
-                                }
-                            }
+                    var line: []const u8 = undefined;
+                    if (carry_len > 0) {
+                        const remaining = i - data_start;
+                        if (carry_len + remaining <= carry.len) {
+                            @memcpy(carry[carry_len .. carry_len + remaining], buf[data_start..i]);
+                            line = carry[0 .. carry_len + remaining];
                         } else {
-                            const line = buf[data_start..i];
-                            if (self.extractUrl(line)) |url| {
-                                const len = @min(url.len, self.public_url.len);
-                                @memcpy(self.public_url[0..len], url[0..len]);
-                                self.url_len = len;
-                                self.url_ready.set();
-                            }
+                            carry_len = 0;
+                            data_start = i + 1;
+                            continue;
+                        }
+                    } else {
+                        line = buf[data_start..i];
+                    }
+
+                    // Try to extract URL
+                    if (self.url_len == 0) {
+                        if (self.extractUrl(line)) |url| {
+                            const len = @min(url.len, self.public_url.len);
+                            @memcpy(self.public_url[0..len], url[0..len]);
+                            self.url_len = len;
+                            self.url_ready.set();
                         }
                     }
+
+                    // Print error/status lines so user sees tunnel problems
+                    if (self.url_len == 0 and line.len > 0) {
+                        self.printTunnelLine(line);
+                    }
+
                     carry_len = 0;
                     data_start = i + 1;
                 }
@@ -357,11 +431,46 @@ pub const Tunnel = struct {
         }
     }
 
+    /// Print relevant tunnel output lines to the user.
+    /// Filters out noise (cloudflared INFO spam) and shows errors.
+    fn printTunnelLine(self: *Tunnel, line: []const u8) void {
+        switch (self.provider) {
+            .cloudflare => {
+                // Show cloudflared errors, skip verbose INFO lines
+                if (std.mem.indexOf(u8, line, "ERR") != null or
+                    std.mem.indexOf(u8, line, "error") != null or
+                    std.mem.indexOf(u8, line, "failed") != null)
+                {
+                    std.debug.print("  cloudflared: {s}\n", .{line});
+                }
+            },
+            .ngrok => {
+                // ngrok outputs JSON - show first error only (avoids spam from retries)
+                if (self.error_shown) return;
+                if (std.mem.indexOf(u8, line, "\"lvl\":\"eror\"") != null or
+                    std.mem.indexOf(u8, line, "\"lvl\":\"crit\"") != null)
+                {
+                    self.error_shown = true;
+                    // Extract and clean error message from JSON
+                    if (extractJsonField(line, "err")) |err_msg| {
+                        printCleanError("ngrok", err_msg);
+                    } else if (extractJsonField(line, "msg")) |msg| {
+                        printCleanError("ngrok", msg);
+                    }
+                }
+            },
+            .tailscale => {
+                // Tailscale outputs plain text - show everything before URL is found
+                std.debug.print("  tailscale: {s}\n", .{line});
+            },
+        }
+    }
+
     fn extractUrl(self: *Tunnel, line: []const u8) ?[]const u8 {
         return switch (self.provider) {
+            .tailscale => extractTailscaleUrl(line),
             .cloudflare => extractCloudflareUrl(line),
             .ngrok => extractNgrokUrl(line),
-            .tailscale => extractTailscaleUrl(line),
         };
     }
 
@@ -376,24 +485,56 @@ pub const Tunnel = struct {
         return after[0..end];
     }
 
-    /// ngrok: parse JSON log line containing "url":"https://..."
+    /// ngrok: parse JSON log line containing "url":"https://..." or "url": "https://..."
     fn extractNgrokUrl(line: []const u8) ?[]const u8 {
-        const marker = "\"url\":\"https://";
-        const marker_pos = std.mem.indexOf(u8, line, marker) orelse return null;
-        const url_offset = marker_pos + ("\"url\":\"").len;
-        if (url_offset >= line.len) return null;
-        const rest = line[url_offset..];
-        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-        return rest[0..end];
+        // Find "url" key in JSON (handles optional spaces: "url":"..." or "url": "...")
+        const key = "\"url\"";
+        const key_pos = std.mem.indexOf(u8, line, key) orelse return null;
+        var i = key_pos + key.len;
+        // Skip : and optional whitespace
+        while (i < line.len and (line[i] == ':' or line[i] == ' ')) : (i += 1) {}
+        // Expect opening quote
+        if (i >= line.len or line[i] != '"') return null;
+        i += 1;
+        // Find URL start
+        const url_start = i;
+        // Find closing quote
+        const end = std.mem.indexOfScalar(u8, line[url_start..], '"') orelse return null;
+        const url = line[url_start .. url_start + end];
+        // Must be https://
+        if (!std.mem.startsWith(u8, url, "https://")) return null;
+        return url;
     }
 
-    /// Tailscale: look for https:// URL in stdout
+    /// Extract a string field value from a JSON line: "key":"value" or "key": "value"
+    fn extractJsonField(line: []const u8, key: []const u8) ?[]const u8 {
+        // Build search pattern: "key"
+        var pattern_buf: [64]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\"", .{key}) catch return null;
+        const key_pos = std.mem.indexOf(u8, line, pattern) orelse return null;
+        var i = key_pos + pattern.len;
+        // Skip : and optional whitespace
+        while (i < line.len and (line[i] == ':' or line[i] == ' ')) : (i += 1) {}
+        // Expect opening quote
+        if (i >= line.len or line[i] != '"') return null;
+        i += 1;
+        const val_start = i;
+        // Find closing quote (handle escaped quotes)
+        while (i < line.len) : (i += 1) {
+            if (line[i] == '"' and (i == val_start or line[i - 1] != '\\')) break;
+        }
+        if (i >= line.len) return null;
+        return line[val_start..i];
+    }
+
+    /// Tailscale: look for https:// URL in stderr output
     fn extractTailscaleUrl(line: []const u8) ?[]const u8 {
         const marker = "https://";
         const pos = std.mem.indexOf(u8, line, marker) orelse return null;
         const rest = line[pos..];
+        // Stop at whitespace or parenthesis (e.g., "https://host.ts.net (tailnet only)")
         const end = for (rest, 0..) |ch, i| {
-            if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') break i;
+            if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n' or ch == '(') break i;
         } else rest.len;
         if (end <= marker.len) return null;
         return rest[0..end];
