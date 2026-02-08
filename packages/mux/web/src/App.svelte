@@ -619,6 +619,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 4px 10px;
+    height: 28px;
     border-bottom: 1px solid rgba(128,128,128,0.2);
     position: relative;
   }
@@ -639,6 +640,8 @@
     font-size: 13px;
     font-weight: 500;
     color: var(--text);
+    line-height: 18px;
+    overflow: hidden;
   }
 
   #hamburger {
@@ -694,11 +697,12 @@
     display: flex;
     align-items: center;
     padding: 5px;
+    height: 40px;
   }
 
   #titlebar.hidden,
   #toolbar.hidden {
-    display: none;
+    visibility: hidden;
   }
 
   #panels {

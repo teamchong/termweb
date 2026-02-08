@@ -672,6 +672,12 @@ export class MuxClient {
     } else if (panelList.length > 0) {
       this.reconnectPanelsAsSplits(panelList);
     }
+    // Apply panel titles from the panel list (layout JSON doesn't include titles)
+    for (const { panel_id, title } of panelList) {
+      if (title) {
+        this.updatePanelTitle(panel_id, title);
+      }
+    }
     // Mark that we've received the initial layout from server
     initialLayoutLoaded.set(true);
     if (this.initialPanelListResolve) {

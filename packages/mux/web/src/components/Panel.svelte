@@ -516,10 +516,9 @@
     setStatus('connected');
 
     if (_serverId !== null) {
-      // Reconnecting to existing panel — send resize after DOM settles
-      connectTimeoutId = setTimeout(() => {
-        connectTimeoutId = null;
-        if (destroyed || !panelEl) return;
+      // Reconnecting to existing panel — send resize immediately (same as create path)
+      // so the server gets consistent dimensions without setTimeout timing differences.
+      if (panelEl) {
         const rect = panelEl.getBoundingClientRect();
         const width = Math.floor(rect.width);
         const height = Math.floor(rect.height);
@@ -528,7 +527,7 @@
           lastReportedHeight = height;
           sendResizeBinary(width, height);
         }
-      }, 0);
+      }
     } else if (_splitInfo) {
       sendSplitPanel();
     } else {
