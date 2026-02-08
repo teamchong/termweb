@@ -91,6 +91,10 @@
   let frameCount = 0;
   let gpuRenderer: WebGPUFrameRenderer | null = null;
   let cachedFrame: VideoFrame | null = null;
+  // Buffer raw H264 frame data until gpuRenderer is ready — prevents hardware
+  // decoder surface exhaustion by not submitting frames for decode before we
+  // can consume VideoFrame output. Keeps latest keyframe + subsequent deltas.
+  let rawFrameBuffer: ArrayBuffer[] = [];
   let lastReportedWidth = 0;
   let lastReportedHeight = 0;
   let resizeObserver: ResizeObserver | null = null;
@@ -231,16 +235,24 @@
     decoder = new VideoDecoder({
       output: (frame) => onFrame(frame),
       error: (e) => {
-        console.error('Decoder error:', e);
+        console.error('[Panel] decoder error callback:', e, 'message:', e.message, 'state:', decoder?.state);
         pendingDecode = 0;
         if (decoder && decoder.state !== 'closed') {
           decoder.reset();
           decoderConfigured = false;
           gotFirstKeyframe = false;
         }
-        requestKeyframe();
+        requestKeyframe('decoder_error');
       },
     });
+
+    // Debug heartbeat: log decoder state every 2s when frames are pending
+    const heartbeat = setInterval(() => {
+      if (destroyed) { clearInterval(heartbeat); return; }
+      if (pendingDecode > 0) {
+        console.log(`[Panel] HEARTBEAT: pending=${pendingDecode} state=${decoder?.state} queueSize=${decoder?.decodeQueueSize} frameCount=${frameCount} configured=${decoderConfigured} gotKF=${gotFirstKeyframe}`);
+      }
+    }, 2000);
   }
 
   function renderFrame(frame: VideoFrame): void {
@@ -286,6 +298,7 @@
 
   function onFrame(frame: VideoFrame): void {
     pendingDecode--;
+    console.log(`[Panel] onFrame: ${frame.displayWidth}x${frame.displayHeight} pending=${pendingDecode} ts=${frame.timestamp.toFixed(0)} format=${frame.format}`);
 
     if (destroyed) {
       frame.close();
@@ -344,6 +357,25 @@
   function handleFrame(data: ArrayBuffer): void {
     if (destroyed) return;
 
+    // Buffer raw frames until renderer is ready — prevents hardware decoder
+    // surface exhaustion by not submitting frames before we can consume output.
+    if (!gpuRenderer) {
+      const peek = new Uint8Array(data);
+      let isKey = false;
+      for (let i = 0; i < peek.length - 4; i++) {
+        if (peek[i] === 0 && peek[i + 1] === 0 && peek[i + 2] === 0 && peek[i + 3] === 1) {
+          if (((peek[i + 4] ?? 0) & NAL.TYPE_MASK) === NAL.TYPE_IDR) { isKey = true; break; }
+        }
+      }
+      if (isKey) {
+        rawFrameBuffer = [data]; // new keyframe — discard everything before
+      } else if (rawFrameBuffer.length > 0) {
+        rawFrameBuffer.push(data); // delta after keyframe — keep
+      }
+      // deltas before any keyframe are discarded
+      return;
+    }
+
     frameTimestamps.push(performance.now());
     const frameData = new Uint8Array(data);
 
@@ -353,13 +385,11 @@
     const nalUnits = parseNalUnits(frameData);
     let isKeyframe = false;
     let sps: Uint8Array | null = null;
-    let pps: Uint8Array | null = null;
 
     for (const nal of nalUnits) {
       if (nal.length === 0) continue;
       const nalType = nal[0] & NAL.TYPE_MASK;
       if (nalType === NAL.TYPE_SPS) sps = nal;
-      else if (nalType === NAL.TYPE_PPS) pps = nal;
       else if (nalType === NAL.TYPE_IDR) isKeyframe = true;
     }
 
@@ -377,7 +407,8 @@
             codec,
             optimizeForLatency: true,
             hardwareAcceleration: 'prefer-hardware',
-          });
+            avc: { format: 'annexb' },
+          } as VideoDecoderConfig);
           decoderConfigured = true;
           lastCodec = codec;
           console.log(`[Panel] decoder configured: ${codec}`);
@@ -398,7 +429,7 @@
 
     // Drop P-frames when decode queue is too deep (reduces pipeline latency).
     if (!isKeyframe && decoder && decoder.decodeQueueSize > 2) {
-      requestKeyframe();
+      requestKeyframe(`queue_overflow_queueSize=${decoder.decodeQueueSize}`);
       return;
     }
 
@@ -407,12 +438,22 @@
     }
 
     // Pass raw Annex B data directly — avc3 codec handles in-band SPS/PPS.
+    const nalInfo = nalUnits.map((nal) => {
+      const nalType = nal.length > 0 ? (nal[0] & 0x1f) : -1;
+      const nalTypeName = nalType === 7 ? 'SPS' : nalType === 8 ? 'PPS' : nalType === 5 ? 'IDR' : nalType === 1 ? 'P' : `nal${nalType}`;
+      return `${nalTypeName}(${nal.length}B)`;
+    }).join(', ');
+    const hex = Array.from(frameData.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    console.log(`[Panel] decode ${isKeyframe ? 'KEY' : 'DELTA'} size=${frameData.length} queueSize=${decoder.decodeQueueSize} pending=${pendingDecode} nals=[${nalInfo}] hex=[${hex}] decoderState=${decoder.state}`);
     decodeFrame(frameData, isKeyframe);
     checkBufferHealth();
   }
 
   function decodeFrame(data: Uint8Array, isKeyframe: boolean): void {
-    if (!decoder || decoder.state !== 'configured') return;
+    if (!decoder || decoder.state !== 'configured') {
+      console.warn(`[Panel] decodeFrame skipped: decoder=${decoder ? decoder.state : 'null'}`);
+      return;
+    }
 
     // Use real time as timestamp so we can measure decode latency in onFrame()
     const timestamp = performance.now() * 1000; // microseconds
@@ -425,9 +466,11 @@
         timestamp,
         data,
       });
+      console.log(`[Panel] calling decoder.decode() frameCount=${frameCount} type=${chunk.type} ts=${timestamp.toFixed(0)} byteLength=${chunk.byteLength}`);
       decoder.decode(chunk);
+      console.log(`[Panel] decoder.decode() returned OK, state=${decoder.state} queueSize=${decoder.decodeQueueSize}`);
     } catch (e) {
-      console.error('Decode error:', e);
+      console.error('[Panel] decoder.decode() threw:', e);
       pendingDecode--;
       setStatus('error');
     }
@@ -449,9 +492,11 @@
 
   let keyframeRequested = false;
 
-  function requestKeyframe(): void {
+  function requestKeyframe(reason: string): void {
+    console.log(`[Panel] requestKeyframe: reason="${reason}" alreadyRequested=${keyframeRequested} canSend=${canSendInput()}`);
     if (keyframeRequested || !canSendInput()) return;
     keyframeRequested = true;
+    console.log(`[Panel] REQUEST_KEYFRAME SENT reason="${reason}"`);
     const buf = new Uint8Array([ClientMsg.REQUEST_KEYFRAME]);
     sendInput(buf);
   }
@@ -941,22 +986,22 @@
         loadingEl = undefined;
       }
 
-      // Flush cached frame that arrived before renderer was ready
+      // Flush raw H264 frames buffered while renderer was initializing.
+      // These are decoded now so the hardware decoder output surfaces are
+      // consumed immediately by the ready renderer.
+      if (rawFrameBuffer.length > 0) {
+        console.log(`[Panel] flushing ${rawFrameBuffer.length} buffered raw frames`);
+        const frames = rawFrameBuffer;
+        rawFrameBuffer = [];
+        for (const frameData of frames) {
+          handleFrame(frameData);
+        }
+      }
+
+      // Flush any cached decoded frame (safety net, should not happen with buffering)
       if (cachedFrame) {
         renderFrame(cachedFrame);
         cachedFrame = null;
-      }
-
-      // Safety net: keep requesting keyframes until one is rendered.
-      // Covers cases where the first keyframe was lost or decode failed.
-      if (renderedFrames === 0) {
-        const retryInterval = setInterval(() => {
-          if (destroyed || renderedFrames > 0) {
-            clearInterval(retryInterval);
-            return;
-          }
-          requestKeyframe();
-        }, 500);
       }
     });
 
@@ -1008,6 +1053,7 @@
       cachedFrame.close();
       cachedFrame = null;
     }
+    rawFrameBuffer = [];
 
     // Cleanup decoder
     if (decoder) {

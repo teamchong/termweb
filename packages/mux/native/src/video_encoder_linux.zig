@@ -240,7 +240,11 @@ pub const SharedVaContext = struct {
         }
         errdefer _ = c.vaTerminate(va_display);
 
-        // Find a supported H.264 encoding profile
+        // Find a supported H.264 encoding profile.
+        // Use Main/High for VAAPI encoding (Constrained Baseline reports
+        // support but fails or is extremely slow on many GPUs). The SPS
+        // advertises Constrained Baseline to the decoder — this is safe
+        // because we use CAVLC, no B-frames, 1 ref frame (all CB-compatible).
         const profiles = [_]c_int{
             VAProfileH264Main,
             VAProfileH264High,
@@ -482,10 +486,12 @@ pub const VideoEncoder = struct {
 
         var bs = BitstreamWriter.init(self.sps_data[5..]);
 
-        // profile_idc = 77 (Main)
-        bs.writeBits(77, 8);
-        // constraint_set1_flag=1 (Main compatible), others=0
-        bs.writeBits(0x40, 8);
+        // profile_idc = 66 (Baseline)
+        bs.writeBits(66, 8);
+        // constraint_set0_flag=1, constraint_set1_flag=1 → Constrained Baseline
+        // This guarantees no B-frames and no reorder buffer, so WebCodecs
+        // hardware decoders emit frames immediately.
+        bs.writeBits(0xC0, 8);
         // level_idc = 52 (Level 5.2 for large frame support)
         bs.writeBits(52, 8);
         // seq_parameter_set_id = 0
@@ -542,14 +548,28 @@ pub const VideoEncoder = struct {
         bs.writeBits(0, 1);
         // pic_struct_present_flag = 0
         bs.writeBits(0, 1);
-        // bitstream_restriction_flag = 0
-        bs.writeBits(0, 1);
+        // bitstream_restriction_flag = 1 (tell decoder: no reordering needed)
+        bs.writeBits(1, 1);
+        // motion_vectors_over_pic_boundaries_flag = 1
+        bs.writeBits(1, 1);
+        // max_bytes_per_pic_denom = 0 (no limit)
+        bs.writeUE(0);
+        // max_bits_per_mb_denom = 0 (no limit)
+        bs.writeUE(0);
+        // log2_max_mv_length_horizontal = 16
+        bs.writeUE(16);
+        // log2_max_mv_length_vertical = 16
+        bs.writeUE(16);
+        // max_num_reorder_frames = 0 (critical: forces immediate output)
+        bs.writeUE(0);
+        // max_dec_frame_buffering = 1 (only 1 ref frame needed)
+        bs.writeUE(1);
 
         bs.writeTrailingBits();
         self.sps_len = 5 + bs.getLength();
     }
 
-    /// Generate PPS NAL unit for H264 Main profile (Annex B format)
+    /// Generate PPS NAL unit for H264 Constrained Baseline profile (Annex B format)
     fn generatePPS(self: *VideoEncoder) void {
         // Clear buffer
         @memset(&self.pps_data, 0);
@@ -1160,6 +1180,15 @@ pub const VideoEncoder = struct {
 
         const is_keyframe = force_keyframe or (self.frame_count == 0) or
             (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
+
+        // IDR resets the H.264 frame numbering sequence. Without this,
+        // frame_num has gaps after forced keyframes (e.g., IDR frame_num=0
+        // followed by P-frame frame_num=3), violating the spec when
+        // gaps_in_frame_num_value_allowed_flag=0 in SPS. Decoders silently
+        // drop P-frames with invalid frame_num gaps.
+        if (is_keyframe) {
+            self.frame_count = 0;
+        }
 
         // Upload frame (CPU copy + VPP color conversion)
         try self.uploadFrame(rgba_data);

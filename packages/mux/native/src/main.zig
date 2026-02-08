@@ -584,6 +584,7 @@ const Panel = struct {
     last_cursor_visible: u8 = 1,
     last_surf_w: u16 = 0,
     last_surf_h: u16 = 0,
+    dbg_input_countdown: u32 = 0, // Debug: log N frames after input
 
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     /// After this many consecutive unchanged frames, reduce tick rate to save CPU/GPU.
@@ -717,6 +718,7 @@ const Panel = struct {
     fn startStreaming(self: *Panel) void {
         self.streaming.store(true, .release);
         self.force_keyframe = true;
+        std.debug.print("FORCE_KF panel={d} reason=startStreaming\n", .{self.id});
         self.ticks_since_connect = 0;
         self.consecutive_unchanged = 0;
     }
@@ -751,6 +753,7 @@ const Panel = struct {
         // Don't resize frame_buffer here - let captureFromIOSurface do it
         // when the IOSurface actually updates to the new size (at pixel dimensions)
         self.force_keyframe = true;
+        std.debug.print("FORCE_KF panel={d} reason=resize\n", .{self.id});
     }
 
     fn pause(self: *Panel) void {
@@ -760,10 +763,12 @@ const Panel = struct {
     fn resumeStream(self: *Panel) void {
         self.streaming.store(true, .release);
         self.force_keyframe = true;
+        std.debug.print("FORCE_KF panel={d} reason=resumeStream\n", .{self.id});
     }
 
     fn requestKeyframe(self: *Panel) void {
         self.force_keyframe = true;
+        std.debug.print("FORCE_KF panel={d} reason=clientRequestKeyframe\n", .{self.id});
     }
 
     // Returns true if frame changed, false if identical to previous
@@ -958,6 +963,8 @@ const Panel = struct {
         // Without this, processInputQueue clears has_pending_input before the
         // frame capture loop checks it, causing the idle skip to stay active.
         self.consecutive_unchanged = 0;
+        // Debug: log the next 30 frames after input to see if hash changes
+        self.dbg_input_countdown = 30;
         self.mutex.unlock();
 
         for (events_buf[0..events_count]) |*event| {
@@ -2010,6 +2017,7 @@ const Server = struct {
         while (panel_it.next()) |panel_ptr| {
             const panel = panel_ptr.*;
             panel.force_keyframe = true;
+            std.debug.print("FORCE_KF panel={d} reason=h264ClientConnected\n", .{panel.id});
             panel.ticks_since_connect = 100; // Skip initial render delay
         }
         self.mutex.unlock();
@@ -2176,6 +2184,7 @@ const Server = struct {
             return;
         } else if (inner_type == @intFromEnum(ClientMsg.request_keyframe)) {
             p.force_keyframe = true;
+            std.debug.print("FORCE_KF panel={d} reason=clientRequestKeyframe_onPanelMsg\n", .{p.id});
             self.wake_signal.notify();
             return;
         }
@@ -2281,6 +2290,7 @@ const Server = struct {
                     for (panel_ids.items) |pid| {
                         if (self.panels.get(pid)) |panel| {
                             panel.force_keyframe = true;
+                            std.debug.print("FORCE_KF panel={d} reason=focusTabSwitch\n", .{panel.id});
                         }
                     }
                 }
@@ -3895,6 +3905,47 @@ const Server = struct {
                         if (read_ok) {
                             // Frame skip: hash the pixel buffer and skip encoding if unchanged
                             const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
+
+                            // Debug: log frames after input to diagnose stale pixels
+                            if (panel.dbg_input_countdown > 0) {
+                                panel.dbg_input_countdown -= 1;
+                                if (dbg_log) |f| {
+                                    // Get cursor info to correlate with pixel content
+                                    var cur_col: u16 = 0;
+                                    var cur_row: u16 = 0;
+                                    var cur_style: u8 = 0;
+                                    var cur_visible: u8 = 0;
+                                    c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible);
+
+                                    // Sample a few pixels to see if content changes
+                                    // Check pixel at row 0, col 5 (likely near prompt text)
+                                    const row_bytes = pixel_width * 4;
+                                    const sample_row: usize = @min(@as(usize, cur_row) * @as(usize, @intCast(c.ghostty_surface_size(panel.surface).cell_height_px)), pixel_height - 1);
+                                    const sample_offset = sample_row * row_bytes + @min(@as(usize, cur_col) * @as(usize, @intCast(c.ghostty_surface_size(panel.surface).cell_width_px)) * 4, row_bytes - 4);
+                                    const px_b = panel.bgra_buffer.?[sample_offset];
+                                    const px_g = panel.bgra_buffer.?[sample_offset + 1];
+                                    const px_r = panel.bgra_buffer.?[sample_offset + 2];
+                                    const px_a = panel.bgra_buffer.?[sample_offset + 3];
+
+                                    // Also check first non-black pixel in row 0
+                                    var first_nonblack: usize = 0;
+                                    for (0..@min(pixel_width, 200)) |x| {
+                                        const off = x * 4;
+                                        if (panel.bgra_buffer.?[off] != 0 or panel.bgra_buffer.?[off + 1] != 0 or panel.bgra_buffer.?[off + 2] != 0) {
+                                            first_nonblack = x;
+                                            break;
+                                        }
+                                    }
+
+                                    var dbg_buf2: [512]u8 = undefined;
+                                    const dbg_line2 = std.fmt.bufPrint(&dbg_buf2, "INPUT_FRAME panel={d} cd={d} hash={x} prev={x} match={} cursor=({d},{d}) px@cursor=({d},{d},{d},{d}) first_nonblack_x={d}\n", .{
+                                        panel.id, panel.dbg_input_countdown, frame_hash, panel.last_frame_hash, @intFromBool(frame_hash == panel.last_frame_hash),
+                                        cur_col, cur_row, px_r, px_g, px_b, px_a, first_nonblack,
+                                    }) catch "";
+                                    _ = f.write(dbg_line2) catch {};
+                                }
+                            }
+
                             if (frame_hash == panel.last_frame_hash and !panel.force_keyframe) {
                                 panel.consecutive_unchanged += 1;
                                 if (panel.ticks_since_connect < 10) {
@@ -3915,10 +3966,10 @@ const Server = struct {
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
-                                if (panel.ticks_since_connect < 10) {
+                                {
                                     if (dbg_log) |f| {
-                                        var dbg_buf: [128]u8 = undefined;
-                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "ENCODED panel={d} tick={d} kf={} size={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len }) catch "";
+                                        var dbg_buf: [256]u8 = undefined;
+                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 }) catch "";
                                         _ = f.write(dbg_line) catch {};
                                     }
                                 }
@@ -3958,6 +4009,7 @@ const Server = struct {
                         } else {
                             // All sends failed — force keyframe for recovery
                             panel.force_keyframe = true;
+                            std.debug.print("FORCE_KF panel={d} reason=allSendsFailed\n", .{panel.id});
                             frames_dropped += 1;
                             send_failed = true;
                         }
