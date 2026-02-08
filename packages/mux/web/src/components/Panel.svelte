@@ -170,15 +170,20 @@
   // Cursor overlay position: percentage-based within a CSS viewport div that
   // replicates the canvas's object-fit:contain area using container queries.
   // No JS objFitScale math — CSS handles the contain-fit sizing identically.
+  //
+  // IMPORTANT: Use surface dims (cursorSurfW/H) not video frame dims (frameWidth/H).
+  // The encoder may scale the surface down (MAX_PIXELS cap) and add 16px alignment
+  // padding. Cursor coordinates are in ghostty surface space, so percentages must
+  // be computed against surface dimensions to stay correct at any resolution.
   let cursorPct = $derived.by(() => {
     if (!cursorVisible || cursorW === 0 || paused) return null;
-    if (frameWidth === 0 || frameHeight === 0) return null;
+    if (cursorSurfW === 0 || cursorSurfH === 0) return null;
 
     return {
-      left: (cursorX / frameWidth) * 100,
-      top: (cursorY / frameHeight) * 100,
-      width: (cursorW / frameWidth) * 100,
-      height: (cursorH / frameHeight) * 100,
+      left: (cursorX / cursorSurfW) * 100,
+      top: (cursorY / cursorSurfH) * 100,
+      width: (cursorW / cursorSurfW) * 100,
+      height: (cursorH / cursorSurfH) * 100,
     };
   });
 
@@ -1052,8 +1057,8 @@
       onwheel={handleWheel}
       oncontextmenu={handleContextMenu}
     ></canvas>
-    {#if frameWidth > 0 && frameHeight > 0}
-      <div class="cursor-container" style="--fw:{frameWidth};--fh:{frameHeight}">
+    {#if cursorSurfW > 0 && cursorSurfH > 0}
+      <div class="cursor-container" style="--fw:{cursorSurfW};--fh:{cursorSurfH}">
         <div class="cursor-viewport">
           {#if cursorPct}
             <div
