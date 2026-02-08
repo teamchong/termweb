@@ -98,6 +98,7 @@
   let frameTimestamps = new CircularBuffer<number>(60);
   let decodeLatencies = new CircularBuffer<number>(PANEL.MAX_LATENCY_SAMPLES);
   let lastDecodeStart = 0;
+  let lastRenderedTime = 0;
   let connectTimeoutId: ReturnType<typeof setTimeout> | null = null;
   // These are intentionally copied from props - we want mutable local copies
   let _initialSize: { width: number; height: number } | null = null;
@@ -278,6 +279,7 @@
       loadingEl = undefined;
     }
 
+    lastRenderedTime = performance.now();
     renderedFrames++;
     updateStatsOverlay();
   }
@@ -336,7 +338,7 @@
     const profile = sps[1];
     const constraints = sps[2];
     const level = sps[3];
-    return `avc1.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
+    return `avc3.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
   }
 
   function handleFrame(data: ArrayBuffer): void {
@@ -345,35 +347,40 @@
     frameTimestamps.push(performance.now());
     const frameData = new Uint8Array(data);
 
-    if (!decoder) return;
+    if (!decoder) { console.debug('[Panel] handleFrame: no decoder'); return; }
 
+    // Parse NAL units to detect SPS/PPS/IDR
     const nalUnits = parseNalUnits(frameData);
     let isKeyframe = false;
     let sps: Uint8Array | null = null;
+    let pps: Uint8Array | null = null;
 
     for (const nal of nalUnits) {
       if (nal.length === 0) continue;
       const nalType = nal[0] & NAL.TYPE_MASK;
-
-      if (nalType === NAL.TYPE_SPS) {
-        sps = nal;
-      } else if (nalType === NAL.TYPE_IDR) {
-        isKeyframe = true;
-      }
+      if (nalType === NAL.TYPE_SPS) sps = nal;
+      else if (nalType === NAL.TYPE_PPS) pps = nal;
+      else if (nalType === NAL.TYPE_IDR) isKeyframe = true;
     }
 
+    // Configure decoder with avc3 codec (SPS/PPS in-band via Annex B, no description needed).
     if (sps) {
       const codec = getCodecFromSps(sps);
-      if (!decoderConfigured || codec !== lastCodec) {
+      const needReconfigure = !decoderConfigured || codec !== lastCodec;
+      if (needReconfigure) {
         try {
           if (decoderConfigured) {
-            console.log('Reconfiguring decoder:', lastCodec, '->', codec);
             decoder.reset();
             gotFirstKeyframe = false;
           }
-          decoder.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
+          decoder.configure({
+            codec,
+            optimizeForLatency: true,
+            hardwareAcceleration: 'prefer-hardware',
+          });
           decoderConfigured = true;
           lastCodec = codec;
+          console.log(`[Panel] decoder configured: ${codec}`);
         } catch (e) {
           console.error('Failed to configure decoder:', e);
           setStatus('error');
@@ -382,15 +389,14 @@
       }
     }
 
-    if (!decoderConfigured) return;
+    if (!decoderConfigured) { console.debug('[Panel] handleFrame: decoder not configured'); return; }
 
     if (!gotFirstKeyframe) {
-      if (!isKeyframe) return;
+      if (!isKeyframe) { console.debug('[Panel] handleFrame: waiting for first keyframe'); return; }
       gotFirstKeyframe = true;
     }
 
     // Drop P-frames when decode queue is too deep (reduces pipeline latency).
-    // Use decoder.decodeQueueSize (browser-tracked, accurate) instead of manual counter.
     if (!isKeyframe && decoder && decoder.decodeQueueSize > 2) {
       requestKeyframe();
       return;
@@ -400,6 +406,7 @@
       keyframeRequested = false;
     }
 
+    // Pass raw Annex B data directly — avc3 codec handles in-band SPS/PPS.
     decodeFrame(frameData, isKeyframe);
     checkBufferHealth();
   }
@@ -990,7 +997,6 @@
       clearTimeout(connectTimeoutId);
       connectTimeoutId = null;
     }
-
     // Cleanup resize observer
     if (resizeObserver) {
       resizeObserver.disconnect();

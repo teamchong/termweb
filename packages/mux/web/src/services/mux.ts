@@ -1272,6 +1272,8 @@ export class MuxClient {
         const view = new DataView(e.data);
         const panelId = view.getUint32(0, true);
         const frameData = new Uint8Array(e.data, 4);
+        // DEBUG: track H264 frame arrival
+        console.debug(`[H264] frame panelId=${panelId} size=${frameData.length} found=${this.panelsByServerId.has(panelId)}`);
         // Route to override handler (overview) if set
         if (this.h264OverrideHandler) {
           this.h264OverrideHandler(panelId, frameData);
