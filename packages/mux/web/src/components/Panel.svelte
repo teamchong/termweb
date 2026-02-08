@@ -1225,11 +1225,18 @@
   .cursor-overlay {
     position: absolute;
     pointer-events: none;
+    box-sizing: border-box;
     animation: cursor-blink 1.2s step-end infinite;
   }
-  .cursor-bar { background: var(--text, #c8c8c8); }
+  .cursor-bar {
+    background: var(--text, #c8c8c8);
+    max-width: 2px;
+  }
   .cursor-block { background: var(--text, #c8c8c8); opacity: 0.7; }
-  .cursor-underline { background: var(--text, #c8c8c8); }
+  .cursor-underline {
+    background: transparent;
+    border-bottom: 2px solid var(--text, #c8c8c8);
+  }
   .cursor-hollow {
     background: transparent;
     border: 1px solid var(--text, #c8c8c8);
@@ -1239,6 +1246,7 @@
   :global(.panel:not(.focused)) .cursor-overlay {
     background: transparent;
     border: 1px solid var(--text, #c8c8c8);
+    max-width: none;
     opacity: 1;
     animation: none;
   }

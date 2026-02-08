@@ -1014,82 +1014,109 @@ index dcf8a6357..7c643b1e3 100644
 +    }
  };
 diff --git a/src/font/sprite/draw/special.zig b/src/font/sprite/draw/special.zig
-index 8cad9ceba..671f347c2 100644
+index 8cad9ceba..141757811 100644
 --- a/src/font/sprite/draw/special.zig
 +++ b/src/font/sprite/draw/special.zig
-@@ -289,11 +289,15 @@ pub fn cursor_rect(
+@@ -286,15 +286,12 @@ pub fn cursor_rect(
+     height: u32,
+     metrics: font.Metrics,
+ ) !void {
++    // Cursor rendering disabled: CSS overlay handles all cursor visuals.
      _ = cp;
++    _ = canvas;
++    _ = width;
++    _ = height;
      _ = metrics;
- 
-+    // Shorten cursor by 1px top + 1px bottom to avoid bottom-row clipping
-+    // in headless/video rendering and give a cleaner visual separation.
-+    const trim: u32 = 1;
-+    const h = height -| (trim * 2);
-     canvas.rect(.{
-         .x = 0,
+-
+-    canvas.rect(.{
+-        .x = 0,
 -        .y = 0,
-+        .y = @intCast(trim),
-         .width = @intCast(width),
+-        .width = @intCast(width),
 -        .height = @intCast(height),
-+        .height = @intCast(h),
-     }, .on);
+-    }, .on);
  }
  
-@@ -306,19 +310,25 @@ pub fn cursor_hollow_rect(
+ pub fn cursor_hollow_rect(
+@@ -304,22 +301,12 @@ pub fn cursor_hollow_rect(
+     height: u32,
+     metrics: font.Metrics,
  ) !void {
++    // Cursor rendering disabled: CSS overlay handles all cursor visuals.
      _ = cp;
- 
-+    // Shorten cursor by 1px top + 1px bottom to avoid bottom-row clipping
-+    // in headless/video rendering and give a cleaner visual separation.
-+    const trim: u32 = 1;
-+    const h = height -| (trim * 2);
-+    const t = metrics.cursor_thickness;
-+
-     // We fill the entire rect and then hollow out the inside, this isn't very
-     // efficient but it doesn't need to be and it's the easiest way to write it.
-     canvas.rect(.{
-         .x = 0,
+-
+-    // We fill the entire rect and then hollow out the inside, this isn't very
+-    // efficient but it doesn't need to be and it's the easiest way to write it.
+-    canvas.rect(.{
+-        .x = 0,
 -        .y = 0,
-+        .y = @intCast(trim),
-         .width = @intCast(width),
+-        .width = @intCast(width),
 -        .height = @intCast(height),
-+        .height = @intCast(h),
-     }, .on);
-     canvas.rect(.{
+-    }, .on);
+-    canvas.rect(.{
 -        .x = @intCast(metrics.cursor_thickness),
 -        .y = @intCast(metrics.cursor_thickness),
 -        .width = @intCast(width -| metrics.cursor_thickness * 2),
 -        .height = @intCast(height -| metrics.cursor_thickness * 2),
-+        .x = @intCast(t),
-+        .y = @intCast(trim + t),
-+        .width = @intCast(width -| t * 2),
-+        .height = @intCast(h -| t * 2),
-     }, .off);
+-    }, .off);
++    _ = canvas;
++    _ = width;
++    _ = height;
++    _ = metrics;
  }
  
-@@ -332,6 +342,10 @@ pub fn cursor_bar(
+ pub fn cursor_bar(
+@@ -329,20 +316,12 @@ pub fn cursor_bar(
+     height: u32,
+     metrics: font.Metrics,
+ ) !void {
++    // Cursor rendering disabled: CSS overlay handles all cursor visuals.
      _ = cp;
++    _ = canvas;
      _ = width;
- 
-+    // Shorten cursor by 1px top + 1px bottom to match other cursor styles.
-+    const trim: u32 = 1;
-+    const h = height -| (trim * 2);
-+
-     // We place the bar cursor half of its thickness over the left edge of the
-     // cell, so that it sits centered between characters, not biased to a side.
-     //
-@@ -339,9 +353,9 @@ pub fn cursor_bar(
-     // 1px cursor shifted left a pixel looks better than having it not shifted.
-     canvas.rect(.{
-         .x = -@as(i32, @intCast((metrics.cursor_thickness + 1) / 2)),
+-
+-    // We place the bar cursor half of its thickness over the left edge of the
+-    // cell, so that it sits centered between characters, not biased to a side.
+-    //
+-    // We round up (add 1 before dividing by 2) because, empirically, having a
+-    // 1px cursor shifted left a pixel looks better than having it not shifted.
+-    canvas.rect(.{
+-        .x = -@as(i32, @intCast((metrics.cursor_thickness + 1) / 2)),
 -        .y = 0,
-+        .y = @intCast(trim),
-         .width = @intCast(metrics.cursor_thickness),
+-        .width = @intCast(metrics.cursor_thickness),
 -        .height = @intCast(height),
-+        .height = @intCast(h),
-     }, .on);
+-    }, .on);
++    _ = height;
++    _ = metrics;
  }
  
+ pub fn cursor_underline(
+@@ -352,21 +331,10 @@ pub fn cursor_underline(
+     height: u32,
+     metrics: font.Metrics,
+ ) !void {
++    // Cursor rendering disabled: CSS overlay handles all cursor visuals.
+     _ = cp;
+-
+-    // We can go beyond the height of the cell a bit, but
+-    // we want to be sure never to exceed the height of the
+-    // canvas, which extends a quarter cell below the cell
+-    // height.
+-    const y = @min(
+-        metrics.underline_position,
+-        height +| canvas.padding_y -| metrics.underline_thickness,
+-    );
+-
+-    canvas.rect(.{
+-        .x = 0,
+-        .y = @intCast(y),
+-        .width = @intCast(width),
+-        .height = @intCast(metrics.cursor_thickness),
+-    }, .on);
++    _ = canvas;
++    _ = width;
++    _ = height;
++    _ = metrics;
+ }
 diff --git a/src/renderer/OpenGL.zig b/src/renderer/OpenGL.zig
 index 4b01da0c5..8d5edd8f4 100644
 --- a/src/renderer/OpenGL.zig

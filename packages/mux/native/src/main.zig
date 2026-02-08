@@ -2630,9 +2630,9 @@ const Server = struct {
             const padding_x: u16 = @intCast(size.padding_left_px);
             const padding_y: u16 = @intCast(size.padding_top_px);
             const surf_x = padding_x + panel.last_cursor_col * cell_w;
-            const surf_y = padding_y + panel.last_cursor_row * cell_h;
-            const surf_w: u16 = if (panel.last_cursor_style == 0) 1 else cell_w;
-            const surf_h: u16 = if (panel.last_cursor_style == 2) 2 else cell_h;
+            const surf_y = padding_y + panel.last_cursor_row * cell_h + 2;
+            const surf_w: u16 = cell_w -| 1;
+            const surf_h: u16 = cell_h -| 2;
             const surf_total_w: u16 = @intCast(size.width_px);
             const surf_total_h: u16 = @intCast(size.height_px);
 
@@ -4050,16 +4050,17 @@ const Server = struct {
                             panel.last_cursor_style = cur_style;
                             panel.last_cursor_visible = cur_visible;
 
-                            // Compute cursor in surface-space pixel coordinates
-                            // Use actual padding from ghostty instead of guessing centered
+                            // Compute cursor in surface-space pixel coordinates.
+                            // Always send cell-sized rectangle; CSS handles bar/underline visuals.
+                            // Y offset +2 accounts for visual baseline alignment with text.
                             const cell_w: u16 = @intCast(size.cell_width_px);
                             const cell_h: u16 = @intCast(size.cell_height_px);
                             const padding_x: u16 = @intCast(size.padding_left_px);
                             const padding_y: u16 = @intCast(size.padding_top_px);
                             const surf_x = padding_x + cur_col * cell_w;
-                            const surf_y = padding_y + cur_row * cell_h;
-                            const surf_w: u16 = if (cur_style == 0) 1 else cell_w;
-                            const surf_h: u16 = if (cur_style == 2) 2 else cell_h; // underline=2px
+                            const surf_y = padding_y + cur_row * cell_h + 2;
+                            const surf_w: u16 = cell_w -| 1;
+                            const surf_h: u16 = cell_h -| 2;
 
                             const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible);
 
