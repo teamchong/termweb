@@ -3,9 +3,8 @@
 
 import { getCompressionPool } from './compression-pool';
 import { TransferMsgType } from './protocol';
-import { getWsUrl, sharedTextEncoder, sharedTextDecoder } from './utils';
+import { sharedTextEncoder, sharedTextDecoder } from './utils';
 import {
-  WS_PATHS,
   FILE_TRANSFER,
   PROTO_HEADER,
   PROTO_SIZE,
@@ -61,7 +60,7 @@ export interface DryRunReport {
 }
 
 export class FileTransferHandler {
-  private ws: WebSocket | null = null;
+  private sendFn: ((data: Uint8Array) => void) | null = null;
   private activeTransfers = new Map<number, TransferState>();
   private chunkSize = FILE_TRANSFER.CHUNK_SIZE;
   private compressionPool = getCompressionPool();
@@ -70,39 +69,26 @@ export class FileTransferHandler {
   onTransferError?: (transferId: number, error: string) => void;
   onDryRunReport?: (transferId: number, report: DryRunReport) => void;
 
-  async connect(): Promise<void> {
-    this.ws = new WebSocket(getWsUrl(WS_PATHS.FILE));
-    this.ws.binaryType = 'arraybuffer';
+  /** Set the send function (injected from MuxClient — sends via control WS) */
+  setSend(fn: ((data: Uint8Array) => void) | null): void {
+    this.sendFn = fn;
+  }
 
-    this.ws.onopen = () => {
-      console.log('File transfer channel connected');
-    };
+  private canSend(): boolean {
+    return this.sendFn !== null;
+  }
 
-    this.ws.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        this.handleMessage(event.data);
-      }
-    };
-
-    this.ws.onclose = () => {
-      console.log('File transfer channel disconnected');
-    };
-
-    this.ws.onerror = (event) => {
-      console.error('File transfer WebSocket error:', event);
-      this.onTransferError?.(0, 'File transfer connection error');
-    };
+  private send(data: ArrayBuffer): void {
+    this.sendFn?.(new Uint8Array(data));
   }
 
   disconnect(): void {
-    this.ws?.close();
-    this.ws = null;
-    // Clear all active transfers to prevent memory leaks
+    this.sendFn = null;
     this.activeTransfers.clear();
-    // Don't destroy the compression pool here - it's shared
   }
 
-  private handleMessage(data: ArrayBuffer): void {
+  /** Handle a server→client file transfer response (routed from control WS) */
+  handleServerMessage(data: ArrayBuffer): void {
     const view = new DataView(data);
     const msgType = view.getUint8(0);
 
@@ -326,8 +312,8 @@ export class FileTransferHandler {
     serverPath: string,
     options: TransferOptions = {}
   ): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.error('File transfer WebSocket not connected');
+    if (!this.canSend()) {
+      console.error('File transfer not connected');
       this.onTransferError?.(0, 'File transfer connection not available');
       return;
     }
@@ -365,7 +351,7 @@ export class FileTransferHandler {
       bytes.set(exclude, offset); offset += exclude.length;
     }
 
-    this.ws.send(msg);
+    this.send(msg);
 
     const transferId = Date.now();
     this.activeTransfers.set(transferId, {
@@ -381,8 +367,8 @@ export class FileTransferHandler {
   }
 
   async startFolderDownload(serverPath: string, options: TransferOptions = {}): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.error('File transfer WebSocket not connected');
+    if (!this.canSend()) {
+      console.error('File transfer not connected');
       this.onTransferError?.(0, 'File transfer connection not available');
       return;
     }
@@ -411,7 +397,7 @@ export class FileTransferHandler {
       bytes.set(exclude, offset); offset += exclude.length;
     }
 
-    this.ws.send(msg);
+    this.send(msg);
 
     const transferId = Date.now();
     this.activeTransfers.set(transferId, {
@@ -522,7 +508,7 @@ export class FileTransferHandler {
     view.setUint32(offset, chunk.length, true); offset += 4;
     bytes.set(compressed, offset);
 
-    this.ws?.send(msg);
+    this.send(msg);
 
     currentTransfer.currentChunkOffset = chunkEnd;
     if (chunkEnd >= fileData.byteLength) {

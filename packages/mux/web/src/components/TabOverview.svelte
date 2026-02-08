@@ -240,8 +240,8 @@
     // Capture initial snapshots for fallback display
     snapshots = muxClient.getTabSnapshots();
 
-    // Connect to preview WS with our frame handler
-    muxClient.connectPreview(handlePreviewFrame);
+    // Set H264 override handler for overview frame rendering
+    muxClient.setH264OverrideHandler(handlePreviewFrame);
   }
 
   function stopLivePreview(): void {
@@ -258,8 +258,8 @@
     panelGotFirstKeyframe.clear();
     canvasRefs = {};
 
-    // Disconnect preview WS
-    muxClient?.disconnectPreview();
+    // Clear H264 override handler
+    muxClient?.setH264OverrideHandler(null);
   }
 
   // Start live preview when overview opens

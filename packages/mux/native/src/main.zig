@@ -166,7 +166,8 @@ pub const BinaryCtrlMsg = enum(u8) {
     panel_assignment = 0x11,  // Multiplayer: panel assigned/unassigned [type:u8][panel_id:u32][session_id_len:u8][session_id:...]
     client_list = 0x12,  // Multiplayer: connected clients list [type:u8][count:u8][{client_id:u32, role:u8, session_id_len:u8, session_id:...}*]
     session_identity = 0x13,  // Multiplayer: your session identity [type:u8][session_id_len:u8][session_id:...]
-    cursor_state = 0x14,  // Cursor position/style for frontend CSS blink
+    cursor_state = 0x14,  // Cursor position/style for frontend CSS blink [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
+    surface_dims = 0x15,  // Surface pixel dimensions (sent on resize, not per-frame) [type:u8][panel_id:u32][width:u16][height:u16] = 9 bytes
     inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
 
     // Auth/Session Server → Client (0x0A-0x0F)
@@ -181,10 +182,14 @@ pub const BinaryCtrlMsg = enum(u8) {
     assign_panel = 0x84,    // Multiplayer: admin assigns panel to session [type:u8][panel_id:u32][session_id_len:u8][session_id:...]
     unassign_panel = 0x85,  // Multiplayer: admin unassigns panel [type:u8][panel_id:u32]
     panel_input = 0x86,     // Multiplayer: coworker sends input to assigned panel [type:u8][panel_id:u32][input_msg...]
+    panel_msg = 0x87,       // Panel message envelope: [type:u8][panel_id:u32][inner_msg...] — routes panel input through zstd WS
     view_action = 0x88,
     set_overview = 0x89,  // Set overview open/closed state
     set_quick_terminal = 0x8A,  // Set quick terminal open/closed state
     set_inspector = 0x8B,  // Set inspector open/closed state
+
+    // Batch envelope (both directions)
+    batch = 0xFE,  // [type:u8][count:u16_le][len1:u16_le][msg1...][len2:u16_le][msg2...]...
 
     // Auth/Session Client → Server (0x90-0x9F)
     get_auth_state = 0x90,       // Request auth state
@@ -555,7 +560,6 @@ const Panel = struct {
     scale: f64,
     streaming: std.atomic.Value(bool),
     force_keyframe: bool,
-    connection: ?*ws.Connection,
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     input_queue: std.ArrayList(InputEvent),
@@ -578,6 +582,8 @@ const Panel = struct {
     last_cursor_row: u16 = 0,
     last_cursor_style: u8 = 0,
     last_cursor_visible: u8 = 1,
+    last_surf_w: u16 = 0,
+    last_surf_h: u16 = 0,
 
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     /// After this many consecutive unchanged frames, reduce tick rate to save CPU/GPU.
@@ -675,9 +681,8 @@ const Panel = struct {
             .width = width,
             .height = height,
             .scale = scale,
-            .streaming = std.atomic.Value(bool).init(false),
+            .streaming = std.atomic.Value(bool).init(true),
             .force_keyframe = true,
-            .connection = null,
             .allocator = allocator,
             .mutex = .{},
             .input_queue = .{},
@@ -709,25 +714,29 @@ const Panel = struct {
         self.allocator.destroy(self);
     }
 
-    fn setConnection(self: *Panel, conn: ?*ws.Connection) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.connection = conn;
-        if (conn != null) {
-            self.streaming.store(true, .release);
-            self.force_keyframe = true;
-            self.ticks_since_connect = 0; // Reset so ghostty can render before we read pixels
-            self.consecutive_unchanged = 0; // Exit adaptive idle mode for new connection
-        } else {
-            self.streaming.store(false, .release);
-        }
+    fn startStreaming(self: *Panel) void {
+        self.streaming.store(true, .release);
+        self.force_keyframe = true;
+        self.ticks_since_connect = 0;
+        self.consecutive_unchanged = 0;
     }
 
     // Internal resize - called from main thread only (via processInputQueue)
-    // width/height are in CSS pixels (points)
-    fn resizeInternal(self: *Panel, width: u32, height: u32) !void {
-        // Skip resize if size hasn't changed to avoid unnecessary terminal reflow
-        if (self.width == width and self.height == height) return;
+    // width/height are in CSS pixels (points), scale may have been updated before this call
+    fn resizeInternal(self: *Panel, width: u32, height: u32, new_scale: f64) !void {
+        // Compute old pixel dims with OLD scale before any update
+        const old_pw: u32 = @intFromFloat(@as(f64, @floatFromInt(self.width)) * self.scale);
+        const old_ph: u32 = @intFromFloat(@as(f64, @floatFromInt(self.height)) * self.scale);
+
+        // Update scale if provided (> 0)
+        if (new_scale > 0) self.scale = new_scale;
+
+        // Compute new pixel dims with (potentially updated) scale
+        const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * self.scale);
+        const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * self.scale);
+
+        // Skip if resulting pixel dimensions haven't changed
+        if (pixel_width == old_pw and pixel_height == old_ph and self.width == width) return;
 
         self.width = width;
         self.height = height;
@@ -737,9 +746,6 @@ const Panel = struct {
             resizeWindow(self.window, width, height);
         }
 
-        // Set ghostty size in pixels
-        const pixel_width: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * self.scale);
-        const pixel_height: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * self.scale);
         c.ghostty_surface_set_size(self.surface, pixel_width, pixel_height);
 
         // Don't resize frame_buffer here - let captureFromIOSurface do it
@@ -980,7 +986,7 @@ const Panel = struct {
                     c.ghostty_surface_mouse_scroll(self.surface, scroll.dx, scroll.dy, 0);
                 },
                 .resize => |size| {
-                    self.resizeInternal(size.width, size.height) catch {};
+                    self.resizeInternal(size.width, size.height, 0) catch {};
                 },
             }
         }
@@ -1007,19 +1013,6 @@ const Panel = struct {
 
     fn getIOSurfaceMacOS(self: *Panel) ?IOSurfacePtr {
         return getIOSurfaceFromView(self.nsview);
-    }
-
-    // Send frame over WebSocket if connected.
-    // Mutex held during send to prevent UAF (WS handler could destroy conn).
-    // Propagates errors (e.g. WouldBlock) so caller can force a keyframe on drop.
-    fn sendFrame(self: *Panel, data: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.connection) |conn| {
-            if (conn.is_open) {
-                try conn.sendBinary(data);
-            }
-        }
     }
 
     // Convert browser mods to ghostty mods
@@ -1467,7 +1460,6 @@ const Panel = struct {
 
 // Panel creation request (to be processed on main thread)
 const PanelRequest = struct {
-    conn: *ws.Connection,
     width: u32,
     height: u32,
     scale: f64,
@@ -1485,11 +1477,11 @@ const PanelResizeRequest = struct {
     id: u32,
     width: u32,
     height: u32,
+    scale: f64, // 0 = keep existing panel.scale
 };
 
 // Panel split request (to be processed on main thread)
 const PanelSplitRequest = struct {
-    conn: *ws.Connection,
     parent_panel_id: u32,
     direction: SplitDirection,
     width: u32,
@@ -1502,7 +1494,7 @@ const Server = struct {
     app: ?c.ghostty_app_t,
     config: ?c.ghostty_config_t,
     panels: std.AutoHashMap(u32, *Panel),
-    panel_connections: std.AutoHashMap(*ws.Connection, *Panel),
+    h264_connections: std.ArrayList(*ws.Connection),
     control_connections: std.ArrayList(*ws.Connection),
     connection_roles: std.AutoHashMap(*ws.Connection, auth.Role),  // Track connection roles
     control_client_ids: std.AutoHashMap(*ws.Connection, u32),  // Track client IDs per control connection
@@ -1517,16 +1509,11 @@ const Server = struct {
     pending_resizes_ch: *Channel(PanelResizeRequest),
     pending_splits_ch: *Channel(PanelSplitRequest),
     next_panel_id: u32,
-    panel_ws_server: *ws.Server,
+    h264_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
-    file_ws_server: *ws.Server,
-    preview_ws_server: *ws.Server,
-    preview_connections: std.ArrayList(*ws.Connection),
-    preview_needs_immediate_frame: bool, // Send preview frames immediately after connect
     http_server: *http.HttpServer,
     auth_state: *auth.AuthState,  // Session and access control
     transfer_manager: transfer.TransferManager,
-    file_connections: std.ArrayList(*ws.Connection),
     running: std.atomic.Value(bool),
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
@@ -1551,25 +1538,15 @@ const Server = struct {
         // Create HTTP server for static files (no ghostty config needed initially)
         const http_srv = try http.HttpServer.init(allocator, "0.0.0.0", http_port, null);
 
-        // Create control WebSocket server (for tab list, layout, etc.)
+        // Create control WebSocket server (zstd channel: all non-H264 traffic)
         const control_ws = try ws.Server.init(allocator, "0.0.0.0", control_port);
         control_ws.setCallbacks(onControlConnect, onControlMessage, onControlDisconnect);
 
-        // Create panel WebSocket server (for pixel streams - no deflate, video is pre-compressed)
+        // Create H264 WebSocket server (video frames only, server→client, no deflate)
         // Short write timeout: video frames are droppable, don't block render loop
-        const panel_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
-        panel_ws.send_timeout_ms = 10; // 10ms — drop frame rather than stall
-        panel_ws.setCallbacks(onPanelConnect, onPanelMessage, onPanelDisconnect);
-
-        // Create file WebSocket server (for file transfers - uses zstd compression)
-        const file_ws = try ws.Server.init(allocator, "0.0.0.0", 0);
-        file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
-
-        // Create preview WebSocket server (for tab overview thumbnails - no deflate, video is pre-compressed)
-        // Short write timeout: preview frames are droppable
-        const preview_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", 0);
-        preview_ws.send_timeout_ms = 10;
-        preview_ws.setCallbacks(onPreviewConnect, onPreviewMessage, onPreviewDisconnect);
+        const h264_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
+        h264_ws.send_timeout_ms = 10; // 10ms — drop frame rather than stall
+        h264_ws.setCallbacks(onH264Connect, onH264Message, onH264Disconnect);
 
         // Initialize auth state
         const auth_state = try auth.AuthState.init(allocator);
@@ -1588,7 +1565,7 @@ const Server = struct {
             .app = null, // Lazy init on first panel
             .config = null,
             .panels = std.AutoHashMap(u32, *Panel).init(allocator),
-            .panel_connections = std.AutoHashMap(*ws.Connection, *Panel).init(allocator),
+            .h264_connections = .{},
             .control_connections = .{},
             .connection_roles = std.AutoHashMap(*ws.Connection, auth.Role).init(allocator),
             .control_client_ids = std.AutoHashMap(*ws.Connection, u32).init(allocator),
@@ -1603,15 +1580,10 @@ const Server = struct {
             .pending_splits_ch = pending_splits_ch,
             .next_panel_id = 1,
             .http_server = http_srv,
-            .panel_ws_server = panel_ws,
+            .h264_ws_server = h264_ws,
             .control_ws_server = control_ws,
-            .file_ws_server = file_ws,
-            .preview_ws_server = preview_ws,
-            .preview_connections = .{},
-            .preview_needs_immediate_frame = false,
             .auth_state = auth_state,
             .transfer_manager = transfer.TransferManager.init(allocator),
-            .file_connections = .{},
             .running = std.atomic.Value(bool).init(false),
             .allocator = allocator,
             .mutex = .{},
@@ -1729,22 +1701,11 @@ const Server = struct {
         // Clear global_server first to prevent callbacks from accessing it during shutdown
         global_server.store(null, .release);
 
-        // Clear panel_connections under mutex so disconnect callbacks find nothing.
-        // This prevents use-after-free if a WS thread outlives the shutdown timeout
-        // and tries to access a freed panel via onPanelDisconnect.
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.panel_connections.clearRetainingCapacity();
-        }
-
         // Shut down WebSocket servers first and wait for all connection threads to finish
         // This must happen BEFORE destroying panels to avoid use-after-free
         self.http_server.deinit();
-        self.panel_ws_server.deinit();
+        self.h264_ws_server.deinit();
         self.control_ws_server.deinit();
-        self.file_ws_server.deinit();
-        self.preview_ws_server.deinit();
 
         // Now safe to destroy panels since all connection threads have finished
         var panel_it = self.panels.valueIterator();
@@ -1752,7 +1713,7 @@ const Server = struct {
             panel.*.deinit();
         }
         self.panels.deinit();
-        self.panel_connections.deinit();
+        self.h264_connections.deinit(self.allocator);
         self.control_connections.deinit(self.allocator);
         self.layout.deinit();
         self.pending_panels_ch.deinit();
@@ -1762,8 +1723,6 @@ const Server = struct {
 
         self.auth_state.deinit();
         self.transfer_manager.deinit();
-        self.file_connections.deinit(self.allocator);
-        self.preview_connections.deinit(self.allocator);
         self.connection_roles.deinit();
         self.control_client_ids.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
@@ -1953,10 +1912,37 @@ const Server = struct {
         if (data.len == 0) return;
 
         const msg_type = data[0];
+        if (msg_type == 0xFE) {
+            // Batch envelope: [0xFE][count:u16_le][len1:u16_le][msg1...][len2:u16_le][msg2...]...
+            if (data.len < 3) return;
+            const count = std.mem.readInt(u16, data[1..3], .little);
+            var offset: usize = 3;
+            for (0..count) |_| {
+                if (offset + 2 > data.len) break;
+                const msg_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+                offset += 2;
+                if (offset + msg_len > data.len) break;
+                const inner = data[offset..][0..msg_len];
+                if (inner.len > 0) {
+                    self.dispatchControlMessage(conn, inner);
+                }
+                offset += msg_len;
+            }
+        } else {
+            self.dispatchControlMessage(conn, data);
+        }
+    }
+
+    fn dispatchControlMessage(self: *Server, conn: *ws.Connection, data: []u8) void {
+        if (data.len == 0) return;
+        const msg_type = data[0];
         if (msg_type >= 0x80 and msg_type <= 0x8F) {
             self.handleBinaryControlMessageFromClient(conn, data);
         } else if (msg_type >= 0x90 and msg_type <= 0x9F) {
             self.handleAuthMessage(conn, data);
+        } else if (msg_type >= 0x20 and msg_type <= 0x24) {
+            // File transfer messages (merged from file WS)
+            self.handleFileTransferMessage(conn, data);
         } else {
             self.handleBinaryControlMessage(conn, data);
         }
@@ -2011,167 +1997,194 @@ const Server = struct {
         self.sendClientListToAdmins();
     }
 
-    // --- Panel WebSocket callbacks---
+    // --- H264 WebSocket callbacks (video frames only, server→client) ---
 
-    fn onPanelConnect(conn: *ws.Connection) void {
-        _ = conn;
-    }
-
-    fn onPanelMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        const self = global_server.load(.acquire) orelse return;
-        _ = is_binary;
-
-        if (conn.user_data) |ud| {
-            const panel: *Panel = @ptrCast(@alignCast(ud));
-
-            // Handle inspector messages (need server access for sendInspectorStateToPanel)
-            if (data.len > 0) {
-                const msg_type = data[0];
-                if (msg_type == @intFromEnum(ClientMsg.inspector_subscribe)) {
-                    panel.inspector_subscribed = true;
-                    const payload = data[1..];
-                    if (payload.len >= 1) {
-                        const tab_len = payload[0];
-                        if (payload.len >= 1 + tab_len) {
-                            const tab = payload[1..][0..tab_len];
-                            const len = @min(tab.len, panel.inspector_tab.len);
-                            @memcpy(panel.inspector_tab[0..len], tab[0..len]);
-                            panel.inspector_tab_len = @intCast(len);
-                        }
-                    } else {
-                        const default_tab = "screen";
-                        @memcpy(panel.inspector_tab[0..default_tab.len], default_tab);
-                        panel.inspector_tab_len = default_tab.len;
-                    }
-                    self.mutex.lock();
-                    self.sendInspectorStateToPanel(panel, conn);
-                    self.mutex.unlock();
-                    return;
-                } else if (msg_type == @intFromEnum(ClientMsg.inspector_unsubscribe)) {
-                    panel.inspector_subscribed = false;
-                    return;
-                } else if (msg_type == @intFromEnum(ClientMsg.inspector_tab)) {
-                    const payload = data[1..];
-                    if (payload.len >= 1) {
-                        const tab_len = payload[0];
-                        if (payload.len >= 1 + tab_len) {
-                            const tab = payload[1..][0..tab_len];
-                            const len = @min(tab.len, panel.inspector_tab.len);
-                            @memcpy(panel.inspector_tab[0..len], tab[0..len]);
-                            panel.inspector_tab_len = @intCast(len);
-                            self.mutex.lock();
-                            self.sendInspectorStateToPanel(panel, conn);
-                            self.mutex.unlock();
-                        }
-                    }
-                    return;
-                }
-            }
-
-            panel.handleMessage(data);
-            panel.has_pending_input.store(true, .release);
-            panel.last_input_time.store(@truncate(std.time.nanoTimestamp()), .release);
-
-            self.wake_signal.notify();
-        } else {
-            // Not connected to panel yet - handle connect/create commands
-            if (data.len == 0) return;
-            const msg_type: ClientMsg = @enumFromInt(data[0]);
-
-            switch (msg_type) {
-                .connect_panel => {
-                    // Connect to existing panel: [msg_type:u8][panel_id:u32][client_id:u32]?
-                    if (data.len >= 5) {
-                        const panel_id = std.mem.readInt(u32, data[1..5], .little);
-                        self.mutex.lock();
-                        if (self.panels.get(panel_id)) |panel| {
-                            panel.setConnection(conn);
-                            conn.user_data = panel;
-                            self.panel_connections.put(conn, panel) catch {};
-                        }
-                        self.mutex.unlock();
-                    }
-                },
-                .create_panel => {
-                    // Create new panel: [msg_type:u8][width:u16][height:u16][scale:f32][inherit_panel_id:u32][flags:u8]?
-                    // flags: bit 0 = quick_terminal (don't add to layout)
-                    var width: u32 = 800;
-                    var height: u32 = 600;
-                    var scale: f64 = 2.0;
-                    var inherit_cwd_from: u32 = 0;
-                    var kind: PanelKind = .regular;
-                    if (data.len >= 5) {
-                        width = std.mem.readInt(u16, data[1..3], .little);
-                        height = std.mem.readInt(u16, data[3..5], .little);
-                    }
-                    if (data.len >= 9) {
-                        const scale_f32: f32 = @bitCast(std.mem.readInt(u32, data[5..9], .little));
-                        scale = @floatCast(scale_f32);
-                    }
-                    if (data.len >= 13) {
-                        inherit_cwd_from = std.mem.readInt(u32, data[9..13], .little);
-                    }
-                    if (data.len >= 14) {
-                        kind = if (data[13] & 1 != 0) .quick_terminal else .regular;
-                    }
-                    _ = self.pending_panels_ch.send(.{
-                        .conn = conn,
-                        .width = width,
-                        .height = height,
-                        .scale = scale,
-                        .inherit_cwd_from = inherit_cwd_from,
-                        .kind = kind,
-                    });
-                    self.wake_signal.notify();
-                },
-                .split_panel => {
-                    // Split existing panel: [msg_type:u8][parent_id:u32][dir_byte:u8][width:u16][height:u16][scale_x100:u16]
-                    if (data.len < 12) return;
-                    const parent_id = std.mem.readInt(u32, data[1..5], .little);
-                    const dir_byte = data[5];
-                    const width = std.mem.readInt(u16, data[6..8], .little);
-                    const height = std.mem.readInt(u16, data[8..10], .little);
-                    const scale_x100 = std.mem.readInt(u16, data[10..12], .little);
-                    const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
-                    const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
-
-                    _ = self.pending_splits_ch.send(.{
-                        .conn = conn,
-                        .parent_panel_id = parent_id,
-                        .direction = direction,
-                        .width = width,
-                        .height = height,
-                        .scale = scale,
-                    });
-                    self.wake_signal.notify();
-                },
-                else => {},
-            }
-        }
-    }
-
-    fn onPanelDisconnect(conn: *ws.Connection) void {
+    fn onH264Connect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
 
         self.mutex.lock();
-        if (self.panel_connections.fetchRemove(conn)) |entry| {
-            const panel = entry.value;
-            // Verify panel is still alive (not freed by processPendingDestroys or deinit)
-            // by checking it exists in the panels map. We can't read panel.id since it
-            // may be freed, so we compare pointers.
-            var still_alive = false;
-            var pit = self.panels.valueIterator();
-            while (pit.next()) |p| {
-                if (p.* == panel) {
-                    still_alive = true;
-                    break;
-                }
-            }
-            if (still_alive) {
-                panel.setConnection(null);
+        self.h264_connections.append(self.allocator, conn) catch {};
+
+        // Force keyframes on all panels so new H264 client gets valid streams
+        var panel_it = self.panels.valueIterator();
+        while (panel_it.next()) |panel_ptr| {
+            const panel = panel_ptr.*;
+            panel.force_keyframe = true;
+            panel.ticks_since_connect = 100; // Skip initial render delay
+        }
+        self.mutex.unlock();
+
+        self.wake_signal.notify();
+        std.debug.print("H264 client connected\n", .{});
+    }
+
+    fn onH264Message(_: *ws.Connection, _: []u8, _: bool) void {
+        // H264 WS is one-way server→client, no messages expected
+    }
+
+    fn onH264Disconnect(conn: *ws.Connection) void {
+        const self = global_server.load(.acquire) orelse return;
+
+        self.mutex.lock();
+        for (self.h264_connections.items, 0..) |hc, i| {
+            if (hc == conn) {
+                _ = self.h264_connections.orderedRemove(i);
+                break;
             }
         }
         self.mutex.unlock();
+
+        std.debug.print("H264 client disconnected\n", .{});
+    }
+
+    // Send H264 frame to all H264 clients with [panel_id:u32][frame_data...] prefix.
+    // Returns true if sent to at least one client, false if all sends failed.
+    fn sendH264Frame(self: *Server, panel_id: u32, frame_data: []const u8) bool {
+        var conns_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        var conns_count: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.h264_connections.items) |conn| {
+                if (conns_count < conns_buf.len) {
+                    conns_buf[conns_count] = conn;
+                    conns_count += 1;
+                }
+            }
+        }
+        if (conns_count == 0) return false;
+
+        var id_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &id_buf, panel_id, .little);
+
+        var any_sent = false;
+        for (conns_buf[0..conns_count]) |conn| {
+            conn.sendBinaryParts(&id_buf, frame_data) catch continue;
+            any_sent = true;
+        }
+        return any_sent;
+    }
+
+    // Handle PANEL_MSG (0x87) — routes panel-level messages through the zstd WS.
+    // Format: [0x87][panel_id:u32][inner_msg_type:u8][inner_payload...]
+    fn handlePanelMsg(self: *Server, conn: *ws.Connection, data: []const u8) void {
+        if (data.len < 6) return; // 1 (type) + 4 (panel_id) + 1 (inner type) minimum
+        const panel_id = std.mem.readInt(u32, data[1..5], .little);
+        const inner = data[5..];
+        const inner_type = inner[0];
+
+        // Handle create_panel and split_panel (no existing panel needed)
+        if (inner_type == @intFromEnum(ClientMsg.create_panel)) {
+            // Create new panel: [inner_type:u8][width:u16][height:u16][scale:f32][inherit_panel_id:u32][flags:u8]?
+            var width: u32 = 800;
+            var height: u32 = 600;
+            var scale: f64 = 2.0;
+            var inherit_cwd_from: u32 = 0;
+            var kind: PanelKind = .regular;
+            if (inner.len >= 5) {
+                width = std.mem.readInt(u16, inner[1..3], .little);
+                height = std.mem.readInt(u16, inner[3..5], .little);
+            }
+            if (inner.len >= 9) {
+                const scale_f32: f32 = @bitCast(std.mem.readInt(u32, inner[5..9], .little));
+                scale = @floatCast(scale_f32);
+            }
+            if (inner.len >= 13) {
+                inherit_cwd_from = std.mem.readInt(u32, inner[9..13], .little);
+            }
+            if (inner.len >= 14) {
+                kind = if (inner[13] & 1 != 0) .quick_terminal else .regular;
+            }
+            _ = self.pending_panels_ch.send(.{
+                .width = width,
+                .height = height,
+                .scale = scale,
+                .inherit_cwd_from = inherit_cwd_from,
+                .kind = kind,
+            });
+            self.wake_signal.notify();
+            return;
+        }
+
+        if (inner_type == @intFromEnum(ClientMsg.split_panel)) {
+            // Split existing panel: [inner_type:u8][parent_id:u32][dir_byte:u8][width:u16][height:u16][scale_x100:u16]
+            if (inner.len < 12) return;
+            const parent_id = std.mem.readInt(u32, inner[1..5], .little);
+            const dir_byte = inner[5];
+            const width = std.mem.readInt(u16, inner[6..8], .little);
+            const height = std.mem.readInt(u16, inner[8..10], .little);
+            const scale_x100 = std.mem.readInt(u16, inner[10..12], .little);
+            const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
+            const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
+
+            _ = self.pending_splits_ch.send(.{
+                .parent_panel_id = parent_id,
+                .direction = direction,
+                .width = width,
+                .height = height,
+                .scale = scale,
+            });
+            self.wake_signal.notify();
+            return;
+        }
+
+        // All other messages target an existing panel
+        self.mutex.lock();
+        const panel = self.panels.get(panel_id);
+        self.mutex.unlock();
+        if (panel == null) return;
+        const p = panel.?;
+
+        // Handle inspector messages
+        if (inner_type == @intFromEnum(ClientMsg.inspector_subscribe)) {
+            p.inspector_subscribed = true;
+            const payload = inner[1..];
+            if (payload.len >= 1) {
+                const tab_len = payload[0];
+                if (payload.len >= 1 + tab_len) {
+                    const tab = payload[1..][0..tab_len];
+                    const len = @min(tab.len, p.inspector_tab.len);
+                    @memcpy(p.inspector_tab[0..len], tab[0..len]);
+                    p.inspector_tab_len = @intCast(len);
+                }
+            } else {
+                const default_tab = "screen";
+                @memcpy(p.inspector_tab[0..default_tab.len], default_tab);
+                p.inspector_tab_len = default_tab.len;
+            }
+            self.mutex.lock();
+            self.sendInspectorStateToPanel(p, conn);
+            self.mutex.unlock();
+            return;
+        } else if (inner_type == @intFromEnum(ClientMsg.inspector_unsubscribe)) {
+            p.inspector_subscribed = false;
+            return;
+        } else if (inner_type == @intFromEnum(ClientMsg.inspector_tab)) {
+            const payload = inner[1..];
+            if (payload.len >= 1) {
+                const tab_len = payload[0];
+                if (payload.len >= 1 + tab_len) {
+                    const tab = payload[1..][0..tab_len];
+                    const len = @min(tab.len, p.inspector_tab.len);
+                    @memcpy(p.inspector_tab[0..len], tab[0..len]);
+                    p.inspector_tab_len = @intCast(len);
+                    self.mutex.lock();
+                    self.sendInspectorStateToPanel(p, conn);
+                    self.mutex.unlock();
+                }
+            }
+            return;
+        } else if (inner_type == @intFromEnum(ClientMsg.request_keyframe)) {
+            p.force_keyframe = true;
+            self.wake_signal.notify();
+            return;
+        }
+
+        // General panel input (key, mouse, text, resize, etc.)
+        p.handleMessage(@constCast(inner));
+        p.has_pending_input.store(true, .release);
+        p.last_input_time.store(@truncate(std.time.nanoTimestamp()), .release);
+        self.wake_signal.notify();
     }
 
 
@@ -2194,6 +2207,23 @@ const Server = struct {
         conn.sendBinary(&buf) catch {};
     }
 
+    // Broadcast inspector state to all control connections (mutex must be held)
+    fn broadcastInspectorStateToAll(self: *Server, panel: *Panel) void {
+        const size = c.ghostty_surface_size(panel.surface);
+        var buf: [15]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state);
+        std.mem.writeInt(u32, buf[1..5], panel.id, .little);
+        std.mem.writeInt(u16, buf[5..7], @intCast(size.columns), .little);
+        std.mem.writeInt(u16, buf[7..9], @intCast(size.rows), .little);
+        std.mem.writeInt(u16, buf[9..11], @intCast(size.width_px), .little);
+        std.mem.writeInt(u16, buf[11..13], @intCast(size.height_px), .little);
+        buf[13] = @intCast(size.cell_width_px);
+        buf[14] = @intCast(size.cell_height_px);
+        for (self.control_connections.items) |ctrl_conn| {
+            ctrl_conn.sendBinary(&buf) catch {};
+        }
+    }
+
     // --- Control message handling---
 
 
@@ -2210,6 +2240,9 @@ const Server = struct {
         } else if (msg_type == 0x86) { // panel_input
             self.handlePanelInput(conn, data);
             return;
+        } else if (msg_type == 0x87) { // panel_msg envelope
+            self.handlePanelMsg(conn, data);
+            return;
         }
 
         if (msg_type == 0x81) { // close_panel
@@ -2222,7 +2255,13 @@ const Server = struct {
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
             const width = std.mem.readInt(u16, data[5..7], .little);
             const height = std.mem.readInt(u16, data[7..9], .little);
-            _ = self.pending_resizes_ch.send(.{ .id = panel_id, .width = width, .height = height });
+            // Extended: [type:u8][panel_id:u32][w:u16][h:u16][scale:f32] = 13 bytes
+            var scale: f64 = 0;
+            if (data.len >= 13) {
+                const scale_f32: f32 = @bitCast(std.mem.readInt(u32, data[9..13], .little));
+                if (scale_f32 > 0) scale = @floatCast(scale_f32);
+            }
+            _ = self.pending_resizes_ch.send(.{ .id = panel_id, .width = width, .height = height, .scale = scale });
             self.wake_signal.notify();
         } else if (msg_type == 0x83) { // focus_panel
             if (data.len < 5) return;
@@ -2532,7 +2571,7 @@ const Server = struct {
         const msg_type = data[0];
         switch (msg_type) {
             // Client control messages
-            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x88, 0x89, 0x8A, 0x8B => {
+            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B => {
                 self.handleBinaryControlMessageFromClient(conn, data);
             },
             else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
@@ -2542,10 +2581,10 @@ const Server = struct {
     /// Max connections for stack-based snapshot (avoids heap allocation during broadcast).
     const max_broadcast_conns = 16;
 
-    /// Build 19-byte cursor state message in surface-space coordinates.
-    /// [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][total_w:u16][total_h:u16]
-    fn buildCursorBuf(panel_id: u32, x: u16, y: u16, w: u16, h: u16, style: u8, visible: u8, total_w: u16, total_h: u16) [19]u8 {
-        var buf: [19]u8 = undefined;
+    /// Build 15-byte cursor state message in surface-space coordinates.
+    /// [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8]
+    fn buildCursorBuf(panel_id: u32, x: u16, y: u16, w: u16, h: u16, style: u8, visible: u8) [15]u8 {
+        var buf: [15]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.cursor_state);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
         std.mem.writeInt(u16, buf[5..7], x, .little);
@@ -2554,13 +2593,22 @@ const Server = struct {
         std.mem.writeInt(u16, buf[11..13], h, .little);
         buf[13] = style;
         buf[14] = visible;
-        std.mem.writeInt(u16, buf[15..17], total_w, .little);
-        std.mem.writeInt(u16, buf[17..19], total_h, .little);
+        return buf;
+    }
+
+    /// Build 9-byte surface dimensions message.
+    /// [type:u8][panel_id:u32][width:u16][height:u16]
+    fn buildSurfaceDimsBuf(panel_id: u32, w: u16, h: u16) [9]u8 {
+        var buf: [9]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.surface_dims);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        std.mem.writeInt(u16, buf[5..7], w, .little);
+        std.mem.writeInt(u16, buf[7..9], h, .little);
         return buf;
     }
 
     /// Send current cursor state for all panels to a single connection.
-    /// Called when a new control client connects so it gets immediate cursor state.
+    /// Called when a new control client connects so it gets immediate cursor/surface state.
     fn sendCursorStateToConn(self: *Server, conn: *ws.Connection) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2585,7 +2633,11 @@ const Server = struct {
             const surf_total_w: u16 = @intCast(size.width_px);
             const surf_total_h: u16 = @intCast(size.height_px);
 
-            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, panel.last_cursor_style, panel.last_cursor_visible, surf_total_w, surf_total_h);
+            // Send surface dims first so client knows coordinate space
+            const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
+            conn.sendBinary(&dims_buf) catch {};
+
+            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, panel.last_cursor_style, panel.last_cursor_visible);
             conn.sendBinary(&cursor_buf) catch {};
         }
     }
@@ -2604,14 +2656,12 @@ const Server = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Send to panel-based inspector subscriptions
+        // Send to panel-based inspector subscriptions via control connections
         var it = self.panels.iterator();
         while (it.next()) |entry| {
             const panel = entry.value_ptr.*;
             if (panel.inspector_subscribed) {
-                if (panel.connection) |conn| {
-                    self.sendInspectorStateToPanel(panel, conn);
-                }
+                self.broadcastInspectorStateToAll(panel);
             }
         }
     }
@@ -2663,20 +2713,10 @@ const Server = struct {
 
         conn.sendBinary(msg_buf) catch {};
 
-        // Send title/pwd for each panel so client can update UI
+        // Send pwd for each panel (titles are already in PANEL_LIST message)
         var it3 = self.panels.iterator();
         while (it3.next()) |entry| {
             const panel = entry.value_ptr.*;
-            if (panel.title.len > 0) {
-                // Binary: [type:u8][panel_id:u32][title_len:u8][title...]
-                const title_len: u8 = @intCast(@min(panel.title.len, 255));
-                var title_buf: [262]u8 = undefined;
-                title_buf[0] = @intFromEnum(BinaryCtrlMsg.panel_title);
-                std.mem.writeInt(u32, title_buf[1..5], panel.id, .little);
-                title_buf[5] = title_len;
-                @memcpy(title_buf[6..][0..title_len], panel.title[0..title_len]);
-                conn.sendBinary(title_buf[0 .. 6 + title_len]) catch {};
-            }
             if (panel.pwd.len > 0) {
                 // Binary: [type:u8][panel_id:u32][pwd_len:u16][pwd...]
                 const pwd_len: u16 = @intCast(@min(panel.pwd.len, 1024));
@@ -3174,141 +3214,17 @@ const Server = struct {
         };
     }
 
-    // Run control WebSocket server
-    fn runControlWebSocket(self: *Server) void {
-        self.control_ws_server.run() catch |err| {
-            std.debug.print("Control WebSocket server error: {}\n", .{err});
-        };
-    }
-
-    // Run panel WebSocket server
-    fn runPanelWebSocket(self: *Server) void {
-        self.panel_ws_server.run() catch |err| {
-            std.debug.print("Panel WebSocket server error: {}\n", .{err});
-        };
-    }
-
-    // Run file WebSocket server
-    fn runFileWebSocket(self: *Server) void {
-        self.file_ws_server.run() catch |err| {
-            std.debug.print("File WebSocket server error: {}\n", .{err});
-        };
-    }
-
-    // --- File WebSocket callbacks---
-
-    fn onFileConnect(conn: *ws.Connection) void {
-        const self = global_server.load(.acquire) orelse return;
-
-        self.mutex.lock();
-        self.file_connections.append(self.allocator, conn) catch {};
-        self.mutex.unlock();
-
-        std.debug.print("File transfer client connected\n", .{});
-    }
-
-    fn onFileMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
-        const self = global_server.load(.acquire) orelse return;
-        if (!is_binary or data.len == 0) return;
-
+    // Route file transfer messages (merged from file WS into control WS)
+    fn handleFileTransferMessage(self: *Server, conn: *ws.Connection, data: []u8) void {
+        if (data.len == 0) return;
         const msg_type = data[0];
-
         switch (msg_type) {
             @intFromEnum(transfer.ClientMsgType.transfer_init) => self.handleTransferInit(conn, data),
             @intFromEnum(transfer.ClientMsgType.file_list_request) => self.handleFileListRequest(conn, data),
             @intFromEnum(transfer.ClientMsgType.file_data) => self.handleFileData(conn, data),
             @intFromEnum(transfer.ClientMsgType.transfer_resume) => self.handleTransferResume(conn, data),
             @intFromEnum(transfer.ClientMsgType.transfer_cancel) => self.handleTransferCancel(conn, data),
-            else => std.debug.print("Unknown file message type: 0x{x:0>2}\n", .{msg_type}),
-        }
-    }
-
-    fn onFileDisconnect(conn: *ws.Connection) void {
-        const self = global_server.load(.acquire) orelse return;
-
-        self.mutex.lock();
-        // Remove from file connections
-        for (self.file_connections.items, 0..) |fc, i| {
-            if (fc == conn) {
-                _ = self.file_connections.orderedRemove(i);
-                break;
-            }
-        }
-        self.mutex.unlock();
-
-        std.debug.print("File transfer client disconnected\n", .{});
-    }
-
-    // --- Preview WebSocket callbacks---
-
-    fn onPreviewConnect(conn: *ws.Connection) void {
-        const self = global_server.load(.acquire) orelse return;
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        self.preview_connections.append(self.allocator, conn) catch {};
-
-        // Force keyframes for all panels for preview
-        // Don't pause panels - let them continue streaming (render loop handles both)
-        var panel_it = self.panels.valueIterator();
-        while (panel_it.next()) |panel_ptr| {
-            const panel = panel_ptr.*;
-            panel.force_keyframe = true; // Ensure first preview frame has SPS/PPS
-            // Skip the initial render delay for panels that have already been running
-            panel.ticks_since_connect = 100;
-        }
-
-        // Request immediate preview frames
-        self.preview_needs_immediate_frame = true;
-
-        std.debug.print("Preview client connected\n", .{});
-    }
-
-    fn onPreviewMessage(_: *ws.Connection, _: []u8, _: bool) void {
-        // Preview is one-way server->client, no messages expected
-    }
-
-    fn onPreviewDisconnect(conn: *ws.Connection) void {
-        const self = global_server.load(.acquire) orelse return;
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Remove from preview connections
-        for (self.preview_connections.items, 0..) |pc, i| {
-            if (pc == conn) {
-                _ = self.preview_connections.orderedRemove(i);
-                break;
-            }
-        }
-
-        std.debug.print("Preview client disconnected\n", .{});
-    }
-
-    // Send frame to all preview clients with panel_id prefix.
-    // Snapshot connections under lock to avoid race with disconnect handlers.
-    fn sendPreviewFrame(self: *Server, panel_id: u32, frame_data: []const u8) void {
-        var conns_buf: [16]*ws.Connection = undefined;
-        var conns_count: usize = 0;
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            for (self.preview_connections.items) |conn| {
-                if (conns_count < conns_buf.len) {
-                    conns_buf[conns_count] = conn;
-                    conns_count += 1;
-                }
-            }
-        }
-        if (conns_count == 0) return;
-
-        // Send [panel_id:u32 LE][frame_data...] via writev (zero-alloc)
-        var id_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &id_buf, panel_id, .little);
-
-        for (conns_buf[0..conns_count]) |conn| {
-            conn.sendBinaryParts(&id_buf, frame_data) catch {};
+            else => std.debug.print("Unknown file transfer message type: 0x{x:0>2}\n", .{msg_type}),
         }
     }
 
@@ -3563,13 +3479,7 @@ const Server = struct {
                 continue;
             };
 
-            panel.setConnection(req.conn);
-            req.conn.user_data = panel;
-
-            self.mutex.lock();
-            self.panel_connections.put(req.conn, panel) catch {};
-            self.mutex.unlock();
-
+            // Panel starts streaming immediately (H264 frames sent to all h264_connections)
             self.broadcastPanelCreated(panel.id);
             // Only broadcast layout update for regular panels (quick terminal is outside layout)
             if (req.kind == .regular) {
@@ -3608,25 +3518,8 @@ const Server = struct {
                     break :blk true;
                 } else false;
 
-                // Find and close the panel's WebSocket connection
-                var conn_to_remove: ?*ws.Connection = null;
-                var it = self.panel_connections.iterator();
-                while (it.next()) |conn_entry| {
-                    if (conn_entry.value_ptr.* == panel) {
-                        conn_to_remove = conn_entry.key_ptr.*;
-                        break;
-                    }
-                }
-                if (conn_to_remove) |conn| {
-                    _ = self.panel_connections.remove(conn);
-                }
-
                 self.mutex.unlock();
 
-                // Send close and deinit outside mutex to avoid blocking render loop
-                if (conn_to_remove) |conn| {
-                    conn.sendClose() catch {};
-                }
                 panel.deinit();
 
                 // Notify clients
@@ -3653,15 +3546,13 @@ const Server = struct {
             self.mutex.lock();
             if (self.panels.get(req.id)) |panel| {
                 self.mutex.unlock();
-                panel.resizeInternal(req.width, req.height) catch {};
+                panel.resizeInternal(req.width, req.height, req.scale) catch {};
 
-                // Send inspector update if subscribed
+                // Send inspector update if subscribed (broadcast to all control connections)
                 if (panel.inspector_subscribed) {
-                    if (panel.connection) |conn| {
-                        self.mutex.lock();
-                        self.sendInspectorStateToPanel(panel, conn);
-                        self.mutex.unlock();
-                    }
+                    self.mutex.lock();
+                    self.broadcastInspectorStateToAll(panel);
+                    self.mutex.unlock();
                 }
             } else {
                 self.mutex.unlock();
@@ -3690,14 +3581,7 @@ const Server = struct {
                 continue;
             };
 
-            // Associate the WebSocket connection with the new panel (same as processPendingPanels)
-            panel.setConnection(req.conn);
-            req.conn.user_data = panel;
-
-            self.mutex.lock();
-            self.panel_connections.put(req.conn, panel) catch {};
-            self.mutex.unlock();
-
+            // Panel starts streaming immediately (H264 frames sent to all h264_connections)
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
 
@@ -3792,17 +3676,11 @@ const Server = struct {
 
                 frame_blocks += 1;
 
-                // Check if we have preview clients (overview mode)
+                // Check if we have H264 clients and overview mode
                 self.mutex.lock();
-                const has_preview_clients = self.preview_connections.items.len > 0;
-                const needs_immediate = self.preview_needs_immediate_frame;
-                if (needs_immediate) {
-                    self.preview_needs_immediate_frame = false;
-                }
+                const has_h264_clients = self.h264_connections.items.len > 0;
+                const is_overview = self.overview_open;
                 self.mutex.unlock();
-
-                // Send preview every 6th frame (5fps at 30fps base), or immediately after connect
-                const send_preview = has_preview_clients and (needs_immediate or frame_blocks % 6 == 0);
 
                 // Tick ghostty to render content to IOSurface
                 crash_phase.store(4, .monotonic); // ghostty_app_tick
@@ -3816,7 +3694,6 @@ const Server = struct {
 
                 // Collect panels to process (release mutex before heavy encode work)
                 var frame_panels_buf: [64]*Panel = undefined;
-                var frame_panels_streaming: [64]bool = undefined;
                 var frame_panels_count: usize = 0;
                 self.mutex.lock();
 
@@ -3837,7 +3714,10 @@ const Server = struct {
                 panel_it = self.panels.valueIterator();
                 while (panel_it.next()) |panel_ptr| {
                     const panel = panel_ptr.*;
-                    const is_streaming = panel.streaming.load(.acquire);
+                    const is_paused = !panel.streaming.load(.acquire);
+
+                    // Skip paused panels (during split operations)
+                    if (is_paused) continue;
 
                     // Check if panel is in the active tab
                     var in_active = false;
@@ -3847,8 +3727,8 @@ const Server = struct {
                             break;
                         }
                     }
-                    // Quick terminal panels are always active when streaming
-                    if (!in_active and is_streaming and panel.kind == .quick_terminal) {
+                    // Quick terminal panels are always active
+                    if (!in_active and panel.kind == .quick_terminal) {
                         in_active = true;
                     }
 
@@ -3856,20 +3736,20 @@ const Server = struct {
                     if (panel.ticks_since_connect < 10) {
                         if (dbg_log) |f| {
                             var dbg_buf: [256]u8 = undefined;
-                            const dbg_line = std.fmt.bufPrint(&dbg_buf, "COLLECT panel={d} tick={d} streaming={} in_active={} send_preview={} force_kf={} consec_unch={d}\n", .{
-                                panel.id, panel.ticks_since_connect, is_streaming, in_active, send_preview, panel.force_keyframe, panel.consecutive_unchanged,
+                            const dbg_line = std.fmt.bufPrint(&dbg_buf, "COLLECT panel={d} tick={d} in_active={} overview={} h264_clients={} force_kf={} consec_unch={d}\n", .{
+                                panel.id, panel.ticks_since_connect, in_active, is_overview, has_h264_clients, panel.force_keyframe, panel.consecutive_unchanged,
                             }) catch "";
                             _ = f.write(dbg_line) catch {};
                         }
                     }
 
-                    // Skip panels not in active tab (unless preview needs them)
-                    if (!in_active and !send_preview) continue;
-                    if (!is_streaming and !send_preview) continue;
+                    // Skip panels not in active tab (unless overview is open = need all panels)
+                    if (!in_active and !is_overview) continue;
+                    // Skip if no H264 clients connected
+                    if (!has_h264_clients) continue;
 
                     if (frame_panels_count < frame_panels_buf.len) {
                         frame_panels_buf[frame_panels_count] = panel;
-                        frame_panels_streaming[frame_panels_count] = is_streaming and in_active;
                         frame_panels_count += 1;
                     }
                 }
@@ -3879,12 +3759,10 @@ const Server = struct {
                 // Reduces input latency for the active panel by ~15ms per
                 // additional panel (avoids waiting for other panels to encode).
                 if (focused_panel_id) |fid| {
-                    if (frame_panels_count < 2) {} else for (frame_panels_buf[1..frame_panels_count], frame_panels_streaming[1..frame_panels_count], 1..) |panel, streaming, i| {
+                    if (frame_panels_count < 2) {} else for (frame_panels_buf[1..frame_panels_count], 1..) |panel, i| {
                         if (panel.id == fid) {
                             frame_panels_buf[i] = frame_panels_buf[0];
                             frame_panels_buf[0] = panel;
-                            frame_panels_streaming[i] = frame_panels_streaming[0];
-                            frame_panels_streaming[0] = streaming;
                             break;
                         }
                     }
@@ -3904,7 +3782,7 @@ const Server = struct {
                 var perf_read_ns: u64 = 0;
                 var perf_encode_ns: u64 = 0;
                 var perf_input_latency_us: i64 = 0; // Latest input-to-frame-send latency
-                for (frame_panels_buf[0..frame_panels_count], frame_panels_streaming[0..frame_panels_count]) |panel, is_streaming| {
+                for (frame_panels_buf[0..frame_panels_count]) |panel| {
 
                     frames_attempted += 1;
                     const t_frame_start = std.time.nanoTimestamp();
@@ -4066,40 +3944,22 @@ const Server = struct {
                         }
                     }
 
-                    // Send frame to panel connection (if streaming)
+                    // Send frame to all H264 clients (multiplexed by panel_id)
                     if (frame_data) |data| {
-                        if (is_streaming) {
-                            if (panel.sendFrame(data)) {
-                                frames_sent += 1;
-                                if (panel.ticks_since_connect < 10) {
-                                    if (dbg_log) |f| {
-                                        var dbg_buf: [128]u8 = undefined;
-                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "SENT panel={d} tick={d} size={d}\n", .{ panel.id, panel.ticks_since_connect, data.len }) catch "";
-                                        _ = f.write(dbg_line) catch {};
-                                    }
-                                }
-                            } else |_| {
-                                // Frame dropped (WouldBlock / TCP buffer full).
-                                // Force keyframe so browser can recover on next successful send.
-                                panel.force_keyframe = true;
-                                frames_dropped += 1;
-                                send_failed = true;
-                                if (panel.ticks_since_connect < 10) {
-                                    if (dbg_log) |f| {
-                                        var dbg_buf: [128]u8 = undefined;
-                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "SEND_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
-                                        _ = f.write(dbg_line) catch {};
-                                    }
-                                }
-                            }
-                        } else {
+                        if (self.sendH264Frame(panel.id, data)) {
+                            frames_sent += 1;
                             if (panel.ticks_since_connect < 10) {
                                 if (dbg_log) |f| {
                                     var dbg_buf: [128]u8 = undefined;
-                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "NOT_STREAMING panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
+                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "SENT panel={d} tick={d} size={d}\n", .{ panel.id, panel.ticks_since_connect, data.len }) catch "";
                                     _ = f.write(dbg_line) catch {};
                                 }
                             }
+                        } else {
+                            // All sends failed — force keyframe for recovery
+                            panel.force_keyframe = true;
+                            frames_dropped += 1;
+                            send_failed = true;
                         }
 
                         // Track input-to-frame-send latency
@@ -4109,20 +3969,31 @@ const Server = struct {
                             const latency = now_trunc - input_ts;
                             if (latency > 0) perf_input_latency_us = @intCast(@divFloor(latency, std.time.ns_per_us));
                         }
-
-                        // Send to preview clients (if any)
-                        if (send_preview) {
-                            self.sendPreviewFrame(panel.id, data);
-                        }
                     }
 
                     // Query cursor state and broadcast if changed (for frontend CSS blink)
-                    if (is_streaming) {
+                    {
                         var cur_col: u16 = 0;
                         var cur_row: u16 = 0;
                         var cur_style: u8 = 0;
                         var cur_visible: u8 = 0;
                         c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible);
+
+                        const size = c.ghostty_surface_size(panel.surface);
+                        const surf_total_w: u16 = @intCast(size.width_px);
+                        const surf_total_h: u16 = @intCast(size.height_px);
+
+                        // Broadcast surface dims only when they change (resize)
+                        if (surf_total_w != panel.last_surf_w or surf_total_h != panel.last_surf_h) {
+                            panel.last_surf_w = surf_total_w;
+                            panel.last_surf_h = surf_total_h;
+                            const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
+                            var ctrl_buf2: [max_broadcast_conns]*ws.Connection = undefined;
+                            const ctrl_conns2 = self.snapshotControlConns(&ctrl_buf2);
+                            for (ctrl_conns2) |ctrl_conn| {
+                                ctrl_conn.sendBinary(&dims_buf) catch {};
+                            }
+                        }
 
                         if (cur_col != panel.last_cursor_col or
                             cur_row != panel.last_cursor_row or
@@ -4134,10 +4005,7 @@ const Server = struct {
                             panel.last_cursor_style = cur_style;
                             panel.last_cursor_visible = cur_visible;
 
-                            // Compute cursor in surface-space pixel coordinates.
-                            // Client maps surface → encoder → CSS using surface dims
-                            // (sent here) and frame dims (from video decoder).
-                            const size = c.ghostty_surface_size(panel.surface);
+                            // Compute cursor in surface-space pixel coordinates
                             const cell_w: u16 = @intCast(size.cell_width_px);
                             const cell_h: u16 = @intCast(size.cell_height_px);
                             const padding_x: u16 = @intCast(
@@ -4150,10 +4018,8 @@ const Server = struct {
                             const surf_y = padding_y + cur_row * cell_h;
                             const surf_w: u16 = if (cur_style == 0) 2 else cell_w; // bar=2px
                             const surf_h: u16 = if (cur_style == 2) 2 else cell_h; // underline=2px
-                            const surf_total_w: u16 = @intCast(size.width_px);
-                            const surf_total_h: u16 = @intCast(size.height_px);
 
-                            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible, surf_total_w, surf_total_h);
+                            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible);
 
                             // Broadcast to control WS connections
                             var ctrl_buf: [max_broadcast_conns]*ws.Connection = undefined;
@@ -4254,9 +4120,8 @@ const Server = struct {
         self.running.store(true, .release);
 
         // Set running flag for WebSocket servers (they don't call run() but need this for handleConnection)
-        self.panel_ws_server.running.store(true, .release);
+        self.h264_ws_server.running.store(true, .release);
         self.control_ws_server.running.store(true, .release);
-        self.file_ws_server.running.store(true, .release);
 
         // Start HTTP server in background (handles all WebSocket via path-based routing)
         const http_thread = try std.Thread.spawn(.{}, runHttpServer, .{self});
@@ -4271,10 +4136,8 @@ const Server = struct {
         // their threads. This is done here instead of the signal handler because
         // .stop() calls allocator/deinit operations that are not signal-safe.
         self.http_server.stop();
-        self.panel_ws_server.stop();
+        self.h264_ws_server.stop();
         self.control_ws_server.stop();
-        self.file_ws_server.stop();
-        self.preview_ws_server.stop();
 
         // Wait for HTTP thread to finish
         http_thread.join();
@@ -4689,7 +4552,7 @@ var crash_phase = std.atomic.Value(u32).init(0);
 // 5 = ghostty_surface_draw
 // 6 = ghostty_surface_read_pixels
 // 7 = video encoder
-// 8 = sendFrame
+// 8 = sendH264Frame
 
 const phase_names = [_][]const u8{
     "idle/sleeping",
@@ -4700,7 +4563,7 @@ const phase_names = [_][]const u8{
     "ghostty_surface_draw",
     "ghostty_surface_read_pixels",
     "video encoder",
-    "sendFrame",
+    "sendH264Frame",
 };
 
 fn handleSigabrt(_: c_int) callconv(.c) void {
@@ -4747,24 +4610,14 @@ fn handleSigint(_: c_int) callconv(.c) void {
 }
 
 // WebSocket upgrade callbacks for HTTP server
-fn onPanelWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
+fn onH264WsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
     const server: *Server = @ptrCast(@alignCast(user_data orelse return));
-    server.panel_ws_server.handleUpgrade(stream, request);
+    server.h264_ws_server.handleUpgrade(stream, request);
 }
 
 fn onControlWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
     const server: *Server = @ptrCast(@alignCast(user_data orelse return));
     server.control_ws_server.handleUpgrade(stream, request);
-}
-
-fn onFileWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
-    const server: *Server = @ptrCast(@alignCast(user_data orelse return));
-    server.file_ws_server.handleUpgrade(stream, request);
-}
-
-fn onPreviewWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
-    const server: *Server = @ptrCast(@alignCast(user_data orelse return));
-    server.preview_ws_server.handleUpgrade(stream, request);
 }
 
 /// Run mux server - can be called from CLI or standalone
@@ -4792,12 +4645,12 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
     defer server.deinit();
 
     // Set up WebSocket upgrade callbacks on HTTP server
-    // All WebSocket connections go through the HTTP port via path-based routing
+    // 2 channels: /ws/h264 (video frames) + /ws/control (everything else, zstd compressed)
     server.http_server.setWsCallbacks(
-        onPanelWsUpgrade,
+        onH264WsUpgrade,
         onControlWsUpgrade,
-        onFileWsUpgrade,
-        onPreviewWsUpgrade,
+        null,
+        null,
         server,
     );
 

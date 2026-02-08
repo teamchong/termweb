@@ -6,10 +6,8 @@
 // ============================================================================
 
 export const WS_PATHS = {
+  H264: '/ws/h264',
   CONTROL: '/ws/control',
-  PANEL: '/ws/panel',
-  FILE: '/ws/file',
-  PREVIEW: '/ws/preview',
 } as const;
 
 export const CONFIG_ENDPOINT = '/config';
@@ -253,8 +251,10 @@ export const SERVER_MSG = {
   CLIENT_LIST: 0x12,
   /** Multiplayer: your session identity */
   SESSION_IDENTITY: 0x13,
-  /** Cursor position/style update for frontend CSS blink */
+  /** Cursor position/style update for frontend CSS blink (15 bytes, no surface dims) */
   CURSOR_STATE: 0x14,
+  /** Surface pixel dimensions per panel (sent on resize, not per-frame) */
+  SURFACE_DIMS: 0x15,
 } as const;
 
 // ============================================================================

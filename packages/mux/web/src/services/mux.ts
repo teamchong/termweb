@@ -13,6 +13,7 @@ import type { PanelStatus } from '../stores/types';
 import { applyColors, generateId, getWsUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
 import { TIMING, WS_PATHS, CONFIG_ENDPOINT, SERVER_MSG, UI } from '../constants';
 import { BinaryCtrlMsg, Role } from '../protocol';
+import { initZstd, compressZstd, decompressZstd } from '../zstd-wasm';
 
 // Extended panel interface with all methods
 interface PanelInstance extends PanelLike {
@@ -95,9 +96,14 @@ export class MuxClient {
   private bellTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
   private panelsEl: HTMLElement | null = null;
   private initialPanelListResolve: (() => void) | null = null;
-  private previewWs: WebSocket | null = null;
-  private previewFrameHandlers = new Map<number, (data: Uint8Array) => void>();
+  private h264Ws: WebSocket | null = null;
+  private surfaceDims = new Map<number, { w: number; h: number }>();
   private isViewer = false;
+  private dpiMediaQuery: MediaQueryList | null = null;
+  private dpiChangeHandler: (() => void) | null = null;
+  private zstdReady = false;
+  private h264PendingFrames = new Map<number, Uint8Array[]>();
+  private controlPendingByPanel = new Map<number, ArrayBuffer[]>();
 
   constructor() {
     this.fileTransfer = new FileTransferHandler();
@@ -120,6 +126,120 @@ export class MuxClient {
     return this.controlWs !== null && this.controlWs.readyState === WebSocket.OPEN;
   }
 
+  // --- Outgoing message batching (60fps bus) ---
+  private controlOutQueue: Uint8Array[] = [];
+  private controlFlushScheduled = false;
+
+  /** Queue binary data for the next batch flush (once per rAF) */
+  private sendControlBinary(data: Uint8Array): void {
+    if (!this.isControlWsOpen()) return;
+    this.controlOutQueue.push(data);
+    if (!this.controlFlushScheduled) {
+      this.controlFlushScheduled = true;
+      requestAnimationFrame(() => this.flushControlBatch());
+    }
+  }
+
+  /** Flush all queued messages as one zstd-compressed batch */
+  private flushControlBatch(): void {
+    this.controlFlushScheduled = false;
+    if (!this.isControlWsOpen() || !this.zstdReady || this.controlOutQueue.length === 0) {
+      // zstd not ready or WS not open — keep messages queued, reschedule
+      if (this.controlOutQueue.length > 0 && !this.controlFlushScheduled) {
+        this.controlFlushScheduled = true;
+        requestAnimationFrame(() => this.flushControlBatch());
+      }
+      return;
+    }
+
+    const queue = this.controlOutQueue;
+    this.controlOutQueue = [];
+
+    // Single message — skip batch envelope overhead
+    if (queue.length === 1) {
+      this.sendRawCompressed(queue[0]);
+      return;
+    }
+
+    // Build batch: [0xFE][count:u16_le][len1:u16_le][msg1...][len2:u16_le][msg2...]...
+    let totalPayload = 3; // type + count
+    for (const msg of queue) totalPayload += 2 + msg.length;
+    const batch = new Uint8Array(totalPayload);
+    const bv = new DataView(batch.buffer);
+    batch[0] = 0xFE;
+    bv.setUint16(1, queue.length, true);
+    let offset = 3;
+    for (const msg of queue) {
+      bv.setUint16(offset, msg.length, true);
+      offset += 2;
+      batch.set(msg, offset);
+      offset += msg.length;
+    }
+    this.sendRawCompressed(batch);
+  }
+
+  /** Compress and send a single zstd-framed message on the control WS */
+  private sendRawCompressed(data: Uint8Array): void {
+    try {
+      const compressed = compressZstd(data);
+      if (compressed.length + 1 < data.length + 1) {
+        const frame = new Uint8Array(1 + compressed.length);
+        frame[0] = 0x01;
+        frame.set(compressed, 1);
+        this.controlWs!.send(frame);
+        return;
+      }
+    } catch { /* compression didn't shrink — send with uncompressed flag */ }
+    const frame = new Uint8Array(1 + data.length);
+    frame[0] = 0x00;
+    frame.set(data, 1);
+    this.controlWs!.send(frame);
+  }
+
+  /** Send control WS resize (0x82) with scale for a single panel */
+  private sendResizePanelWithScale(serverId: number, width: number, height: number, scale: number): void {
+    const buf = new Uint8Array(13);
+    const view = new DataView(buf.buffer);
+    view.setUint8(0, BinaryCtrlMsg.RESIZE_PANEL);
+    view.setUint32(1, serverId, true);
+    view.setUint16(5, width, true);
+    view.setUint16(7, height, true);
+    view.setFloat32(9, scale, true);
+    this.sendControlBinary(buf);
+  }
+
+  /** Detect devicePixelRatio changes (screen move, zoom) and notify server */
+  private setupDpiDetection(): void {
+    const listen = () => {
+      this.dpiMediaQuery = matchMedia(`(resolution: ${devicePixelRatio}dppx)`);
+      this.dpiChangeHandler = () => {
+        const newScale = devicePixelRatio || 1;
+        // Send resize with new scale for every active panel
+        for (const [serverId, panel] of this.panelsByServerId) {
+          const rect = panel.element.getBoundingClientRect();
+          const w = Math.floor(rect.width);
+          const h = Math.floor(rect.height);
+          if (w > 0 && h > 0) {
+            this.sendResizePanelWithScale(serverId, w, h, newScale);
+          }
+        }
+        // Re-listen for the next change (new dppx value)
+        listen();
+      };
+      this.dpiMediaQuery.addEventListener('change', this.dpiChangeHandler, { once: true });
+    };
+    listen();
+  }
+
+  /** Remove DPI change listener */
+  private teardownDpiDetection(): void {
+    if (this.dpiMediaQuery && this.dpiChangeHandler) {
+      this.dpiMediaQuery.removeEventListener('change', this.dpiChangeHandler);
+    }
+    this.dpiMediaQuery = null;
+    this.dpiChangeHandler = null;
+  }
+
   async init(panelsEl: HTMLElement): Promise<void> {
     if (!MuxClient.checkWebCodecsSupport()) {
       const error = 'WebCodecs API not supported. Please use a modern browser (Chrome 94+, Edge 94+, or Safari 16.4+).';
@@ -129,6 +249,11 @@ export class MuxClient {
     }
 
     this.panelsEl = panelsEl;
+
+    // Init zstd WASM for control WS compression
+    await initZstd();
+    this.zstdReady = true;
+
     const config = await this.fetchConfig();
     if (config.colors) {
       applyColors(config.colors);
@@ -139,9 +264,8 @@ export class MuxClient {
     });
 
     this.connectControl();
-    this.fileTransfer.connect().catch(err => {
-      console.warn('File transfer connection failed:', err);
-    });
+    this.connectH264();
+    this.setupDpiDetection();
 
     await Promise.race([
       initialPanelListPromise,
@@ -152,6 +276,7 @@ export class MuxClient {
   destroy(): void {
     this.destroyed = true;
     initialLayoutLoaded.set(false);
+    this.teardownDpiDetection();
     if (this.initialPanelListResolve) {
       this.initialPanelListResolve();
       this.initialPanelListResolve = null;
@@ -168,14 +293,18 @@ export class MuxClient {
       this.controlWs.close();
       this.controlWs = null;
     }
+    if (this.h264Ws) {
+      this.h264Ws.close();
+      this.h264Ws = null;
+    }
     this.fileTransfer.disconnect();
-    this.forceDisconnectPreview();
-    this.previewFrameHandlers.clear();
     for (const panel of this.panelInstances.values()) {
       panel.destroy();
     }
     this.panelInstances.clear();
     this.panelsByServerId.clear();
+    this.h264PendingFrames.clear();
+    this.controlPendingByPanel.clear();
     panels.clear();
     for (const tab of this.tabInstances.values()) {
       tab.root.destroy();
@@ -207,6 +336,8 @@ export class MuxClient {
       console.log('Control channel connected');
       connectionStatus.set('connected');
       this.reconnectDelay = TIMING.WS_RECONNECT_INITIAL;
+      // Wire file transfer to send via control WS (bypasses batch queue for large payloads)
+      this.fileTransfer.setSend((data) => this.sendControlDirect(data));
     };
 
     this.controlWs.onmessage = (event) => {
@@ -218,7 +349,22 @@ export class MuxClient {
           console.error('Failed to parse JSON message:', err);
         }
       } else if (event.data instanceof ArrayBuffer) {
-        this.handleBinaryMessage(event.data);
+        // Server sends [compression_flag:u8][data...] — zstd framed, no exceptions
+        const raw = new Uint8Array(event.data);
+        if (raw.length < 2) return;
+        const flag = raw[0];
+        if (flag === 0x01) {
+          // zstd compressed — decompress and pass inner data
+          try {
+            const decompressed = decompressZstd(raw.subarray(1));
+            this.handleBinaryMessage(decompressed.buffer as ArrayBuffer);
+          } catch (err) {
+            console.error('zstd decompress failed:', err);
+          }
+        } else if (flag === 0x00) {
+          // Uncompressed — strip flag byte
+          this.handleBinaryMessage(raw.buffer.slice(1));
+        }
       }
     };
 
@@ -272,6 +418,25 @@ export class MuxClient {
     const view = new DataView(data);
     const bytes = new Uint8Array(data);
     const msgType = view.getUint8(0);
+
+    // Panel-specific messages: cache if panel not registered yet
+    if (data.byteLength >= 5 && (
+      msgType === SERVER_MSG.PANEL_TITLE ||
+      msgType === SERVER_MSG.PANEL_PWD ||
+      msgType === SERVER_MSG.PANEL_BELL ||
+      msgType === SERVER_MSG.CURSOR_STATE
+    )) {
+      const panelId = view.getUint32(1, true);
+      if (!this.panelsByServerId.has(panelId)) {
+        let pending = this.controlPendingByPanel.get(panelId);
+        if (!pending) {
+          pending = [];
+          this.controlPendingByPanel.set(panelId, pending);
+        }
+        pending.push(data);
+        return;
+      }
+    }
 
     try {
       switch (msgType) {
@@ -432,9 +597,18 @@ export class MuxClient {
           break;
         }
 
+        case SERVER_MSG.SURFACE_DIMS: {
+          // [0x15][panel_id:u32][width:u16][height:u16] = 9 bytes
+          if (data.byteLength < 9) break;
+          this.surfaceDims.set(view.getUint32(1, true), {
+            w: view.getUint16(5, true),
+            h: view.getUint16(7, true),
+          });
+          break;
+        }
         case SERVER_MSG.CURSOR_STATE: {
-          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][total_w:u16][total_h:u16] = 19 bytes
-          if (data.byteLength < 19) break;
+          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
+          if (data.byteLength < 15) break;
           const panelId = view.getUint32(1, true);
           const x = view.getUint16(5, true);
           const y = view.getUint16(7, true);
@@ -442,14 +616,22 @@ export class MuxClient {
           const h = view.getUint16(11, true);
           const style = view.getUint8(13);   // 0=bar, 1=block, 2=underline, 3=block_hollow
           const visible = view.getUint8(14) === 1;
-          const totalW = view.getUint16(15, true); // server surface width
-          const totalH = view.getUint16(17, true); // server surface height
+          // Use cached surface dims from SURFACE_DIMS message
+          const dims = this.surfaceDims.get(panelId);
+          const totalW = dims?.w ?? 0;
+          const totalH = dims?.h ?? 0;
           const panel = this.panelsByServerId.get(panelId);
           if (panel) {
             panel.updateCursorState(x, y, w, h, style, visible, totalW, totalH);
           }
           break;
         }
+        default:
+          // Route file transfer responses (0x30-0x36) to FileTransferHandler
+          if (msgType >= 0x30 && msgType <= 0x36) {
+            this.fileTransfer.handleServerMessage(data);
+          }
+          break;
       }
     } catch (err) {
       console.error('Failed to parse binary message:', err);
@@ -514,12 +696,40 @@ export class MuxClient {
       if (panel.serverId === null) {
         panel.serverId = panelId;
         this.panelsByServerId.set(panelId, panel);
+        // Flush any control messages that arrived before the panel was registered
+        const pendingCtrl = this.controlPendingByPanel.get(panelId);
+        if (pendingCtrl) {
+          this.controlPendingByPanel.delete(panelId);
+          for (const msg of pendingCtrl) {
+            this.handleBinaryMessage(msg);
+          }
+        }
+        // Flush any H264 frames that arrived before the panel was registered
+        const pendingFrames = this.h264PendingFrames.get(panelId);
+        if (pendingFrames) {
+          this.h264PendingFrames.delete(panelId);
+          for (const frame of pendingFrames) {
+            panel.decodePreviewFrame(frame);
+          }
+        }
+        // Send resize now that the server has assigned an ID.
+        // Any resize sent before this point used serverId=0 and was dropped.
+        const rect = panel.element.getBoundingClientRect();
+        const w = Math.floor(rect.width);
+        const h = Math.floor(rect.height);
+        if (w > 0 && h > 0) {
+          const scale = window.devicePixelRatio || 1;
+          this.sendResizePanelWithScale(panelId, w, h, scale);
+        }
         break;
       }
     }
   }
 
   private handlePanelClosed(serverId: number): void {
+    this.surfaceDims.delete(serverId);
+    this.h264PendingFrames.delete(serverId);
+    this.controlPendingByPanel.delete(serverId);
     const panel = this.panelsByServerId.get(serverId);
     if (panel) {
       this.removePanel(panel.id);
@@ -600,7 +810,7 @@ export class MuxClient {
       // Send close message to server (optimistic update - frontend updates immediately)
       if (panel.serverId !== null) {
         this.sendClosePanel(panel.serverId);
-        this.unregisterPreviewHandler(panel.serverId);
+
         this.panelsByServerId.delete(panel.serverId);
       }
       this.panelInstances.delete(panel.id);
@@ -715,14 +925,15 @@ export class MuxClient {
       this.panelsByServerId.set(serverId, panel);
     }
     panels.add(createPanelInfo(panelId, serverId, isQuickTerminal));
-    if (this.isViewer) {
-      // In viewer mode, don't connect panel WS - use preview frames instead
-      if (serverId !== null) {
-        this.registerPreviewHandler(serverId, (frameData) => {
-          panel.decodePreviewFrame(frameData);
-        });
-      }
-    } else {
+
+    // Wire panel to send via PANEL_MSG envelope on control WS
+    panel.setControlWsSend((msg) => {
+      const sid = panel.serverId ?? 0;
+      this.sendPanelMsg(sid, msg);
+    });
+
+    // Viewers only receive frames (via H264 WS demux) — no create/split/input
+    if (!this.isViewer) {
       panel.connect();
     }
     return panel;
@@ -800,7 +1011,7 @@ export class MuxClient {
       // Send close message to server (optimistic update - frontend updates immediately)
       if (panel.serverId !== null) {
         this.sendClosePanel(panel.serverId);
-        this.unregisterPreviewHandler(panel.serverId);
+
         this.panelsByServerId.delete(panel.serverId);
       }
       tab.root.removePanel(panel);
@@ -1028,84 +1239,68 @@ export class MuxClient {
   }
 
   private enterMainMode(): void {
-    if (!this.isViewer) return; // Already main
+    if (!this.isViewer) return;
     this.isViewer = false;
     console.log('Entering main mode');
-    this.forceDisconnectPreview();
-    // Connect all panels to panel WS
+    // Resume all panels (they receive frames via shared H264 WS)
     for (const panel of this.panelInstances.values()) {
-      if (panel.serverId != null) {
-        panel.connect();
-      }
+      panel.show();
     }
   }
 
   private enterViewerMode(): void {
-    if (this.isViewer) return; // Already viewer
+    if (this.isViewer) return;
     this.isViewer = true;
     console.log('Entering viewer mode');
-    // Disconnect all panel WS connections (don't steal from main)
+    // Pause all panels — viewers receive frames but don't send input
     for (const panel of this.panelInstances.values()) {
-      panel.hide(); // closes panel WS / pauses stream
+      panel.hide();
     }
-    // Connect to preview WS for read-only viewing
-    this.connectPreview();
   }
 
-  private previewOverrideHandler: ((panelId: number, data: Uint8Array) => void) | null = null;
+  private h264OverrideHandler: ((panelId: number, data: Uint8Array) => void) | null = null;
 
-  connectPreview(overrideHandler?: (panelId: number, data: Uint8Array) => void): void {
-    // Update the override handler even if already connected
-    if (overrideHandler) {
-      this.previewOverrideHandler = overrideHandler;
-    }
-    if (this.previewWs && this.previewWs.readyState !== WebSocket.CLOSED) return;
-    const url = getWsUrl(WS_PATHS.PREVIEW);
-    this.previewWs = new WebSocket(url);
-    this.previewWs.binaryType = 'arraybuffer';
-    this.previewWs.onmessage = (e) => {
+  /** Connect the shared H264 WebSocket for receiving video frames */
+  private connectH264(): void {
+    if (this.destroyed) return;
+    if (this.h264Ws && this.h264Ws.readyState !== WebSocket.CLOSED) return;
+    const url = getWsUrl(WS_PATHS.H264);
+    this.h264Ws = new WebSocket(url);
+    this.h264Ws.binaryType = 'arraybuffer';
+    this.h264Ws.onmessage = (e: MessageEvent) => {
       if (e.data instanceof ArrayBuffer && e.data.byteLength > 4) {
-        const frameView = new DataView(e.data);
-        const panelId = frameView.getUint32(0, true);
+        const view = new DataView(e.data);
+        const panelId = view.getUint32(0, true);
         const frameData = new Uint8Array(e.data, 4);
         // Route to override handler (overview) if set
-        if (this.previewOverrideHandler) {
-          this.previewOverrideHandler(panelId, frameData);
+        if (this.h264OverrideHandler) {
+          this.h264OverrideHandler(panelId, frameData);
         }
-        // Also route to panel handlers (viewer mode panels)
-        const handler = this.previewFrameHandlers.get(panelId);
-        handler?.(frameData);
+        // Route to panel by server ID, cache if not ready yet
+        const panel = this.panelsByServerId.get(panelId);
+        if (panel) {
+          panel.decodePreviewFrame(frameData);
+        } else {
+          let pending = this.h264PendingFrames.get(panelId);
+          if (!pending) {
+            pending = [];
+            this.h264PendingFrames.set(panelId, pending);
+          }
+          pending.push(frameData);
+        }
       }
     };
-    this.previewWs.onclose = () => {
-      this.previewWs = null;
+    this.h264Ws.onclose = () => {
+      this.h264Ws = null;
+      if (!this.destroyed) {
+        setTimeout(() => this.connectH264(), TIMING.WS_RECONNECT_DELAY);
+      }
     };
   }
 
-  disconnectPreview(): void {
-    this.previewOverrideHandler = null;
-    // Only close the WS if viewer mode doesn't need it
-    if (!this.isViewer && this.previewWs) {
-      this.previewWs.close();
-      this.previewWs = null;
-    }
-  }
-
-  /** Force-close the preview WS regardless of viewer state */
-  private forceDisconnectPreview(): void {
-    this.previewOverrideHandler = null;
-    if (this.previewWs) {
-      this.previewWs.close();
-      this.previewWs = null;
-    }
-  }
-
-  registerPreviewHandler(serverId: number, handler: (data: Uint8Array) => void): void {
-    this.previewFrameHandlers.set(serverId, handler);
-  }
-
-  unregisterPreviewHandler(serverId: number): void {
-    this.previewFrameHandlers.delete(serverId);
+  /** Set an override handler for H264 frames (used by overview) */
+  setH264OverrideHandler(handler: ((panelId: number, data: Uint8Array) => void) | null): void {
+    this.h264OverrideHandler = handler;
   }
 
   isViewerMode(): boolean {
@@ -1113,12 +1308,27 @@ export class MuxClient {
   }
 
   sendControlMessage(type: number, data: Uint8Array): void {
-    if (this.isControlWsOpen()) {
-      const message = new Uint8Array(1 + data.length);
-      message[0] = type;
-      message.set(data, 1);
-      this.controlWs!.send(message);
-    }
+    const message = new Uint8Array(1 + data.length);
+    message[0] = type;
+    message.set(data, 1);
+    this.sendControlBinary(message);
+  }
+
+  /** Send binary data via the control WS bus */
+  sendControlDirect(data: Uint8Array): void {
+    this.sendControlBinary(data);
+  }
+
+  /** Wrap a panel message in PANEL_MSG envelope and send via control WS */
+  private sendPanelMsg(serverId: number, msg: ArrayBuffer | ArrayBufferView): void {
+    const inputBytes = msg instanceof ArrayBuffer
+      ? new Uint8Array(msg)
+      : new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
+    const envelope = new Uint8Array(1 + 4 + inputBytes.length);
+    envelope[0] = BinaryCtrlMsg.PANEL_MSG;
+    new DataView(envelope.buffer).setUint32(1, serverId, true);
+    envelope.set(inputBytes, 5);
+    this.sendControlBinary(envelope);
   }
 
   private sendClosePanel(serverId: number): void {
@@ -1175,7 +1385,6 @@ export class MuxClient {
 
   /** Send input to assigned panel via control WS (coworker mode) */
   private sendPanelInputViaControl(serverId: number, inputMsg: ArrayBuffer | ArrayBufferView): void {
-    if (!this.isControlWsOpen()) return;
     const inputBytes = inputMsg instanceof ArrayBuffer
       ? new Uint8Array(inputMsg)
       : new Uint8Array(inputMsg.buffer, inputMsg.byteOffset, inputMsg.byteLength);
@@ -1184,7 +1393,7 @@ export class MuxClient {
     const view = new DataView(msg.buffer);
     view.setUint32(1, serverId, true);
     msg.set(inputBytes, 5);
-    this.controlWs!.send(msg);
+    this.sendControlBinary(msg);
   }
 
   /** Wire up coworker input for a panel */
@@ -1205,7 +1414,7 @@ export class MuxClient {
     if (!panel) return;
 
     const currentAuth = get(authState);
-    // Admin uses panel WS directly, no control WS routing needed
+    // Admin uses PANEL_MSG envelope — coworker overrides don't apply
     if (currentAuth.role === Role.ADMIN) return;
 
     const uiState = get(ui);

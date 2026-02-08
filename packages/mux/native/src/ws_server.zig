@@ -159,6 +159,9 @@ pub const Connection = struct {
     zstd_enabled: bool = false,
     compressor: ?zstd.Compressor = null,
     decompressor: ?zstd.Decompressor = null,
+    // Serializes cross-thread writes (sendBinary) with deinit to prevent
+    // use-after-free when broadcast threads access a connection being torn down.
+    write_mutex: Thread.Mutex = .{},
 
     pub fn init(stream: net.Stream, allocator: Allocator) Connection {
         return .{
@@ -170,11 +173,15 @@ pub const Connection = struct {
             .zstd_enabled = false,
             .compressor = null,
             .decompressor = null,
+            .write_mutex = .{},
         };
     }
 
     pub fn deinit(self: *Connection) void {
-        // Free zstd resources - null out after freeing to prevent double-free
+        // Lock write_mutex to prevent broadcast threads from using the
+        // compressor or stream while we tear them down.
+        self.write_mutex.lock();
+        self.is_open = false;
         if (self.compressor) |*comp| {
             comp.deinit();
             self.compressor = null;
@@ -183,12 +190,13 @@ pub const Connection = struct {
             decomp.deinit();
             self.decompressor = null;
         }
+        self.write_mutex.unlock();
+        // Close stream and free URI after unlocking (no longer accessed by writers)
         if (self.request_uri) |uri| {
             self.allocator.free(uri);
             self.request_uri = null;
         }
         self.stream.close();
-        self.is_open = false;
     }
 
     /// Perform WebSocket handshake (server side).
@@ -229,10 +237,7 @@ pub const Connection = struct {
         var accept_key: [28]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&accept_key, &hash);
 
-        // Check for X-Compression: zstd header (app-level compression)
-        const has_zstd = enable_zstd and findHeaderValue(request, "x-compression") != null;
-
-        // Send handshake response (no permessage-deflate - we use app-level zstd)
+        // Send handshake response
         const response = "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
@@ -240,9 +245,9 @@ pub const Connection = struct {
         _ = try self.stream.write(response);
         _ = try self.stream.write(&accept_key);
 
-        // Enable zstd if client supports it (indicated by X-Compression header)
-        if (has_zstd) {
-            _ = try self.stream.write("\r\nX-Compression: zstd");
+        // Always enable zstd on non-H264 channels (control, file).
+        // H264 channels use initNoDeflate which sets enable_zstd=false.
+        if (enable_zstd) {
             self.zstd_enabled = true;
             self.compressor = zstd.Compressor.init(self.allocator, 3) catch null;
             self.decompressor = zstd.Decompressor.init(self.allocator) catch null;
@@ -274,10 +279,7 @@ pub const Connection = struct {
         var accept_key: [28]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&accept_key, &hash);
 
-        // Check for X-Compression: zstd header (app-level compression)
-        const has_zstd = enable_zstd and findHeaderValue(request, "x-compression") != null;
-
-        // Send handshake response (no permessage-deflate - we use app-level zstd)
+        // Send handshake response
         const response = "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
@@ -285,9 +287,9 @@ pub const Connection = struct {
         _ = try self.stream.write(response);
         _ = try self.stream.write(&accept_key);
 
-        // Enable zstd if client supports it
-        if (has_zstd) {
-            _ = try self.stream.write("\r\nX-Compression: zstd");
+        // Always enable zstd on non-H264 channels (control, file).
+        // H264 channels use initNoDeflate which sets enable_zstd=false.
+        if (enable_zstd) {
             self.zstd_enabled = true;
             self.compressor = zstd.Compressor.init(self.allocator, 3) catch null;
             self.decompressor = zstd.Decompressor.init(self.allocator) catch null;
@@ -384,20 +386,17 @@ pub const Connection = struct {
     /// compression_flag: 0x00 = uncompressed, 0x01 = zstd compressed.
     pub fn writeFrame(self: *Connection, opcode: Opcode, payload: []const u8) !void {
         if (opcode == .binary and self.zstd_enabled) {
-            // Try compression for payloads > 64 bytes
-            if (payload.len > 64) {
-                if (self.compressor) |*comp| {
-                    if (comp.compress(payload)) |compressed| {
-                        defer self.allocator.free(compressed);
-                        if (compressed.len + 1 < payload.len) {
-                            // Send compressed: [0x01][compressed_data] via writev (zero-alloc)
-                            const flag = [_]u8{0x01};
-                            return self.writeFrameRawParts(.binary, &flag, compressed);
-                        }
-                    } else |_| {}
-                }
+            // Always try compression — batching makes zstd efficient at any size
+            if (self.compressor) |*comp| {
+                if (comp.compress(payload)) |compressed| {
+                    defer self.allocator.free(compressed);
+                    if (compressed.len + 1 < payload.len) {
+                        const flag = [_]u8{0x01};
+                        return self.writeFrameRawParts(.binary, &flag, compressed);
+                    }
+                } else |_| {}
             }
-            // Uncompressed: [0x00][payload] via writev (zero-alloc)
+            // Compression didn't shrink — send uncompressed with flag
             return self.sendUncompressedWithFlag(payload);
         }
 
@@ -526,19 +525,28 @@ pub const Connection = struct {
         }
     }
 
-    /// Send binary data.
+    /// Send binary data (thread-safe — may be called from broadcast threads).
     pub fn sendBinary(self: *Connection, data: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        if (!self.is_open) return error.ConnectionClosed;
         try self.writeFrame(.binary, data);
     }
 
-    /// Send binary data with prefix + payload (zero-alloc via writev).
+    /// Send binary data with prefix + payload (thread-safe, zero-alloc via writev).
     /// Used for sending [prefix][payload] without allocating a concatenated buffer.
     pub fn sendBinaryParts(self: *Connection, prefix: []const u8, payload: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        if (!self.is_open) return error.ConnectionClosed;
         try self.writeFrameRawParts(.binary, prefix, payload);
     }
 
-    /// Send text data.
+    /// Send text data (thread-safe — may be called from broadcast threads).
     pub fn sendText(self: *Connection, data: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        if (!self.is_open) return error.ConnectionClosed;
         try self.writeFrame(.text, data);
     }
 

@@ -214,24 +214,14 @@ pub const HttpServer = struct {
 
         // Check for WebSocket upgrade
         if (self.isWebSocketUpgrade(request)) {
-            // Route WebSocket by path - don't close stream, callback owns it
-            if (std.mem.eql(u8, path, "/ws/panel")) {
+            // Route WebSocket by path - 2 channels: h264 (video) + control (zstd, everything else)
+            if (std.mem.eql(u8, path, "/ws/h264")) {
                 if (self.panel_ws_callback) |cb| {
                     cb(stream, request, self.ws_user_data);
                     return; // Callback owns the stream
                 }
             } else if (std.mem.eql(u8, path, "/ws/control")) {
                 if (self.control_ws_callback) |cb| {
-                    cb(stream, request, self.ws_user_data);
-                    return;
-                }
-            } else if (std.mem.eql(u8, path, "/ws/file")) {
-                if (self.file_ws_callback) |cb| {
-                    cb(stream, request, self.ws_user_data);
-                    return;
-                }
-            } else if (std.mem.eql(u8, path, "/ws/preview")) {
-                if (self.preview_ws_callback) |cb| {
                     cb(stream, request, self.ws_user_data);
                     return;
                 }

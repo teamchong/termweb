@@ -11,12 +11,10 @@ export const ClientMsg = {
   PAUSE_STREAM: 0x12,
   RESUME_STREAM: 0x13,
   BUFFER_STATS: 0x14, // Client reports buffer health for adaptive bitrate
-  CONNECT_PANEL: 0x20,
   CREATE_PANEL: 0x21,
-  SPLIT_PANEL: 0x22, // Create panel as split of existing panel (panel WebSocket)
+  SPLIT_PANEL: 0x22, // Create panel as split of existing panel (via PANEL_MSG envelope on control WS)
   INSPECTOR_SUBSCRIBE: 0x30,   // Subscribe to inspector: [msg_type:u8][tab_len:u8][tab:...]
   INSPECTOR_UNSUBSCRIBE: 0x31, // Unsubscribe from inspector: [msg_type:u8]
-  INSPECTOR_TAB: 0x32,         // Change inspector tab: [msg_type:u8][tab_len:u8][tab:...]
 } as const;
 
 export const FrameType = {
@@ -32,12 +30,12 @@ export const BinaryCtrlMsg = {
   VIEW_ACTION: 0x88,
   SET_OVERVIEW: 0x89,  // Set overview open/closed state
   SET_QUICK_TERMINAL: 0x8A,  // Set quick terminal open/closed state
-  SET_INSPECTOR: 0x8B,  // Set inspector open/closed state
   SET_CLIPBOARD: 0x8C,  // Send clipboard text to server: [panel_id:u32][len:u32][text...]
   // Multiplayer messages
   ASSIGN_PANEL: 0x84,     // Admin assigns panel to session: [panel_id:u32][session_id_len:u8][session_id:...]
   UNASSIGN_PANEL: 0x85,   // Admin unassigns panel: [panel_id:u32]
   PANEL_INPUT: 0x86,      // Coworker input to assigned panel: [panel_id:u32][input_msg...]
+  PANEL_MSG: 0x87,        // Panel message envelope: [type:u8][panel_id:u32][inner_msg...] — routes panel input through zstd WS
   // Auth messages
   GET_AUTH_STATE: 0x90,
   SET_PASSWORD: 0x91,

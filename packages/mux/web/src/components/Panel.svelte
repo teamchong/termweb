@@ -1,11 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { get } from 'svelte/store';
   import { ClientMsg } from '../protocol';
   import type { PanelStatus } from '../stores/types';
-  import { ui } from '../stores/index';
-  import { getWsUrl, sharedTextEncoder, CircularBuffer, throttle } from '../utils';
-  import { PANEL, TIMING, WS_PATHS, UI, NAL, MODIFIER, WHEEL_MODE, STATS_THRESHOLD } from '../constants';
+  import { sharedTextEncoder, CircularBuffer, throttle } from '../utils';
+  import { PANEL, TIMING, UI, NAL, MODIFIER, WHEEL_MODE, STATS_THRESHOLD } from '../constants';
   import { initWebGPURenderer, type WebGPUFrameRenderer } from '../webgpu-renderer';
 
   // ============================================================================
@@ -81,7 +79,6 @@
   // Internal State (non-reactive for performance)
   // ============================================================================
 
-  let ws: WebSocket | null = null;
   let controlWsSend: ((msg: ArrayBuffer | ArrayBufferView) => void) | null = null;
   let decoder: VideoDecoder | null = null;
   let snapshotCanvas: HTMLCanvasElement | undefined;
@@ -205,22 +202,14 @@
   // WebSocket Helpers
   // ============================================================================
 
-  function isWsOpen(): boolean {
-    return ws !== null && ws.readyState === WebSocket.OPEN;
-  }
-
-  /** Check if any send path is available (panel WS or control WS) */
+  /** Check if send path is available (control WS via PANEL_MSG envelope) */
   function canSendInput(): boolean {
-    return controlWsSend !== null || isWsOpen();
+    return controlWsSend !== null;
   }
 
-  /** Send input via control WS (coworker mode) or panel WS (admin mode) */
+  /** Send input via control WS (PANEL_MSG envelope) */
   function sendInput(buf: ArrayBuffer | ArrayBufferView): void {
-    if (controlWsSend) {
-      controlWsSend(buf);
-    } else if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(buf);
-    }
+    controlWsSend?.(buf);
   }
 
   export function setControlWsSend(fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null): void {
@@ -438,7 +427,7 @@
   }
 
   function checkBufferHealth(): void {
-    if (!isWsOpen()) return;
+    if (!canSendInput()) return;
 
     const now = performance.now();
     const oneSecondAgo = now - TIMING.FPS_CALCULATION_WINDOW;
@@ -454,14 +443,14 @@
   let keyframeRequested = false;
 
   function requestKeyframe(): void {
-    if (keyframeRequested || !isWsOpen()) return;
+    if (keyframeRequested || !canSendInput()) return;
     keyframeRequested = true;
     const buf = new Uint8Array([ClientMsg.REQUEST_KEYFRAME]);
-    ws!.send(buf);
+    sendInput(buf);
   }
 
   function sendBufferStats(health: number, fps: number): void {
-    if (!isWsOpen()) return;
+    if (!canSendInput()) return;
 
     const buf = new ArrayBuffer(5);
     const view = new DataView(buf);
@@ -469,7 +458,7 @@
     view.setUint8(1, Math.round(health));
     view.setUint8(2, Math.round(fps));
     view.setUint16(3, pendingDecode * PANEL.APPROX_FRAME_DURATION_MS, true);
-    ws!.send(buf);
+    sendInput(buf);
   }
 
   // ============================================================================
@@ -507,74 +496,32 @@
   // ============================================================================
 
   export function connect(): void {
-    if (ws) {
-      ws.close();
+    if (!canSendInput()) return;
+    setStatus('connected');
+
+    if (_serverId !== null) {
+      // Reconnecting to existing panel — send resize after DOM settles
+      connectTimeoutId = setTimeout(() => {
+        connectTimeoutId = null;
+        if (destroyed || !panelEl) return;
+        const rect = panelEl.getBoundingClientRect();
+        const width = Math.floor(rect.width);
+        const height = Math.floor(rect.height);
+        if (width > 0 && height > 0) {
+          lastReportedWidth = width;
+          lastReportedHeight = height;
+          sendResizeBinary(width, height);
+        }
+      }, 0);
+    } else if (_splitInfo) {
+      sendSplitPanel();
+    } else {
+      sendCreatePanel();
     }
-
-    setStatus('connecting');
-
-    const wsUrl = getWsUrl(WS_PATHS.PANEL);
-    ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
-
-    ws.onopen = () => {
-      setStatus('connected');
-      if (_serverId !== null) {
-        sendConnectPanel(_serverId);
-      } else if (_splitInfo) {
-        sendSplitPanel();
-      } else {
-        sendCreatePanel();
-      }
-    };
-
-    ws.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        handleFrame(event.data);
-      }
-    };
-
-    ws.onclose = () => {
-      ws = null;
-      if (!destroyed) {
-        setStatus('disconnected');
-      }
-    };
-
-    ws.onerror = (e) => {
-      console.error('WebSocket error:', e);
-      setStatus('error');
-    };
-  }
-
-  function sendConnectPanel(panelId: number): void {
-    if (!isWsOpen()) return;
-
-    // Include client_id for future role-based access: [0x20][panel_id:u32][client_id:u32]
-    const clientId = get(ui).clientId;
-    const buf = new ArrayBuffer(9);
-    const view = new DataView(buf);
-    view.setUint8(0, ClientMsg.CONNECT_PANEL);
-    view.setUint32(1, panelId, true);
-    view.setUint32(5, clientId, true);
-    ws!.send(buf);
-
-    connectTimeoutId = setTimeout(() => {
-      connectTimeoutId = null;
-      if (destroyed || !panelEl) return;
-      const rect = panelEl.getBoundingClientRect();
-      const width = Math.floor(rect.width);
-      const height = Math.floor(rect.height);
-      if (width > 0 && height > 0) {
-        lastReportedWidth = width;
-        lastReportedHeight = height;
-        sendResizeBinary(width, height);
-      }
-    }, 0);
   }
 
   function sendCreatePanel(): void {
-    if (!isWsOpen()) return;
+    if (!canSendInput()) return;
 
     let width: number, height: number;
     if (_initialSize) {
@@ -602,11 +549,11 @@
     view.setFloat32(5, scale, true);
     view.setUint32(9, inheritCwdFrom ?? 0, true);
     view.setUint8(13, isQuickTerminal ? 1 : 0);
-    ws!.send(buf);
+    sendInput(buf);
   }
 
   function sendSplitPanel(): void {
-    if (!isWsOpen() || !_splitInfo) return;
+    if (!canSendInput() || !_splitInfo) return;
 
     let width: number, height: number;
     if (_initialSize) {
@@ -637,17 +584,17 @@
     view.setUint16(6, width, true);
     view.setUint16(8, height, true);
     view.setUint16(10, Math.round(scale * 100), true);
-    ws!.send(buf);
+    sendInput(buf);
     _splitInfo = null;
   }
 
   function sendResizeBinary(width: number, height: number): void {
-    if (!isWsOpen()) return;
+    if (!canSendInput()) return;
 
     resizeView.setUint8(0, ClientMsg.RESIZE);
     resizeView.setUint16(1, width, true);
     resizeView.setUint16(3, height, true);
-    ws!.send(resizeBuffer);
+    sendInput(resizeBuffer);
   }
 
   // ============================================================================
@@ -867,24 +814,24 @@
 
   function showInspector(): void {
     inspectorVisible = true;
-    if (isWsOpen()) {
+    if (canSendInput()) {
       const tab = sharedTextEncoder.encode(inspectorActiveTab);
       const buf = new ArrayBuffer(2 + tab.length);
       const view = new DataView(buf);
       view.setUint8(0, ClientMsg.INSPECTOR_SUBSCRIBE);
       view.setUint8(1, tab.length);
       new Uint8Array(buf).set(tab, 2);
-      ws!.send(buf);
+      sendInput(buf);
     }
     triggerResize();
   }
 
   function hideInspector(): void {
     inspectorVisible = false;
-    if (isWsOpen()) {
+    if (canSendInput()) {
       const buf = new ArrayBuffer(1);
       new DataView(buf).setUint8(0, ClientMsg.INSPECTOR_UNSUBSCRIBE);
-      ws!.send(buf);
+      sendInput(buf);
     }
     triggerResize();
   }
@@ -893,10 +840,10 @@
     if (paused) return;
     paused = true;
 
-    if (isWsOpen()) {
+    if (canSendInput()) {
       const buf = new ArrayBuffer(1);
       new DataView(buf).setUint8(0, ClientMsg.PAUSE_STREAM);
-      ws!.send(buf);
+      sendInput(buf);
     }
   }
 
@@ -904,10 +851,10 @@
     if (!paused) return;
     paused = false;
 
-    if (isWsOpen()) {
+    if (canSendInput()) {
       const buf = new ArrayBuffer(1);
       new DataView(buf).setUint8(0, ClientMsg.RESUME_STREAM);
-      ws!.send(buf);
+      sendInput(buf);
     }
   }
 
@@ -1048,12 +995,6 @@
     if (resizeObserver) {
       resizeObserver.disconnect();
       resizeObserver = null;
-    }
-
-    // Cleanup WebSocket
-    if (ws) {
-      ws.close();
-      ws = null;
     }
 
     // Cleanup cached frame
@@ -1256,6 +1197,14 @@
   .cursor-hollow {
     background: transparent;
     border: 1px solid var(--text, #c8c8c8);
+  }
+
+  /* Inactive panel: show hollow cursor without blink */
+  :global(.panel:not(.focused)) .cursor-overlay {
+    background: transparent;
+    border: 1px solid var(--text, #c8c8c8);
+    opacity: 1;
+    animation: none;
   }
 
   @keyframes cursor-blink {
