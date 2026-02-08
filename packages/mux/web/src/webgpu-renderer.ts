@@ -62,7 +62,20 @@ export async function initWebGPURenderer(
     const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     const bindGroupLayout = pipeline.getBindGroupLayout(0);
 
+    // Track configured canvas size to reconfigure context on resize
+    let configuredWidth = canvas.width;
+    let configuredHeight = canvas.height;
+
     function renderFrame(frame: VideoFrame): void {
+      // Reconfigure the WebGPU context if canvas dimensions changed.
+      // Without this, the backing texture from the initial configure()
+      // doesn't match the canvas size, causing a blank frame.
+      if (canvas.width !== configuredWidth || canvas.height !== configuredHeight) {
+        gpuCtx!.configure({ device, format, alphaMode: 'opaque' });
+        configuredWidth = canvas.width;
+        configuredHeight = canvas.height;
+      }
+
       const externalTexture = device.importExternalTexture({ source: frame as any });
 
       const bindGroup = device.createBindGroup({

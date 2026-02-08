@@ -253,6 +253,8 @@ export const SERVER_MSG = {
   CLIENT_LIST: 0x12,
   /** Multiplayer: your session identity */
   SESSION_IDENTITY: 0x13,
+  /** Cursor position/style update for frontend CSS blink */
+  CURSOR_STATE: 0x14,
 } as const;
 
 // ============================================================================

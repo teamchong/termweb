@@ -150,7 +150,48 @@
     inspectorState ? `${inspectorState.cell_width ?? 0}px × ${inspectorState.cell_height ?? 0}px` : ''
   );
 
-  // Cursor overlay position computed from frame-space pixel coords + object-fit scaling
+  // Cursor state from server (frame-space pixel coordinates)
+  let cursorX = $state(0);
+  let cursorY = $state(0);
+  let cursorW = $state(0);
+  let cursorH = $state(0);
+  let cursorStyle = $state(1); // 0=bar, 1=block, 2=underline, 3=block_hollow
+  let cursorVisible = $state(true);
+
+  // Cursor overlay position: map frame-space pixel coords to display coords via object-fit scaling.
+  // Recomputes reactively when cursor state or canvas dimensions change.
+  let cursorCss = $derived.by(() => {
+    if (!canvasEl || !cursorVisible || cursorW === 0 || paused) return null;
+    const cw = canvasEl.width;
+    const ch = canvasEl.height;
+    if (cw === 0 || ch === 0) return null;
+
+    const rect = canvasEl.getBoundingClientRect();
+    // Account for object-fit: contain letterboxing
+    const frameAspect = cw / ch;
+    const displayAspect = rect.width / rect.height;
+    let scale: number, offsetX: number, offsetY: number;
+
+    if (displayAspect > frameAspect) {
+      // Pillarboxed (black bars on sides)
+      scale = rect.height / ch;
+      offsetX = (rect.width - cw * scale) / 2;
+      offsetY = 0;
+    } else {
+      // Letterboxed (black bars top/bottom)
+      scale = rect.width / cw;
+      offsetX = 0;
+      offsetY = (rect.height - ch * scale) / 2;
+    }
+
+    return {
+      left: offsetX + cursorX * scale,
+      top: offsetY + cursorY * scale,
+      width: cursorW * scale,
+      height: cursorH * scale,
+    };
+  });
+
   // ============================================================================
   // WebSocket Helpers
   // ============================================================================
@@ -890,9 +931,13 @@
     onPwdChange?.(newPwd);
   }
 
-  export function updateCursorState(_x: number, _y: number, _w: number, _h: number, _style: number, _visible: boolean): void {
-    // No-op: cursor is rendered by Ghostty in the H.264 frame (blink disabled).
-    // CSS overlay removed to avoid double cursor.
+  export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean): void {
+    cursorX = x;
+    cursorY = y;
+    cursorW = w;
+    cursorH = h;
+    cursorStyle = style;
+    cursorVisible = visible;
   }
 
   // ============================================================================
@@ -919,10 +964,29 @@
       }
       gpuRenderer = renderer;
 
+      // Renderer is ready — remove Loading overlay immediately.
+      // A blank canvas is acceptable; an indefinite spinner is not.
+      if (loadingEl) {
+        loadingEl.remove();
+        loadingEl = undefined;
+      }
+
       // Flush cached frame that arrived before renderer was ready
       if (cachedFrame) {
         renderFrame(cachedFrame);
         cachedFrame = null;
+      }
+
+      // Safety net: keep requesting keyframes until one is rendered.
+      // Covers cases where the first keyframe was lost or decode failed.
+      if (renderedFrames === 0) {
+        const retryInterval = setInterval(() => {
+          if (destroyed || renderedFrames > 0) {
+            clearInterval(retryInterval);
+            return;
+          }
+          requestKeyframe();
+        }, 500);
       }
     });
 
@@ -1021,6 +1085,16 @@
       onwheel={handleWheel}
       oncontextmenu={handleContextMenu}
     ></canvas>
+    {#if cursorCss}
+      <div
+        class="cursor-overlay"
+        class:cursor-bar={cursorStyle === 0}
+        class:cursor-block={cursorStyle === 1}
+        class:cursor-underline={cursorStyle === 2}
+        class:cursor-hollow={cursorStyle === 3}
+        style="left:{cursorCss.left}px;top:{cursorCss.top}px;width:{cursorCss.width}px;height:{cursorCss.height}px"
+      ></div>
+    {/if}
     <div class="panel-loading" bind:this={loadingEl}>
       <div class="spinner"></div>
       <span>Loading...</span>
@@ -1152,6 +1226,25 @@
     object-position: top left;
     background: var(--bg);
     outline: none;
+  }
+
+  .cursor-overlay {
+    position: absolute;
+    pointer-events: none;
+    z-index: 5;
+    animation: cursor-blink 1.2s step-end infinite;
+  }
+  .cursor-bar { background: var(--text, #c8c8c8); }
+  .cursor-block { background: var(--text, #c8c8c8); opacity: 0.7; }
+  .cursor-underline { background: var(--text, #c8c8c8); }
+  .cursor-hollow {
+    background: transparent;
+    border: 1px solid var(--text, #c8c8c8);
+  }
+
+  @keyframes cursor-blink {
+    0%, 49% { visibility: visible; }
+    50%, 100% { visibility: hidden; }
   }
 
   .panel-loading {

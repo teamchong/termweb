@@ -20,6 +20,7 @@ const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
 const auth = @import("auth.zig");
 const WakeSignal = @import("wake_signal.zig").WakeSignal;
+const Channel = @import("async/channel.zig").Channel;
 pub const tunnel_mod = @import("tunnel.zig");
 
 
@@ -165,7 +166,7 @@ pub const BinaryCtrlMsg = enum(u8) {
     panel_assignment = 0x11,  // Multiplayer: panel assigned/unassigned [type:u8][panel_id:u32][session_id_len:u8][session_id:...]
     client_list = 0x12,  // Multiplayer: connected clients list [type:u8][count:u8][{client_id:u32, role:u8, session_id_len:u8, session_id:...}*]
     session_identity = 0x13,  // Multiplayer: your session identity [type:u8][session_id_len:u8][session_id:...]
-    // 0x14 reserved for future cursor_state
+    cursor_state = 0x14,  // Cursor position/style for frontend CSS blink
     inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
 
     // Auth/Session Server → Client (0x0A-0x0F)
@@ -572,6 +573,12 @@ const Panel = struct {
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
     consecutive_unchanged: u32, // Consecutive frames with no pixel change (for adaptive frame rate)
 
+    // Cursor state tracking (for frontend CSS blink overlay)
+    last_cursor_col: u16 = 0,
+    last_cursor_row: u16 = 0,
+    last_cursor_style: u8 = 0,
+    last_cursor_visible: u8 = 1,
+
     const TARGET_FPS: i64 = 30; // 30 FPS for video
     /// After this many consecutive unchanged frames, reduce tick rate to save CPU/GPU.
     /// At 30 FPS, 30 unchanged frames ≈ 1 second of idle.
@@ -941,6 +948,10 @@ const Panel = struct {
         @memcpy(events_buf[0..events_count], items[0..events_count]);
         self.input_queue.clearRetainingCapacity();
         self.has_pending_input.store(false, .release);
+        // Reset adaptive idle mode so the next frame capture runs immediately.
+        // Without this, processInputQueue clears has_pending_input before the
+        // frame capture loop checks it, causing the idle skip to stay active.
+        self.consecutive_unchanged = 0;
         self.mutex.unlock();
 
         for (events_buf[0..events_count]) |*event| {
@@ -1501,10 +1512,10 @@ const Server = struct {
     main_client_id: u32,       // ID of current main client (0 = none)
     next_client_id: u32,       // Counter for assigning client IDs
     layout: Layout,
-    pending_panels: std.ArrayList(PanelRequest),
-    pending_destroys: std.ArrayList(PanelDestroyRequest),
-    pending_resizes: std.ArrayList(PanelResizeRequest),
-    pending_splits: std.ArrayList(PanelSplitRequest),
+    pending_panels_ch: *Channel(PanelRequest),
+    pending_destroys_ch: *Channel(PanelDestroyRequest),
+    pending_resizes_ch: *Channel(PanelResizeRequest),
+    pending_splits_ch: *Channel(PanelSplitRequest),
     next_panel_id: u32,
     panel_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
@@ -1563,6 +1574,16 @@ const Server = struct {
         // Initialize auth state
         const auth_state = try auth.AuthState.init(allocator);
 
+        // Create inter-thread message channels (replaces mutex-protected ArrayLists)
+        const pending_panels_ch = try Channel(PanelRequest).initBuffered(allocator, 64);
+        errdefer pending_panels_ch.deinit();
+        const pending_destroys_ch = try Channel(PanelDestroyRequest).initBuffered(allocator, 64);
+        errdefer pending_destroys_ch.deinit();
+        const pending_resizes_ch = try Channel(PanelResizeRequest).initBuffered(allocator, 64);
+        errdefer pending_resizes_ch.deinit();
+        const pending_splits_ch = try Channel(PanelSplitRequest).initBuffered(allocator, 64);
+        errdefer pending_splits_ch.deinit();
+
         server.* = .{
             .app = null, // Lazy init on first panel
             .config = null,
@@ -1576,10 +1597,10 @@ const Server = struct {
             .main_client_id = 0,
             .next_client_id = 1,
             .layout = Layout.init(allocator),
-            .pending_panels = .{},
-            .pending_destroys = .{},
-            .pending_resizes = .{},
-            .pending_splits = .{},
+            .pending_panels_ch = pending_panels_ch,
+            .pending_destroys_ch = pending_destroys_ch,
+            .pending_resizes_ch = pending_resizes_ch,
+            .pending_splits_ch = pending_splits_ch,
             .next_panel_id = 1,
             .http_server = http_srv,
             .panel_ws_server = panel_ws,
@@ -1697,25 +1718,33 @@ const Server = struct {
     }
 
     fn deinit(self: *Server) void {
-        std.debug.print("Server.deinit() starting...\n", .{});
         self.running.store(false, .release);
+
+        // Close channels to unblock any blocked senders before WS server shutdown
+        self.pending_panels_ch.close();
+        self.pending_destroys_ch.close();
+        self.pending_resizes_ch.close();
+        self.pending_splits_ch.close();
 
         // Clear global_server first to prevent callbacks from accessing it during shutdown
         global_server.store(null, .release);
 
+        // Clear panel_connections under mutex so disconnect callbacks find nothing.
+        // This prevents use-after-free if a WS thread outlives the shutdown timeout
+        // and tries to access a freed panel via onPanelDisconnect.
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.panel_connections.clearRetainingCapacity();
+        }
+
         // Shut down WebSocket servers first and wait for all connection threads to finish
         // This must happen BEFORE destroying panels to avoid use-after-free
-        std.debug.print("  deinit: HTTP server...\n", .{});
         self.http_server.deinit();
-        std.debug.print("  deinit: panel WS...\n", .{});
         self.panel_ws_server.deinit();
-        std.debug.print("  deinit: control WS...\n", .{});
         self.control_ws_server.deinit();
-        std.debug.print("  deinit: file WS...\n", .{});
         self.file_ws_server.deinit();
-        std.debug.print("  deinit: preview WS...\n", .{});
         self.preview_ws_server.deinit();
-        std.debug.print("  deinit: servers done, cleaning up...\n", .{});
 
         // Now safe to destroy panels since all connection threads have finished
         var panel_it = self.panels.valueIterator();
@@ -1726,10 +1755,10 @@ const Server = struct {
         self.panel_connections.deinit();
         self.control_connections.deinit(self.allocator);
         self.layout.deinit();
-        self.pending_panels.deinit(self.allocator);
-        self.pending_destroys.deinit(self.allocator);
-        self.pending_resizes.deinit(self.allocator);
-        self.pending_splits.deinit(self.allocator);
+        self.pending_panels_ch.deinit();
+        self.pending_destroys_ch.deinit();
+        self.pending_resizes_ch.deinit();
+        self.pending_splits_ch.deinit();
 
         self.auth_state.deinit();
         self.transfer_manager.deinit();
@@ -2082,16 +2111,14 @@ const Server = struct {
                     if (data.len >= 14) {
                         kind = if (data[13] & 1 != 0) .quick_terminal else .regular;
                     }
-                    self.mutex.lock();
-                    self.pending_panels.append(self.allocator, .{
+                    _ = self.pending_panels_ch.send(.{
                         .conn = conn,
                         .width = width,
                         .height = height,
                         .scale = scale,
                         .inherit_cwd_from = inherit_cwd_from,
                         .kind = kind,
-                    }) catch {};
-                    self.mutex.unlock();
+                    });
                     self.wake_signal.notify();
                 },
                 .split_panel => {
@@ -2105,16 +2132,14 @@ const Server = struct {
                     const direction: SplitDirection = if (dir_byte == 1) .vertical else .horizontal;
                     const scale: f64 = @as(f64, @floatFromInt(scale_x100)) / 100.0;
 
-                    self.mutex.lock();
-                    self.pending_splits.append(self.allocator, .{
+                    _ = self.pending_splits_ch.send(.{
                         .conn = conn,
                         .parent_panel_id = parent_id,
                         .direction = direction,
                         .width = width,
                         .height = height,
                         .scale = scale,
-                    }) catch {};
-                    self.mutex.unlock();
+                    });
                     self.wake_signal.notify();
                 },
                 else => {},
@@ -2128,7 +2153,20 @@ const Server = struct {
         self.mutex.lock();
         if (self.panel_connections.fetchRemove(conn)) |entry| {
             const panel = entry.value;
-            panel.setConnection(null);
+            // Verify panel is still alive (not freed by processPendingDestroys or deinit)
+            // by checking it exists in the panels map. We can't read panel.id since it
+            // may be freed, so we compare pointers.
+            var still_alive = false;
+            var pit = self.panels.valueIterator();
+            while (pit.next()) |p| {
+                if (p.* == panel) {
+                    still_alive = true;
+                    break;
+                }
+            }
+            if (still_alive) {
+                panel.setConnection(null);
+            }
         }
         self.mutex.unlock();
     }
@@ -2174,18 +2212,14 @@ const Server = struct {
         if (msg_type == 0x81) { // close_panel
             if (data.len < 5) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
-            self.mutex.lock();
-            self.pending_destroys.append(self.allocator, .{ .id = panel_id }) catch {};
-            self.mutex.unlock();
+            _ = self.pending_destroys_ch.send(.{ .id = panel_id });
             self.wake_signal.notify();
         } else if (msg_type == 0x82) { // resize_panel
             if (data.len < 9) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
             const width = std.mem.readInt(u16, data[5..7], .little);
             const height = std.mem.readInt(u16, data[7..9], .little);
-            self.mutex.lock();
-            self.pending_resizes.append(self.allocator, .{ .id = panel_id, .width = width, .height = height }) catch {};
-            self.mutex.unlock();
+            _ = self.pending_resizes_ch.send(.{ .id = panel_id, .width = width, .height = height });
             self.wake_signal.notify();
         } else if (msg_type == 0x83) { // focus_panel
             if (data.len < 5) return;
@@ -3465,14 +3499,7 @@ const Server = struct {
 
     // Process pending panel creation requests (must run on main thread)
     fn processPendingPanels(self: *Server) void {
-        self.mutex.lock();
-        const pending = self.pending_panels.toOwnedSlice(self.allocator) catch {
-            self.mutex.unlock();
-            return;
-        };
-        self.mutex.unlock();
-
-        for (pending) |req| {
+        while (self.pending_panels_ch.tryRecv()) |req| {
             // Determine CWD: inherit from specified panel, or use initial_cwd
             const working_dir: []const u8 = if (req.inherit_cwd_from != 0) blk: {
                 if (self.panels.get(req.inherit_cwd_from)) |parent_panel| {
@@ -3497,8 +3524,6 @@ const Server = struct {
             if (req.kind == .regular) {
                 self.broadcastLayoutUpdate();
             }
-            // Trigger immediate render so the new panel's focus state appears instantly
-
 
             // Linux only: Send initial title since shell integration may not be configured
             // macOS works fine without this as ghostty auto-injects shell integration
@@ -3514,20 +3539,11 @@ const Server = struct {
                 self.broadcastPanelTitle(panel.id, initial_title);
             }
         }
-
-        self.allocator.free(pending);
     }
 
     // Process pending panel destruction requests (must run on main thread)
     fn processPendingDestroys(self: *Server) void {
-        self.mutex.lock();
-        const pending = self.pending_destroys.toOwnedSlice(self.allocator) catch {
-            self.mutex.unlock();
-            return;
-        };
-        self.mutex.unlock();
-
-        for (pending) |req| {
+        while (self.pending_destroys_ch.tryRecv()) |req| {
             self.mutex.lock();
             if (self.panels.fetchRemove(req.id)) |entry| {
                 const panel = entry.value;
@@ -3577,21 +3593,12 @@ const Server = struct {
             }
         }
 
-        self.allocator.free(pending);
-
         // Free ghostty if no panels left (scale to zero)
         self.freeGhosttyIfEmpty();
     }
 
     fn processPendingResizes(self: *Server) void {
-        self.mutex.lock();
-        const pending = self.pending_resizes.toOwnedSlice(self.allocator) catch {
-            self.mutex.unlock();
-            return;
-        };
-        self.mutex.unlock();
-
-        for (pending) |req| {
+        while (self.pending_resizes_ch.tryRecv()) |req| {
             self.mutex.lock();
             if (self.panels.get(req.id)) |panel| {
                 self.mutex.unlock();
@@ -3609,20 +3616,11 @@ const Server = struct {
                 self.mutex.unlock();
             }
         }
-
-        self.allocator.free(pending);
     }
 
     // Process pending panel split requests (must run on main thread)
     fn processPendingSplits(self: *Server) void {
-        self.mutex.lock();
-        const pending = self.pending_splits.toOwnedSlice(self.allocator) catch {
-            self.mutex.unlock();
-            return;
-        };
-        self.mutex.unlock();
-
-        for (pending) |req| {
+        while (self.pending_splits_ch.tryRecv()) |req| {
             // Pause parent panel to prevent frame capture race during split
             // The parent will resume when client sends resize after layout update
             self.mutex.lock();
@@ -3652,15 +3650,12 @@ const Server = struct {
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
 
-
             // Resume parent panel streaming (will get keyframe on next frame)
             // Note: If parent will be resized, resizeInternal sets force_keyframe
             if (parent_panel) |parent| {
                 parent.resumeStream();
             }
         }
-
-        self.allocator.free(pending);
     }
 
     // Main render loop
@@ -4070,6 +4065,59 @@ const Server = struct {
                         }
                     }
 
+                    // Query cursor state and broadcast if changed (for frontend CSS blink)
+                    if (is_streaming) {
+                        var cur_col: u16 = 0;
+                        var cur_row: u16 = 0;
+                        var cur_style: u8 = 0;
+                        var cur_visible: u8 = 0;
+                        c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible);
+
+                        if (cur_col != panel.last_cursor_col or
+                            cur_row != panel.last_cursor_row or
+                            cur_style != panel.last_cursor_style or
+                            cur_visible != panel.last_cursor_visible)
+                        {
+                            panel.last_cursor_col = cur_col;
+                            panel.last_cursor_row = cur_row;
+                            panel.last_cursor_style = cur_style;
+                            panel.last_cursor_visible = cur_visible;
+
+                            // Compute pixel coordinates from cell position
+                            const size = c.ghostty_surface_size(panel.surface);
+                            const cell_w: u16 = @intCast(size.cell_width_px);
+                            const cell_h: u16 = @intCast(size.cell_height_px);
+                            const padding_x: u16 = @intCast(
+                                (@as(u32, @intCast(size.width_px)) -| (@as(u32, @intCast(size.columns)) * cell_w)) / 2,
+                            );
+                            const padding_y: u16 = @intCast(
+                                (@as(u32, @intCast(size.height_px)) -| (@as(u32, @intCast(size.rows)) * cell_h)) / 2,
+                            );
+                            const px_x = padding_x + cur_col * cell_w;
+                            const px_y = padding_y + cur_row * cell_h;
+                            const px_w: u16 = if (cur_style == 0) 2 else cell_w; // bar=2px, block/underline=full
+                            const px_h: u16 = if (cur_style == 2) 2 else cell_h; // underline=2px, block/bar=full
+
+                            // [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
+                            var cursor_buf: [15]u8 = undefined;
+                            cursor_buf[0] = @intFromEnum(BinaryCtrlMsg.cursor_state);
+                            std.mem.writeInt(u32, cursor_buf[1..5], panel.id, .little);
+                            std.mem.writeInt(u16, cursor_buf[5..7], px_x, .little);
+                            std.mem.writeInt(u16, cursor_buf[7..9], px_y, .little);
+                            std.mem.writeInt(u16, cursor_buf[9..11], px_w, .little);
+                            std.mem.writeInt(u16, cursor_buf[11..13], px_h, .little);
+                            cursor_buf[13] = cur_style;
+                            cursor_buf[14] = cur_visible;
+
+                            // Broadcast to control WS connections
+                            var ctrl_buf: [max_broadcast_conns]*ws.Connection = undefined;
+                            const ctrl_conns = self.snapshotControlConns(&ctrl_buf);
+                            for (ctrl_conns) |ctrl_conn| {
+                                ctrl_conn.sendBinary(&cursor_buf) catch {};
+                            }
+                        }
+                    }
+
                     // Spike detection: log immediately if any single frame exceeds 50ms
                     const frame_total_ns: u64 = @intCast(std.time.nanoTimestamp() - t_frame_start);
                     const spike_threshold_ns: u64 = 50 * std.time.ns_per_ms;
@@ -4176,21 +4224,14 @@ const Server = struct {
         // Render loop exited (Ctrl+C or error) — stop all servers to unblock
         // their threads. This is done here instead of the signal handler because
         // .stop() calls allocator/deinit operations that are not signal-safe.
-        std.debug.print("Stopping servers...\n", .{});
         self.http_server.stop();
-        std.debug.print("  HTTP stopped, panel WS conns={}\n", .{self.panel_ws_server.active_connections.load(.acquire)});
         self.panel_ws_server.stop();
-        std.debug.print("  Panel WS stopped, control WS conns={}\n", .{self.control_ws_server.active_connections.load(.acquire)});
         self.control_ws_server.stop();
-        std.debug.print("  Control WS stopped, file WS conns={}\n", .{self.file_ws_server.active_connections.load(.acquire)});
         self.file_ws_server.stop();
-        std.debug.print("  File WS stopped, preview conns={}\n", .{self.preview_ws_server.active_connections.load(.acquire)});
         self.preview_ws_server.stop();
-        std.debug.print("  All servers stopped, joining HTTP thread...\n", .{});
 
         // Wait for HTTP thread to finish
         http_thread.join();
-        std.debug.print("  HTTP thread joined\n", .{});
     }
 };
 
@@ -4550,9 +4591,7 @@ fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c)
     const self = Server.global_server.load(.acquire) orelse return;
 
     // Queue the panel for destruction on main thread
-    self.mutex.lock();
-    self.pending_destroys.append(self.allocator, .{ .id = panel.id }) catch {};
-    self.mutex.unlock();
+    _ = self.pending_destroys_ch.send(.{ .id = panel.id });
     self.wake_signal.notify();
 }
 

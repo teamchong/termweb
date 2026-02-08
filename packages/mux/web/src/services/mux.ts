@@ -431,6 +431,23 @@ export class MuxClient {
           ui.update(s => ({ ...s, connectedClients: clients }));
           break;
         }
+
+        case SERVER_MSG.CURSOR_STATE: {
+          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
+          if (data.byteLength < 15) break;
+          const panelId = view.getUint32(1, true);
+          const x = view.getUint16(5, true);
+          const y = view.getUint16(7, true);
+          const w = view.getUint16(9, true);
+          const h = view.getUint16(11, true);
+          const style = view.getUint8(13);   // 0=bar, 1=block, 2=underline, 3=block_hollow
+          const visible = view.getUint8(14) === 1;
+          const panel = this.panelsByServerId.get(panelId);
+          if (panel) {
+            panel.updateCursorState(x, y, w, h, style, visible);
+          }
+          break;
+        }
       }
     } catch (err) {
       console.error('Failed to parse binary message:', err);
