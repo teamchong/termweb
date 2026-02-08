@@ -167,39 +167,18 @@
   let frameWidth = $state(0);
   let frameHeight = $state(0);
 
-  // Cursor overlay position: surface coords → encoder coords → CSS display coords.
-  // The server renders at surface dimensions, the encoder aligns to 16px boundaries,
-  // and object-fit:contain scales the video to fill the CSS rect.
-  // Path: surface(x,y) * (frameW/surfW) * objFitScale → CSS pixels
-  let cursorCss = $derived.by(() => {
-    if (!canvasEl || !cursorVisible || cursorW === 0 || paused) return null;
-    if (cursorSurfW === 0 || cursorSurfH === 0) return null;
+  // Cursor overlay position: percentage-based within a CSS viewport div that
+  // replicates the canvas's object-fit:contain area using container queries.
+  // No JS objFitScale math — CSS handles the contain-fit sizing identically.
+  let cursorPct = $derived.by(() => {
+    if (!cursorVisible || cursorW === 0 || paused) return null;
+    if (frameWidth === 0 || frameHeight === 0) return null;
 
-    const rect = canvasEl.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return null;
-
-    // If we have video frame dimensions, account for encoder alignment stretch
-    // and use object-fit:contain scaling. Otherwise fall back to surface→CSS directly.
-    if (frameWidth > 0 && frameHeight > 0) {
-      // object-fit:contain scale from encoder dims to CSS display
-      const objFitScale = Math.min(rect.width / frameWidth, rect.height / frameHeight);
-      // surface → encoder (accounts for 16px alignment stretch)
-      const scaleX = frameWidth / cursorSurfW;
-      const scaleY = frameHeight / cursorSurfH;
-      return {
-        left: cursorX * scaleX * objFitScale,
-        top: cursorY * scaleY * objFitScale,
-        width: cursorW * scaleX * objFitScale,
-        height: cursorH * scaleY * objFitScale,
-      };
-    }
-
-    // Before first frame: scale surface coords directly to CSS rect
     return {
-      left: cursorX * rect.width / cursorSurfW,
-      top: cursorY * rect.height / cursorSurfH,
-      width: cursorW * rect.width / cursorSurfW,
-      height: cursorH * rect.height / cursorSurfH,
+      left: (cursorX / frameWidth) * 100,
+      top: (cursorY / frameHeight) * 100,
+      width: (cursorW / frameWidth) * 100,
+      height: (cursorH / frameHeight) * 100,
     };
   });
 
@@ -246,13 +225,6 @@
       },
     });
 
-    // Debug heartbeat: log decoder state every 2s when frames are pending
-    const heartbeat = setInterval(() => {
-      if (destroyed) { clearInterval(heartbeat); return; }
-      if (pendingDecode > 0) {
-        console.log(`[Panel] HEARTBEAT: pending=${pendingDecode} state=${decoder?.state} queueSize=${decoder?.decodeQueueSize} frameCount=${frameCount} configured=${decoderConfigured} gotKF=${gotFirstKeyframe}`);
-      }
-    }, 2000);
   }
 
   function renderFrame(frame: VideoFrame): void {
@@ -260,7 +232,7 @@
       canvasEl.width = frame.displayWidth;
       canvasEl.height = frame.displayHeight;
     }
-    // Update reactive frame dimensions so cursorCss recomputes
+    // Update reactive frame dimensions so cursorPct recomputes
     if (frameWidth !== frame.displayWidth || frameHeight !== frame.displayHeight) {
       frameWidth = frame.displayWidth;
       frameHeight = frame.displayHeight;
@@ -298,7 +270,6 @@
 
   function onFrame(frame: VideoFrame): void {
     pendingDecode--;
-    console.log(`[Panel] onFrame: ${frame.displayWidth}x${frame.displayHeight} pending=${pendingDecode} ts=${frame.timestamp.toFixed(0)} format=${frame.format}`);
 
     if (destroyed) {
       frame.close();
@@ -437,14 +408,6 @@
       keyframeRequested = false;
     }
 
-    // Pass raw Annex B data directly — avc3 codec handles in-band SPS/PPS.
-    const nalInfo = nalUnits.map((nal) => {
-      const nalType = nal.length > 0 ? (nal[0] & 0x1f) : -1;
-      const nalTypeName = nalType === 7 ? 'SPS' : nalType === 8 ? 'PPS' : nalType === 5 ? 'IDR' : nalType === 1 ? 'P' : `nal${nalType}`;
-      return `${nalTypeName}(${nal.length}B)`;
-    }).join(', ');
-    const hex = Array.from(frameData.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-    console.log(`[Panel] decode ${isKeyframe ? 'KEY' : 'DELTA'} size=${frameData.length} queueSize=${decoder.decodeQueueSize} pending=${pendingDecode} nals=[${nalInfo}] hex=[${hex}] decoderState=${decoder.state}`);
     decodeFrame(frameData, isKeyframe);
     checkBufferHealth();
   }
@@ -466,9 +429,7 @@
         timestamp,
         data,
       });
-      console.log(`[Panel] calling decoder.decode() frameCount=${frameCount} type=${chunk.type} ts=${timestamp.toFixed(0)} byteLength=${chunk.byteLength}`);
       decoder.decode(chunk);
-      console.log(`[Panel] decoder.decode() returned OK, state=${decoder.state} queueSize=${decoder.decodeQueueSize}`);
     } catch (e) {
       console.error('[Panel] decoder.decode() threw:', e);
       pendingDecode--;
@@ -493,10 +454,8 @@
   let keyframeRequested = false;
 
   function requestKeyframe(reason: string): void {
-    console.log(`[Panel] requestKeyframe: reason="${reason}" alreadyRequested=${keyframeRequested} canSend=${canSendInput()}`);
     if (keyframeRequested || !canSendInput()) return;
     keyframeRequested = true;
-    console.log(`[Panel] REQUEST_KEYFRAME SENT reason="${reason}"`);
     const buf = new Uint8Array([ClientMsg.REQUEST_KEYFRAME]);
     sendInput(buf);
   }
@@ -990,7 +949,6 @@
       // These are decoded now so the hardware decoder output surfaces are
       // consumed immediately by the ready renderer.
       if (rawFrameBuffer.length > 0) {
-        console.log(`[Panel] flushing ${rawFrameBuffer.length} buffered raw frames`);
         const frames = rawFrameBuffer;
         rawFrameBuffer = [];
         for (const frameData of frames) {
@@ -1082,7 +1040,7 @@
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-<div class="panel" bind:this={panelEl} tabindex={PANEL.CANVAS_TAB_INDEX}>
+<div class="panel-root" bind:this={panelEl} tabindex={PANEL.CANVAS_TAB_INDEX}>
   <div class="panel-content">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <canvas
@@ -1094,15 +1052,21 @@
       onwheel={handleWheel}
       oncontextmenu={handleContextMenu}
     ></canvas>
-    {#if cursorCss}
-      <div
-        class="cursor-overlay"
-        class:cursor-bar={cursorStyle === 0}
-        class:cursor-block={cursorStyle === 1}
-        class:cursor-underline={cursorStyle === 2}
-        class:cursor-hollow={cursorStyle === 3}
-        style="left:{cursorCss.left}px;top:{cursorCss.top}px;width:{cursorCss.width}px;height:{cursorCss.height}px"
-      ></div>
+    {#if frameWidth > 0 && frameHeight > 0}
+      <div class="cursor-container" style="--fw:{frameWidth};--fh:{frameHeight}">
+        <div class="cursor-viewport">
+          {#if cursorPct}
+            <div
+              class="cursor-overlay"
+              class:cursor-bar={cursorStyle === 0}
+              class:cursor-block={cursorStyle === 1}
+              class:cursor-underline={cursorStyle === 2}
+              class:cursor-hollow={cursorStyle === 3}
+              style="left:{cursorPct.left}%;top:{cursorPct.top}%;width:{cursorPct.width}%;height:{cursorPct.height}%"
+            ></div>
+          {/if}
+        </div>
+      </div>
     {/if}
     <div class="panel-loading" bind:this={loadingEl}>
       <div class="spinner"></div>
@@ -1206,7 +1170,7 @@
 </div>
 
 <style>
-  .panel {
+  .panel-root {
     position: absolute;
     top: 0;
     left: 0;
@@ -1237,10 +1201,30 @@
     outline: none;
   }
 
+  .cursor-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 5;
+    container-type: size;
+    overflow: hidden;
+  }
+
+  /* Replicates object-fit:contain + object-position:top left using container queries.
+     min(full-inline, block-scaled-by-aspect) picks the constraining dimension,
+     exactly matching what object-fit:contain computes for the canvas content. */
+  .cursor-viewport {
+    position: relative;
+    width: min(100cqi, calc(100cqb * var(--fw) / var(--fh)));
+    height: min(100cqb, calc(100cqi * var(--fh) / var(--fw)));
+  }
+
   .cursor-overlay {
     position: absolute;
     pointer-events: none;
-    z-index: 5;
     animation: cursor-blink 1.2s step-end infinite;
   }
   .cursor-bar { background: var(--text, #c8c8c8); }

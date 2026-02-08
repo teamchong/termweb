@@ -1,5 +1,5 @@
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 3d3973084..7dd686ea7 100644
+index 3d3973084..880806f2b 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
 @@ -38,6 +38,7 @@ typedef enum {
@@ -27,7 +27,18 @@ index 3d3973084..7dd686ea7 100644
  } ghostty_platform_u;
  
  typedef enum {
-@@ -1066,6 +1074,7 @@ void ghostty_surface_refresh(ghostty_surface_t);
+@@ -459,6 +467,10 @@ typedef struct {
+   uint32_t height_px;
+   uint32_t cell_width_px;
+   uint32_t cell_height_px;
++  uint32_t padding_top_px;
++  uint32_t padding_bottom_px;
++  uint32_t padding_left_px;
++  uint32_t padding_right_px;
+ } ghostty_surface_size_s;
+ 
+ // Config types
+@@ -1066,6 +1078,7 @@ void ghostty_surface_refresh(ghostty_surface_t);
  void ghostty_surface_draw(ghostty_surface_t);
  void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
  void ghostty_surface_set_focus(ghostty_surface_t, bool);
@@ -35,7 +46,7 @@ index 3d3973084..7dd686ea7 100644
  void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
  void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
  ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
-@@ -1146,6 +1155,13 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
+@@ -1146,6 +1159,13 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
  bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
  #endif
  
@@ -729,7 +740,7 @@ index 000000000..c68a974d3
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..ff5a7215f 100644
+index dcf8a6357..7c643b1e3 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -901,7 +912,29 @@ index dcf8a6357..ff5a7215f 100644
          // Runtimes sometimes generate superfluous resize events even
          // if the size did not actually change (SwiftUI). We check
          // that the size actually changed from what we last recorded
-@@ -1708,6 +1807,13 @@ pub const CAPI = struct {
+@@ -1255,6 +1354,10 @@ pub const CAPI = struct {
+         height_px: u32,
+         cell_width_px: u32,
+         cell_height_px: u32,
++        padding_top_px: u32,
++        padding_bottom_px: u32,
++        padding_left_px: u32,
++        padding_right_px: u32,
+     };
+ 
+     // ghostty_clipboard_content_s
+@@ -1682,6 +1785,10 @@ pub const CAPI = struct {
+             .height_px = surface.core_surface.size.screen.height,
+             .cell_width_px = surface.core_surface.size.cell.width,
+             .cell_height_px = surface.core_surface.size.cell.height,
++            .padding_top_px = surface.core_surface.size.padding.top,
++            .padding_bottom_px = surface.core_surface.size.padding.bottom,
++            .padding_left_px = surface.core_surface.size.padding.left,
++            .padding_right_px = surface.core_surface.size.padding.right,
+         };
+     }
+ 
+@@ -1708,6 +1815,13 @@ pub const CAPI = struct {
          surface.focusCallback(focused);
      }
  
@@ -915,7 +948,7 @@ index dcf8a6357..ff5a7215f 100644
      /// Update the occlusion state of a surface.
      export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
          surface.occlusionCallback(visible);
-@@ -2204,4 +2310,64 @@ pub const CAPI = struct {
+@@ -2204,4 +2318,64 @@ pub const CAPI = struct {
              }
          }
      };

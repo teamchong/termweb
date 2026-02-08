@@ -36,9 +36,6 @@ const is_linux = builtin.os.tag == .linux;
 // Cross-platform video encoder (uses comptime to select implementation)
 const video = @import("video.zig");
 
-// Ghostty stub for Linux (comptime selected)
-const ghostty_stub = @import("ghostty_stub.zig");
-
 // Platform-specific C imports + ghostty
 const c = if (is_macos) @cImport({
     @cInclude("ghostty.h");
@@ -2630,15 +2627,11 @@ const Server = struct {
             const size = c.ghostty_surface_size(panel.surface);
             const cell_w: u16 = @intCast(size.cell_width_px);
             const cell_h: u16 = @intCast(size.cell_height_px);
-            const padding_x: u16 = @intCast(
-                (@as(u32, @intCast(size.width_px)) -| (@as(u32, @intCast(size.columns)) * cell_w)) / 2,
-            );
-            const padding_y: u16 = @intCast(
-                (@as(u32, @intCast(size.height_px)) -| (@as(u32, @intCast(size.rows)) * cell_h)) / 2,
-            );
+            const padding_x: u16 = @intCast(size.padding_left_px);
+            const padding_y: u16 = @intCast(size.padding_top_px);
             const surf_x = padding_x + panel.last_cursor_col * cell_w;
             const surf_y = padding_y + panel.last_cursor_row * cell_h;
-            const surf_w: u16 = if (panel.last_cursor_style == 0) 2 else cell_w;
+            const surf_w: u16 = if (panel.last_cursor_style == 0) 1 else cell_w;
             const surf_h: u16 = if (panel.last_cursor_style == 2) 2 else cell_h;
             const surf_total_w: u16 = @intCast(size.width_px);
             const surf_total_h: u16 = @intCast(size.height_px);
@@ -4058,17 +4051,14 @@ const Server = struct {
                             panel.last_cursor_visible = cur_visible;
 
                             // Compute cursor in surface-space pixel coordinates
+                            // Use actual padding from ghostty instead of guessing centered
                             const cell_w: u16 = @intCast(size.cell_width_px);
                             const cell_h: u16 = @intCast(size.cell_height_px);
-                            const padding_x: u16 = @intCast(
-                                (@as(u32, @intCast(size.width_px)) -| (@as(u32, @intCast(size.columns)) * cell_w)) / 2,
-                            );
-                            const padding_y: u16 = @intCast(
-                                (@as(u32, @intCast(size.height_px)) -| (@as(u32, @intCast(size.rows)) * cell_h)) / 2,
-                            );
+                            const padding_x: u16 = @intCast(size.padding_left_px);
+                            const padding_y: u16 = @intCast(size.padding_top_px);
                             const surf_x = padding_x + cur_col * cell_w;
                             const surf_y = padding_y + cur_row * cell_h;
-                            const surf_w: u16 = if (cur_style == 0) 2 else cell_w; // bar=2px
+                            const surf_w: u16 = if (cur_style == 0) 1 else cell_w;
                             const surf_h: u16 = if (cur_style == 2) 2 else cell_h; // underline=2px
 
                             const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible);
