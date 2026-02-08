@@ -32,7 +32,7 @@ interface PanelInstance extends PanelLike {
   getPwd: () => string;
   setPwd: (pwd: string) => void;
   getSnapshotCanvas: () => HTMLCanvasElement | undefined;
-  updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean) => void;
+  updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number) => void;
 }
 
 // Type guard for validating LayoutData structure from server
@@ -433,8 +433,8 @@ export class MuxClient {
         }
 
         case SERVER_MSG.CURSOR_STATE: {
-          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
-          if (data.byteLength < 15) break;
+          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][total_w:u16][total_h:u16] = 19 bytes
+          if (data.byteLength < 19) break;
           const panelId = view.getUint32(1, true);
           const x = view.getUint16(5, true);
           const y = view.getUint16(7, true);
@@ -442,9 +442,11 @@ export class MuxClient {
           const h = view.getUint16(11, true);
           const style = view.getUint8(13);   // 0=bar, 1=block, 2=underline, 3=block_hollow
           const visible = view.getUint8(14) === 1;
+          const totalW = view.getUint16(15, true); // server surface width
+          const totalH = view.getUint16(17, true); // server surface height
           const panel = this.panelsByServerId.get(panelId);
           if (panel) {
-            panel.updateCursorState(x, y, w, h, style, visible);
+            panel.updateCursorState(x, y, w, h, style, visible, totalW, totalH);
           }
           break;
         }
@@ -677,7 +679,7 @@ export class MuxClient {
       setPwd: (pwd: string) => void;
       getCanvas: () => HTMLCanvasElement | undefined;
       getSnapshotCanvas: () => HTMLCanvasElement | undefined;
-      updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean) => void;
+      updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number) => void;
     };
 
     const panel: PanelInstance = {
@@ -705,7 +707,7 @@ export class MuxClient {
       getPwd: () => comp.getPwd(),
       setPwd: (p) => comp.setPwd(p),
       getSnapshotCanvas: () => comp.getSnapshotCanvas(),
-      updateCursorState: (x, y, w, h, s, v) => comp.updateCursorState(x, y, w, h, s, v),
+      updateCursorState: (x, y, w, h, s, v, tw, th) => comp.updateCursorState(x, y, w, h, s, v, tw, th),
     };
 
     this.panelInstances.set(panelId, panel);

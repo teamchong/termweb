@@ -150,45 +150,54 @@
     inspectorState ? `${inspectorState.cell_width ?? 0}px × ${inspectorState.cell_height ?? 0}px` : ''
   );
 
-  // Cursor state from server (frame-space pixel coordinates)
+  // Cursor state from server (surface-space pixel coordinates)
   let cursorX = $state(0);
   let cursorY = $state(0);
   let cursorW = $state(0);
   let cursorH = $state(0);
   let cursorStyle = $state(1); // 0=bar, 1=block, 2=underline, 3=block_hollow
   let cursorVisible = $state(true);
+  // Server surface dimensions — the coordinate space cursor values live in
+  let cursorSurfW = $state(0);
+  let cursorSurfH = $state(0);
 
-  // Cursor overlay position: map frame-space pixel coords to display coords via object-fit scaling.
-  // Recomputes reactively when cursor state or canvas dimensions change.
+  // Reactive canvas buffer dimensions (encoder-aligned) — updated from video frames.
+  let frameWidth = $state(0);
+  let frameHeight = $state(0);
+
+  // Cursor overlay position: surface coords → encoder coords → CSS display coords.
+  // The server renders at surface dimensions, the encoder aligns to 16px boundaries,
+  // and object-fit:contain scales the video to fill the CSS rect.
+  // Path: surface(x,y) * (frameW/surfW) * objFitScale → CSS pixels
   let cursorCss = $derived.by(() => {
     if (!canvasEl || !cursorVisible || cursorW === 0 || paused) return null;
-    const cw = canvasEl.width;
-    const ch = canvasEl.height;
-    if (cw === 0 || ch === 0) return null;
+    if (cursorSurfW === 0 || cursorSurfH === 0) return null;
 
     const rect = canvasEl.getBoundingClientRect();
-    // Account for object-fit: contain letterboxing
-    const frameAspect = cw / ch;
-    const displayAspect = rect.width / rect.height;
-    let scale: number, offsetX: number, offsetY: number;
+    if (rect.width === 0 || rect.height === 0) return null;
 
-    if (displayAspect > frameAspect) {
-      // Pillarboxed (black bars on sides)
-      scale = rect.height / ch;
-      offsetX = (rect.width - cw * scale) / 2;
-      offsetY = 0;
-    } else {
-      // Letterboxed (black bars top/bottom)
-      scale = rect.width / cw;
-      offsetX = 0;
-      offsetY = (rect.height - ch * scale) / 2;
+    // If we have video frame dimensions, account for encoder alignment stretch
+    // and use object-fit:contain scaling. Otherwise fall back to surface→CSS directly.
+    if (frameWidth > 0 && frameHeight > 0) {
+      // object-fit:contain scale from encoder dims to CSS display
+      const objFitScale = Math.min(rect.width / frameWidth, rect.height / frameHeight);
+      // surface → encoder (accounts for 16px alignment stretch)
+      const scaleX = frameWidth / cursorSurfW;
+      const scaleY = frameHeight / cursorSurfH;
+      return {
+        left: cursorX * scaleX * objFitScale,
+        top: cursorY * scaleY * objFitScale,
+        width: cursorW * scaleX * objFitScale,
+        height: cursorH * scaleY * objFitScale,
+      };
     }
 
+    // Before first frame: scale surface coords directly to CSS rect
     return {
-      left: offsetX + cursorX * scale,
-      top: offsetY + cursorY * scale,
-      width: cursorW * scale,
-      height: cursorH * scale,
+      left: cursorX * rect.width / cursorSurfW,
+      top: cursorY * rect.height / cursorSurfH,
+      width: cursorW * rect.width / cursorSurfW,
+      height: cursorH * rect.height / cursorSurfH,
     };
   });
 
@@ -248,6 +257,11 @@
     if (canvasEl && (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight)) {
       canvasEl.width = frame.displayWidth;
       canvasEl.height = frame.displayHeight;
+    }
+    // Update reactive frame dimensions so cursorCss recomputes
+    if (frameWidth !== frame.displayWidth || frameHeight !== frame.displayHeight) {
+      frameWidth = frame.displayWidth;
+      frameHeight = frame.displayHeight;
     }
 
     gpuRenderer!.renderFrame(frame);
@@ -931,13 +945,15 @@
     onPwdChange?.(newPwd);
   }
 
-  export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean): void {
+  export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number): void {
     cursorX = x;
     cursorY = y;
     cursorW = w;
     cursorH = h;
     cursorStyle = style;
     cursorVisible = visible;
+    cursorSurfW = totalW;
+    cursorSurfH = totalH;
   }
 
   // ============================================================================

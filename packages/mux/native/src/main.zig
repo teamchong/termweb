@@ -1661,7 +1661,7 @@ const Server = struct {
         const defaults_path = "/tmp/termweb-ghostty-defaults.conf";
         if (std.fs.cwd().createFile(defaults_path, .{})) |f| {
             defer f.close();
-            f.writeAll("cursor-style = bar\ncursor-style-blink = false\n") catch {};
+            f.writeAll("cursor-style = bar\ncursor-style-blink = false\ncursor-opacity = 0\n") catch {};
             c.ghostty_config_load_file(config, defaults_path);
         } else |_| {}
 
@@ -1934,6 +1934,9 @@ const Server = struct {
 
         // Send current panel assignments to newly connected client
         self.sendAllPanelAssignments(conn);
+
+        // Send current cursor state for all panels so cursor appears immediately
+        self.sendCursorStateToConn(conn);
 
         // Send client list to admin(s)
         self.sendClientListToAdmins();
@@ -2538,6 +2541,54 @@ const Server = struct {
 
     /// Max connections for stack-based snapshot (avoids heap allocation during broadcast).
     const max_broadcast_conns = 16;
+
+    /// Build 19-byte cursor state message in surface-space coordinates.
+    /// [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][total_w:u16][total_h:u16]
+    fn buildCursorBuf(panel_id: u32, x: u16, y: u16, w: u16, h: u16, style: u8, visible: u8, total_w: u16, total_h: u16) [19]u8 {
+        var buf: [19]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.cursor_state);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        std.mem.writeInt(u16, buf[5..7], x, .little);
+        std.mem.writeInt(u16, buf[7..9], y, .little);
+        std.mem.writeInt(u16, buf[9..11], w, .little);
+        std.mem.writeInt(u16, buf[11..13], h, .little);
+        buf[13] = style;
+        buf[14] = visible;
+        std.mem.writeInt(u16, buf[15..17], total_w, .little);
+        std.mem.writeInt(u16, buf[17..19], total_h, .little);
+        return buf;
+    }
+
+    /// Send current cursor state for all panels to a single connection.
+    /// Called when a new control client connects so it gets immediate cursor state.
+    fn sendCursorStateToConn(self: *Server, conn: *ws.Connection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var pit = self.panels.valueIterator();
+        while (pit.next()) |panel_ptr| {
+            const panel = panel_ptr.*;
+            if (panel.surface == null) continue;
+            const size = c.ghostty_surface_size(panel.surface);
+            const cell_w: u16 = @intCast(size.cell_width_px);
+            const cell_h: u16 = @intCast(size.cell_height_px);
+            const padding_x: u16 = @intCast(
+                (@as(u32, @intCast(size.width_px)) -| (@as(u32, @intCast(size.columns)) * cell_w)) / 2,
+            );
+            const padding_y: u16 = @intCast(
+                (@as(u32, @intCast(size.height_px)) -| (@as(u32, @intCast(size.rows)) * cell_h)) / 2,
+            );
+            const surf_x = padding_x + panel.last_cursor_col * cell_w;
+            const surf_y = padding_y + panel.last_cursor_row * cell_h;
+            const surf_w: u16 = if (panel.last_cursor_style == 0) 2 else cell_w;
+            const surf_h: u16 = if (panel.last_cursor_style == 2) 2 else cell_h;
+            const surf_total_w: u16 = @intCast(size.width_px);
+            const surf_total_h: u16 = @intCast(size.height_px);
+
+            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, panel.last_cursor_style, panel.last_cursor_visible, surf_total_w, surf_total_h);
+            conn.sendBinary(&cursor_buf) catch {};
+        }
+    }
 
     /// Copy control connection list under mutex so sends can happen without holding it.
     /// Caller provides stack buffer; returned slice points into it.
@@ -4083,7 +4134,9 @@ const Server = struct {
                             panel.last_cursor_style = cur_style;
                             panel.last_cursor_visible = cur_visible;
 
-                            // Compute pixel coordinates from cell position
+                            // Compute cursor in surface-space pixel coordinates.
+                            // Client maps surface → encoder → CSS using surface dims
+                            // (sent here) and frame dims (from video decoder).
                             const size = c.ghostty_surface_size(panel.surface);
                             const cell_w: u16 = @intCast(size.cell_width_px);
                             const cell_h: u16 = @intCast(size.cell_height_px);
@@ -4093,21 +4146,14 @@ const Server = struct {
                             const padding_y: u16 = @intCast(
                                 (@as(u32, @intCast(size.height_px)) -| (@as(u32, @intCast(size.rows)) * cell_h)) / 2,
                             );
-                            const px_x = padding_x + cur_col * cell_w;
-                            const px_y = padding_y + cur_row * cell_h;
-                            const px_w: u16 = if (cur_style == 0) 2 else cell_w; // bar=2px, block/underline=full
-                            const px_h: u16 = if (cur_style == 2) 2 else cell_h; // underline=2px, block/bar=full
+                            const surf_x = padding_x + cur_col * cell_w;
+                            const surf_y = padding_y + cur_row * cell_h;
+                            const surf_w: u16 = if (cur_style == 0) 2 else cell_w; // bar=2px
+                            const surf_h: u16 = if (cur_style == 2) 2 else cell_h; // underline=2px
+                            const surf_total_w: u16 = @intCast(size.width_px);
+                            const surf_total_h: u16 = @intCast(size.height_px);
 
-                            // [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
-                            var cursor_buf: [15]u8 = undefined;
-                            cursor_buf[0] = @intFromEnum(BinaryCtrlMsg.cursor_state);
-                            std.mem.writeInt(u32, cursor_buf[1..5], panel.id, .little);
-                            std.mem.writeInt(u16, cursor_buf[5..7], px_x, .little);
-                            std.mem.writeInt(u16, cursor_buf[7..9], px_y, .little);
-                            std.mem.writeInt(u16, cursor_buf[9..11], px_w, .little);
-                            std.mem.writeInt(u16, cursor_buf[11..13], px_h, .little);
-                            cursor_buf[13] = cur_style;
-                            cursor_buf[14] = cur_visible;
+                            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible, surf_total_w, surf_total_h);
 
                             // Broadcast to control WS connections
                             var ctrl_buf: [max_broadcast_conns]*ws.Connection = undefined;
