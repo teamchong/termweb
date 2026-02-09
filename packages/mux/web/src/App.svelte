@@ -178,8 +178,10 @@
 
   function toggleFullscreen() {
     isFullscreen = !isFullscreen;
-    // Trigger resize for panels to reclaim space
-    window.dispatchEvent(new Event('resize'));
+    // Trigger resize after DOM updates so panels reclaim space
+    requestAnimationFrame(() => {
+      window.dispatchEvent(new Event('resize'));
+    });
   }
 
   // Handle command execution from command palette
@@ -702,7 +704,7 @@
 
   #titlebar.hidden,
   #toolbar.hidden {
-    visibility: hidden;
+    display: none;
   }
 
   #panels {
