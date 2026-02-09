@@ -82,6 +82,7 @@ export const TransferMsgType = {
   TRANSFER_COMPLETE: 0x34,
   TRANSFER_ERROR: 0x35,
   DRY_RUN_REPORT: 0x36,
+  BATCH_DATA: 0x37,
 } as const;
 
 // Role constants

@@ -75,7 +75,7 @@ mux-run:
 
 # Clean mux build artifacts
 mux-clean:
-	rm -f packages/mux/web/client.js packages/mux/web/zstd.wasm packages/mux/wasm/zstd.wasm
+	rm -f packages/mux/web/client.js packages/mux/web/file-worker.js packages/mux/web/zstd.wasm packages/mux/wasm/zstd.wasm
 	rm -rf packages/mux/native/zig-out packages/mux/native/zig-cache
 
 # =============================================================================

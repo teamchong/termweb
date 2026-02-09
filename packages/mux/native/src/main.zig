@@ -3309,6 +3309,9 @@ const Server = struct {
                 const list_msg = transfer.buildFileList(self.allocator, session) catch return;
                 defer self.allocator.free(list_msg);
                 conn.sendBinary(list_msg) catch {};
+
+                // Push all file data to the client
+                self.pushDownloadFiles(conn, session);
             }
         }
     }
@@ -3462,6 +3465,139 @@ const Server = struct {
         conn.user_data = null;
 
         std.debug.print("Transfer {d} cancelled\n", .{transfer_id});
+    }
+
+    /// Push all file chunks for a download transfer.
+    /// Iterates every non-directory file in the session, reads/compresses
+    /// chunks via mmap, and sends FILE_REQUEST messages to the client.
+    /// Sends TRANSFER_COMPLETE when finished.
+    fn pushDownloadFiles(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
+        const chunk_size: usize = 256 * 1024;
+        var bytes_sent: u64 = 0;
+
+        // Batch buffer for small files
+        var batch_entries: std.ArrayListUnmanaged(transfer.BatchEntry) = .{};
+        defer batch_entries.deinit(self.allocator);
+        var batch_data_bufs: std.ArrayListUnmanaged([]const u8) = .{};
+        defer {
+            for (batch_data_bufs.items) |buf| self.allocator.free(buf);
+            batch_data_bufs.deinit(self.allocator);
+        }
+        var batch_bytes: u64 = 0;
+
+        for (session.files.items, 0..) |entry, i| {
+            if (entry.is_dir) continue;
+            if (!session.is_active) break;
+
+            const file_index: u32 = @intCast(i);
+
+            // Empty files: client creates from FILE_LIST metadata
+            if (entry.size == 0) continue;
+
+            // Small files: accumulate into batch
+            if (entry.size <= transfer.batch_threshold) {
+                const file_data = session.readFileChunk(file_index, 0, @intCast(entry.size)) catch |err| {
+                    std.debug.print("Failed to read small file {s}: {}\n", .{ entry.path, err });
+                    continue;
+                };
+                // readFileChunk returns a slice into mmap — dupe it since we close the file
+                const duped = self.allocator.dupe(u8, file_data) catch continue;
+                session.closeCurrentFile();
+
+                batch_data_bufs.append(self.allocator, duped) catch continue;
+                batch_entries.append(self.allocator, .{ .file_index = file_index, .data = duped }) catch continue;
+                batch_bytes += entry.size;
+
+                // Flush batch if accumulated enough data (256KB or 256 files)
+                if (batch_bytes >= chunk_size or batch_entries.items.len >= 256) {
+                    self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
+                }
+                continue;
+            }
+
+            // Flush any pending batch before sending a large file
+            if (batch_entries.items.len > 0) {
+                self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
+            }
+
+            // Large files: send individually in chunks
+            var chunk_offset: u64 = 0;
+            while (chunk_offset < entry.size) {
+                if (!session.is_active) break;
+
+                const remaining = entry.size - chunk_offset;
+                const this_chunk = @min(chunk_size, remaining);
+
+                const msg = transfer.buildFileChunk(self.allocator, session, file_index, chunk_offset, this_chunk) catch |err| {
+                    std.debug.print("Failed to build file chunk for {s}: {}\n", .{ entry.path, err });
+                    const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read file") catch return;
+                    defer self.allocator.free(error_msg);
+                    conn.sendBinary(error_msg) catch {};
+                    return;
+                };
+                defer self.allocator.free(msg);
+
+                conn.sendBinary(msg) catch return;
+
+                chunk_offset += this_chunk;
+                bytes_sent += this_chunk;
+            }
+
+            session.closeCurrentFile();
+        }
+
+        // Flush remaining batch
+        if (batch_entries.items.len > 0) {
+            self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
+        }
+
+        const complete_msg = transfer.buildTransferComplete(self.allocator, session.id, bytes_sent) catch return;
+        defer self.allocator.free(complete_msg);
+        conn.sendBinary(complete_msg) catch {};
+
+        std.debug.print("Download complete: {d} bytes sent across {d} files\n", .{ bytes_sent, session.files.items.len });
+    }
+
+    fn flushBatch(
+        self: *Server,
+        conn: *ws.Connection,
+        session: *transfer.TransferSession,
+        batch_entries: *std.ArrayListUnmanaged(transfer.BatchEntry),
+        batch_data_bufs: *std.ArrayListUnmanaged([]const u8),
+        batch_bytes: *u64,
+        bytes_sent: *u64,
+    ) void {
+        if (batch_entries.items.len == 0) return;
+
+        const msg = transfer.buildBatchData(self.allocator, session, batch_entries.items) catch |err| {
+            std.debug.print("Failed to build batch: {}\n", .{err});
+            // Fallback: send each file individually via FILE_REQUEST
+            for (batch_entries.items) |entry| {
+                const fallback = transfer.buildFileRequest(self.allocator, session, entry.file_index, 0, entry.data) catch continue;
+                defer self.allocator.free(fallback);
+                conn.sendBinary(fallback) catch {};
+            }
+            bytes_sent.* += batch_bytes.*;
+            self.clearBatch(batch_entries, batch_data_bufs, batch_bytes);
+            return;
+        };
+        defer self.allocator.free(msg);
+
+        conn.sendBinary(msg) catch {};
+        bytes_sent.* += batch_bytes.*;
+        self.clearBatch(batch_entries, batch_data_bufs, batch_bytes);
+    }
+
+    fn clearBatch(
+        self: *Server,
+        batch_entries: *std.ArrayListUnmanaged(transfer.BatchEntry),
+        batch_data_bufs: *std.ArrayListUnmanaged([]const u8),
+        batch_bytes: *u64,
+    ) void {
+        for (batch_data_bufs.items) |buf| self.allocator.free(buf);
+        batch_data_bufs.clearRetainingCapacity();
+        batch_entries.clearRetainingCapacity();
+        batch_bytes.* = 0;
     }
 
     // Send dry run report

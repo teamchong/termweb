@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "vite build",
+    "build": "vite build && bun build src/file-transfer-worker.ts --outfile file-worker.js --minify --target browser",
     "build:legacy": "bun build src/index.ts --outfile=client.js --minify --format=iife",
     "dev": "vite build --watch",
     "typecheck": "tsc --noEmit"

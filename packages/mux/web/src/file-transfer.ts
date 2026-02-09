@@ -1,5 +1,6 @@
 // File transfer protocol and handlers
-// Uses zstd compression via WASM worker pool
+// Uses zstd WASM via dedicated Web Worker (off main thread)
+// with synchronous OPFS access for file caching
 
 import { getCompressionPool } from './compression-pool';
 import { TransferMsgType } from './protocol';
@@ -14,6 +15,7 @@ import {
   PROTO_TRANSFER_COMPLETE,
   PROTO_TRANSFER_ERROR,
   PROTO_DRY_RUN,
+  PROTO_BATCH_DATA,
   DRY_RUN_ACTION,
 } from './constants';
 import type { FileSystemDirectoryHandleIterator } from './types';
@@ -62,12 +64,115 @@ export interface DryRunReport {
 export class FileTransferHandler {
   private sendFn: ((data: Uint8Array) => void) | null = null;
   private activeTransfers = new Map<number, TransferState>();
+  private pendingTransfer: TransferState | null = null;
   private chunkSize = FILE_TRANSFER.CHUNK_SIZE;
+
+  // Worker for off-thread zstd WASM + synchronous OPFS access
+  private worker: Worker | null = null;
+  private workerReady = false;
+  private opfsAvailable = false;
+  private workerInitPromise: Promise<void>;
+  private pendingCompression = new Map<number, { resolve: (data: Uint8Array) => void; reject: (err: Error) => void }>();
+  private nextCompressionId = 0;
+
+  // Fallback: main-thread compression pool (used if Worker unavailable)
   private compressionPool = getCompressionPool();
 
   onTransferComplete?: (transferId: number, totalBytes: number) => void;
   onTransferError?: (transferId: number, error: string) => void;
   onDryRunReport?: (transferId: number, report: DryRunReport) => void;
+
+  constructor() {
+    this.workerInitPromise = this.initWorker();
+  }
+
+  private initWorker(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      try {
+        this.worker = new Worker('/file-worker.js');
+        this.worker.onmessage = (e) => this.handleWorkerMessage(e);
+        this.worker.onerror = () => {
+          this.worker = null;
+          resolve();
+        };
+
+        const timeout = setTimeout(() => {
+          if (!this.workerReady) {
+            this.worker = null;
+            resolve();
+          }
+        }, 5000);
+
+        this._workerInitResolve = () => {
+          clearTimeout(timeout);
+          resolve();
+        };
+
+        this.worker.postMessage({ type: 'init' });
+      } catch {
+        resolve();
+      }
+    });
+  }
+
+  private _workerInitResolve: (() => void) | null = null;
+
+  private handleWorkerMessage(e: MessageEvent): void {
+    const msg = e.data;
+    switch (msg.type) {
+      case 'init-done':
+        this.workerReady = true;
+        this.opfsAvailable = msg.opfsAvailable;
+        this._workerInitResolve?.();
+        this._workerInitResolve = null;
+        break;
+
+      case 'compressed': {
+        const pending = this.pendingCompression.get(msg.id);
+        if (pending) {
+          this.pendingCompression.delete(msg.id);
+          pending.resolve(new Uint8Array(msg.data));
+        }
+        break;
+      }
+
+      case 'decompressed': {
+        const pending = this.pendingCompression.get(msg.id);
+        if (pending) {
+          this.pendingCompression.delete(msg.id);
+          pending.resolve(new Uint8Array(msg.data));
+        }
+        break;
+      }
+
+      case 'chunk-written':
+        this.onChunkWrittenToOPFS(msg);
+        break;
+
+      case 'chunk-decompressed':
+        this.onChunkDecompressedNoOPFS(msg);
+        break;
+
+      case 'file-data':
+        this.onFileDataFromOPFS(msg);
+        break;
+
+      case 'cleanup-done':
+        break;
+
+      case 'error':
+        console.error('Worker error:', msg.message);
+        // Reject any pending compression promise
+        if (msg.id !== undefined) {
+          const pending = this.pendingCompression.get(msg.id);
+          if (pending) {
+            this.pendingCompression.delete(msg.id);
+            pending.reject(new Error(msg.message));
+          }
+        }
+        break;
+    }
+  }
 
   /** Set the send function (injected from MuxClient — sends via control WS) */
   setSend(fn: ((data: Uint8Array) => void) | null): void {
@@ -85,6 +190,7 @@ export class FileTransferHandler {
   disconnect(): void {
     this.sendFn = null;
     this.activeTransfers.clear();
+    this.pendingTransfer = null;
   }
 
   /** Handle a server→client file transfer response (routed from control WS) */
@@ -114,6 +220,9 @@ export class FileTransferHandler {
       case TransferMsgType.DRY_RUN_REPORT:
         this.handleDryRunReport(data);
         break;
+      case TransferMsgType.BATCH_DATA:
+        this.handleBatchData(data).catch(err => console.error('Batch data handling failed:', err));
+        break;
     }
   }
 
@@ -122,9 +231,22 @@ export class FileTransferHandler {
     const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
     console.log(`Transfer ${transferId} ready`);
 
+    // Move pending transfer to active with the server's assigned ID
+    if (this.pendingTransfer) {
+      this.pendingTransfer.id = transferId;
+      this.activeTransfers.set(transferId, this.pendingTransfer);
+      this.pendingTransfer = null;
+    }
+
     const transfer = this.activeTransfers.get(transferId);
     if (transfer) {
       transfer.state = 'ready';
+
+      // For uploads, start sending file data immediately
+      if (transfer.direction === 'upload' && transfer.files) {
+        transfer.state = 'transferring';
+        this.sendNextChunk(transferId).catch(err => console.error('Send chunk failed:', err));
+      }
     }
   }
 
@@ -181,65 +303,171 @@ export class FileTransferHandler {
 
     const transfer = this.activeTransfers.get(transferId);
     if (!transfer || !transfer.files) return;
+    if (fileIndex >= transfer.files.length) return;
 
-    try {
-      const fileData = await this.decompress(compressedData);
+    const file = transfer.files[fileIndex];
 
-      // Re-check transfer state after async operation
-      const currentTransfer = this.activeTransfers.get(transferId);
-      if (!currentTransfer || !currentTransfer.files || currentTransfer.state === 'complete' || currentTransfer.state === 'error') {
-        return;
-      }
-
-      // Validate fileIndex is within bounds
-      if (fileIndex < 0 || fileIndex >= currentTransfer.files.length) {
-        console.error(`Invalid fileIndex ${fileIndex} for transfer ${transferId}`);
-        return;
-      }
-      const file = currentTransfer.files[fileIndex];
-
-      if (!currentTransfer.receivedFiles) currentTransfer.receivedFiles = new Map();
-      let fileChunks = currentTransfer.receivedFiles.get(fileIndex);
-      if (!fileChunks) {
-        fileChunks = [];
-        currentTransfer.receivedFiles.set(fileIndex, fileChunks);
-      }
-      fileChunks.push({ offset: chunkOffset, data: fileData });
-
-      currentTransfer.bytesTransferred += fileData.length;
-
-      if (currentTransfer.bytesTransferred >= file.size) {
-        const chunks = fileChunks;
-        chunks.sort((a, b) => a.offset - b.offset);
-        const fullData = new Uint8Array(file.size);
-        let writeOffset = 0;
-        for (const chunk of chunks) {
-          fullData.set(chunk.data, writeOffset);
-          writeOffset += chunk.data.length;
-        }
-
-        if (!this.saveFile(file.path, fullData)) {
-          currentTransfer.state = 'error';
-          currentTransfer.receivedFiles?.clear();
-          this.activeTransfers.delete(transferId);
-          this.onTransferError?.(transferId, `Failed to save file: ${file.path}`);
-          return;
-        }
-        currentTransfer.receivedFiles.delete(fileIndex);
-        currentTransfer.currentFileIndex++;
-      }
-    } catch (err) {
-      console.error('Decompression failed:', err);
-      // Update transfer state and notify via callback
-      const failedTransfer = this.activeTransfers.get(transferId);
-      if (failedTransfer) {
-        failedTransfer.state = 'error';
-        // Clear received chunks to release memory immediately
-        failedTransfer.receivedFiles?.clear();
-        this.activeTransfers.delete(transferId);
-        this.onTransferError?.(transferId, err instanceof Error ? err.message : 'Decompression failed');
+    if (this.worker && this.workerReady) {
+      // Delegate to Worker: decompress + OPFS write (or decompress-only fallback)
+      const buffer = compressedData.buffer.slice(
+        compressedData.byteOffset,
+        compressedData.byteOffset + compressedData.byteLength,
+      );
+      this.worker.postMessage({
+        type: 'decompress-and-write',
+        transferId,
+        fileIndex,
+        filePath: file.path,
+        offset: chunkOffset,
+        compressedData: buffer,
+        fileSize: file.size,
+      }, [buffer]);
+    } else {
+      // Fallback: decompress on main thread, accumulate in memory
+      try {
+        const fileData = await this.decompress(compressedData);
+        this.accumulateAndSave(transferId, fileIndex, chunkOffset, fileData);
+      } catch (err) {
+        console.error('Decompression failed:', err);
+        this.failTransfer(transferId, err instanceof Error ? err.message : 'Decompression failed');
       }
     }
+  }
+
+  /** Handle BATCH_DATA: multiple small files compressed as one block */
+  private async handleBatchData(data: ArrayBuffer): Promise<void> {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const uncompressedSize = view.getUint32(PROTO_BATCH_DATA.UNCOMPRESSED_SIZE, true);
+    const compressedData = bytes.slice(PROTO_BATCH_DATA.DATA);
+
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer || !transfer.files) return;
+
+    let payload: Uint8Array;
+    try {
+      payload = await this.decompress(compressedData);
+    } catch (err) {
+      console.error('Batch decompression failed:', err);
+      this.failTransfer(transferId, 'Batch decompression failed');
+      return;
+    }
+
+    if (payload.length !== uncompressedSize) {
+      console.warn(`Batch size mismatch: expected ${uncompressedSize}, got ${payload.length}`);
+    }
+
+    // Parse batch payload: [file_count:u16] then per file: [file_index:u32][size:u32][data...]
+    const batchView = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    let offset = 0;
+    const fileCount = batchView.getUint16(offset, true); offset += 2;
+
+    for (let i = 0; i < fileCount; i++) {
+      if (offset + 8 > payload.length) break;
+
+      const fileIndex = batchView.getUint32(offset, true); offset += 4;
+      const fileSize = batchView.getUint32(offset, true); offset += 4;
+
+      if (offset + fileSize > payload.length) break;
+      if (fileIndex >= transfer.files.length) {
+        offset += fileSize;
+        continue;
+      }
+
+      const fileData = payload.slice(offset, offset + fileSize);
+      offset += fileSize;
+
+      const file = transfer.files[fileIndex];
+      transfer.bytesTransferred += fileData.length;
+
+      // Small batched files are always complete — save directly
+      this.saveFile(file.path, fileData);
+    }
+  }
+
+  /** Worker callback: chunk decompressed and written to OPFS */
+  private onChunkWrittenToOPFS(msg: { transferId: number; fileIndex: number; filePath: string; bytesWritten: number; complete: boolean }): void {
+    const transfer = this.activeTransfers.get(msg.transferId);
+    if (!transfer || !transfer.files) return;
+
+    transfer.bytesTransferred += msg.bytesWritten;
+
+    if (msg.complete) {
+      // File fully written to OPFS — read it back for browser download
+      this.worker!.postMessage({
+        type: 'get-file',
+        transferId: msg.transferId,
+        filePath: msg.filePath,
+      });
+      transfer.currentFileIndex++;
+    }
+  }
+
+  /** Worker callback: no OPFS available, decompressed data returned */
+  private onChunkDecompressedNoOPFS(msg: { transferId: number; fileIndex: number; filePath: string; offset: number; data: ArrayBuffer; bytesWritten: number }): void {
+    this.accumulateAndSave(msg.transferId, msg.fileIndex, msg.offset, new Uint8Array(msg.data));
+  }
+
+  /** Worker callback: file data read from OPFS for browser download */
+  private onFileDataFromOPFS(msg: { transferId: number; filePath: string; data: ArrayBuffer }): void {
+    const transfer = this.activeTransfers.get(msg.transferId);
+    if (!transfer) return;
+
+    this.saveFile(msg.filePath, new Uint8Array(msg.data));
+  }
+
+  /** Accumulate decompressed chunks in memory and save when file is complete */
+  private accumulateAndSave(transferId: number, fileIndex: number, chunkOffset: number, fileData: Uint8Array): void {
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer || !transfer.files || transfer.state === 'complete' || transfer.state === 'error') return;
+    if (fileIndex >= transfer.files.length) return;
+
+    const file = transfer.files[fileIndex];
+
+    if (!transfer.receivedFiles) transfer.receivedFiles = new Map();
+    let fileChunks = transfer.receivedFiles.get(fileIndex);
+    if (!fileChunks) {
+      fileChunks = [];
+      transfer.receivedFiles.set(fileIndex, fileChunks);
+    }
+    fileChunks.push({ offset: chunkOffset, data: fileData });
+
+    transfer.bytesTransferred += fileData.length;
+
+    // Check per-file completion using accumulated chunk bytes
+    const fileBytes = fileChunks.reduce((sum, c) => sum + c.data.length, 0);
+    if (fileBytes >= file.size) {
+      const chunks = fileChunks;
+      chunks.sort((a, b) => a.offset - b.offset);
+      const fullData = new Uint8Array(file.size);
+      let writeOffset = 0;
+      for (const chunk of chunks) {
+        fullData.set(chunk.data, writeOffset);
+        writeOffset += chunk.data.length;
+      }
+
+      if (!this.saveFile(file.path, fullData)) {
+        this.failTransfer(transferId, `Failed to save file: ${file.path}`);
+        return;
+      }
+      transfer.receivedFiles.delete(fileIndex);
+      transfer.currentFileIndex++;
+    }
+  }
+
+  /** Mark a transfer as failed and clean up */
+  private failTransfer(transferId: number, message: string): void {
+    const transfer = this.activeTransfers.get(transferId);
+    if (transfer) {
+      transfer.state = 'error';
+      transfer.receivedFiles?.clear();
+      this.activeTransfers.delete(transferId);
+      this.onTransferError?.(transferId, message);
+    }
+    // Clean up OPFS temp files
+    this.worker?.postMessage({ type: 'cleanup', transferId });
   }
 
   private handleFileAck(data: ArrayBuffer): void {
@@ -267,6 +495,9 @@ export class FileTransferHandler {
     }
     this.activeTransfers.delete(transferId);
     this.onTransferComplete?.(transferId, totalBytes);
+
+    // Clean up OPFS temp files for this transfer
+    this.worker?.postMessage({ type: 'cleanup', transferId });
   }
 
   private handleTransferError(data: ArrayBuffer): void {
@@ -353,9 +584,9 @@ export class FileTransferHandler {
 
     this.send(msg);
 
-    const transferId = Date.now();
-    this.activeTransfers.set(transferId, {
-      id: transferId,
+    // Store as pending — server will assign the real ID in TRANSFER_READY
+    this.pendingTransfer = {
+      id: 0,
       direction: 'upload',
       files,
       dirHandle,
@@ -363,7 +594,7 @@ export class FileTransferHandler {
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
-    });
+    };
   }
 
   async startFilesUpload(
@@ -410,16 +641,16 @@ export class FileTransferHandler {
 
     this.send(msg);
 
-    const transferId = Date.now();
-    this.activeTransfers.set(transferId, {
-      id: transferId,
+    // Store as pending — server will assign the real ID in TRANSFER_READY
+    this.pendingTransfer = {
+      id: 0,
       direction: 'upload',
       files: transferFiles,
       options,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
-    });
+    };
   }
 
   async startFolderDownload(serverPath: string, options: TransferOptions = {}): Promise<void> {
@@ -455,16 +686,16 @@ export class FileTransferHandler {
 
     this.send(msg);
 
-    const transferId = Date.now();
-    this.activeTransfers.set(transferId, {
-      id: transferId,
+    // Store as pending — server will assign the real ID in TRANSFER_READY
+    this.pendingTransfer = {
+      id: 0,
       direction: 'download',
       serverPath,
       options,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
-    });
+    };
   }
 
   private async collectFilesFromHandle(
@@ -574,6 +805,10 @@ export class FileTransferHandler {
   }
 
   private async compress(data: Uint8Array): Promise<Uint8Array> {
+    // Prefer Worker for off-thread compression
+    if (this.worker && this.workerReady) {
+      return this.compressViaWorker(data, FILE_TRANSFER.COMPRESSION_LEVEL);
+    }
     if (this.compressionPool) {
       return await this.compressionPool.compress(data, FILE_TRANSFER.COMPRESSION_LEVEL);
     }
@@ -581,10 +816,32 @@ export class FileTransferHandler {
   }
 
   private async decompress(data: Uint8Array): Promise<Uint8Array> {
+    // Prefer Worker for off-thread decompression
+    if (this.worker && this.workerReady) {
+      return this.decompressViaWorker(data);
+    }
     if (this.compressionPool) {
       return await this.compressionPool.decompress(data);
     }
     throw new Error('Decompression unavailable: zstd WASM not initialized');
+  }
+
+  private compressViaWorker(data: Uint8Array, level: number): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+      const id = this.nextCompressionId++;
+      this.pendingCompression.set(id, { resolve, reject });
+      const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      this.worker!.postMessage({ type: 'compress', id, data: buffer, level }, [buffer]);
+    });
+  }
+
+  private decompressViaWorker(data: Uint8Array): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+      const id = this.nextCompressionId++;
+      this.pendingCompression.set(id, { resolve, reject });
+      const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      this.worker!.postMessage({ type: 'decompress', id, data: buffer }, [buffer]);
+    });
   }
 
   private saveFile(path: string, data: Uint8Array): boolean {

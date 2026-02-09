@@ -47,6 +47,7 @@ const c = if (is_macos) @cImport({
 const web_assets = @import("web_assets");
 const embedded_index_html = web_assets.index_html;
 const embedded_client_js = web_assets.client_js;
+const embedded_file_worker_js = web_assets.file_worker_js;
 const embedded_zstd_wasm = web_assets.zstd_wasm;
 
 // Common headers for all responses:
@@ -262,6 +263,8 @@ pub const HttpServer = struct {
             embedded_index_html
         else if (std.mem.eql(u8, clean_path, "/client.js"))
             embedded_client_js
+        else if (std.mem.eql(u8, clean_path, "/file-worker.js"))
+            embedded_file_worker_js
         else if (std.mem.eql(u8, clean_path, "/zstd.wasm"))
             embedded_zstd_wasm
         else {

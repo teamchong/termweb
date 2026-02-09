@@ -54,6 +54,10 @@ const is_darwin = builtin.os.tag == .macos;
 /// Balances parallelism overhead with compression efficiency.
 const default_chunk_size = 256 * 1024;
 
+/// Files smaller than this threshold are batched together for better compression.
+/// 16KB captures most JS/TS source files, package.json, type declarations, etc.
+pub const batch_threshold: u64 = 16 * 1024;
+
 /// High water mark for dispatch I/O (256KB).
 /// Controls buffer size for macOS async I/O.
 const dispatch_high_water = 256 * 1024;
@@ -575,6 +579,7 @@ pub const ServerMsgType = enum(u8) {
     transfer_complete = 0x34, // Done
     transfer_error = 0x35,    // Error
     dry_run_report = 0x36,    // Preview results
+    batch_data = 0x37,        // Batched small files (compressed together)
 };
 
 // Transfer direction
@@ -1092,6 +1097,55 @@ pub fn buildFileChunk(allocator: Allocator, session: *TransferSession, file_inde
     offset += 4;
 
     @memcpy(msg[offset..], compressed);
+
+    return msg;
+}
+
+/// Entry for a file to include in a batch message.
+pub const BatchEntry = struct {
+    file_index: u32,
+    data: []const u8,
+};
+
+/// Build BATCH_DATA message — multiple small files compressed as one block.
+/// Wire format: [0x37][transfer_id:u32][uncompressed_size:u32][compressed_data...]
+/// Uncompressed payload: [file_count:u16] then per file: [file_index:u32][size:u32][data...]
+pub fn buildBatchData(allocator: Allocator, session: *TransferSession, entries: []const BatchEntry) ![]u8 {
+    // Calculate uncompressed payload size
+    var payload_size: usize = 2; // file_count:u16
+    for (entries) |entry| {
+        payload_size += 4 + 4 + entry.data.len; // file_index:u32 + size:u32 + data
+    }
+
+    // Build uncompressed payload
+    const payload = try allocator.alloc(u8, payload_size);
+    defer allocator.free(payload);
+
+    var offset: usize = 0;
+    std.mem.writeInt(u16, payload[offset..][0..2], @intCast(entries.len), .little);
+    offset += 2;
+
+    for (entries) |entry| {
+        std.mem.writeInt(u32, payload[offset..][0..4], entry.file_index, .little);
+        offset += 4;
+        std.mem.writeInt(u32, payload[offset..][0..4], @intCast(entry.data.len), .little);
+        offset += 4;
+        @memcpy(payload[offset..][0..entry.data.len], entry.data);
+        offset += entry.data.len;
+    }
+
+    // Compress entire payload as one block
+    const compressed = try session.compress(payload);
+    defer allocator.free(compressed);
+
+    // Build wire message
+    const header_len: usize = 1 + 4 + 4; // msg_type + transfer_id + uncompressed_size
+    var msg = try allocator.alloc(u8, header_len + compressed.len);
+
+    msg[0] = @intFromEnum(ServerMsgType.batch_data);
+    std.mem.writeInt(u32, msg[1..5], session.id, .little);
+    std.mem.writeInt(u32, msg[5..9], @intCast(payload_size), .little);
+    @memcpy(msg[9..], compressed);
 
     return msg;
 }

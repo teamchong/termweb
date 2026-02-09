@@ -99,6 +99,8 @@ export const FILE_TRANSFER = {
   MAX_DECOMPRESSED_SIZE: 16 * 1024 * 1024,
   /** Compress bound constant for zstd */
   COMPRESS_BOUND_CONSTANT: 512,
+  /** Files smaller than this are batched together for better compression (16KB) */
+  BATCH_THRESHOLD: 16 * 1024,
 } as const;
 
 // ============================================================================
@@ -159,6 +161,14 @@ export const PROTO_DRY_RUN = {
   UPDATE_COUNT: 9,
   DELETE_COUNT: 13,
   ENTRIES: 17,
+} as const;
+
+/** BATCH_DATA message offsets */
+export const PROTO_BATCH_DATA = {
+  /** Uncompressed total size of the batch payload */
+  UNCOMPRESSED_SIZE: 5,
+  /** Start of compressed batch data */
+  DATA: 9,
 } as const;
 
 /** Action codes for dry run entries */
