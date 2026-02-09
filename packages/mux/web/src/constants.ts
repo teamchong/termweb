@@ -237,6 +237,8 @@ export const SERVER_MSG = {
   LAYOUT_UPDATE: 0x07,
   /** Clipboard data from terminal */
   CLIPBOARD: 0x08,
+  /** Inspector state: panel dimensions */
+  INSPECTOR_STATE: 0x09,
   /** Authentication state */
   AUTH_STATE: 0x0A,
   /** Overview open/closed state */
@@ -255,6 +257,8 @@ export const SERVER_MSG = {
   CURSOR_STATE: 0x14,
   /** Surface pixel dimensions per panel (sent on resize, not per-frame) */
   SURFACE_DIMS: 0x15,
+  /** Inspector open/closed state */
+  INSPECTOR_OPEN_STATE: 0x1E,
 } as const;
 
 // ============================================================================

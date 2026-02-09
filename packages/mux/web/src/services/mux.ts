@@ -425,7 +425,8 @@ export class MuxClient {
       msgType === SERVER_MSG.PANEL_TITLE ||
       msgType === SERVER_MSG.PANEL_PWD ||
       msgType === SERVER_MSG.PANEL_BELL ||
-      msgType === SERVER_MSG.CURSOR_STATE
+      msgType === SERVER_MSG.CURSOR_STATE ||
+      msgType === SERVER_MSG.INSPECTOR_STATE
     )) {
       const panelId = view.getUint32(1, true);
       if (!this.panelsByServerId.has(panelId)) {
@@ -624,6 +625,34 @@ export class MuxClient {
           const panel = this.panelsByServerId.get(panelId);
           if (panel) {
             panel.updateCursorState(x, y, w, h, style, visible, totalW, totalH);
+          }
+          break;
+        }
+        case SERVER_MSG.INSPECTOR_STATE: {
+          // [type:u8][panel_id:u32][cols:u16][rows:u16][sw:u16][sh:u16][cw:u8][ch:u8] = 15 bytes
+          if (data.byteLength < 15) break;
+          const panelId = view.getUint32(1, true);
+          const state = {
+            cols: view.getUint16(5, true),
+            rows: view.getUint16(7, true),
+            width_px: view.getUint16(9, true),
+            height_px: view.getUint16(11, true),
+            cell_width: view.getUint8(13),
+            cell_height: view.getUint8(14),
+          };
+          const panel = this.panelsByServerId.get(panelId);
+          if (panel) panel.handleInspectorState(state);
+          break;
+        }
+        case SERVER_MSG.INSPECTOR_OPEN_STATE: {
+          // [type:u8][open:u8] = 2 bytes
+          if (data.byteLength < 2) break;
+          const isOpen = view.getUint8(1) === 1;
+          ui.update(s => ({ ...s, inspectorOpen: isOpen }));
+          if (isOpen) {
+            for (const panel of this.panelInstances.values()) {
+              panel.toggleInspector(true);
+            }
           }
           break;
         }
@@ -1650,6 +1679,9 @@ export class MuxClient {
   toggleInspector(): void {
     if (this.currentActivePanel) {
       this.currentActivePanel.toggleInspector();
+      const isOpen = this.currentActivePanel.isInspectorOpen();
+      const data = new Uint8Array([isOpen ? 1 : 0]);
+      this.sendControlMessage(BinaryCtrlMsg.SET_INSPECTOR, data);
     }
   }
 

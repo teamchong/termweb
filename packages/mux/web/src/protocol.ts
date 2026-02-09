@@ -36,6 +36,7 @@ export const BinaryCtrlMsg = {
   UNASSIGN_PANEL: 0x85,   // Admin unassigns panel: [panel_id:u32]
   PANEL_INPUT: 0x86,      // Coworker input to assigned panel: [panel_id:u32][input_msg...]
   PANEL_MSG: 0x87,        // Panel message envelope: [type:u8][panel_id:u32][inner_msg...] — routes panel input through zstd WS
+  SET_INSPECTOR: 0x8B,    // Set inspector open/closed state: [type:u8][open:u8]
   // Auth messages
   GET_AUTH_STATE: 0x90,
   SET_PASSWORD: 0x91,
