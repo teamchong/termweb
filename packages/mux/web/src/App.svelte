@@ -56,6 +56,7 @@
     { separator: true },
     { label: 'Upload...', action: '_upload', shortcut: '⌘U', icon: '⬆', disabled: !hasTabs },
     { label: 'Download...', action: '_download', shortcut: '⌘⇧S', icon: '⬇', disabled: !hasTabs },
+    { label: 'Storage...', action: '_storage', icon: '⛃' },
     { separator: true },
     { label: 'Split Right', action: '_split_right', shortcut: '⌘D', icon: '⬚▐', disabled: !hasTabs },
     { label: 'Split Down', action: '_split_down', shortcut: '⌘⇧D', icon: '⬚▄', disabled: !hasTabs },
@@ -237,6 +238,9 @@
         break;
       case '_download':
         muxClient?.showDownloadDialog();
+        break;
+      case '_storage':
+        muxClient?.showStorageDialog();
         break;
       case '_close_window':
         // Close all tabs (close window)

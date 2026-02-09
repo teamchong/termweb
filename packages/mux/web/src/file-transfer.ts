@@ -16,6 +16,7 @@ import {
   PROTO_FILE_ACK,
   PROTO_TRANSFER_COMPLETE,
   PROTO_TRANSFER_ERROR,
+  PROTO_TRANSFER_READY,
   PROTO_DRY_RUN,
   PROTO_BATCH_DATA,
   PROTO_SYNC_FILE_LIST,
@@ -53,6 +54,8 @@ export interface TransferState {
   options?: TransferOptions;
   /** Number of files that received deltas (for sync progress) */
   syncFilesProcessed?: number;
+  /** Resume position from server (set by handleTransferReady, consumed by handleFileList) */
+  resumePosition?: { fileIndex: number; fileOffset: number; bytesTransferred: number };
 }
 
 export interface TransferOptions {
@@ -73,6 +76,8 @@ export class FileTransferHandler {
   private activeTransfers = new Map<number, TransferState>();
   private pendingTransfer: TransferState | null = null;
   private chunkSize = FILE_TRANSFER.CHUNK_SIZE;
+  /** Interrupted uploads saved on disconnect for same-page-session resume */
+  private interruptedUploads = new Map<number, TransferState>();
 
   // Worker for off-thread zstd WASM + synchronous OPFS access
   private worker: Worker | null = null;
@@ -204,10 +209,93 @@ export class FileTransferHandler {
     this.sendFn?.(new Uint8Array(data));
   }
 
+  /** Called when the file WS connection is lost.
+   *  Saves interrupted uploads for resume, fails other transfers. */
+  onDisconnect(): void {
+    this.sendFn = null;
+
+    for (const [transferId, transfer] of this.activeTransfers) {
+      if (transfer.state === 'complete' || transfer.state === 'error') continue;
+
+      if (transfer.direction === 'upload' && (transfer.state === 'transferring' || transfer.state === 'ready')) {
+        // Save upload for resume — file handles survive within same page session
+        this.interruptedUploads.set(transferId, { ...transfer, state: 'pending', receivedFiles: undefined });
+      } else {
+        // Non-upload or non-resumable: fail with error
+        transfer.state = 'error';
+        transfer.receivedFiles?.clear();
+        this.onTransferError?.(transferId, 'File transfer connection lost');
+      }
+    }
+    this.activeTransfers.clear();
+
+    if (this.pendingTransfer) {
+      this.onTransferError?.(this.pendingTransfer.id, 'File transfer connection lost');
+      this.pendingTransfer = null;
+    }
+
+    // Reject any pending OPFS cache operations
+    this.cache?.rejectAll(new Error('File transfer connection lost'));
+  }
+
+  /** Check if any transfers are currently in progress */
+  hasActiveTransfers(): boolean {
+    if (this.pendingTransfer) return true;
+    for (const transfer of this.activeTransfers.values()) {
+      if (transfer.state === 'transferring' || transfer.state === 'ready' || transfer.state === 'pending') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Send TRANSFER_RESUME for a specific transfer ID */
+  sendTransferResume(transferId: number): void {
+    if (!this.canSend()) return;
+    // TRANSFER_RESUME: [msg_type:1][transfer_id:4]
+    const msg = new ArrayBuffer(5);
+    const view = new DataView(msg);
+    view.setUint8(0, TransferMsgType.TRANSFER_RESUME);
+    view.setUint32(1, transferId, true);
+    this.send(msg);
+  }
+
+  /** Get interrupted uploads that can be resumed */
+  getInterruptedUploads(): ReadonlyMap<number, TransferState> {
+    return this.interruptedUploads;
+  }
+
+  /** Resume all interrupted uploads by sending TRANSFER_RESUME for each.
+   *  Called by mux.ts when the file WS reconnects. */
+  resumeInterruptedUploads(): void {
+    if (!this.canSend()) return;
+    for (const [transferId, interrupted] of this.interruptedUploads) {
+      // Re-register as active transfer awaiting server's resume response
+      this.activeTransfers.set(transferId, { ...interrupted, state: 'pending' });
+      this.sendTransferResume(transferId);
+    }
+    this.interruptedUploads.clear();
+  }
+
   disconnect(): void {
     this.sendFn = null;
     this.activeTransfers.clear();
     this.pendingTransfer = null;
+    this.interruptedUploads.clear();
+  }
+
+  /** Get cache disk usage (bytes + file count) */
+  async getCacheUsage(): Promise<{ totalBytes: number; fileCount: number }> {
+    await this.workerInitPromise;
+    if (!this.cache?.available) return { totalBytes: 0, fileCount: 0 };
+    return this.cache.getUsage();
+  }
+
+  /** Clear all cached files */
+  async clearCache(): Promise<void> {
+    await this.workerInitPromise;
+    if (!this.cache?.available) return;
+    return this.cache.clearAll();
   }
 
   /** Handle a server→client file transfer response (routed from control WS) */
@@ -255,7 +343,19 @@ export class FileTransferHandler {
   private handleTransferReady(data: ArrayBuffer): void {
     const view = new DataView(data);
     const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
-    console.log(`Transfer ${transferId} ready`);
+
+    // Parse resume position from extended format (25 bytes)
+    let resumeFileIndex = 0;
+    let resumeFileOffset = 0;
+    let resumeBytesTransferred = 0;
+    if (data.byteLength >= PROTO_TRANSFER_READY.EXTENDED_SIZE) {
+      resumeFileIndex = view.getUint32(PROTO_TRANSFER_READY.FILE_INDEX, true);
+      resumeFileOffset = Number(view.getBigUint64(PROTO_TRANSFER_READY.FILE_OFFSET, true));
+      resumeBytesTransferred = Number(view.getBigUint64(PROTO_TRANSFER_READY.BYTES_TRANSFERRED, true));
+    }
+
+    const isResume = resumeFileIndex > 0 || resumeFileOffset > 0 || resumeBytesTransferred > 0;
+    console.log(`Transfer ${transferId} ready${isResume ? ` (resume: file=${resumeFileIndex}, offset=${resumeFileOffset}, transferred=${resumeBytesTransferred})` : ''}`);
 
     // Move pending transfer to active with the server's assigned ID
     if (this.pendingTransfer) {
@@ -268,8 +368,16 @@ export class FileTransferHandler {
     if (transfer) {
       transfer.state = 'ready';
 
-      // For uploads, start sending file data immediately
-      if (transfer.direction === 'upload' && transfer.files) {
+      if (isResume) {
+        // Store resume position — will be applied when FILE_LIST arrives
+        transfer.resumePosition = {
+          fileIndex: resumeFileIndex,
+          fileOffset: resumeFileOffset,
+          bytesTransferred: resumeBytesTransferred,
+        };
+        // Don't start uploading yet — server sends FILE_LIST next for resumes
+      } else if (transfer.direction === 'upload' && transfer.files) {
+        // Fresh upload — start sending immediately
         transfer.state = 'transferring';
         this.sendNextChunk(transferId).catch(err => console.error('Send chunk failed:', err));
       }
@@ -301,13 +409,24 @@ export class FileTransferHandler {
     if (transfer) {
       transfer.files = files;
       transfer.totalBytes = totalBytes;
-      transfer.currentFileIndex = 0;
-      transfer.bytesTransferred = 0;
       transfer.state = 'transferring';
 
-      // If this is a download, start requesting files
+      // Apply resume position if set (from handleTransferReady during resume)
+      if (transfer.resumePosition) {
+        transfer.currentFileIndex = transfer.resumePosition.fileIndex;
+        transfer.currentChunkOffset = transfer.resumePosition.fileOffset;
+        transfer.bytesTransferred = transfer.resumePosition.bytesTransferred;
+        transfer.resumePosition = undefined;
+      } else {
+        transfer.currentFileIndex = 0;
+        transfer.bytesTransferred = 0;
+      }
+
       if (transfer.direction === 'download') {
         this.requestNextFile(transferId);
+      } else if (transfer.direction === 'upload' && transfer.files) {
+        // Resume upload — start sending from resume position
+        this.sendNextChunk(transferId).catch(err => console.error('Send chunk failed:', err));
       }
     }
   }

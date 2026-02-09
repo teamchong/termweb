@@ -305,6 +305,45 @@ async function cacheRemove(serverPath: string, filePath: string): Promise<void> 
   }
 }
 
+/** Remove the entire termweb-cache directory tree */
+async function cacheClearAll(): Promise<void> {
+  if (!opfsRoot) return;
+  try {
+    await opfsRoot.removeEntry(CACHE_ROOT, { recursive: true });
+  } catch {
+    // Directory might not exist
+  }
+}
+
+/** Walk the cache directory and sum file sizes */
+async function cacheUsage(): Promise<{ totalBytes: number; fileCount: number }> {
+  if (!opfsRoot) return { totalBytes: 0, fileCount: 0 };
+
+  let totalBytes = 0;
+  let fileCount = 0;
+
+  async function walkDir(dir: FileSystemDirectoryHandle): Promise<void> {
+    for await (const [, handle] of dir as unknown as AsyncIterable<[string, FileSystemHandle]>) {
+      if (handle.kind === 'file') {
+        const file = await (handle as FileSystemFileHandle).getFile();
+        totalBytes += file.size;
+        fileCount++;
+      } else {
+        await walkDir(handle as FileSystemDirectoryHandle);
+      }
+    }
+  }
+
+  try {
+    const cacheDir = await opfsRoot.getDirectoryHandle(CACHE_ROOT);
+    await walkDir(cacheDir);
+  } catch {
+    // Cache directory doesn't exist yet
+  }
+
+  return { totalBytes, fileCount };
+}
+
 // ── Block checksum computation (for rsync delta sync) ──
 
 /** Rsync-style rolling checksum (Adler32 variant) */
@@ -502,6 +541,20 @@ self.onmessage = async (e: MessageEvent) => {
         const { id, serverPath, filePath } = msg;
         await cacheRemove(serverPath, filePath);
         (self as unknown as Worker).postMessage({ type: 'cache-remove-done', id, serverPath, filePath });
+        break;
+      }
+
+      case 'cache-clear-all': {
+        const { id } = msg;
+        await cacheClearAll();
+        (self as unknown as Worker).postMessage({ type: 'cache-cleared', id });
+        break;
+      }
+
+      case 'cache-usage': {
+        const { id } = msg;
+        const usage = await cacheUsage();
+        (self as unknown as Worker).postMessage({ type: 'cache-usage-result', id, ...usage });
         break;
       }
 

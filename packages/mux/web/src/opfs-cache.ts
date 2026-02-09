@@ -65,6 +65,18 @@ export class OPFSCache {
     return this.request('apply-delta', { serverPath, filePath, deltaPayload }, [deltaPayload]) as Promise<ArrayBuffer>;
   }
 
+  /** Delete the entire cache directory */
+  clearAll(): Promise<void> {
+    if (!this._available) return Promise.resolve();
+    return this.request('cache-clear-all', {}) as Promise<void>;
+  }
+
+  /** Get total cache disk usage */
+  getUsage(): Promise<{ totalBytes: number; fileCount: number }> {
+    if (!this._available) return Promise.resolve({ totalBytes: 0, fileCount: 0 });
+    return this.request('cache-usage', {}) as Promise<{ totalBytes: number; fileCount: number }>;
+  }
+
   /** Handle Worker response messages. Returns true if the message was a cache response. */
   handleWorkerMessage(msg: Record<string, unknown>): boolean {
     switch (msg.type) {
@@ -101,6 +113,14 @@ export class OPFSCache {
       }
       case 'delta-error': {
         this.reject(msg.id as number, new Error(msg.message as string));
+        return true;
+      }
+      case 'cache-cleared': {
+        this.resolve(msg.id as number, undefined);
+        return true;
+      }
+      case 'cache-usage-result': {
+        this.resolve(msg.id as number, { totalBytes: msg.totalBytes, fileCount: msg.fileCount });
         return true;
       }
       default:

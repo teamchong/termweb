@@ -2011,6 +2011,17 @@ const Server = struct {
 
     fn onFileDisconnect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
+
+        // Clean up any transfer session associated with this connection
+        if (conn.user_data) |user_data| {
+            const session: *transfer.TransferSession = @ptrCast(@alignCast(user_data));
+            const session_id = session.id;
+            session.deleteState();
+            self.transfer_manager.removeSession(session_id);
+            conn.user_data = null;
+            std.debug.print("File WS disconnected — cleaned up transfer session {d}\n", .{session_id});
+        }
+
         self.mutex.lock();
         for (self.file_connections.items, 0..) |file_conn, i| {
             if (file_conn == conn) {
@@ -3442,17 +3453,37 @@ const Server = struct {
 
         conn.user_data = session;
 
-        // Send TRANSFER_READY
-        const ready_msg = transfer.buildTransferReady(self.allocator, session.id) catch return;
+        // Send TRANSFER_READY with resume position
+        const ready_msg = transfer.buildTransferReadyEx(
+            self.allocator,
+            session.id,
+            session.current_file_index,
+            session.current_file_offset,
+            session.bytes_transferred,
+        ) catch return;
         defer self.allocator.free(ready_msg);
         conn.sendBinary(ready_msg) catch {};
 
-        // Send file list with current progress
-        const list_msg = transfer.buildFileList(self.allocator, session) catch return;
-        defer self.allocator.free(list_msg);
-        conn.sendBinary(list_msg) catch {};
+        // For uploads, send file list so client can correlate file indices
+        if (session.direction == .upload) {
+            const list_msg = transfer.buildFileList(self.allocator, session) catch return;
+            defer self.allocator.free(list_msg);
+            conn.sendBinary(list_msg) catch {};
+        } else {
+            // For downloads, resume pushing files from saved position
+            const list_msg = transfer.buildFileList(self.allocator, session) catch return;
+            defer self.allocator.free(list_msg);
+            conn.sendBinary(list_msg) catch {};
+            self.pushDownloadFiles(conn, session);
+        }
 
-        std.debug.print("Resumed transfer {d} at {d}/{d} bytes\n", .{ session.id, session.bytes_transferred, session.total_bytes });
+        std.debug.print("Resumed transfer {d} at file {d}, offset {d}, {d}/{d} bytes\n", .{
+            session.id,
+            session.current_file_index,
+            session.current_file_offset,
+            session.bytes_transferred,
+            session.total_bytes,
+        });
     }
 
     // Handle TRANSFER_CANCEL message
@@ -3636,20 +3667,55 @@ const Server = struct {
                 self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
             }
 
-            // Large files: send individually in chunks
+            // Prefetch next file into memory while we process this one
+            if (i + 1 < session.files.items.len) {
+                const next_entry = session.files.items[i + 1];
+                if (!next_entry.is_dir and next_entry.size > 0) {
+                    self.prefetchFile(session, @intCast(i + 1));
+                }
+            }
+
+            // Large files: compress all chunks in parallel, then send sequentially
+            const file_data = session.readFileChunk(file_index, 0, @intCast(entry.size)) catch |err| {
+                std.debug.print("Failed to read file {s}: {}\n", .{ entry.path, err });
+                const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read file") catch return;
+                defer self.allocator.free(error_msg);
+                conn.sendBinary(error_msg) catch {};
+                return;
+            };
+
+            // Use parallel compressor to compress all chunks at once
+            const compressed_chunks = transfer.ParallelCompressor.compressChunksParallel(
+                self.allocator,
+                file_data,
+                3, // compression level
+            ) catch |err| {
+                std.debug.print("Parallel compression failed for {s}: {}, falling back\n", .{ entry.path, err });
+                // Fallback to sequential chunk-by-chunk
+                session.closeCurrentFile();
+                self.pushFileSequential(conn, session, file_index, entry.size, chunk_size, &bytes_sent);
+                continue;
+            };
+            defer transfer.ParallelCompressor.freeChunks(self.allocator, compressed_chunks);
+
+            // Send each pre-compressed chunk
             var chunk_offset: u64 = 0;
-            while (chunk_offset < entry.size) {
+            for (compressed_chunks, 0..) |compressed, ci| {
                 if (!session.is_active) break;
 
                 const remaining = entry.size - chunk_offset;
-                const this_chunk = @min(chunk_size, remaining);
+                const this_chunk: u32 = @intCast(@min(chunk_size, remaining));
 
-                const msg = transfer.buildFileChunk(self.allocator, session, file_index, chunk_offset, this_chunk) catch |err| {
-                    std.debug.print("Failed to build file chunk for {s}: {}\n", .{ entry.path, err });
-                    const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read file") catch return;
-                    defer self.allocator.free(error_msg);
-                    conn.sendBinary(error_msg) catch {};
-                    return;
+                const msg = transfer.buildFileChunkPrecompressed(
+                    self.allocator,
+                    session.id,
+                    file_index,
+                    chunk_offset,
+                    this_chunk,
+                    compressed,
+                ) catch |err| {
+                    std.debug.print("Failed to build chunk {d} for {s}: {}\n", .{ ci, entry.path, err });
+                    break;
                 };
                 defer self.allocator.free(msg);
 
@@ -3714,6 +3780,51 @@ const Server = struct {
         batch_data_bufs.clearRetainingCapacity();
         batch_entries.clearRetainingCapacity();
         batch_bytes.* = 0;
+    }
+
+    /// Prefetch a file into memory using madvise(WILLNEED).
+    /// This triggers the kernel to read-ahead the file's pages while we process the current file.
+    fn prefetchFile(self: *Server, session: *transfer.TransferSession, file_index: u32) void {
+        // Temporarily map the file and advise the kernel
+        const entry = session.files.items[file_index];
+        const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ session.base_path, entry.path }) catch return;
+        defer self.allocator.free(full_path);
+
+        var mapped = transfer.MappedFile.init(full_path) catch return;
+        mapped.adviseWillNeed();
+        mapped.deinit();
+    }
+
+    /// Fallback: send a large file chunk-by-chunk with sequential compression.
+    /// Used when parallel compression fails.
+    fn pushFileSequential(
+        self: *Server,
+        conn: *ws.Connection,
+        session: *transfer.TransferSession,
+        file_index: u32,
+        file_size: u64,
+        chunk_size: usize,
+        bytes_sent: *u64,
+    ) void {
+        var chunk_offset: u64 = 0;
+        while (chunk_offset < file_size) {
+            if (!session.is_active) break;
+
+            const remaining = file_size - chunk_offset;
+            const this_chunk = @min(chunk_size, remaining);
+
+            const msg = transfer.buildFileChunk(self.allocator, session, file_index, chunk_offset, this_chunk) catch |err| {
+                std.debug.print("Failed to build file chunk: {}\n", .{err});
+                return;
+            };
+            defer self.allocator.free(msg);
+
+            conn.sendBinary(msg) catch return;
+
+            chunk_offset += this_chunk;
+            bytes_sent.* += this_chunk;
+        }
+        session.closeCurrentFile();
     }
 
     // Send dry run report

@@ -34,6 +34,8 @@ export const TIMING = {
   FPS_CALCULATION_WINDOW: 1000,
   /** Clipboard copy flash duration */
   CLIPBOARD_FLASH_DURATION: 500,
+  /** File WS idle timeout before closing (30s) */
+  FILE_WS_IDLE_TIMEOUT: 30_000,
 } as const;
 
 // ============================================================================
@@ -161,6 +163,18 @@ export const PROTO_DRY_RUN = {
   UPDATE_COUNT: 9,
   DELETE_COUNT: 13,
   ENTRIES: 17,
+} as const;
+
+/** TRANSFER_READY extended format offsets (resume support) */
+export const PROTO_TRANSFER_READY = {
+  /** Current file index (resume position) */
+  FILE_INDEX: 5,
+  /** Current file offset within that file */
+  FILE_OFFSET: 9,
+  /** Total bytes transferred so far */
+  BYTES_TRANSFERRED: 17,
+  /** Extended message size (25 bytes) */
+  EXTENDED_SIZE: 25,
 } as const;
 
 /** BATCH_DATA message offsets */

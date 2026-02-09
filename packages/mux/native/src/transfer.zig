@@ -368,22 +368,56 @@ pub const ParallelCompressor = struct {
                 _ = i;
             }
         } else {
-            // Sequential fallback for Linux (TODO: use std.Thread.Pool)
-            for (0..chunk_count) |i| {
-                const start = i * CHUNK_SIZE;
-                const end = @min(start + CHUNK_SIZE, data.len);
-                const chunk = data[start..end];
+            // Linux: parallel compression using threads
+            const max_threads: usize = 8;
+            const thread_count = @min(chunk_count, max_threads);
 
-                // Use zstd for compression
-                const compressed = zstd.compressSimple(allocator, chunk, compression_level) catch {
-                    for (results[0..i]) |result| {
-                        allocator.free(result);
-                    }
+            if (thread_count <= 1) {
+                // Single chunk: no threading overhead
+                const compressed = zstd.compressSimple(allocator, data, compression_level) catch {
                     allocator.free(results);
                     return error.CompressionFailed;
                 };
+                results[0] = compressed;
+            } else {
+                const ThreadCtx = struct {
+                    data: []const u8,
+                    results: [][]u8,
+                    errors: []bool,
+                    alloc: Allocator,
+                    level: c_int,
+                    chunk_count: usize,
+                };
+                var ctx = ThreadCtx{
+                    .data = data,
+                    .results = results,
+                    .errors = errors,
+                    .alloc = allocator,
+                    .level = compression_level,
+                    .chunk_count = chunk_count,
+                };
 
-                results[i] = compressed;
+                // Spawn worker threads
+                var threads: [8]?std.Thread = .{null} ** 8;
+                for (0..thread_count) |t| {
+                    threads[t] = std.Thread.spawn(.{}, threadCompress, .{ &ctx, t, thread_count }) catch null;
+                }
+
+                // Wait for all threads
+                for (0..thread_count) |t| {
+                    if (threads[t]) |thread| thread.join();
+                }
+
+                // Check for errors
+                for (errors) |err| {
+                    if (err) {
+                        for (results) |chunk| {
+                            if (chunk.len > 0) allocator.free(chunk);
+                        }
+                        allocator.free(results);
+                        return error.CompressionFailed;
+                    }
+                }
             }
         }
 
@@ -412,6 +446,23 @@ pub const ParallelCompressor = struct {
             };
 
             ctx.results[idx] = compressed;
+        }
+    }
+
+    fn threadCompress(ctx: anytype, thread_id: usize, thread_count: usize) void {
+        // Each thread handles a strided range of chunks
+        var i = thread_id;
+        while (i < ctx.chunk_count) : (i += thread_count) {
+            const start = i * CHUNK_SIZE;
+            const end = @min(start + CHUNK_SIZE, ctx.data.len);
+            const chunk = ctx.data[start..end];
+
+            const compressed = zstd.compressSimple(ctx.alloc, chunk, ctx.level) catch {
+                ctx.errors[i] = true;
+                return;
+            };
+
+            ctx.results[i] = compressed;
         }
     }
 
@@ -1018,12 +1069,26 @@ pub const TransferSession = struct {
 // Message Builders
 
 
-// Build TRANSFER_READY message
-// [0x30][transfer_id:u32]
+/// Build TRANSFER_READY message with resume position.
+/// [0x30][transfer_id:u32][current_file_index:u32][current_file_offset:u64][bytes_transferred:u64]
+/// Resume fields are 0 for new transfers.
 pub fn buildTransferReady(allocator: Allocator, transfer_id: u32) ![]u8 {
-    var msg = try allocator.alloc(u8, 5);
+    return buildTransferReadyEx(allocator, transfer_id, 0, 0, 0);
+}
+
+pub fn buildTransferReadyEx(
+    allocator: Allocator,
+    transfer_id: u32,
+    current_file_index: u32,
+    current_file_offset: u64,
+    bytes_transferred: u64,
+) ![]u8 {
+    var msg = try allocator.alloc(u8, 25);
     msg[0] = @intFromEnum(ServerMsgType.transfer_ready);
     std.mem.writeInt(u32, msg[1..5], transfer_id, .little);
+    std.mem.writeInt(u32, msg[5..9], current_file_index, .little);
+    std.mem.writeInt(u64, msg[9..17], current_file_offset, .little);
+    std.mem.writeInt(u64, msg[17..25], bytes_transferred, .little);
     return msg;
 }
 
@@ -1102,6 +1167,40 @@ pub fn buildFileChunk(allocator: Allocator, session: *TransferSession, file_inde
     offset += 8;
 
     std.mem.writeInt(u32, msg[offset..][0..4], @intCast(chunk.len), .little);
+    offset += 4;
+
+    @memcpy(msg[offset..], compressed);
+
+    return msg;
+}
+
+/// Build FILE_REQUEST message from pre-compressed data (used by pipelined download).
+/// Avoids re-reading and re-compressing when data was already compressed in parallel.
+pub fn buildFileChunkPrecompressed(
+    allocator: Allocator,
+    transfer_id: u32,
+    file_index: u32,
+    chunk_offset: u64,
+    uncompressed_size: u32,
+    compressed: []const u8,
+) ![]u8 {
+    const header_len: usize = 1 + 4 + 4 + 8 + 4;
+    var msg = try allocator.alloc(u8, header_len + compressed.len);
+
+    var offset: usize = 0;
+    msg[offset] = @intFromEnum(ServerMsgType.file_request);
+    offset += 1;
+
+    std.mem.writeInt(u32, msg[offset..][0..4], transfer_id, .little);
+    offset += 4;
+
+    std.mem.writeInt(u32, msg[offset..][0..4], file_index, .little);
+    offset += 4;
+
+    std.mem.writeInt(u64, msg[offset..][0..8], chunk_offset, .little);
+    offset += 8;
+
+    std.mem.writeInt(u32, msg[offset..][0..4], uncompressed_size, .little);
     offset += 4;
 
     @memcpy(msg[offset..], compressed);

@@ -82,6 +82,9 @@ interface InternalTabInfo {
 export class MuxClient {
   private controlWs: WebSocket | null = null;
   private fileWs: WebSocket | null = null;
+  private fileWsReady: Promise<void> | null = null;
+  private fileWsReadyResolve: (() => void) | null = null;
+  private fileWsIdleTimer: ReturnType<typeof setTimeout> | null = null;
   private fileTransfer: FileTransferHandler;
   private panelInstances = new Map<string, PanelInstance>();
   private panelsByServerId = new Map<number, PanelInstance>();
@@ -111,12 +114,15 @@ export class MuxClient {
     this.fileTransfer = new FileTransferHandler();
     this.fileTransfer.onTransferComplete = (transferId, totalBytes) => {
       console.log(`Transfer ${transferId} completed: ${totalBytes} bytes`);
+      this.resetFileWsIdleTimer();
     };
     this.fileTransfer.onTransferError = (transferId, error) => {
       console.error(`Transfer ${transferId} failed: ${error}`);
+      this.resetFileWsIdleTimer();
     };
     this.fileTransfer.onDryRunReport = (transferId, report) => {
       console.log(`Transfer ${transferId} dry run: ${report.newCount} new, ${report.updateCount} update, ${report.deleteCount} delete`);
+      this.resetFileWsIdleTimer();
     };
   }
 
@@ -128,43 +134,118 @@ export class MuxClient {
     return this.controlWs !== null && this.controlWs.readyState === WebSocket.OPEN;
   }
 
-  /** Lazy file WS — connects on first transfer, not on page load */
-  private ensureFileWs(): void {
-    if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) return;
-    if (this.fileWs && this.fileWs.readyState === WebSocket.CONNECTING) return;
+  /** Lazy file WS — connects on first transfer, not on page load.
+   *  Returns a promise that resolves when the WS is open and ready to send. */
+  private ensureFileWs(): Promise<void> {
+    // Already open — just reset idle timer
+    if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
+      this.resetFileWsIdleTimer();
+      return Promise.resolve();
+    }
+    // Already connecting — return the existing ready promise
+    if (this.fileWs && this.fileWs.readyState === WebSocket.CONNECTING && this.fileWsReady) {
+      return this.fileWsReady;
+    }
+
+    // Clean up any stale WS in CLOSING/CLOSED state
+    this.closeFileWs();
 
     const wsUrl = getWsUrl(WS_PATHS.FILE);
     this.fileWs = new WebSocket(wsUrl);
     this.fileWs.binaryType = 'arraybuffer';
 
-    this.fileWs.onopen = () => {
-      console.log('File transfer channel connected');
-      this.fileTransfer.setSend((data) => {
-        if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
-          // Copy to fresh Uint8Array with standard ArrayBuffer backing
-          const copy = new Uint8Array(data.length);
-          copy.set(data);
-          this.fileWs.send(copy);
+    this.fileWsReady = new Promise<void>((resolve, reject) => {
+      this.fileWsReadyResolve = resolve;
+      const ws = this.fileWs!;
+
+      ws.onopen = () => {
+        console.log('File transfer channel connected');
+        this.fileTransfer.setSend((data) => {
+          if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
+            const copy = new Uint8Array(data.length);
+            copy.set(data);
+            this.fileWs.send(copy);
+            this.resetFileWsIdleTimer();
+          }
+        });
+        this.resetFileWsIdleTimer();
+        this.fileWsReadyResolve = null;
+        resolve();
+
+        // Auto-resume interrupted uploads from previous connection
+        const interrupted = this.fileTransfer.getInterruptedUploads();
+        if (interrupted.size > 0) {
+          console.log(`Resuming ${interrupted.size} interrupted upload(s)`);
+          this.fileTransfer.resumeInterruptedUploads();
         }
-      });
-    };
+      };
 
-    this.fileWs.onmessage = (event) => {
-      if (this.destroyed) return;
-      if (event.data instanceof ArrayBuffer) {
-        this.fileTransfer.handleServerMessage(event.data);
-      }
-    };
+      ws.onmessage = (event) => {
+        if (this.destroyed) return;
+        this.resetFileWsIdleTimer();
+        if (event.data instanceof ArrayBuffer) {
+          this.fileTransfer.handleServerMessage(event.data);
+        }
+      };
 
-    this.fileWs.onclose = () => {
-      console.log('File transfer channel disconnected');
-      this.fileTransfer.setSend(null);
+      ws.onclose = () => {
+        console.log('File transfer channel disconnected');
+        this.fileTransfer.onDisconnect();
+        this.clearFileWsIdleTimer();
+        this.fileWs = null;
+        this.fileWsReady = null;
+        // Reject if we were still connecting
+        if (this.fileWsReadyResolve) {
+          this.fileWsReadyResolve = null;
+          reject(new Error('File transfer channel closed before open'));
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error('File transfer channel error:', err);
+      };
+    });
+
+    return this.fileWsReady;
+  }
+
+  /** Close file WS and clean up all associated state */
+  private closeFileWs(): void {
+    this.clearFileWsIdleTimer();
+    if (this.fileWs) {
+      this.fileWs.onclose = null;
+      this.fileWs.onerror = null;
+      this.fileWs.onmessage = null;
+      this.fileWs.onopen = null;
+      this.fileWs.close();
       this.fileWs = null;
-    };
+    }
+    this.fileTransfer.onDisconnect();
+    this.fileWsReady = null;
+    if (this.fileWsReadyResolve) {
+      this.fileWsReadyResolve = null;
+    }
+  }
 
-    this.fileWs.onerror = (err) => {
-      console.error('File transfer channel error:', err);
-    };
+  /** Reset the idle timer — closes file WS after FILE_WS_IDLE_TIMEOUT of inactivity */
+  private resetFileWsIdleTimer(): void {
+    this.clearFileWsIdleTimer();
+    // Don't close while transfers are in progress
+    if (this.fileTransfer.hasActiveTransfers()) return;
+    this.fileWsIdleTimer = setTimeout(() => {
+      if (this.fileWs && !this.fileTransfer.hasActiveTransfers()) {
+        console.log('File transfer channel idle — closing');
+        this.closeFileWs();
+      }
+    }, TIMING.FILE_WS_IDLE_TIMEOUT);
+  }
+
+  /** Clear the idle timer */
+  private clearFileWsIdleTimer(): void {
+    if (this.fileWsIdleTimer) {
+      clearTimeout(this.fileWsIdleTimer);
+      this.fileWsIdleTimer = null;
+    }
   }
 
   // --- Outgoing message batching (60fps bus) ---
@@ -338,10 +419,7 @@ export class MuxClient {
       this.h264Ws.close();
       this.h264Ws = null;
     }
-    if (this.fileWs) {
-      this.fileWs.close();
-      this.fileWs = null;
-    }
+    this.closeFileWs();
     this.fileTransfer.disconnect();
     for (const panel of this.panelInstances.values()) {
       panel.destroy();
@@ -1782,7 +1860,7 @@ export class MuxClient {
       const defaultPath = panelInfo?.pwd || '~';
       const serverPath = window.prompt('Upload to server path:', defaultPath);
       if (!serverPath) return;
-      this.ensureFileWs();
+      await this.ensureFileWs();
       await this.fileTransfer.startFolderUpload(dirHandle, serverPath);
     } catch (err: unknown) {
       if (err instanceof Error && err.name !== 'AbortError') {
@@ -1798,7 +1876,7 @@ export class MuxClient {
     const serverPath = window.prompt('Download from server path:', defaultPath);
     if (!serverPath) return;
     try {
-      this.ensureFileWs();
+      await this.ensureFileWs();
       await this.fileTransfer.startFolderDownload(serverPath);
     } catch (err: unknown) {
       console.error('Download failed:', err);
@@ -1814,7 +1892,7 @@ export class MuxClient {
     if (!serverPath) return;
 
     try {
-      this.ensureFileWs();
+      await this.ensureFileWs();
       await this.fileTransfer.startFilesUpload(files, serverPath);
     } catch (err: unknown) {
       if (err instanceof Error) {
@@ -1823,6 +1901,43 @@ export class MuxClient {
     }
   }
 
+  async showStorageDialog(): Promise<void> {
+    let usage: { totalBytes: number; fileCount: number };
+    try {
+      usage = await this.fileTransfer.getCacheUsage();
+    } catch {
+      usage = { totalBytes: 0, fileCount: 0 };
+    }
+
+    const formatBytes = (bytes: number): string => {
+      if (bytes === 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+      const val = bytes / Math.pow(1024, i);
+      return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    };
+
+    if (usage.fileCount === 0) {
+      window.alert('File cache is empty.');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `File cache: ${formatBytes(usage.totalBytes)} (${usage.fileCount} files)\n\n` +
+      'Clear all cached files?\n' +
+      'This will remove locally cached copies used for delta sync.\n' +
+      'Next sync will re-download full files.',
+    );
+
+    if (confirmed) {
+      try {
+        await this.fileTransfer.clearCache();
+        console.log('File cache cleared');
+      } catch (err) {
+        console.error('Failed to clear cache:', err);
+      }
+    }
+  }
 
 }
 
