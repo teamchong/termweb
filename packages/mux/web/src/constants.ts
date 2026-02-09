@@ -311,6 +311,10 @@ export const STATS_THRESHOLD = {
   FPS_GOOD: 25,
   /** FPS considered warning (yellow) */
   FPS_WARN: 15,
+  /** Decode latency considered good (green), in ms */
+  LATENCY_GOOD: 16,
+  /** Decode latency considered warning (yellow), in ms */
+  LATENCY_WARN: 50,
   /** Buffer health considered good (green) */
   HEALTH_GOOD: 80,
   /** Buffer health considered warning (yellow) */

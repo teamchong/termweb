@@ -569,7 +569,7 @@ const Panel = struct {
     inspector_tab_len: u8,
     last_iosurface_seed: u32, // For detecting IOSurface/SharedMemory changes
     last_frame_hash: u64, // For detecting unchanged frames on Linux
-    last_frame_time: i64, // For FPS control
+    last_frame_time: i128, // For per-panel adaptive FPS control
     last_tick_time: i128, // For rate limiting panel.tick()
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
     consecutive_unchanged: u32, // Consecutive frames with no pixel change (for adaptive frame rate)
@@ -1438,22 +1438,25 @@ const Panel = struct {
         }
     }
 
-    // Handle buffer stats from client for adaptive bitrate
+    // Handle buffer stats from client for adaptive quality (AIMD tiered system).
+    // Client sends: [health:u8][fps:u8][buffer_ms:u16] every ~1s.
     fn handleBufferStats(self: *Panel, payload: []const u8) void {
         if (payload.len < 4) return;
 
-        const health = payload[0];  // 0-100: buffer health
-        const fps = payload[1];     // Received FPS
+        const health = payload[0]; // 0-100: buffer health (100 = all frames consumed)
+        const fps = payload[1]; // Received FPS at client
         const buffer_ms = std.mem.readInt(u16, payload[2..4], .little);
 
-        _ = fps;
-        _ = buffer_ms;
-
-        // Adjust quality based on buffer health
-        // health < 30: buffer starving, reduce quality
-        // health > 70: buffer growing, can increase quality
         if (self.video_encoder) |encoder| {
+            const old_level = encoder.quality_level;
             encoder.adjustQuality(health);
+
+            // Log tier changes (adjustQuality handles AIMD internally)
+            if (encoder.quality_level != old_level) {
+                std.debug.print("ADAPTIVE panel={d}: tier {d}->{d} health={d} fps={d} buf={d}ms\n", .{
+                    self.id, old_level, encoder.quality_level, health, fps, buffer_ms,
+                });
+            }
         }
     }
 };
@@ -3779,6 +3782,57 @@ const Server = struct {
                     c.ghostty_surface_set_headless_focus(panel.surface, should_focus);
                 }
 
+                // Distribute pixel budget proportionally based on each panel's
+                // visible pixel area. The tier's max_pixels is a TOTAL budget
+                // for all panels combined. If total visible pixels fit within
+                // the budget, every panel encodes at native resolution (no
+                // downscale). Only when total exceeds the budget do panels get
+                // proportionally scaled down.
+                if (frame_panels_count > 0) {
+                    // Find the lowest tier budget across encoders (conservative)
+                    var tier_budget: u64 = 0;
+                    var total_visible: u64 = 0;
+                    for (frame_panels_buf[0..frame_panels_count]) |panel| {
+                        if (panel.video_encoder) |enc| {
+                            const t = enc.tierMaxPixels();
+                            if (tier_budget == 0 or t < tier_budget) tier_budget = t;
+                        }
+                        const pw = panel.getPixelWidth();
+                        const ph = panel.getPixelHeight();
+                        total_visible += @as(u64, pw) * @as(u64, ph);
+                    }
+                    if (tier_budget > 0 and total_visible > 0) {
+                        if (total_visible <= tier_budget) {
+                            // All panels fit at native resolution — no cap needed.
+                            // Set each panel's budget to its own visible pixels
+                            // (effectively unlimited for this panel's source size).
+                            for (frame_panels_buf[0..frame_panels_count]) |panel| {
+                                if (panel.video_encoder) |enc| {
+                                    const pw = panel.getPixelWidth();
+                                    const ph = panel.getPixelHeight();
+                                    enc.setPixelBudget(@as(u64, pw) * @as(u64, ph));
+                                }
+                            }
+                        } else {
+                            // Total exceeds budget — scale each panel proportionally.
+                            // panel_budget = tier_budget * (panel_pixels / total_pixels)
+                            for (frame_panels_buf[0..frame_panels_count]) |panel| {
+                                if (panel.video_encoder) |enc| {
+                                    const pw = panel.getPixelWidth();
+                                    const ph = panel.getPixelHeight();
+                                    const panel_pixels = @as(u64, pw) * @as(u64, ph);
+                                    const budget = @as(u64, @intFromFloat(
+                                        @as(f64, @floatFromInt(tier_budget)) *
+                                            (@as(f64, @floatFromInt(panel_pixels)) /
+                                            @as(f64, @floatFromInt(total_visible))),
+                                    ));
+                                    enc.setPixelBudget(@max(budget, 640 * 480));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Process each panel WITHOUT holding the server mutex
                 // This prevents mutex starvation when encoding takes 100+ms per panel
                 var perf_tick_ns: u64 = 0;
@@ -3790,8 +3844,24 @@ const Server = struct {
                     frames_attempted += 1;
                     const t_frame_start = std.time.nanoTimestamp();
 
-                    // Adaptive frame rate: when idle for both macOS and Linux,
-                    // skip expensive draw+readpixels to save CPU/GPU.
+                    // Per-panel adaptive FPS: when encoder's quality tier has fps < 30,
+                    // skip frames to match the tier's target rate. This saves encode
+                    // bandwidth on degraded connections. Input and keyframe requests bypass.
+                    if (panel.video_encoder) |encoder| {
+                        if (encoder.target_fps < 30 and
+                            !panel.force_keyframe and
+                            !panel.has_pending_input.load(.acquire))
+                        {
+                            const panel_interval_ns: i64 = @divFloor(std.time.ns_per_s, @as(i64, encoder.target_fps));
+                            const elapsed = t_frame_start - panel.last_frame_time;
+                            if (elapsed < panel_interval_ns) {
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Adaptive idle mode: when terminal content is unchanged for ~1s,
+                    // reduce tick rate to save CPU/GPU (cursor/spinner checks only).
                     // Input or force_keyframe (reconnection) resets immediately.
                     if (panel.consecutive_unchanged >= Panel.IDLE_THRESHOLD and
                         !panel.force_keyframe and
@@ -3992,6 +4062,7 @@ const Server = struct {
                     if (frame_data) |data| {
                         if (self.sendH264Frame(panel.id, data)) {
                             frames_sent += 1;
+                            panel.last_frame_time = t_frame_start; // For per-panel adaptive FPS
                             if (panel.ticks_since_connect < 10) {
                                 if (dbg_log) |f| {
                                     var dbg_buf: [128]u8 = undefined;

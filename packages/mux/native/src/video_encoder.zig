@@ -69,31 +69,48 @@ pub const VideoEncoder = struct {
     // CVPixelBuffer pool for buffer reuse (reduces allocation overhead)
     pixel_buffer_pool: c.CVPixelBufferPoolRef,
 
-    // Adaptive bitrate/FPS
+    // Adaptive bitrate/FPS/resolution
     current_bitrate: u32,
     target_fps: u32,
     quality_level: u8, // 0-4: 0=lowest, 4=highest
+    active_max_pixels: u64,
+
+    // AIMD adaptive quality state
+    frames_at_current_level: u32,
+    consecutive_bad: u8,
+    consecutive_good: u8,
 
     const MAX_OUTPUT_SIZE = 2 * 1024 * 1024; // 2MB max per frame
-    const MAX_PIXELS: u64 = 1920 * 1080; // ~2MP, roughly 1080p
 
-    // Quality presets - FPS fixed at 30, only bitrate varies
-    const QUALITY_PRESETS = [_]struct { bitrate: u32, fps: u32 }{
-        .{ .bitrate = 2_000_000, .fps = 30 }, // Level 0: Low (2 Mbps)
-        .{ .bitrate = 3_000_000, .fps = 30 }, // Level 1: Medium (3 Mbps)
-        .{ .bitrate = 4_000_000, .fps = 30 }, // Level 2: High (4 Mbps)
-        .{ .bitrate = 5_000_000, .fps = 30 }, // Level 3: Very high (5 Mbps)
-        .{ .bitrate = 8_000_000, .fps = 30 }, // Level 4: Max (8 Mbps)
+    /// Quality tiers for adaptive streaming (AIMD pattern).
+    /// Ordered lowest-to-highest. Resolution changes trigger encoder resize + keyframe.
+    /// For terminals: text sharpness (resolution) is most important, so we reduce
+    /// fps first, then bitrate, then resolution as a last resort.
+    const QualityTier = struct { bitrate: u32, max_pixels: u64, fps: u32 };
+    const QUALITY_TIERS = [_]QualityTier{
+        .{ .bitrate = 1_000_000, .max_pixels = 1024 * 768, .fps = 15 },   // 0: Emergency
+        .{ .bitrate = 2_000_000, .max_pixels = 1280 * 1024, .fps = 24 },  // 1: Low
+        .{ .bitrate = 3_000_000, .max_pixels = 1920 * 1080, .fps = 30 },  // 2: Medium
+        .{ .bitrate = 5_000_000, .max_pixels = 2048 * 2048, .fps = 30 },  // 3: High (default)
+        .{ .bitrate = 8_000_000, .max_pixels = 3840 * 2160, .fps = 30 },  // 4: Max (4K)
     };
+    const DEFAULT_TIER: u8 = 3;
 
-    // Calculate scaled dimensions to fit within MAX_PIXELS while keeping aspect ratio
-    fn calcScaledDimensions(width: u32, height: u32) struct { w: u32, h: u32 } {
+    /// AIMD stability constants — prevent oscillation between tiers.
+    const HEALTH_BAD: u8 = 30; // Below this: client is starving
+    const HEALTH_GOOD: u8 = 70; // Above this: client is healthy
+    const DOWNGRADE_STREAK: u8 = 2; // Consecutive bad reports before dropping (2s)
+    const UPGRADE_STREAK: u8 = 3; // Consecutive good reports before upgrading (3s)
+    const MIN_STABLE_FRAMES: u32 = 150; // Frames at current tier before upgrade (~5s at 30fps)
+
+    // Calculate scaled dimensions to fit within quality tier's pixel cap while keeping aspect ratio
+    fn calcScaledDimensions(width: u32, height: u32, max_pixels: u64) struct { w: u32, h: u32 } {
         const pixels: u64 = @as(u64, width) * @as(u64, height);
-        if (pixels <= MAX_PIXELS) {
+        if (pixels <= max_pixels) {
             return .{ .w = width, .h = height };
         }
-        // Scale down to fit within MAX_PIXELS
-        const scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(pixels)));
+        // Scale down to fit within max_pixels
+        const scale = @sqrt(@as(f64, @floatFromInt(max_pixels)) / @as(f64, @floatFromInt(pixels)));
         const new_w: u32 = @intFromFloat(@as(f64, @floatFromInt(width)) * scale);
         const new_h: u32 = @intFromFloat(@as(f64, @floatFromInt(height)) * scale);
         // Round to even numbers (required for H.264)
@@ -107,8 +124,9 @@ pub const VideoEncoder = struct {
         const output_buffer = try allocator.alloc(u8, MAX_OUTPUT_SIZE);
         errdefer allocator.free(output_buffer);
 
-        // Calculate encode dimensions (may be scaled down)
-        const scaled = calcScaledDimensions(width, height);
+        // Calculate encode dimensions (may be scaled down based on default tier)
+        const default_tier = QUALITY_TIERS[DEFAULT_TIER];
+        const scaled = calcScaledDimensions(width, height, default_tier.max_pixels);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
         const needs_scaling = (encode_width != width or encode_height != height);
@@ -193,9 +211,13 @@ pub const VideoEncoder = struct {
             .scale_buffer = scale_buffer,
             .nv12_buffer = nv12_buffer,
             .pixel_buffer_pool = pixel_buffer_pool,
-            .current_bitrate = 5_000_000, // Start at high quality
-            .target_fps = 30,
-            .quality_level = 3, // High
+            .current_bitrate = default_tier.bitrate,
+            .target_fps = default_tier.fps,
+            .quality_level = DEFAULT_TIER,
+            .active_max_pixels = default_tier.max_pixels,
+            .frames_at_current_level = 0,
+            .consecutive_bad = 0,
+            .consecutive_good = 0,
         };
 
         // Configure for zero latency
@@ -477,39 +499,106 @@ pub const VideoEncoder = struct {
         self.allocator.destroy(self);
     }
 
-    // Adjust quality based on client buffer health (0-100)
+    /// Adaptive quality adjustment using AIMD (Additive Increase, Multiplicative Decrease).
+    /// Called once per second from client buffer health reports.
+    /// - Bad health (<30): fast drop — 2 tiers after 2 consecutive bad reports
+    /// - Good health (>70): slow recovery — 1 tier after 3 good reports AND 5s stability
+    /// - Dead zone (30-70): no change, reset streaks
     pub fn adjustQuality(self: *VideoEncoder, buffer_health: u8) void {
         if (buffer_health == 0) return;
 
-        const new_level: u8 = if (buffer_health < 30)
-            if (self.quality_level > 0) self.quality_level - 1 else 0
-        else if (buffer_health > 70)
-            if (self.quality_level < 4) self.quality_level + 1 else 4
-        else
-            self.quality_level;
+        self.frames_at_current_level +|= 30; // ~1 second worth of frames per report
 
-        if (new_level != self.quality_level) {
-            std.debug.print("QUALITY: level {d}->{d} (health={d}%)\n", .{
-                self.quality_level, new_level, buffer_health,
-            });
-            self.quality_level = new_level;
-            const preset = QUALITY_PRESETS[new_level];
-            self.current_bitrate = preset.bitrate;
-            self.target_fps = preset.fps;
+        if (buffer_health < HEALTH_BAD) {
+            self.consecutive_good = 0;
+            self.consecutive_bad +|= 1;
 
-            var bitrate: c.SInt32 = @intCast(preset.bitrate);
-            const bitrate_number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &bitrate);
-            if (bitrate_number != null) {
-                _ = c.VTSessionSetProperty(self.session, c.kVTCompressionPropertyKey_AverageBitRate, bitrate_number);
-                c.CFRelease(bitrate_number);
+            if (self.consecutive_bad >= DOWNGRADE_STREAK) {
+                // Multiplicative decrease: drop 2 tiers at once
+                const drop = @min(@as(u8, 2), self.quality_level);
+                if (drop > 0) {
+                    self.applyTier(self.quality_level - drop);
+                }
+                self.consecutive_bad = 0;
             }
+        } else if (buffer_health > HEALTH_GOOD) {
+            self.consecutive_bad = 0;
+            self.consecutive_good +|= 1;
+
+            // Additive increase: 1 tier, only after stability at current level
+            if (self.consecutive_good >= UPGRADE_STREAK and
+                self.frames_at_current_level >= MIN_STABLE_FRAMES)
+            {
+                if (self.quality_level < QUALITY_TIERS.len - 1) {
+                    self.applyTier(self.quality_level + 1);
+                    self.consecutive_good = 0;
+                }
+            }
+        } else {
+            // Dead zone: network is adequate, don't oscillate
+            self.consecutive_bad = 0;
+            self.consecutive_good = 0;
+        }
+    }
+
+    /// Apply a new quality tier. Updates bitrate and fps only.
+    /// Resolution is managed by the server via setPixelBudget() based on
+    /// total budget divided by active panel count.
+    fn applyTier(self: *VideoEncoder, level: u8) void {
+        if (level == self.quality_level) return;
+
+        const old_level = self.quality_level;
+        const tier = QUALITY_TIERS[level];
+
+        std.debug.print("QUALITY: tier {d}->{d} bitrate={d} fps={d}\n", .{
+            old_level, level, tier.bitrate, tier.fps,
+        });
+
+        self.quality_level = level;
+        self.frames_at_current_level = 0;
+        self.current_bitrate = tier.bitrate;
+        self.target_fps = tier.fps;
+
+        // Apply bitrate to VideoToolbox session
+        var bitrate: c.SInt32 = @intCast(tier.bitrate);
+        const bitrate_number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &bitrate);
+        if (bitrate_number != null) {
+            _ = c.VTSessionSetProperty(self.session, c.kVTCompressionPropertyKey_AverageBitRate, bitrate_number);
+            c.CFRelease(bitrate_number);
+        }
+    }
+
+    /// Returns the current tier's max pixel budget (before per-panel division).
+    pub fn tierMaxPixels(self: *const VideoEncoder) u64 {
+        return QUALITY_TIERS[self.quality_level].max_pixels;
+    }
+
+    /// Set the per-panel pixel budget. Called by server when panel count changes
+    /// or quality tier changes. May trigger encoder resize + keyframe.
+    pub fn setPixelBudget(self: *VideoEncoder, budget: u64) void {
+        if (budget == self.active_max_pixels) return;
+        self.active_max_pixels = budget;
+
+        // Check if encode dimensions changed with new budget
+        const new_dims = calcScaledDimensions(self.source_width, self.source_height, budget);
+        if (new_dims.w != self.width or new_dims.h != self.height) {
+            // Force resize — will recreate VT session at new resolution
+            const saved_src_w = self.source_width;
+            const saved_src_h = self.source_height;
+            self.source_width = 0; // Force resize() to proceed
+            self.source_height = 0;
+            self.resize(saved_src_w, saved_src_h) catch |err| {
+                std.debug.print("BUDGET: resize for tier failed: {}\n", .{err});
+                self.source_width = saved_src_w;
+                self.source_height = saved_src_h;
+            };
         }
     }
 
     pub fn resize(self: *VideoEncoder, width: u32, height: u32) !void {
         if (self.source_width == width and self.source_height == height) return;
 
-        const scaled = calcScaledDimensions(width, height);
+        const scaled = calcScaledDimensions(width, height, self.active_max_pixels);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
         const needs_scaling = (encode_width != width or encode_height != height);

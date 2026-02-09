@@ -347,6 +347,12 @@ pub const VideoEncoder = struct {
     target_fps: u32,
     quality_level: u8,
     keyframe_interval: u32,
+    active_max_pixels: u64,
+
+    // AIMD adaptive quality state
+    frames_at_current_level: u32,
+    consecutive_bad: u8,
+    consecutive_good: u8,
 
     // Cached SPS/PPS for prepending to keyframes
     sps_data: [64]u8,
@@ -362,40 +368,50 @@ pub const VideoEncoder = struct {
     has_vpp: bool,
 
     const MAX_OUTPUT_SIZE = 16 * 1024 * 1024; // 16MB max per frame (low QP keyframes can be large)
-    const MAX_PIXELS: u64 = 2048 * 2048; // Reduced for fast encode
 
-    // Quality presets - FPS fixed at 30, only bitrate varies
-    const QUALITY_PRESETS = [_]struct { bitrate: u32, fps: u32 }{
-        .{ .bitrate = 2_000_000, .fps = 30 }, // Level 0: Low (2 Mbps)
-        .{ .bitrate = 3_000_000, .fps = 30 }, // Level 1: Medium (3 Mbps)
-        .{ .bitrate = 4_000_000, .fps = 30 }, // Level 2: High (4 Mbps)
-        .{ .bitrate = 5_000_000, .fps = 30 }, // Level 3: Very high (5 Mbps)
-        .{ .bitrate = 8_000_000, .fps = 30 }, // Level 4: Max (8 Mbps)
+    /// Hardware safety limit per axis — most VA-API encoders max at 4096.
+    const HW_MAX_DIM: u32 = 4096;
+
+    /// Quality tiers for adaptive streaming (AIMD pattern).
+    /// Ordered lowest-to-highest. Resolution changes trigger encoder resize + keyframe.
+    /// For terminals: text sharpness (resolution) is most important, so we reduce
+    /// fps first, then bitrate, then resolution as a last resort.
+    const QualityTier = struct { bitrate: u32, max_pixels: u64, fps: u32 };
+    const QUALITY_TIERS = [_]QualityTier{
+        .{ .bitrate = 1_000_000, .max_pixels = 1024 * 768, .fps = 15 },   // 0: Emergency
+        .{ .bitrate = 2_000_000, .max_pixels = 1280 * 1024, .fps = 24 },  // 1: Low
+        .{ .bitrate = 3_000_000, .max_pixels = 1920 * 1080, .fps = 30 },  // 2: Medium
+        .{ .bitrate = 5_000_000, .max_pixels = 2048 * 2048, .fps = 30 },  // 3: High (default)
+        .{ .bitrate = 8_000_000, .max_pixels = 3840 * 2160, .fps = 30 },  // 4: Max (4K)
     };
+    const DEFAULT_TIER: u8 = 3;
 
-    /// Maximum dimension for a single axis. Capped at 2048 for fast encode —
-    /// terminal text is still sharp and H.264 artifacts dominate at any higher resolution.
-    const MAX_DIM: u32 = 2048;
+    /// AIMD stability constants — prevent oscillation between tiers.
+    const HEALTH_BAD: u8 = 30; // Below this: client is starving
+    const HEALTH_GOOD: u8 = 70; // Above this: client is healthy
+    const DOWNGRADE_STREAK: u8 = 2; // Consecutive bad reports before dropping (2s)
+    const UPGRADE_STREAK: u8 = 3; // Consecutive good reports before upgrading (3s)
+    const MIN_STABLE_FRAMES: u32 = 150; // Frames at current tier before upgrade (~5s at 30fps)
 
-    fn calcAlignedDimensions(width: u32, height: u32) struct { w: u32, h: u32 } {
+    fn calcAlignedDimensions(width: u32, height: u32, max_pixels: u64) struct { w: u32, h: u32 } {
         // VA-API hardware encoders require 16-pixel aligned surfaces.
         // We also enforce per-dimension caps (GPU H.264 encode typically maxes at 4096).
         var w = width;
         var h = height;
 
-        // Enforce per-dimension limit first
-        if (w > MAX_DIM or h > MAX_DIM) {
-            const scale_w = @as(f64, @floatFromInt(MAX_DIM)) / @as(f64, @floatFromInt(w));
-            const scale_h = @as(f64, @floatFromInt(MAX_DIM)) / @as(f64, @floatFromInt(h));
+        // Enforce per-dimension hardware limit first
+        if (w > HW_MAX_DIM or h > HW_MAX_DIM) {
+            const scale_w = @as(f64, @floatFromInt(HW_MAX_DIM)) / @as(f64, @floatFromInt(w));
+            const scale_h = @as(f64, @floatFromInt(HW_MAX_DIM)) / @as(f64, @floatFromInt(h));
             const scale = @min(scale_w, scale_h);
             w = @intFromFloat(@as(f64, @floatFromInt(w)) * scale);
             h = @intFromFloat(@as(f64, @floatFromInt(h)) * scale);
         }
 
-        // Also enforce total pixel count
+        // Enforce quality-tier pixel count cap
         const pixels: u64 = @as(u64, w) * @as(u64, h);
-        if (pixels > MAX_PIXELS) {
-            const scale = @sqrt(@as(f64, @floatFromInt(MAX_PIXELS)) / @as(f64, @floatFromInt(pixels)));
+        if (pixels > max_pixels) {
+            const scale = @sqrt(@as(f64, @floatFromInt(max_pixels)) / @as(f64, @floatFromInt(pixels)));
             w = @intFromFloat(@as(f64, @floatFromInt(w)) * scale);
             h = @intFromFloat(@as(f64, @floatFromInt(h)) * scale);
         }
@@ -644,11 +660,12 @@ pub const VideoEncoder = struct {
         const output_buffer = try allocator.alloc(u8, MAX_OUTPUT_SIZE);
         errdefer allocator.free(output_buffer);
 
-        const scaled = calcAlignedDimensions(width, height);
+        const default_tier = QUALITY_TIERS[DEFAULT_TIER];
+        const scaled = calcAlignedDimensions(width, height, default_tier.max_pixels);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
 
-        std.debug.print("ENCODER: init {}x{} -> encode {}x{}\n", .{ width, height, encode_width, encode_height });
+        std.debug.print("ENCODER: init {}x{} -> encode {}x{} tier={d}\n", .{ width, height, encode_width, encode_height, DEFAULT_TIER });
 
         const va_display = shared.va_display;
 
@@ -778,10 +795,14 @@ pub const VideoEncoder = struct {
             .coded_buf = coded_buf,
             .output_buffer = output_buffer,
             .output_len = 0,
-            .current_bitrate = 5_000_000,
-            .target_fps = 30,
-            .quality_level = 3,
+            .current_bitrate = default_tier.bitrate,
+            .target_fps = default_tier.fps,
+            .quality_level = DEFAULT_TIER,
             .keyframe_interval = 600, // keyframe every 20 seconds at 30fps
+            .active_max_pixels = default_tier.max_pixels,
+            .frames_at_current_level = 0,
+            .consecutive_bad = 0,
+            .consecutive_good = 0,
             .sps_data = undefined,
             .sps_len = 0,
             .pps_data = undefined,
@@ -814,28 +835,198 @@ pub const VideoEncoder = struct {
         self.allocator.destroy(self);
     }
 
+    /// Adaptive quality adjustment using AIMD (Additive Increase, Multiplicative Decrease).
+    /// Called once per second from client buffer health reports.
+    /// - Bad health (<30): fast drop — 2 tiers after 2 consecutive bad reports
+    /// - Good health (>70): slow recovery — 1 tier after 3 good reports AND 5s stability
+    /// - Dead zone (30-70): no change, reset streaks
     pub fn adjustQuality(self: *VideoEncoder, buffer_health: u8) void {
         if (buffer_health == 0) return;
 
-        const new_level: u8 = if (buffer_health < 30)
-            if (self.quality_level > 0) self.quality_level - 1 else 0
-        else if (buffer_health > 70)
-            if (self.quality_level < 4) self.quality_level + 1 else 4
-        else
-            self.quality_level;
+        self.frames_at_current_level +|= 30; // ~1 second worth of frames per report
 
-        if (new_level != self.quality_level) {
-            self.quality_level = new_level;
-            const preset = QUALITY_PRESETS[new_level];
-            self.current_bitrate = preset.bitrate;
-            self.target_fps = preset.fps;
+        if (buffer_health < HEALTH_BAD) {
+            self.consecutive_good = 0;
+            self.consecutive_bad +|= 1;
+
+            if (self.consecutive_bad >= DOWNGRADE_STREAK) {
+                // Multiplicative decrease: drop 2 tiers at once
+                const drop = @min(@as(u8, 2), self.quality_level);
+                if (drop > 0) {
+                    self.applyTier(self.quality_level - drop);
+                }
+                self.consecutive_bad = 0;
+            }
+        } else if (buffer_health > HEALTH_GOOD) {
+            self.consecutive_bad = 0;
+            self.consecutive_good +|= 1;
+
+            // Additive increase: 1 tier, only after stability at current level
+            if (self.consecutive_good >= UPGRADE_STREAK and
+                self.frames_at_current_level >= MIN_STABLE_FRAMES)
+            {
+                if (self.quality_level < QUALITY_TIERS.len - 1) {
+                    self.applyTier(self.quality_level + 1);
+                    self.consecutive_good = 0;
+                }
+            }
+        } else {
+            // Dead zone: network is adequate, don't oscillate
+            self.consecutive_bad = 0;
+            self.consecutive_good = 0;
         }
+    }
+
+    /// Apply a new quality tier. Updates bitrate and fps only.
+    /// Resolution is managed by the server via setPixelBudget() based on
+    /// total budget divided by active panel count.
+    fn applyTier(self: *VideoEncoder, level: u8) void {
+        if (level == self.quality_level) return;
+
+        const old_level = self.quality_level;
+        const tier = QUALITY_TIERS[level];
+
+        std.debug.print("QUALITY: tier {d}->{d} bitrate={d} fps={d}\n", .{
+            old_level, level, tier.bitrate, tier.fps,
+        });
+
+        self.quality_level = level;
+        self.frames_at_current_level = 0;
+        self.current_bitrate = tier.bitrate;
+        self.target_fps = tier.fps;
+    }
+
+    /// Returns the current tier's max pixel budget (before per-panel division).
+    pub fn tierMaxPixels(self: *const VideoEncoder) u64 {
+        return QUALITY_TIERS[self.quality_level].max_pixels;
+    }
+
+    /// Set the per-panel pixel budget. Called by server when panel count changes
+    /// or quality tier changes. May trigger encoder resize + keyframe.
+    pub fn setPixelBudget(self: *VideoEncoder, budget: u64) void {
+        if (budget == self.active_max_pixels) return;
+        self.active_max_pixels = budget;
+
+        // Check if encode dimensions changed with new budget
+        const new_dims = calcAlignedDimensions(self.source_width, self.source_height, budget);
+        if (new_dims.w != self.width or new_dims.h != self.height) {
+            self.resizeForTier() catch |err| {
+                std.debug.print("BUDGET: resize failed: {}\n", .{err});
+            };
+        }
+    }
+
+    /// Resize encoder for pixel budget / quality tier change (same source dims, different resolution cap).
+    /// Unlike resize(), this doesn't check source_width/source_height equality.
+    fn resizeForTier(self: *VideoEncoder) ResizeError!void {
+        const scaled = calcAlignedDimensions(self.source_width, self.source_height, self.active_max_pixels);
+        const encode_width = scaled.w;
+        const encode_height = scaled.h;
+
+        if (encode_width == self.width and encode_height == self.height) return;
+
+        std.debug.print("QUALITY: resize {d}x{d} -> {d}x{d} (source {d}x{d})\n", .{
+            self.width, self.height, encode_width, encode_height, self.source_width, self.source_height,
+        });
+
+        const va_display = self.shared.va_display;
+
+        // Destroy old VPP resources
+        if (self.has_vpp) {
+            _ = c.vaDestroyContext(va_display, self.vpp_context);
+            _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
+            self.has_vpp = false;
+        }
+
+        // Destroy old resources
+        var old_surfaces = [_]c.VASurfaceID{ self.src_surface, self.ref_surface, self.recon_surface };
+        _ = vaDestroyBuffer(va_display, self.coded_buf);
+        _ = c.vaDestroyContext(va_display, self.va_context);
+        _ = c.vaDestroySurfaces(va_display, &old_surfaces, 3);
+
+        // Create new surfaces
+        var surfaces: [3]c.VASurfaceID = undefined;
+        var status = c.vaCreateSurfaces(
+            va_display,
+            c.VA_RT_FORMAT_YUV420,
+            encode_width,
+            encode_height,
+            &surfaces,
+            3,
+            null,
+            0,
+        );
+        if (status != c.VA_STATUS_SUCCESS) return error.VaSurfacesFailed;
+
+        // Create new context
+        status = c.vaCreateContext(
+            va_display,
+            self.shared.va_config,
+            @intCast(encode_width),
+            @intCast(encode_height),
+            c.VA_PROGRESSIVE,
+            &surfaces,
+            3,
+            &self.va_context,
+        );
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
+            return error.VaContextFailed;
+        }
+
+        // Create new coded buffer
+        status = vaCreateBuffer(
+            va_display,
+            self.va_context,
+            VAEncCodedBufferType,
+            MAX_OUTPUT_SIZE,
+            1,
+            null,
+            &self.coded_buf,
+        );
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = c.vaDestroyContext(va_display, self.va_context);
+            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
+            return error.VaBufferFailed;
+        }
+
+        self.src_surface = surfaces[0];
+        self.ref_surface = surfaces[1];
+        self.recon_surface = surfaces[2];
+        self.width = encode_width;
+        self.height = encode_height;
+        self.frame_count = 0;
+
+        // Recreate VPP resources at new encode resolution
+        if (self.shared.has_vpp) vpp_blk: {
+            var rgba_attribs = [_]c.VASurfaceAttrib{
+                .{
+                    .type = c.VASurfaceAttribPixelFormat,
+                    .flags = c.VA_SURFACE_ATTRIB_SETTABLE,
+                    .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = @as(c_int, @bitCast(@as(u32, c.VA_FOURCC_BGRX))) } },
+                },
+            };
+            status = c.vaCreateSurfaces(va_display, c.VA_RT_FORMAT_RGB32, encode_width, encode_height, @ptrCast(&self.rgba_surface), 1, &rgba_attribs, 1);
+            if (status != c.VA_STATUS_SUCCESS) break :vpp_blk;
+            status = c.vaCreateContext(va_display, self.shared.vpp_config, @intCast(encode_width), @intCast(encode_height), c.VA_PROGRESSIVE, @ptrCast(&self.rgba_surface), 1, &self.vpp_context);
+            if (status != c.VA_STATUS_SUCCESS) {
+                _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
+                break :vpp_blk;
+            }
+            self.rgba_width = encode_width;
+            self.rgba_height = encode_height;
+            self.has_vpp = true;
+        }
+
+        // Regenerate SPS/PPS for new dimensions
+        self.generateSPS();
+        self.generatePPS();
     }
 
     pub fn resize(self: *VideoEncoder, width: u32, height: u32) ResizeError!void {
         if (self.source_width == width and self.source_height == height) return;
 
-        const scaled = calcAlignedDimensions(width, height);
+        const scaled = calcAlignedDimensions(width, height, self.active_max_pixels);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
 
