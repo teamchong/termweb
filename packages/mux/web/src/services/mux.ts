@@ -981,6 +981,11 @@ export class MuxClient {
           this.panelsByServerId.set(newServerId, panel);
         },
         onActivate: () => this.setActivePanel(panel),
+        onFileDrop: (files: File[]) => this.handleFileDrop(panel, files),
+        onTextPaste: (text: string) => {
+          this.sendClipboard(text);
+          this.sendViewAction('paste_from_clipboard');
+        },
       },
     });
 
@@ -1799,6 +1804,26 @@ export class MuxClient {
       console.error('Download failed:', err);
     }
   }
+
+  async handleFileDrop(panel: PanelInstance, files: File[]): Promise<void> {
+    if (files.length === 0) return;
+
+    const panelInfo = panels.get(panel.id);
+    const defaultPath = panelInfo?.pwd || panel.getPwd() || '~';
+    const serverPath = window.prompt('Upload to server path:', defaultPath);
+    if (!serverPath) return;
+
+    try {
+      this.ensureFileWs();
+      await this.fileTransfer.startFilesUpload(files, serverPath);
+    } catch (err: unknown) {
+      if (err instanceof Error) {
+        console.error('File upload failed:', err);
+      }
+    }
+  }
+
+
 }
 
 let muxClient: MuxClient | null = null;

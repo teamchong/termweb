@@ -366,6 +366,62 @@ export class FileTransferHandler {
     });
   }
 
+  async startFilesUpload(
+    files: File[],
+    serverPath: string,
+    options: TransferOptions = {}
+  ): Promise<void> {
+    if (!this.canSend()) {
+      console.error('File transfer not connected');
+      this.onTransferError?.(0, 'File transfer connection not available');
+      return;
+    }
+
+    const { deleteExtra = false, dryRun = false, excludes = [] } = options;
+
+    const transferFiles: TransferFile[] = files.map(f => ({
+      path: f.name,
+      isDir: false,
+      size: f.size,
+      file: f,
+    }));
+
+    const pathBytes = sharedTextEncoder.encode(serverPath);
+    const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
+    const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
+
+    const msgLen = 1 + 1 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
+    view.setUint8(offset, 0); offset += 1; // direction: upload
+    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0)); offset += 1;
+    view.setUint8(offset, excludes.length); offset += 1;
+    view.setUint16(offset, pathBytes.length, true); offset += 2;
+    bytes.set(pathBytes, offset); offset += pathBytes.length;
+
+    for (const exclude of excludeBytes) {
+      view.setUint8(offset, exclude.length); offset += 1;
+      bytes.set(exclude, offset); offset += exclude.length;
+    }
+
+    this.send(msg);
+
+    const transferId = Date.now();
+    this.activeTransfers.set(transferId, {
+      id: transferId,
+      direction: 'upload',
+      files: transferFiles,
+      options,
+      state: 'pending',
+      bytesTransferred: 0,
+      currentFileIndex: 0,
+    });
+  }
+
   async startFolderDownload(serverPath: string, options: TransferOptions = {}): Promise<void> {
     if (!this.canSend()) {
       console.error('File transfer not connected');

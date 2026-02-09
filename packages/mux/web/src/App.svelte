@@ -495,8 +495,8 @@
       handleCommand('copy_to_clipboard');
       return;
     } else if (e.metaKey && key === 'v' && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      handleCommand('paste_from_clipboard');
+      // Don't preventDefault — let the browser fire native paste event on the focused panel.
+      // Panel.svelte's handlePaste detects files (→ upload) vs text (→ terminal paste).
       return;
     } else if (e.metaKey && key === 'a' && !e.shiftKey && !e.altKey) {
       e.preventDefault();

@@ -49,9 +49,12 @@ const embedded_index_html = web_assets.index_html;
 const embedded_client_js = web_assets.client_js;
 const embedded_zstd_wasm = web_assets.zstd_wasm;
 
-// COOP/COEP headers for SharedArrayBuffer support (required for Web Workers with shared memory)
+// Common headers for all responses:
+// - COOP/COEP for SharedArrayBuffer support (required for Web Workers with shared memory)
+// - Cache-Control: no-store to prevent browsers from caching terminal client (security)
 const cross_origin_headers = "Cross-Origin-Opener-Policy: same-origin\r\n" ++
-    "Cross-Origin-Embedder-Policy: require-corp\r\n";
+    "Cross-Origin-Embedder-Policy: require-corp\r\n" ++
+    "Cache-Control: no-store\r\n";
 
 // Color struct matching ghostty_config_color_s
 const Color = extern struct {

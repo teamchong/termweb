@@ -22,6 +22,8 @@
     onPwdChange?: (pwd: string) => void;
     onServerIdAssigned?: (serverId: number) => void;
     onActivate?: () => void;
+    onFileDrop?: (files: File[]) => void;
+    onTextPaste?: (text: string) => void;
   }
 
   let {
@@ -36,6 +38,8 @@
     onPwdChange,
     onServerIdAssigned,
     onActivate,
+    onFileDrop,
+    onTextPaste,
   }: Props = $props();
 
   // ============================================================================
@@ -55,6 +59,10 @@
   let inspectorLeftHeaderHidden = $state(false);
   let inspectorRightHeaderHidden = $state(false);
   let dockMenuVisible = $state<'left' | 'right' | null>(null);
+
+  // Drag-and-drop
+  let isDragging = $state(false);
+  let dragCounter = 0;
 
   // Stats
   let pendingDecode = $state(0);
@@ -1083,6 +1091,80 @@
   }
 
   // ============================================================================
+  // File Drop / Paste
+  // ============================================================================
+
+  function hasFiles(dt: DataTransfer | null): boolean {
+    if (!dt) return false;
+    for (let i = 0; i < dt.types.length; i++) {
+      if (dt.types[i] === 'Files') return true;
+    }
+    return false;
+  }
+
+  function handleDragEnter(e: DragEvent): void {
+    if (!hasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    dragCounter++;
+    isDragging = true;
+  }
+
+  function handleDragOver(e: DragEvent): void {
+    if (!hasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  }
+
+  function handleDragLeave(_e: DragEvent): void {
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      isDragging = false;
+    }
+  }
+
+  function handleDrop(e: DragEvent): void {
+    e.preventDefault();
+    dragCounter = 0;
+    isDragging = false;
+    if (!e.dataTransfer) return;
+    // Extract files synchronously — DataTransferItemList becomes invalid after handler returns
+    const files: File[] = [];
+    for (let i = 0; i < e.dataTransfer.items.length; i++) {
+      const item = e.dataTransfer.items[i];
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length > 0) onFileDrop?.(files);
+  }
+
+  function handlePaste(e: ClipboardEvent): void {
+    if (!e.clipboardData) return;
+    // Check items for file-kind entries (images, copied files)
+    const files: File[] = [];
+    for (let i = 0; i < e.clipboardData.items.length; i++) {
+      const item = e.clipboardData.items[i];
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault();
+      onFileDrop?.(files);
+      return;
+    }
+    // No files — handle as text paste into terminal
+    const text = e.clipboardData.getData('text/plain');
+    if (text) {
+      e.preventDefault();
+      onTextPaste?.(text);
+    }
+  }
+
+  // ============================================================================
   // Public API
   // ============================================================================
 
@@ -1351,7 +1433,22 @@
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-<div class="panel-root" bind:this={panelEl} tabindex={PANEL.CANVAS_TAB_INDEX}>
+<div
+  class="panel-root"
+  bind:this={panelEl}
+  role="application"
+  tabindex={PANEL.CANVAS_TAB_INDEX}
+  ondragenter={handleDragEnter}
+  ondragover={handleDragOver}
+  ondragleave={handleDragLeave}
+  ondrop={handleDrop}
+  onpaste={handlePaste}
+>
+  {#if isDragging}
+    <div class="drop-overlay">
+      <span>Drop files to upload</span>
+    </div>
+  {/if}
   <div class="panel-content">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <canvas
@@ -1530,6 +1627,25 @@
     flex-direction: column;
     background: var(--bg);
     outline: none;
+  }
+
+  .drop-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(80, 140, 255, 0.15);
+    border: 2px dashed rgba(80, 140, 255, 0.6);
+    border-radius: 8px;
+    pointer-events: none;
+  }
+
+  .drop-overlay span {
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.8);
+    font-weight: 500;
   }
 
   .panel-content {
