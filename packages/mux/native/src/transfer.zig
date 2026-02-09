@@ -97,11 +97,7 @@ pub const IoUringReader = if (is_linux) struct {
         errdefer allocator.free(buf);
 
         // Submit read request
-        var iovecs = [_]posix.iovec{.{
-            .base = buf.ptr,
-            .len = buf.len,
-        }};
-        _ = try self.ring.read(0, self.fd, .{ .buffer = &iovecs }, offset);
+        _ = try self.ring.read(0, self.fd, .{ .buffer = buf }, offset);
         _ = try self.ring.submit();
 
         // Wait for completion
@@ -132,16 +128,12 @@ pub const IoUringReader = if (is_linux) struct {
         const results = try allocator.alloc([]u8, count);
         errdefer allocator.free(results);
 
-        const iovecs = try allocator.alloc(posix.iovec, count);
-        defer allocator.free(iovecs);
-
         // Allocate buffers and submit all reads
         for (0..count) |i| {
             const buf = try allocator.alloc(u8, lengths[i]);
             results[i] = buf;
-            iovecs[i] = .{ .base = buf.ptr, .len = buf.len };
 
-            _ = try self.ring.read(@intCast(i), self.fd, .{ .buffer = iovecs[i..][0..1] }, offsets[i]);
+            _ = try self.ring.read(@intCast(i), self.fd, .{ .buffer = buf }, offsets[i]);
         }
 
         _ = try self.ring.submit();
@@ -215,7 +207,6 @@ pub const DispatchIO = if (is_darwin) struct {
             queue,
             null, // cleanup handler
         );
-        // Set high water mark for better throughput
         dispatch.dispatch_io_set_high_water(channel, dispatch_high_water);
         return .{ .channel = channel, .queue = queue };
     }
@@ -225,22 +216,24 @@ pub const DispatchIO = if (is_darwin) struct {
         dispatch.dispatch_release(self.channel);
     }
 
-    // Read file data asynchronously
+    const ReadState = struct {
+        result: *?[]u8,
+        err: *bool,
+        sema: dispatch.dispatch_semaphore_t,
+        alloc: Allocator,
+    };
+
+    /// Read a single chunk. Blocks via dispatch_semaphore (no busy-wait).
     pub fn read(self: *@This(), offset: u64, length: usize, allocator: Allocator) ![]u8 {
         var result: ?[]u8 = null;
         var read_error: bool = false;
-        var done = std.atomic.Value(bool).init(false);
+        const sema = dispatch.dispatch_semaphore_create(0);
+        defer dispatch.dispatch_release(sema);
 
-        const State = struct {
-            result: *?[]u8,
-            err: *bool,
-            done: *std.atomic.Value(bool),
-            alloc: Allocator,
-        };
-        var state = State{
+        var state = ReadState{
             .result = &result,
             .err = &read_error,
-            .done = &done,
+            .sema = sema,
             .alloc = allocator,
         };
 
@@ -253,58 +246,427 @@ pub const DispatchIO = if (is_darwin) struct {
             @ptrCast(&state),
         );
 
-        // Wait for completion
-        while (!done.load(.acquire)) {
-            std.time.sleep(100);
-        }
+        _ = dispatch.dispatch_semaphore_wait(sema, dispatch.DISPATCH_TIME_FOREVER);
 
         if (read_error) return error.ReadFailed;
         return result orelse error.NoData;
     }
 
+    /// Read multiple chunks in parallel. All reads are dispatched at once,
+    /// then we wait for all completions via semaphore.
+    pub fn readMultiple(
+        self: *@This(),
+        offsets: []const u64,
+        lengths: []const usize,
+        allocator: Allocator,
+    ) ![][]u8 {
+        const count = offsets.len;
+        if (count == 0) return &[_][]u8{};
+
+        const results_opt = try allocator.alloc(?[]u8, count);
+        defer allocator.free(results_opt);
+        @memset(results_opt, null);
+
+        const errors = try allocator.alloc(bool, count);
+        defer allocator.free(errors);
+        @memset(errors, false);
+
+        const sema = dispatch.dispatch_semaphore_create(0);
+        defer dispatch.dispatch_release(sema);
+
+        const states = try allocator.alloc(ReadState, count);
+        defer allocator.free(states);
+
+        // Dispatch all reads
+        for (0..count) |i| {
+            states[i] = .{
+                .result = &results_opt[i],
+                .err = &errors[i],
+                .sema = sema,
+                .alloc = allocator,
+            };
+            dispatch.dispatch_io_read(
+                self.channel,
+                @intCast(offsets[i]),
+                lengths[i],
+                self.queue,
+                &handleReadComplete,
+                @ptrCast(&states[i]),
+            );
+        }
+
+        // Wait for all completions (each signals the semaphore once)
+        for (0..count) |_| {
+            _ = dispatch.dispatch_semaphore_wait(sema, dispatch.DISPATCH_TIME_FOREVER);
+        }
+
+        // Collect results
+        const results = try allocator.alloc([]u8, count);
+        for (0..count) |i| {
+            if (errors[i] or results_opt[i] == null) {
+                // Free all on error
+                for (0..i) |j| allocator.free(results[j]);
+                for (results_opt) |r| if (r) |buf| allocator.free(buf);
+                allocator.free(results);
+                return error.ReadFailed;
+            }
+            results[i] = results_opt[i].?;
+        }
+        return results;
+    }
+
     fn handleReadComplete(ctx: ?*anyopaque, data: dispatch.dispatch_data_t, err: c_int) callconv(.C) void {
-        const State = struct {
-            result: *?[]u8,
-            err: *bool,
-            done: *std.atomic.Value(bool),
-            alloc: Allocator,
-        };
-        const state = @as(*State, @ptrCast(@alignCast(ctx)));
+        if (comptime !is_darwin) return;
+        const state = @as(*ReadState, @ptrCast(@alignCast(ctx)));
+        defer _ = dispatch.dispatch_semaphore_signal(state.sema);
 
         if (err != 0) {
             state.err.* = true;
-        } else if (data != null) {
+            return;
+        }
+        if (data != null) {
             var buffer: ?*const anyopaque = null;
             var size: usize = 0;
             _ = dispatch.dispatch_data_create_map(data, &buffer, &size);
             if (buffer != null and size > 0) {
                 const buf = state.alloc.alloc(u8, size) catch {
                     state.err.* = true;
-                    state.done.store(true, .release);
                     return;
                 };
                 @memcpy(buf, @as([*]const u8, @ptrCast(buffer))[0..size]);
                 state.result.* = buf;
             }
         }
-        state.done.store(true, .release);
     }
 } else struct {
-    // Non-macOS fallback - uses IoUringReader on Linux, standard I/O otherwise
+    // Non-macOS: compile-only stub — callers must guard with comptime is_darwin
     fd: posix.fd_t,
 
     pub fn init(fd: posix.fd_t) @This() {
         return .{ .fd = fd };
     }
+    pub fn deinit(_: *@This()) void {}
+    pub fn read(_: *@This(), _: u64, _: usize, _: Allocator) ![]u8 {
+        @compileError("DispatchIO is macOS-only; wrap call with comptime is_darwin guard");
+    }
+    pub fn readMultiple(_: *@This(), _: []const u64, _: []const usize, _: Allocator) ![][]u8 {
+        @compileError("DispatchIO is macOS-only; wrap call with comptime is_darwin guard");
+    }
+};
+
+
+// Multi-file batch reader — io_uring on Linux, dispatch_apply + pread on macOS
+
+
+/// Batched multi-file reader that minimizes syscall overhead.
+/// On Linux: uses io_uring to batch openat/read/close across multiple files.
+/// On macOS: uses dispatch_apply for parallel pread.
+/// Fallback: sequential pread.
+pub const MultiFileReader = if (is_linux) struct {
+    ring: IoUring,
+    dir_fd: posix.fd_t,
+    allocator: Allocator,
+
+    /// Ring size 256: accommodates batches of up to ~128 files
+    /// (2 SQEs per file in phase 2: linked read + close).
+    const ring_size: u13 = 256;
+    /// Max files per io_uring batch (ring_size / 2 for read+close pairs).
+    const batch_limit: usize = 128;
+
+    pub const ReadResult = struct {
+        data: []u8,
+        size: usize,
+    };
+
+    pub fn init(dir_fd: posix.fd_t, allocator: Allocator) !@This() {
+        const ring = try IoUring.init(ring_size, 0);
+        return .{ .ring = ring, .dir_fd = dir_fd, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.ring.deinit();
+    }
+
+    /// Batch-read multiple files relative to dir_fd.
+    /// Uses two-phase io_uring: phase 1 opens all files, phase 2 reads+closes them.
+    /// Returns owned ReadResult array; caller must free each .data and the slice.
+    pub fn readFiles(
+        self: *@This(),
+        paths: []const [*:0]const u8,
+        sizes: []const u64,
+    ) ![]ReadResult {
+        const count = paths.len;
+        if (count == 0) return &[_]ReadResult{};
+
+        const results = try self.allocator.alloc(ReadResult, count);
+        @memset(results, ReadResult{ .data = &[_]u8{}, .size = 0 });
+        errdefer {
+            for (results) |r| {
+                if (r.data.len > 0) self.allocator.free(r.data);
+            }
+            self.allocator.free(results);
+        }
+
+        // Process in chunks of batch_limit
+        var offset: usize = 0;
+        while (offset < count) {
+            const batch_end = @min(offset + batch_limit, count);
+            try self.readFilesBatch(
+                paths[offset..batch_end],
+                sizes[offset..batch_end],
+                results[offset..batch_end],
+            );
+            offset = batch_end;
+        }
+
+        return results;
+    }
+
+    fn readFilesBatch(
+        self: *@This(),
+        paths: []const [*:0]const u8,
+        sizes: []const u64,
+        results: []ReadResult,
+    ) !void {
+        const batch_count = paths.len;
+
+        // Phase 1: Batch OPENAT — submit all opens in one syscall
+        const fds = try self.allocator.alloc(posix.fd_t, batch_count);
+        defer self.allocator.free(fds);
+        @memset(fds, -1);
+
+        for (paths, 0..) |path, i| {
+            _ = try self.ring.openat(
+                @intCast(i), // user_data = file index
+                self.dir_fd,
+                path,
+                .{ .ACCMODE = .RDONLY },
+                0,
+            );
+        }
+        _ = try self.ring.submit();
+
+        // Collect OPENAT completions
+        var completed: usize = 0;
+        while (completed < batch_count) {
+            var cqes: [32]linux.io_uring_cqe = undefined;
+            const n = try self.ring.copy_cqes(&cqes, 1);
+            for (cqes[0..n]) |cqe| {
+                const idx: usize = @intCast(cqe.user_data);
+                if (cqe.res >= 0) {
+                    fds[idx] = @intCast(cqe.res);
+                }
+                // On error, fd stays -1 (file skipped)
+                completed += 1;
+            }
+        }
+
+        // Phase 2: Batch READ + CLOSE for each successfully opened fd
+        var read_count: usize = 0;
+        for (fds, 0..) |fd, i| {
+            if (fd < 0) continue;
+
+            const size: usize = @intCast(sizes[i]);
+            const buf = self.allocator.alloc(u8, size) catch {
+                posix.close(fd);
+                continue;
+            };
+            results[i].data = buf;
+
+            // Submit linked READ → CLOSE
+            const read_sqe = self.ring.read(
+                @as(u64, @intCast(i)) | (1 << 32), // user_data: index + read flag
+                fd,
+                .{ .buffer = buf },
+                0,
+            ) catch {
+                self.allocator.free(buf);
+                results[i].data = &[_]u8{};
+                posix.close(fd);
+                continue;
+            };
+            read_sqe.flags |= linux.IOSQE_IO_LINK;
+
+            _ = self.ring.close(
+                @as(u64, @intCast(i)) | (2 << 32), // user_data: index + close flag
+                fd,
+            ) catch {
+                // If we can't queue close, close manually after read completes
+                continue;
+            };
+
+            read_count += 1;
+        }
+
+        if (read_count == 0) return;
+        _ = try self.ring.submit();
+
+        // Collect READ + CLOSE completions (2 CQEs per file)
+        var read_completed: usize = 0;
+        const total_cqes = read_count * 2;
+        while (read_completed < total_cqes) {
+            var cqes: [32]linux.io_uring_cqe = undefined;
+            const n = try self.ring.copy_cqes(&cqes, 1);
+            for (cqes[0..n]) |cqe| {
+                const idx: usize = @intCast(cqe.user_data & 0xFFFFFFFF);
+                const op: u2 = @truncate(cqe.user_data >> 32);
+
+                if (op == 1) { // READ
+                    if (cqe.res >= 0) {
+                        results[idx].size = @intCast(cqe.res);
+                    } else {
+                        // Read failed — free buffer
+                        if (results[idx].data.len > 0) {
+                            self.allocator.free(results[idx].data);
+                            results[idx] = .{ .data = &[_]u8{}, .size = 0 };
+                        }
+                    }
+                }
+                // op == 2 (CLOSE) — nothing to do
+                read_completed += 1;
+            }
+        }
+    }
+
+    /// Batch-read files and compute xxh3 hash for each.
+    /// Returns array of hashes (0 on per-file failure). Caller owns the slice.
+    pub fn readAndHashFiles(
+        self: *@This(),
+        paths: []const [*:0]const u8,
+        sizes: []const u64,
+    ) ![]u64 {
+        const results = try self.readFiles(paths, sizes);
+        defer {
+            for (results) |r| {
+                if (r.data.len > 0) self.allocator.free(r.data);
+            }
+            self.allocator.free(results);
+        }
+
+        const hashes = try self.allocator.alloc(u64, paths.len);
+        for (results, 0..) |r, i| {
+            hashes[i] = if (r.size > 0) xxh3Hash(r.data[0..r.size]) else 0;
+        }
+        return hashes;
+    }
+} else struct {
+    // Non-Linux: dispatch_apply on macOS, sequential on other platforms
+    dir_fd: posix.fd_t,
+    allocator: Allocator,
+
+    pub const ReadResult = struct { data: []u8, size: usize };
+
+    pub fn init(dir_fd: posix.fd_t, allocator: Allocator) !@This() {
+        return .{ .dir_fd = dir_fd, .allocator = allocator };
+    }
 
     pub fn deinit(_: *@This()) void {}
 
-    pub fn read(self: *@This(), offset: u64, length: usize, allocator: Allocator) ![]u8 {
-        const file = std.fs.File{ .handle = self.fd };
-        try file.seekTo(offset);
-        const buf = try allocator.alloc(u8, length);
-        const n = try file.read(buf);
-        return buf[0..n];
+    pub fn readFiles(
+        self: *@This(),
+        paths: []const [*:0]const u8,
+        sizes: []const u64,
+    ) ![]ReadResult {
+        const count = paths.len;
+        if (count == 0) return &[_]ReadResult{};
+
+        const results = try self.allocator.alloc(ReadResult, count);
+        @memset(results, ReadResult{ .data = &[_]u8{}, .size = 0 });
+
+        if (comptime is_darwin) {
+            // macOS: parallel reads via dispatch_apply
+            const Ctx = struct {
+                dir_fd: posix.fd_t,
+                paths: []const [*:0]const u8,
+                sizes: []const u64,
+                results: []ReadResult,
+                alloc: Allocator,
+            };
+            var ctx = Ctx{
+                .dir_fd = self.dir_fd,
+                .paths = paths,
+                .sizes = sizes,
+                .results = results,
+                .alloc = self.allocator,
+            };
+            const queue = dispatch.dispatch_get_global_queue(dispatch.DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+            dispatch.dispatch_apply(count, queue, &dispatchReadFile, @ptrCast(&ctx));
+        } else {
+            // Sequential fallback
+            for (paths, sizes, 0..) |path, size, i| {
+                self.readSingleFile(path, @intCast(size), &results[i]);
+            }
+        }
+        return results;
+    }
+
+    fn dispatchReadFile(context: ?*anyopaque, idx: usize) callconv(.C) void {
+        if (comptime is_darwin) {
+            const Ctx = struct {
+                dir_fd: posix.fd_t,
+                paths: []const [*:0]const u8,
+                sizes: []const u64,
+                results: []ReadResult,
+                alloc: Allocator,
+            };
+            const ctx = @as(*Ctx, @ptrCast(@alignCast(context)));
+            const self_proxy = @This(){ .dir_fd = ctx.dir_fd, .allocator = ctx.alloc };
+            _ = self_proxy;
+
+            const size: usize = @intCast(ctx.sizes[idx]);
+            const buf = ctx.alloc.alloc(u8, size) catch return;
+
+            const fd = posix.openatZ(ctx.dir_fd, ctx.paths[idx], .{ .ACCMODE = .RDONLY }, 0) catch {
+                ctx.alloc.free(buf);
+                return;
+            };
+            defer posix.close(fd);
+
+            const file = std.fs.File{ .handle = fd };
+            const n = file.preadAll(buf, 0) catch {
+                ctx.alloc.free(buf);
+                return;
+            };
+
+            ctx.results[idx] = .{ .data = buf, .size = n };
+        }
+    }
+
+    fn readSingleFile(self: *@This(), path: [*:0]const u8, size: usize, result: *ReadResult) void {
+        const buf = self.allocator.alloc(u8, size) catch return;
+        const fd = posix.openatZ(self.dir_fd, path, .{ .ACCMODE = .RDONLY }, 0) catch {
+            self.allocator.free(buf);
+            return;
+        };
+        defer posix.close(fd);
+
+        const file = std.fs.File{ .handle = fd };
+        const n = file.preadAll(buf, 0) catch {
+            self.allocator.free(buf);
+            return;
+        };
+
+        result.* = .{ .data = buf, .size = n };
+    }
+
+    pub fn readAndHashFiles(
+        self: *@This(),
+        paths: []const [*:0]const u8,
+        sizes: []const u64,
+    ) ![]u64 {
+        const results = try self.readFiles(paths, sizes);
+        defer {
+            for (results) |r| {
+                if (r.data.len > 0) self.allocator.free(r.data);
+            }
+            self.allocator.free(results);
+        }
+
+        const hashes = try self.allocator.alloc(u64, paths.len);
+        for (results, 0..) |r, i| {
+            hashes[i] = if (r.size > 0) xxh3Hash(r.data[0..r.size]) else 0;
+        }
+        return hashes;
     }
 };
 
@@ -503,9 +865,32 @@ pub const ParallelHasher = struct {
 
             dispatch.dispatch_apply(file_names.len, queue, &dispatchWork, @ptrCast(&ctx));
         } else {
-            // Sequential fallback for Linux (TODO: use std.Thread.Pool)
-            for (file_names, 0..) |name, i| {
-                results[i] = hashFileMmapStatic(dir, name) catch 0;
+            // Threaded hashing on Linux (up to 8 threads, strided)
+            if (file_names.len <= 2) {
+                // Too few files to justify threading overhead
+                for (file_names, 0..) |name, i| {
+                    results[i] = hashFileMmapStatic(dir, name) catch 0;
+                }
+            } else {
+                const thread_count = @min(file_names.len, 8);
+                const HashThreadCtx = struct {
+                    dir: fs.Dir,
+                    names: []const []const u8,
+                    hashes: []u64,
+                };
+                var ctx = HashThreadCtx{
+                    .dir = dir,
+                    .names = file_names,
+                    .hashes = results,
+                };
+
+                var threads: [8]?std.Thread = .{null} ** 8;
+                for (0..thread_count) |t| {
+                    threads[t] = std.Thread.spawn(.{}, threadHash, .{ &ctx, t, thread_count }) catch null;
+                }
+                for (0..thread_count) |t| {
+                    if (threads[t]) |thread| thread.join();
+                }
             }
         }
 
@@ -521,6 +906,13 @@ pub const ParallelHasher = struct {
             };
             const ctx = @as(*Context, @ptrCast(@alignCast(context)));
             ctx.hashes[idx] = hashFileMmapStatic(ctx.dir, ctx.names[idx]) catch 0;
+        }
+    }
+
+    fn threadHash(ctx: anytype, thread_id: usize, thread_count: usize) void {
+        var i = thread_id;
+        while (i < ctx.names.len) : (i += thread_count) {
+            ctx.hashes[i] = hashFileMmapStatic(ctx.dir, ctx.names[i]) catch 0;
         }
     }
 
@@ -851,6 +1243,111 @@ pub const TransferSession = struct {
         return xxh3Hash(mapped.data);
     }
 
+    /// Build file list with deferred batch hashing.
+    /// Phase 1: walk directory tree without hashing (hash = 0).
+    /// Phase 2: batch-hash all files using MultiFileReader (io_uring/dispatch_apply).
+    /// Falls back to sync buildFileList on failure.
+    pub fn buildFileListAsync(self: *TransferSession) !void {
+        self.files.clearRetainingCapacity();
+        self.total_bytes = 0;
+
+        var dir = fs.openDirAbsolute(self.base_path, .{ .iterate = true }) catch |err| {
+            std.debug.print("Failed to open directory {s}: {}\n", .{ self.base_path, err });
+            return err;
+        };
+        defer dir.close();
+
+        // Phase 1: walk without hashing
+        try self.walkDirectoryNoHash(dir, "");
+
+        // Phase 2: batch hash all non-directory files
+        self.batchHashFiles(dir) catch {
+            // Fallback: hash each file individually (same as sync buildFileList)
+            for (self.files.items) |*entry| {
+                if (!entry.is_dir and entry.hash == 0 and entry.size > 0) {
+                    entry.hash = self.hashFileMmap(dir, entry.path) catch 0;
+                }
+            }
+        };
+    }
+
+    /// Walk directory tree without hashing (deferred for batch hashing).
+    fn walkDirectoryNoHash(self: *TransferSession, dir: fs.Dir, prefix: []const u8) !void {
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            const rel_path = if (prefix.len > 0)
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, entry.name })
+            else
+                try self.allocator.dupe(u8, entry.name);
+
+            if (self.isExcluded(rel_path)) {
+                self.allocator.free(rel_path);
+                continue;
+            }
+
+            if (entry.kind == .directory) {
+                try self.files.append(self.allocator, .{
+                    .path = rel_path,
+                    .size = 0,
+                    .mtime = 0,
+                    .hash = 0,
+                    .is_dir = true,
+                });
+
+                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                defer subdir.close();
+                try self.walkDirectoryNoHash(subdir, rel_path);
+            } else if (entry.kind == .file) {
+                const stat = dir.statFile(entry.name) catch continue;
+                const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+
+                try self.files.append(self.allocator, .{
+                    .path = rel_path,
+                    .size = stat.size,
+                    .mtime = mtime,
+                    .hash = 0, // Deferred — will be batch-hashed
+                    .is_dir = false,
+                });
+
+                self.total_bytes += stat.size;
+            } else {
+                self.allocator.free(rel_path);
+            }
+        }
+    }
+
+    /// Batch-hash all non-directory files using io_uring (Linux) or dispatch_apply (macOS).
+    fn batchHashFiles(self: *TransferSession, dir: fs.Dir) !void {
+        // Collect indices of files needing hashing
+        var file_indices = std.ArrayListUnmanaged(usize){};
+        defer file_indices.deinit(self.allocator);
+
+        for (self.files.items, 0..) |entry, i| {
+            if (!entry.is_dir and entry.size > 0) {
+                try file_indices.append(self.allocator, i);
+            }
+        }
+
+        if (file_indices.items.len == 0) return;
+
+        // Build name arrays for ParallelHasher
+        const names = try self.allocator.alloc([]const u8, file_indices.items.len);
+        defer self.allocator.free(names);
+
+        for (file_indices.items, 0..) |fi, i| {
+            names[i] = self.files.items[fi].path;
+        }
+
+        // Use ParallelHasher (threads on Linux, dispatch_apply on macOS)
+        const hashes = try ParallelHasher.hashFilesParallel(self.allocator, dir, names);
+        defer self.allocator.free(hashes);
+
+        // Write hashes back to file entries
+        for (file_indices.items, 0..) |fi, i| {
+            self.files.items[fi].hash = hashes[i];
+        }
+    }
+
     // Read a file chunk using mmap for downloads
     pub fn readFileChunk(self: *TransferSession, file_index: u32, offset: u64, max_size: usize) ![]const u8 {
         if (file_index >= self.files.items.len) return error.InvalidFileIndex;
@@ -892,6 +1389,124 @@ pub const TransferSession = struct {
             mf.deinit();
             self.current_mapped_file = null;
         }
+    }
+
+    /// Read an entire file via io_uring pipelined multi-chunk reads.
+    /// Linux only — callers must wrap with `if (comptime is_linux)`.
+    /// Returns owned buffer — caller must free with allocator.
+    pub fn readFileViaUring(self: *TransferSession, file_index: u32, allocator: Allocator) ![]u8 {
+        if (comptime !is_linux) @compileError("readFileViaUring is Linux-only; wrap call with comptime is_linux guard");
+        if (file_index >= self.files.items.len) return error.InvalidFileIndex;
+        const file_entry = self.files.items[file_index];
+        if (file_entry.is_dir) return error.IsDirectory;
+        if (file_entry.size == 0) return allocator.alloc(u8, 0);
+
+        const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.base_path, file_entry.path });
+        defer self.allocator.free(full_path);
+
+        const fd = try posix.open(full_path, .{ .ACCMODE = .RDONLY }, 0);
+        errdefer posix.close(fd);
+
+        const file_size: usize = @intCast(file_entry.size);
+        const uring_chunk_size: usize = 256 * 1024; // 256KB chunks for io_uring pipelining
+        const chunk_count = (file_size + uring_chunk_size - 1) / uring_chunk_size;
+
+        if (chunk_count <= 1) {
+            // Single read — no pipelining needed
+            const buf = try allocator.alloc(u8, file_size);
+            errdefer allocator.free(buf);
+            const file = std.fs.File{ .handle = fd };
+            const n = try file.readAll(buf);
+            posix.close(fd);
+            return buf[0..n];
+        }
+
+        // Build offset/length arrays for pipelined read
+        const offsets = try self.allocator.alloc(u64, chunk_count);
+        defer self.allocator.free(offsets);
+        const lengths = try self.allocator.alloc(usize, chunk_count);
+        defer self.allocator.free(lengths);
+
+        for (0..chunk_count) |i| {
+            offsets[i] = @intCast(i * uring_chunk_size);
+            lengths[i] = @min(uring_chunk_size, file_size - i * uring_chunk_size);
+        }
+
+        var reader = try IoUringReader.init(fd);
+        defer reader.deinit();
+
+        const chunks = try reader.readMultiple(offsets, lengths, allocator);
+        defer allocator.free(chunks);
+
+        // Assemble into single buffer
+        const result = try allocator.alloc(u8, file_size);
+        var written: usize = 0;
+        for (chunks) |chunk| {
+            @memcpy(result[written..][0..chunk.len], chunk);
+            written += chunk.len;
+            allocator.free(chunk);
+        }
+
+        posix.close(fd);
+        return result[0..written];
+    }
+
+    /// Read an entire file via dispatch_io pipelined multi-chunk reads.
+    /// macOS only — callers must wrap with `if (comptime is_darwin)`.
+    /// Returns owned buffer — caller must free with allocator.
+    pub fn readFileViaDispatchIO(self: *TransferSession, file_index: u32, allocator: Allocator) ![]u8 {
+        if (comptime !is_darwin) @compileError("readFileViaDispatchIO is macOS-only; wrap call with comptime is_darwin guard");
+        if (file_index >= self.files.items.len) return error.InvalidFileIndex;
+        const file_entry = self.files.items[file_index];
+        if (file_entry.is_dir) return error.IsDirectory;
+        if (file_entry.size == 0) return allocator.alloc(u8, 0);
+
+        const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.base_path, file_entry.path });
+        defer self.allocator.free(full_path);
+
+        const fd = try posix.open(full_path, .{ .ACCMODE = .RDONLY }, 0);
+
+        const file_size: usize = @intCast(file_entry.size);
+        const dio_chunk_size: usize = 256 * 1024; // 256KB chunks for dispatch_io pipelining
+        const chunk_count = (file_size + dio_chunk_size - 1) / dio_chunk_size;
+
+        if (chunk_count <= 1) {
+            // Single read
+            const buf = try allocator.alloc(u8, file_size);
+            errdefer allocator.free(buf);
+            const file = std.fs.File{ .handle = fd };
+            const n = try file.readAll(buf);
+            posix.close(fd);
+            return buf[0..n];
+        }
+
+        // Build offset/length arrays for pipelined dispatch_io reads
+        const offsets = try self.allocator.alloc(u64, chunk_count);
+        defer self.allocator.free(offsets);
+        const lengths = try self.allocator.alloc(usize, chunk_count);
+        defer self.allocator.free(lengths);
+
+        for (0..chunk_count) |i| {
+            offsets[i] = @intCast(i * dio_chunk_size);
+            lengths[i] = @min(dio_chunk_size, file_size - i * dio_chunk_size);
+        }
+
+        var dio = DispatchIO.init(fd);
+        defer dio.deinit(); // dispatch_io_close also closes the fd
+
+        const chunks = try dio.readMultiple(offsets, lengths, allocator);
+        defer allocator.free(chunks);
+
+        // Assemble into single buffer
+        const result = try allocator.alloc(u8, file_size);
+        var written: usize = 0;
+        for (chunks) |chunk| {
+            @memcpy(result[written..][0..chunk.len], chunk);
+            written += chunk.len;
+            allocator.free(chunk);
+        }
+
+        return result[0..written];
     }
 
     // Compress data using zstd

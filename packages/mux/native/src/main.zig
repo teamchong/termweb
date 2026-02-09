@@ -3308,7 +3308,7 @@ const Server = struct {
 
         // For downloads, build file list and send
         if (init_data.direction == .download) {
-            session.buildFileList() catch |err| {
+            session.buildFileListAsync() catch |err| {
                 std.debug.print("Failed to build file list: {}\n", .{err});
                 const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read directory") catch return;
                 defer self.allocator.free(error_msg);
@@ -3337,8 +3337,8 @@ const Server = struct {
         const transfer_id = std.mem.readInt(u32, data[1..5], .little);
         const session = self.transfer_manager.getSession(transfer_id) orelse return;
 
-        // Build file list
-        session.buildFileList() catch |err| {
+        // Build file list (async: walk then batch hash)
+        session.buildFileListAsync() catch |err| {
             std.debug.print("Failed to build file list: {}\n", .{err});
             return;
         };
@@ -3526,8 +3526,8 @@ const Server = struct {
 
         conn.user_data = session;
 
-        // Build file list
-        session.buildFileList() catch |err| {
+        // Build file list (async: walk then batch hash)
+        session.buildFileListAsync() catch |err| {
             std.debug.print("Failed to build sync file list: {}\n", .{err});
             const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read directory") catch return;
             defer self.allocator.free(error_msg);
@@ -3632,6 +3632,13 @@ const Server = struct {
         }
         var batch_bytes: u64 = 0;
 
+        // Accumulator for small file indices (batch-read on flush)
+        var small_indices: std.ArrayListUnmanaged(u32) = .{};
+        defer small_indices.deinit(self.allocator);
+        var small_sizes: std.ArrayListUnmanaged(u64) = .{};
+        defer small_sizes.deinit(self.allocator);
+        var small_bytes: u64 = 0;
+
         for (session.files.items, 0..) |entry, i| {
             if (entry.is_dir) continue;
             if (!session.is_active) break;
@@ -3641,48 +3648,62 @@ const Server = struct {
             // Empty files: client creates from FILE_LIST metadata
             if (entry.size == 0) continue;
 
-            // Small files: accumulate into batch
+            // Small files: accumulate indices for batch read
             if (entry.size <= transfer.batch_threshold) {
-                const file_data = session.readFileChunk(file_index, 0, @intCast(entry.size)) catch |err| {
-                    std.debug.print("Failed to read small file {s}: {}\n", .{ entry.path, err });
-                    continue;
-                };
-                // readFileChunk returns a slice into mmap — dupe it since we close the file
-                const duped = self.allocator.dupe(u8, file_data) catch continue;
-                session.closeCurrentFile();
+                small_indices.append(self.allocator, file_index) catch continue;
+                small_sizes.append(self.allocator, entry.size) catch continue;
+                small_bytes += entry.size;
 
-                batch_data_bufs.append(self.allocator, duped) catch continue;
-                batch_entries.append(self.allocator, .{ .file_index = file_index, .data = duped }) catch continue;
-                batch_bytes += entry.size;
-
-                // Flush batch if accumulated enough data (256KB or 256 files)
-                if (batch_bytes >= chunk_size or batch_entries.items.len >= 256) {
-                    self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
+                // Flush batch if accumulated enough (256KB or 64 files)
+                if (small_bytes >= chunk_size or small_indices.items.len >= 64) {
+                    self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
                 }
                 continue;
             }
 
-            // Flush any pending batch before sending a large file
+            // Flush any pending small files before sending a large file
+            if (small_indices.items.len > 0) {
+                self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
+            }
             if (batch_entries.items.len > 0) {
                 self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
             }
 
-            // Prefetch next file into memory while we process this one
-            if (i + 1 < session.files.items.len) {
-                const next_entry = session.files.items[i + 1];
-                if (!next_entry.is_dir and next_entry.size > 0) {
-                    self.prefetchFile(session, @intCast(i + 1));
-                }
-            }
+            // Large files: read via platform-optimal I/O
+            // Linux: io_uring pipelined reads
+            // macOS: dispatch_io pipelined reads
+            // Other: mmap with madvise prefetch
+            const owned_buf: ?[]u8 = if (comptime is_linux) blk: {
+                break :blk session.readFileViaUring(file_index, self.allocator) catch |err| {
+                    std.debug.print("io_uring read failed for {s}: {}\n", .{ entry.path, err });
+                    break :blk null;
+                };
+            } else if (comptime is_macos) blk: {
+                break :blk session.readFileViaDispatchIO(file_index, self.allocator) catch |err| {
+                    std.debug.print("dispatch_io read failed for {s}: {}\n", .{ entry.path, err });
+                    break :blk null;
+                };
+            } else null;
 
-            // Large files: compress all chunks in parallel, then send sequentially
-            const file_data = session.readFileChunk(file_index, 0, @intCast(entry.size)) catch |err| {
-                std.debug.print("Failed to read file {s}: {}\n", .{ entry.path, err });
-                const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read file") catch return;
-                defer self.allocator.free(error_msg);
-                conn.sendBinary(error_msg) catch {};
-                return;
+            const file_data: []const u8 = if (owned_buf) |ud| ud else blk: {
+                // mmap fallback (other platforms, or if async I/O init fails)
+                if (i + 1 < session.files.items.len) {
+                    const next_entry = session.files.items[i + 1];
+                    if (!next_entry.is_dir and next_entry.size > 0) {
+                        self.prefetchFile(session, @intCast(i + 1));
+                    }
+                }
+                break :blk session.readFileChunk(file_index, 0, @intCast(entry.size)) catch |err| {
+                    std.debug.print("Failed to read file {s}: {}\n", .{ entry.path, err });
+                    const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read file") catch return;
+                    defer self.allocator.free(error_msg);
+                    conn.sendBinary(error_msg) catch {};
+                    return;
+                };
             };
+            defer {
+                if (owned_buf) |ud| self.allocator.free(ud) else session.closeCurrentFile();
+            }
 
             // Use parallel compressor to compress all chunks at once
             const compressed_chunks = transfer.ParallelCompressor.compressChunksParallel(
@@ -3691,8 +3712,7 @@ const Server = struct {
                 3, // compression level
             ) catch |err| {
                 std.debug.print("Parallel compression failed for {s}: {}, falling back\n", .{ entry.path, err });
-                // Fallback to sequential chunk-by-chunk
-                session.closeCurrentFile();
+                // Defer handles uring_data/mmap cleanup; pushFileSequential does its own reads
                 self.pushFileSequential(conn, session, file_index, entry.size, chunk_size, &bytes_sent);
                 continue;
             };
@@ -3725,10 +3745,13 @@ const Server = struct {
                 bytes_sent += this_chunk;
             }
 
-            session.closeCurrentFile();
+            // Cleanup handled by defer (frees uring_data or closes mmap)
         }
 
-        // Flush remaining batch
+        // Flush remaining small files and batch
+        if (small_indices.items.len > 0) {
+            self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
+        }
         if (batch_entries.items.len > 0) {
             self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
         }
@@ -3780,6 +3803,78 @@ const Server = struct {
         batch_data_bufs.clearRetainingCapacity();
         batch_entries.clearRetainingCapacity();
         batch_bytes.* = 0;
+    }
+
+    /// Batch-read accumulated small files via MultiFileReader
+    /// (io_uring on Linux, dispatch_apply on macOS, sequential pread on other).
+    /// No fallback — each platform compiles only its optimal path.
+    fn flushSmallBatch(
+        self: *Server,
+        conn: *ws.Connection,
+        session: *transfer.TransferSession,
+        small_indices: *std.ArrayListUnmanaged(u32),
+        small_sizes: *std.ArrayListUnmanaged(u64),
+        small_bytes: *u64,
+        batch_entries: *std.ArrayListUnmanaged(transfer.BatchEntry),
+        batch_data_bufs: *std.ArrayListUnmanaged([]const u8),
+        batch_bytes: *u64,
+        bytes_sent: *u64,
+        chunk_size: usize,
+    ) void {
+        const count = small_indices.items.len;
+        if (count == 0) return;
+
+        defer {
+            small_indices.clearRetainingCapacity();
+            small_sizes.clearRetainingCapacity();
+            small_bytes.* = 0;
+        }
+
+        // Build null-terminated relative paths for MultiFileReader
+        const z_paths = self.allocator.alloc([*:0]const u8, count) catch return;
+        defer self.allocator.free(z_paths);
+        var allocated: usize = 0;
+        defer for (z_paths[0..allocated]) |p| self.allocator.free(std.mem.span(p));
+
+        for (small_indices.items, 0..) |fi, idx| {
+            z_paths[idx] = self.allocator.dupeZ(u8, session.files.items[fi].path) catch return;
+            allocated = idx + 1;
+        }
+
+        // Open base directory for relative path reads
+        var dir = std.fs.openDirAbsolute(session.base_path, .{}) catch return;
+        defer dir.close();
+
+        // MultiFileReader: io_uring on Linux, dispatch_apply on macOS, pread on other
+        var reader = transfer.MultiFileReader.init(dir.fd, self.allocator) catch return;
+        defer reader.deinit();
+
+        const results = reader.readFiles(z_paths, small_sizes.items) catch return;
+        defer self.allocator.free(results);
+
+        // Build batch entries from read results
+        for (small_indices.items, 0..) |fi, idx| {
+            const r = results[idx];
+            if (r.size == 0 and r.data.len == 0) continue; // Per-file read failure, skip
+
+            const data = if (r.size < r.data.len) blk: {
+                const trimmed = self.allocator.dupe(u8, r.data[0..r.size]) catch continue;
+                self.allocator.free(r.data);
+                break :blk trimmed;
+            } else r.data;
+
+            batch_data_bufs.append(self.allocator, data) catch {
+                self.allocator.free(data);
+                continue;
+            };
+            batch_entries.append(self.allocator, .{ .file_index = fi, .data = data }) catch continue;
+            batch_bytes.* += session.files.items[fi].size;
+        }
+
+        // Flush to network if accumulated enough
+        if (batch_bytes.* >= chunk_size or batch_entries.items.len >= 256) {
+            self.flushBatch(conn, session, batch_entries, batch_data_bufs, batch_bytes, bytes_sent);
+        }
     }
 
     /// Prefetch a file into memory using madvise(WILLNEED).
