@@ -81,6 +81,7 @@ interface InternalTabInfo {
  */
 export class MuxClient {
   private controlWs: WebSocket | null = null;
+  private fileWs: WebSocket | null = null;
   private fileTransfer: FileTransferHandler;
   private panelInstances = new Map<string, PanelInstance>();
   private panelsByServerId = new Map<number, PanelInstance>();
@@ -125,6 +126,45 @@ export class MuxClient {
 
   private isControlWsOpen(): boolean {
     return this.controlWs !== null && this.controlWs.readyState === WebSocket.OPEN;
+  }
+
+  /** Lazy file WS — connects on first transfer, not on page load */
+  private ensureFileWs(): void {
+    if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) return;
+    if (this.fileWs && this.fileWs.readyState === WebSocket.CONNECTING) return;
+
+    const wsUrl = getWsUrl(WS_PATHS.FILE);
+    this.fileWs = new WebSocket(wsUrl);
+    this.fileWs.binaryType = 'arraybuffer';
+
+    this.fileWs.onopen = () => {
+      console.log('File transfer channel connected');
+      this.fileTransfer.setSend((data) => {
+        if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
+          // Copy to fresh Uint8Array with standard ArrayBuffer backing
+          const copy = new Uint8Array(data.length);
+          copy.set(data);
+          this.fileWs.send(copy);
+        }
+      });
+    };
+
+    this.fileWs.onmessage = (event) => {
+      if (this.destroyed) return;
+      if (event.data instanceof ArrayBuffer) {
+        this.fileTransfer.handleServerMessage(event.data);
+      }
+    };
+
+    this.fileWs.onclose = () => {
+      console.log('File transfer channel disconnected');
+      this.fileTransfer.setSend(null);
+      this.fileWs = null;
+    };
+
+    this.fileWs.onerror = (err) => {
+      console.error('File transfer channel error:', err);
+    };
   }
 
   // --- Outgoing message batching (60fps bus) ---
@@ -298,6 +338,10 @@ export class MuxClient {
       this.h264Ws.close();
       this.h264Ws = null;
     }
+    if (this.fileWs) {
+      this.fileWs.close();
+      this.fileWs = null;
+    }
     this.fileTransfer.disconnect();
     for (const panel of this.panelInstances.values()) {
       panel.destroy();
@@ -337,8 +381,6 @@ export class MuxClient {
       console.log('Control channel connected');
       connectionStatus.set('connected');
       this.reconnectDelay = TIMING.WS_RECONNECT_INITIAL;
-      // Wire file transfer to send via control WS (bypasses batch queue for large payloads)
-      this.fileTransfer.setSend((data) => this.sendControlDirect(data));
     };
 
     this.controlWs.onmessage = (event) => {
@@ -657,10 +699,6 @@ export class MuxClient {
           break;
         }
         default:
-          // Route file transfer responses (0x30-0x36) to FileTransferHandler
-          if (msgType >= 0x30 && msgType <= 0x36) {
-            this.fileTransfer.handleServerMessage(data);
-          }
           break;
       }
     } catch (err) {
@@ -1739,6 +1777,7 @@ export class MuxClient {
       const defaultPath = panelInfo?.pwd || '~';
       const serverPath = window.prompt('Upload to server path:', defaultPath);
       if (!serverPath) return;
+      this.ensureFileWs();
       await this.fileTransfer.startFolderUpload(dirHandle, serverPath);
     } catch (err: unknown) {
       if (err instanceof Error && err.name !== 'AbortError') {
@@ -1754,6 +1793,7 @@ export class MuxClient {
     const serverPath = window.prompt('Download from server path:', defaultPath);
     if (!serverPath) return;
     try {
+      this.ensureFileWs();
       await this.fileTransfer.startFolderDownload(serverPath);
     } catch (err: unknown) {
       console.error('Download failed:', err);

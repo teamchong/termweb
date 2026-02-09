@@ -1483,6 +1483,7 @@ const Server = struct {
     panels: std.AutoHashMap(u32, *Panel),
     h264_connections: std.ArrayList(*ws.Connection),
     control_connections: std.ArrayList(*ws.Connection),
+    file_connections: std.ArrayList(*ws.Connection),
     connection_roles: std.AutoHashMap(*ws.Connection, auth.Role),  // Track connection roles
     control_client_ids: std.AutoHashMap(*ws.Connection, u32),  // Track client IDs per control connection
     // Multiplayer: pane assignment state
@@ -1498,6 +1499,7 @@ const Server = struct {
     next_panel_id: u32,
     h264_ws_server: *ws.Server,
     control_ws_server: *ws.Server,
+    file_ws_server: *ws.Server,
     http_server: *http.HttpServer,
     auth_state: *auth.AuthState,  // Session and access control
     transfer_manager: transfer.TransferManager,
@@ -1529,6 +1531,10 @@ const Server = struct {
         const control_ws = try ws.Server.init(allocator, "0.0.0.0", control_port);
         control_ws.setCallbacks(onControlConnect, onControlMessage, onControlDisconnect);
 
+        // Create file transfer WebSocket server (dedicated channel for uploads/downloads)
+        const file_ws = try ws.Server.init(allocator, "0.0.0.0", 0);
+        file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
+
         // Create H264 WebSocket server (video frames only, server→client, no deflate)
         // Short write timeout: video frames are droppable, don't block render loop
         const h264_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
@@ -1554,6 +1560,7 @@ const Server = struct {
             .panels = std.AutoHashMap(u32, *Panel).init(allocator),
             .h264_connections = .{},
             .control_connections = .{},
+            .file_connections = .{},
             .connection_roles = std.AutoHashMap(*ws.Connection, auth.Role).init(allocator),
             .control_client_ids = std.AutoHashMap(*ws.Connection, u32).init(allocator),
             .panel_assignments = std.AutoHashMap(u32, []const u8).init(allocator),
@@ -1569,6 +1576,7 @@ const Server = struct {
             .http_server = http_srv,
             .h264_ws_server = h264_ws,
             .control_ws_server = control_ws,
+            .file_ws_server = file_ws,
             .auth_state = auth_state,
             .transfer_manager = transfer.TransferManager.init(allocator),
             .running = std.atomic.Value(bool).init(false),
@@ -1691,6 +1699,7 @@ const Server = struct {
         self.http_server.deinit();
         self.h264_ws_server.deinit();
         self.control_ws_server.deinit();
+        self.file_ws_server.deinit();
 
         // Now safe to destroy panels since all connection threads have finished
         var panel_it = self.panels.valueIterator();
@@ -1700,6 +1709,7 @@ const Server = struct {
         self.panels.deinit();
         self.h264_connections.deinit(self.allocator);
         self.control_connections.deinit(self.allocator);
+        self.file_connections.deinit(self.allocator);
         self.layout.deinit();
         self.pending_panels_ch.deinit();
         self.pending_destroys_ch.deinit();
@@ -1926,7 +1936,8 @@ const Server = struct {
         } else if (msg_type >= 0x90 and msg_type <= 0x9F) {
             self.handleAuthMessage(conn, data);
         } else if (msg_type >= 0x20 and msg_type <= 0x24) {
-            // File transfer messages (merged from file WS)
+            // File transfer messages: deprecated on control WS, use /ws/file instead.
+            // Keep fallback for backwards compatibility with older clients.
             self.handleFileTransferMessage(conn, data);
         } else {
             self.handleBinaryControlMessage(conn, data);
@@ -1980,6 +1991,34 @@ const Server = struct {
 
         // Update admin's client list
         self.sendClientListToAdmins();
+    }
+
+    // --- File transfer WebSocket callbacks (dedicated channel for uploads/downloads) ---
+
+    fn onFileConnect(conn: *ws.Connection) void {
+        const self = global_server.load(.acquire) orelse return;
+        self.mutex.lock();
+        self.file_connections.append(self.allocator, conn) catch {};
+        self.mutex.unlock();
+    }
+
+    fn onFileMessage(conn: *ws.Connection, data: []u8, is_binary: bool) void {
+        _ = is_binary;
+        const self = global_server.load(.acquire) orelse return;
+        if (data.len == 0) return;
+        self.handleFileTransferMessage(conn, data);
+    }
+
+    fn onFileDisconnect(conn: *ws.Connection) void {
+        const self = global_server.load(.acquire) orelse return;
+        self.mutex.lock();
+        for (self.file_connections.items, 0..) |file_conn, i| {
+            if (file_conn == conn) {
+                _ = self.file_connections.swapRemove(i);
+                break;
+            }
+        }
+        self.mutex.unlock();
     }
 
     // --- H264 WebSocket callbacks (video frames only, server→client) ---
@@ -4224,6 +4263,7 @@ const Server = struct {
         // Set running flag for WebSocket servers (they don't call run() but need this for handleConnection)
         self.h264_ws_server.running.store(true, .release);
         self.control_ws_server.running.store(true, .release);
+        self.file_ws_server.running.store(true, .release);
 
         // Start HTTP server in background (handles all WebSocket via path-based routing)
         const http_thread = try std.Thread.spawn(.{}, runHttpServer, .{self});
@@ -4240,6 +4280,7 @@ const Server = struct {
         self.http_server.stop();
         self.h264_ws_server.stop();
         self.control_ws_server.stop();
+        self.file_ws_server.stop();
 
         // Wait for HTTP thread to finish
         http_thread.join();
@@ -4722,6 +4763,11 @@ fn onControlWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*
     server.control_ws_server.handleUpgrade(stream, request);
 }
 
+fn onFileWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*anyopaque) void {
+    const server: *Server = @ptrCast(@alignCast(user_data orelse return));
+    server.file_ws_server.handleUpgrade(stream, request);
+}
+
 /// Run mux server - can be called from CLI or standalone
 pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) !void {
     // Setup SIGINT handler for graceful shutdown
@@ -4747,11 +4793,11 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
     defer server.deinit();
 
     // Set up WebSocket upgrade callbacks on HTTP server
-    // 2 channels: /ws/h264 (video frames) + /ws/control (everything else, zstd compressed)
+    // 3 channels: /ws/h264 (video) + /ws/control (zstd) + /ws/file (transfers)
     server.http_server.setWsCallbacks(
         onH264WsUpgrade,
         onControlWsUpgrade,
-        null,
+        onFileWsUpgrade,
         null,
         server,
     );

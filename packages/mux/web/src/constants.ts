@@ -8,6 +8,7 @@
 export const WS_PATHS = {
   H264: '/ws/h264',
   CONTROL: '/ws/control',
+  FILE: '/ws/file',
 } as const;
 
 export const CONFIG_ENDPOINT = '/config';
