@@ -776,7 +776,60 @@
   // Mobile / Touch Input
   // ============================================================================
 
-  const isTouchDevice = typeof window !== 'undefined' && !window.matchMedia('(hover: hover)').matches;
+  const isTouchDevice = typeof window !== 'undefined' && ('ontouchstart' in window) && window.matchMedia('(pointer: coarse)').matches;
+
+  // Sticky modifier state for accessory bar
+  let stickyShift = $state(false);
+  let stickyCtrl = $state(false);
+  let stickyAlt = $state(false);
+  let stickyMeta = $state(false);
+  let accessoryCollapsed = $state(false);
+  let accessoryBottom = $state(0);
+
+  // Track visual viewport to position accessory bar above keyboard / safe area
+  $effect(() => {
+    if (!isTouchDevice) return;
+    const vv = window.visualViewport;
+    if (!vv) return;
+
+    function update() {
+      // On iOS, visualViewport.height shrinks when keyboard opens.
+      // The gap between innerHeight and visualViewport is keyboard + any offset.
+      accessoryBottom = Math.max(0, window.innerHeight - vv!.height - vv!.offsetTop);
+    }
+
+    update();
+    vv.addEventListener('resize', update);
+    vv.addEventListener('scroll', update);
+    return () => {
+      vv.removeEventListener('resize', update);
+      vv.removeEventListener('scroll', update);
+    };
+  });
+
+  function getStickyMods(): number {
+    let mods = 0;
+    if (stickyShift) mods |= MODIFIER.SHIFT;
+    if (stickyCtrl) mods |= MODIFIER.CTRL;
+    if (stickyAlt) mods |= MODIFIER.ALT;
+    if (stickyMeta) mods |= MODIFIER.META;
+    return mods;
+  }
+
+  function clearStickyMods(): void {
+    stickyShift = false;
+    stickyCtrl = false;
+    stickyAlt = false;
+    stickyMeta = false;
+  }
+
+  function handleAccessoryKey(key: string, code: string): void {
+    const mods = getStickyMods();
+    const text = (key.length === 1) ? key : '';
+    sendKeyPress(code, text, mods);
+    clearStickyMods();
+    focusMobileInput();
+  }
 
   // Track touch state for gesture detection
   let touchStartTime = 0;
@@ -842,19 +895,22 @@
       // processes it through its input handler (cursor style, key mapping, etc.)
       const typed = val.slice(1);
       if (canSendInput()) {
+        const mods = getStickyMods();
         for (const char of typed) {
           const code = charToKeyCode(char);
           if (code) {
-            sendKeyPress(code, char, 0);
+            sendKeyPress(code, char, mods);
           } else {
             // Non-ASCII or unmapped — fall back to TEXT_INPUT
             sendTextInput(char);
           }
         }
+        if (mods) clearStickyMods();
       }
     } else if (val.length === 0) {
       // Backspace deleted the sentinel space
-      sendKeyPress('Backspace', '', 0);
+      sendKeyPress('Backspace', '', getStickyMods());
+      clearStickyMods();
     }
 
     // Reset to sentinel space
@@ -1299,6 +1355,29 @@
         spellcheck={false}
         style="top:{cursorPct ? cursorPct.top : 50}%;left:{cursorPct ? cursorPct.left : 0}%"
       ></textarea>
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <div class="accessory-bar" tabindex={-1} class:collapsed={accessoryCollapsed} style="bottom:{accessoryBottom}px">
+        <div class="accessory-handle" tabindex={-1} ontouchend={(e) => { e.preventDefault(); accessoryCollapsed = !accessoryCollapsed; focusMobileInput(); }}></div>
+        <div class="accessory-keys" tabindex={-1}>
+          <button tabindex={-1} class="accessory-key" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('Escape', 'Escape'); }}>esc</button>
+          <button tabindex={-1} class="accessory-key" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('Tab', 'Tab'); }}>tab</button>
+          <button tabindex={-1} class="accessory-key" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('|', 'Backslash'); }}>|</button>
+          <button tabindex={-1} class="accessory-key" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('~', 'Backquote'); }}>~</button>
+          <button tabindex={-1} class="accessory-key" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('-', 'Minus'); }}>-</button>
+          <button tabindex={-1} class="accessory-key" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('/', 'Slash'); }}>/</button>
+          <div class="accessory-sep"></div>
+          <button tabindex={-1} class="accessory-key modifier" class:active={stickyShift} ontouchend={(e) => { e.preventDefault(); stickyShift = !stickyShift; focusMobileInput(); }}>⇧</button>
+          <button tabindex={-1} class="accessory-key modifier" class:active={stickyCtrl} ontouchend={(e) => { e.preventDefault(); stickyCtrl = !stickyCtrl; focusMobileInput(); }}>⌃</button>
+          <button tabindex={-1} class="accessory-key modifier" class:active={stickyAlt} ontouchend={(e) => { e.preventDefault(); stickyAlt = !stickyAlt; focusMobileInput(); }}>⌥</button>
+          <button tabindex={-1} class="accessory-key modifier" class:active={stickyMeta} ontouchend={(e) => { e.preventDefault(); stickyMeta = !stickyMeta; focusMobileInput(); }}>⌘</button>
+          <div class="accessory-sep"></div>
+          <button tabindex={-1} class="accessory-key arrow" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('ArrowUp', 'ArrowUp'); }}>▲</button>
+          <button tabindex={-1} class="accessory-key arrow" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('ArrowDown', 'ArrowDown'); }}>▼</button>
+          <button tabindex={-1} class="accessory-key arrow" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('ArrowLeft', 'ArrowLeft'); }}>◀</button>
+          <button tabindex={-1} class="accessory-key arrow" ontouchend={(e) => { e.preventDefault(); handleAccessoryKey('ArrowRight', 'ArrowRight'); }}>▶</button>
+        </div>
+      </div>
     {/if}
     {#if cursorSurfW > 0 && cursorSurfH > 0}
       <div class="cursor-container" style="--fw:{cursorSurfW};--fh:{cursorSurfH}">
@@ -1470,6 +1549,97 @@
     background: transparent;
     /* Allow programmatic focus but don't block touch on canvas */
     pointer-events: none;
+  }
+
+  .accessory-bar {
+    position: fixed;
+    bottom: 0;  /* overridden by inline style via visualViewport */
+    left: 0;
+    right: 0;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    transition: transform 0.2s ease;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .accessory-bar.collapsed {
+    transform: translateY(calc(32px + env(safe-area-inset-bottom, 0px)));
+  }
+
+  .accessory-handle {
+    width: 40px;
+    height: 16px;
+    margin: 0 auto;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .accessory-handle::after {
+    content: '';
+    width: 32px;
+    height: 4px;
+    background: rgba(128, 128, 128, 0.5);
+    border-radius: 2px;
+  }
+
+  .accessory-keys {
+    display: flex;
+    gap: 4px;
+    padding: 3px 6px 5px;
+    background: rgba(30, 30, 30, 0.9);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-top: 1px solid rgba(128, 128, 128, 0.2);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .accessory-keys::-webkit-scrollbar {
+    display: none;
+  }
+
+  .accessory-sep {
+    width: 1px;
+    background: rgba(128, 128, 128, 0.3);
+    align-self: stretch;
+    flex-shrink: 0;
+  }
+
+  .accessory-key {
+    padding: 4px 8px;
+    min-width: 28px;
+    border: 1px solid rgba(128, 128, 128, 0.3);
+    border-radius: 5px;
+    background: rgba(60, 60, 60, 0.8);
+    color: #ddd;
+    font-size: 12px;
+    font-family: system-ui, sans-serif;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  .accessory-key:active {
+    background: rgba(100, 100, 100, 0.8);
+  }
+
+  .accessory-key.modifier.active {
+    background: #007aff;
+    border-color: #007aff;
+    color: #fff;
+  }
+
+  .accessory-key.arrow {
+    padding: 4px 7px;
+    min-width: 26px;
+    font-size: 11px;
   }
 
   .cursor-container {

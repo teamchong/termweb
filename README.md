@@ -1,46 +1,70 @@
 # termweb
 
-A next-generation terminal multiplexer for the web, powered by [Ghostty](https://ghostty.org)'s libghostty rendering engine with H.264 video streaming.
+Stream [Ghostty](https://ghostty.org) to any browser. A headless terminal multiplexer that runs Ghostty on your server and streams pixel-perfect H.264 video to web clients over WebSocket.
 
 ## Demo
 
 https://github.com/user-attachments/assets/70b86b29-19b4-458b-8d5d-683f5e139908
 
-## Features
+## Why
 
-- **Cross-Platform**: macOS (VideoToolbox) and Linux (VA-API hardware H.264)
-- **H.264 Video Streaming**: libghostty renders to GPU, hardware-encoded H.264, WebCodecs decodes in browser
-- **Low Latency**: Direct WebCodecs decoding to canvas (no MSE buffering)
-- **Tab Management**: Multiple tabs with LRU switching on close
-- **Split Panes**: Horizontal/vertical splits with draggable dividers, zoom to maximize
-- **Mouse Support**: Full mouse tracking (hover, click, scroll, drag)
-- **File Transfer**: Upload/download with rsync-like options (exclude, delete, preview)
-- **Shell Integration**: pwd tracking, running command indicators
-- **Scale to Zero**: Ghostty initializes on first panel, frees when last closes
+Ghostty is a fantastic terminal emulator, but it's a native desktop app. termweb turns it into a streaming service — run Ghostty headlessly on a server, and connect from any device with a browser: laptop, iPad, phone. No native app install required.
 
-## Architecture
+- **One server, many clients** — multiple users can connect to the same session simultaneously
+- **Access from anywhere** — any device with a browser becomes a Ghostty terminal
+- **Native rendering quality** — libghostty renders to GPU, hardware-encodes to H.264, streams pixels (not text)
+- **Real terminal** — full mouse tracking, shell integration, split panes, tabs — not a web terminal approximation
+
+## How It Works
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Browser (WebCodecs)                      │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐                      │
-│  │  Tab 1  │  │  Tab 2  │  │  Tab 3  │  ← Tab bar           │
-│  └────┬────┘  └─────────┘  └─────────┘                      │
-│       │                                                     │
-│  ┌────┴────────────────────────────────┐                    │
-│  │ Panel: H.264 → WebCodecs → Canvas   │                    │
-│  └─────────────────────────────────────┘                    │
+│                    Browser / Any Client                     │
+│                                                             │
+│  WebSocket ──→ Zstd decompress ──→ WebCodecs H.264 decode   │
+│  ──→ WebGPU / Canvas 2D render                              │
+│                                                             │
+│  Keyboard/Mouse ──→ WebSocket ──→ Server                    │
 └─────────────────────────────────────────────────────────────┘
                       │ WebSocket (single port)
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                    Server (Zig)                             │
+│                    Server (Zig + libghostty)                │
 │                                                             │
-│  macOS:  libghostty → IOSurface → VideoToolbox (H.264)      │
-│  Linux:  libghostty → EGL → VA-API (H.264)                  │
+│  libghostty ──→ GPU surface ──→ Hardware H.264 encode       │
+│  ──→ Zstd compress ──→ WebSocket broadcast                  │
 │                                                             │
+│  macOS:  IOSurface → VideoToolbox                           │
+│  Linux:  EGL → VA-API                                       │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Features
+
+### Streaming
+- **Hardware H.264 encoding** — VideoToolbox (macOS) / VA-API (Linux), not software encode
+- **Low latency** — WebCodecs decodes directly to canvas, no MSE buffering
+- **Adaptive quality** — AIMD algorithm adjusts quality per-panel based on available bandwidth
+- **WebGPU rendering** — GPU-accelerated frame display with Canvas 2D fallback for iOS Safari
+- **Zstd compression** — all WebSocket frames compressed for lower bandwidth
+
+### Multiplexer
+- **Tabs** — multiple tabs with LRU switching on close
+- **Split panes** — horizontal/vertical splits with draggable dividers, zoom to maximize
+- **Quick terminal** — dropdown terminal overlay
+- **Shell integration** — pwd tracking, running command indicators
+- **Scale to zero** — Ghostty initializes on first panel, frees resources when last one closes
+
+### Input
+- **Full mouse support** — hover, click, scroll, drag with modifier keys
+- **Mobile touch** — tap, drag, two-finger scroll, pinch-to-zoom on iOS/Android
+- **Virtual keyboard** — on-screen accessory bar with Esc, Tab, Ctrl, Alt, Cmd, arrow keys
+- **Keyboard shortcuts** — native-feeling key bindings (see below)
+
+### Collaboration
+- **Multi-client sessions** — multiple browsers connect to the same session
+- **Access control** — session management with share links and viewer/editor roles
+- **File transfer** — upload/download with rsync-like options (exclude patterns, delete, preview)
 
 ## Quick Start
 
@@ -52,14 +76,16 @@ make
 ./zig-out/bin/termweb mux
 ```
 
-Open `http://localhost:8080` in Chrome/Edge (WebCodecs required).
+Open `http://localhost:8080` in any modern browser.
+
+**Browser support:** Chrome, Edge, Safari (including iOS), Firefox — requires WebCodecs.
 
 ## Building
 
 ### From Source
 
 ```bash
-git clone https://github.com/anthropics/termweb
+git clone https://github.com/nichochar/termweb
 cd termweb
 make
 ./zig-out/bin/termweb mux
@@ -99,7 +125,7 @@ termweb also includes a web browser for terminals:
 termweb open https://example.com
 ```
 
-See [packages/mux/README.md](packages/mux/README.md) for detailed multiplexer documentation.
+See [packages/mux/README.md](packages/mux/README.md) for detailed protocol and architecture documentation.
 
 ## License
 
