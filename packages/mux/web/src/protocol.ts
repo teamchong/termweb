@@ -74,6 +74,10 @@ export const TransferMsgType = {
   FILE_DATA: 0x22,
   TRANSFER_RESUME: 0x23,
   TRANSFER_CANCEL: 0x24,
+  // Client -> Server (sync/rsync)
+  SYNC_REQUEST: 0x25,
+  BLOCK_CHECKSUMS: 0x26,
+  SYNC_ACK: 0x27,
   // Server -> Client
   TRANSFER_READY: 0x30,
   FILE_LIST: 0x31,
@@ -83,6 +87,10 @@ export const TransferMsgType = {
   TRANSFER_ERROR: 0x35,
   DRY_RUN_REPORT: 0x36,
   BATCH_DATA: 0x37,
+  // Server -> Client (sync/rsync)
+  SYNC_FILE_LIST: 0x38,
+  DELTA_DATA: 0x39,
+  SYNC_COMPLETE: 0x3A,
 } as const;
 
 // Role constants

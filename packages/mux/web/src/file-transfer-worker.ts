@@ -191,6 +191,207 @@ async function cleanupTransfer(transferId: number): Promise<void> {
   }
 }
 
+// ── OPFS Cache (persistent storage for delta sync) ──
+
+const CACHE_ROOT = 'termweb-cache';
+
+interface CacheFilesMeta {
+  [filePath: string]: { size: number; mtime: number; hash: string };
+}
+
+async function getCacheDir(serverPath: string): Promise<FileSystemDirectoryHandle> {
+  if (!opfsRoot) throw new Error('OPFS not available');
+  let dir = await ensureDir(opfsRoot, CACHE_ROOT);
+
+  // Use server path segments as nested OPFS directories
+  const cleanPath = serverPath.replace(/^\/+/, '');
+  if (cleanPath) {
+    for (const part of cleanPath.split('/')) {
+      if (part) dir = await ensureDir(dir, part);
+    }
+  }
+  return dir;
+}
+
+async function getCacheFilesDir(serverPath: string): Promise<FileSystemDirectoryHandle> {
+  const cacheDir = await getCacheDir(serverPath);
+  return ensureDir(cacheDir, 'files');
+}
+
+async function readCacheMeta(serverPath: string): Promise<CacheFilesMeta> {
+  try {
+    const cacheDir = await getCacheDir(serverPath);
+    const metaHandle = await cacheDir.getFileHandle('.termweb-meta');
+    const file = await metaHandle.getFile();
+    const text = await file.text();
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+async function writeCacheMeta(serverPath: string, meta: CacheFilesMeta): Promise<void> {
+  const cacheDir = await getCacheDir(serverPath);
+  const metaHandle = await cacheDir.getFileHandle('.termweb-meta', { create: true });
+  const accessHandle = await metaHandle.createSyncAccessHandle();
+  try {
+    const encoded = new TextEncoder().encode(JSON.stringify(meta));
+    accessHandle.truncate(0);
+    accessHandle.write(encoded, { at: 0 });
+    accessHandle.flush();
+  } finally {
+    accessHandle.close();
+  }
+}
+
+async function cachePut(serverPath: string, filePath: string, data: ArrayBuffer, metadata: { size: number; mtime: number; hash: string }): Promise<void> {
+  const filesDir = await getCacheFilesDir(serverPath);
+
+  // Create subdirectories for the file path
+  const parts = filePath.split('/');
+  let dir = filesDir;
+  for (let i = 0; i < parts.length - 1; i++) {
+    dir = await ensureDir(dir, parts[i]);
+  }
+
+  // Write file data using sync access handle
+  const fileHandle = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+  const accessHandle = await fileHandle.createSyncAccessHandle();
+  try {
+    accessHandle.truncate(0);
+    accessHandle.write(new Uint8Array(data), { at: 0 });
+    accessHandle.flush();
+  } finally {
+    accessHandle.close();
+  }
+
+  // Update metadata
+  const meta = await readCacheMeta(serverPath);
+  meta[filePath] = metadata;
+  await writeCacheMeta(serverPath, meta);
+}
+
+async function cacheGet(serverPath: string, filePath: string): Promise<ArrayBuffer> {
+  const filesDir = await getCacheFilesDir(serverPath);
+
+  const parts = filePath.split('/');
+  let dir = filesDir;
+  for (let i = 0; i < parts.length - 1; i++) {
+    dir = await dir.getDirectoryHandle(parts[i]);
+  }
+
+  const fileHandle = await dir.getFileHandle(parts[parts.length - 1]);
+  const file = await fileHandle.getFile();
+  return file.arrayBuffer();
+}
+
+async function cacheRemove(serverPath: string, filePath: string): Promise<void> {
+  // Remove from metadata
+  const meta = await readCacheMeta(serverPath);
+  delete meta[filePath];
+  await writeCacheMeta(serverPath, meta);
+
+  // Remove file
+  try {
+    const filesDir = await getCacheFilesDir(serverPath);
+    const parts = filePath.split('/');
+    let dir = filesDir;
+    for (let i = 0; i < parts.length - 1; i++) {
+      dir = await dir.getDirectoryHandle(parts[i]);
+    }
+    await dir.removeEntry(parts[parts.length - 1]);
+  } catch {
+    // File might not exist
+  }
+}
+
+// ── Block checksum computation (for rsync delta sync) ──
+
+/** Rsync-style rolling checksum (Adler32 variant) */
+function rollingChecksum(data: Uint8Array): number {
+  let a = 0, b = 0;
+  for (let i = 0; i < data.length; i++) {
+    a = (a + data[i]) & 0xFFFF;
+    b = (b + a) & 0xFFFF;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/** Strong checksum: use zstd WASM's memory to compute XXH3 via a simple hash.
+ *  Since we don't have direct XXH3 in JS, use a FNV-1a 64-bit variant. */
+function strongChecksum(data: Uint8Array): bigint {
+  // FNV-1a 64-bit - fast and collision-resistant for our use case
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  for (let i = 0; i < data.length; i++) {
+    hash ^= BigInt(data[i]);
+    hash = (hash * prime) & 0xFFFFFFFFFFFFFFFFn;
+  }
+  return hash;
+}
+
+/** Compute block checksums for a cached file */
+async function computeBlockChecksums(
+  serverPath: string,
+  filePath: string,
+  blockSize: number
+): Promise<{ rolling: Uint32Array; strong: BigUint64Array }> {
+  const data = new Uint8Array(await cacheGet(serverPath, filePath));
+  const blockCount = Math.ceil(data.length / blockSize);
+  const rolling = new Uint32Array(blockCount);
+  const strong = new BigUint64Array(blockCount);
+
+  for (let i = 0; i < blockCount; i++) {
+    const start = i * blockSize;
+    const end = Math.min(start + blockSize, data.length);
+    const block = data.subarray(start, end);
+    rolling[i] = rollingChecksum(block);
+    strong[i] = strongChecksum(block);
+  }
+
+  return { rolling, strong };
+}
+
+/** Apply delta commands to a cached file, producing a new file.
+ *  Commands: COPY [offset:u64][length:u32] | LITERAL [length:u32][data...] */
+function applyDelta(cachedData: Uint8Array, deltaPayload: Uint8Array): Uint8Array {
+  const view = new DataView(deltaPayload.buffer, deltaPayload.byteOffset, deltaPayload.byteLength);
+  const parts: Uint8Array[] = [];
+  let totalSize = 0;
+  let offset = 0;
+
+  while (offset < deltaPayload.length) {
+    const cmd = deltaPayload[offset]; offset += 1;
+
+    if (cmd === 0x00) {
+      // COPY: [offset:u64][length:u32]
+      const copyOffset = Number(view.getBigUint64(offset, true)); offset += 8;
+      const copyLen = view.getUint32(offset, true); offset += 4;
+      const slice = cachedData.slice(copyOffset, copyOffset + copyLen);
+      parts.push(slice);
+      totalSize += slice.length;
+    } else if (cmd === 0x01) {
+      // LITERAL: [length:u32][data...]
+      const litLen = view.getUint32(offset, true); offset += 4;
+      const slice = deltaPayload.slice(offset, offset + litLen);
+      parts.push(slice);
+      totalSize += litLen;
+      offset += litLen;
+    } else {
+      break; // Unknown command
+    }
+  }
+
+  // Assemble result
+  const result = new Uint8Array(totalSize);
+  let writeOffset = 0;
+  for (const part of parts) {
+    result.set(part, writeOffset);
+    writeOffset += part.length;
+  }
+  return result;
+}
+
 // Message handler
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
@@ -268,6 +469,75 @@ self.onmessage = async (e: MessageEvent) => {
       case 'cleanup': {
         await cleanupTransfer(msg.transferId);
         (self as unknown as Worker).postMessage({ type: 'cleanup-done', transferId: msg.transferId });
+        break;
+      }
+
+      // ── Cache operations ──
+
+      case 'cache-put': {
+        const { id, serverPath, filePath, data, metadata } = msg;
+        await cachePut(serverPath, filePath, data, metadata);
+        (self as unknown as Worker).postMessage({ type: 'cache-put-done', id, serverPath, filePath });
+        break;
+      }
+
+      case 'cache-get': {
+        const { id, serverPath, filePath } = msg;
+        const data = await cacheGet(serverPath, filePath);
+        (self as unknown as Worker).postMessage(
+          { type: 'cache-file', id, serverPath, filePath, data },
+          [data]
+        );
+        break;
+      }
+
+      case 'cache-list': {
+        const { id, serverPath } = msg;
+        const files = await readCacheMeta(serverPath);
+        (self as unknown as Worker).postMessage({ type: 'cache-list-result', id, serverPath, files });
+        break;
+      }
+
+      case 'cache-remove': {
+        const { id, serverPath, filePath } = msg;
+        await cacheRemove(serverPath, filePath);
+        (self as unknown as Worker).postMessage({ type: 'cache-remove-done', id, serverPath, filePath });
+        break;
+      }
+
+      // ── Rsync delta sync operations ──
+
+      case 'compute-checksums': {
+        const { id, serverPath, filePath, blockSize } = msg;
+        try {
+          const { rolling, strong } = await computeBlockChecksums(serverPath, filePath, blockSize);
+          const rollingBuf = rolling.buffer as ArrayBuffer;
+          const strongBuf = strong.buffer as ArrayBuffer;
+          (self as unknown as Worker).postMessage(
+            { type: 'checksums-computed', id, rolling: rollingBuf, strong: strongBuf },
+            [rollingBuf, strongBuf]
+          );
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : 'Checksum computation failed';
+          (self as unknown as Worker).postMessage({ type: 'checksums-error', id, message });
+        }
+        break;
+      }
+
+      case 'apply-delta': {
+        const { id, serverPath, filePath, deltaPayload } = msg;
+        try {
+          const cachedData = new Uint8Array(await cacheGet(serverPath, filePath));
+          const result = applyDelta(cachedData, new Uint8Array(deltaPayload));
+          const buffer = result.buffer as ArrayBuffer;
+          (self as unknown as Worker).postMessage(
+            { type: 'delta-applied', id, data: buffer },
+            [buffer]
+          );
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : 'Delta application failed';
+          (self as unknown as Worker).postMessage({ type: 'delta-error', id, message });
+        }
         break;
       }
     }

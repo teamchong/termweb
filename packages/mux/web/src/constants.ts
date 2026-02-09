@@ -171,6 +171,34 @@ export const PROTO_BATCH_DATA = {
   DATA: 9,
 } as const;
 
+/** SYNC_FILE_LIST message offsets (0x38) */
+export const PROTO_SYNC_FILE_LIST = {
+  /** [msg_type:1][transfer_id:4] => file_count at offset 5 */
+  FILE_COUNT: 5,
+  /** Total bytes of all files */
+  TOTAL_BYTES: 9,
+  /** Start of file entries */
+  PAYLOAD: 17,
+} as const;
+
+/** DELTA_DATA message offsets (0x39) */
+export const PROTO_DELTA_DATA = {
+  /** File index within the sync file list */
+  FILE_INDEX: 5,
+  /** Uncompressed size of delta payload */
+  UNCOMPRESSED_SIZE: 9,
+  /** Start of compressed delta commands payload */
+  DATA: 13,
+} as const;
+
+/** SYNC_COMPLETE message offsets (0x3A) */
+export const PROTO_SYNC_COMPLETE = {
+  /** Number of files synced */
+  FILES_SYNCED: 5,
+  /** Total bytes transferred */
+  BYTES_TRANSFERRED: 9,
+} as const;
+
 /** Action codes for dry run entries */
 export const DRY_RUN_ACTION = ['create', 'update', 'delete'] as const;
 

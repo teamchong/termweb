@@ -568,6 +568,10 @@ pub const ClientMsgType = enum(u8) {
     file_data = 0x22,         // File chunk data (upload)
     transfer_resume = 0x23,   // Resume interrupted transfer
     transfer_cancel = 0x24,   // Cancel transfer
+    // Rsync/sync messages
+    sync_request = 0x25,      // Start incremental sync
+    block_checksums = 0x26,   // Client sends block checksums of cached copy
+    sync_ack = 0x27,          // Client confirms delta applied
 };
 
 // Message types from server (0x30-0x3F)
@@ -580,6 +584,10 @@ pub const ServerMsgType = enum(u8) {
     transfer_error = 0x35,    // Error
     dry_run_report = 0x36,    // Preview results
     batch_data = 0x37,        // Batched small files (compressed together)
+    // Rsync/sync messages
+    sync_file_list = 0x38,    // File list for sync (with mtime comparison)
+    delta_data = 0x39,        // Delta commands (COPY + LITERAL)
+    sync_complete = 0x3A,     // Sync finished
 };
 
 // Transfer direction
@@ -1438,6 +1446,332 @@ fn matchGlob(pattern: []const u8, path: []const u8) bool {
     }
 
     return p_idx == pattern.len;
+}
+
+
+// Rsync Protocol — Block-Level Delta Sync
+
+
+/// Rolling checksum (rsync-style Adler32 variant).
+/// Fast to compute incrementally as a sliding window moves through data.
+pub const RollingChecksum = struct {
+    a: u16,
+    b: u16,
+    count: u32,
+
+    pub fn init() RollingChecksum {
+        return .{ .a = 0, .b = 0, .count = 0 };
+    }
+
+    /// Compute checksum over a block of data.
+    pub fn compute(data: []const u8) RollingChecksum {
+        var a: u32 = 0;
+        var b: u32 = 0;
+        for (data) |byte| {
+            a +%= byte;
+            b +%= a;
+        }
+        return .{
+            .a = @truncate(a),
+            .b = @truncate(b),
+            .count = @intCast(data.len),
+        };
+    }
+
+    /// Combined 32-bit hash for hash table lookup.
+    pub fn hash(self: RollingChecksum) u32 {
+        return (@as(u32, self.b) << 16) | @as(u32, self.a);
+    }
+
+    /// Roll the window forward: remove old_byte, add new_byte.
+    pub fn roll(self: *RollingChecksum, old_byte: u8, new_byte: u8) void {
+        self.a -%= old_byte;
+        self.a +%= new_byte;
+        self.b -%= @as(u16, @truncate(self.count)) *% old_byte;
+        self.b +%= self.a;
+    }
+};
+
+/// Block checksum pair: rolling (fast) + strong (XXH3, collision-resistant).
+pub const BlockChecksum = struct {
+    rolling: u32,  // RollingChecksum.hash()
+    strong: u64,   // XXH3 64-bit hash (server computes via xxh3Hash)
+};
+
+/// Delta command types.
+pub const DeltaCmd = enum(u8) {
+    copy = 0x00,    // Reuse block from client's cached copy
+    literal = 0x01, // New data from server
+};
+
+/// Compute adaptive block size: sqrt(file_size) clamped to [512, 65536].
+pub fn computeBlockSize(file_size: u64) u32 {
+    if (file_size == 0) return 512;
+    const sqrt = std.math.sqrt(file_size);
+    return @intCast(std.math.clamp(sqrt, 512, 65536));
+}
+
+/// Parse SYNC_REQUEST from client.
+/// [0x25][flags:u8][path_len:u16][path][exclude_count:u8][excludes...]
+pub const SyncRequestData = struct {
+    flags: u8,
+    path: []const u8,
+    excludes: []const []const u8,
+
+    pub fn deinit(self: *SyncRequestData, allocator: Allocator) void {
+        allocator.free(self.path);
+        for (self.excludes) |pattern| {
+            allocator.free(pattern);
+        }
+        allocator.free(self.excludes);
+    }
+};
+
+pub fn parseSyncRequest(allocator: Allocator, data: []const u8) !SyncRequestData {
+    if (data.len < 5) return error.MessageTooShort;
+
+    var offset: usize = 1; // Skip msg type
+
+    const flags = data[offset];
+    offset += 1;
+
+    const path_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+    offset += 2;
+
+    if (data.len < offset + path_len) return error.MessageTooShort;
+    const path = try allocator.dupe(u8, data[offset..][0..path_len]);
+    offset += path_len;
+
+    if (offset >= data.len) {
+        return .{ .flags = flags, .path = path, .excludes = &[_][]const u8{} };
+    }
+
+    const exclude_count = data[offset];
+    offset += 1;
+
+    var excludes = try allocator.alloc([]const u8, exclude_count);
+    var i: u8 = 0;
+    while (i < exclude_count) : (i += 1) {
+        if (offset >= data.len) break;
+        const pattern_len = data[offset];
+        offset += 1;
+        if (data.len < offset + pattern_len) break;
+        excludes[i] = try allocator.dupe(u8, data[offset..][0..pattern_len]);
+        offset += pattern_len;
+    }
+
+    return .{ .flags = flags, .path = path, .excludes = excludes[0..i] };
+}
+
+/// Parse BLOCK_CHECKSUMS from client.
+/// [0x26][transfer_id:u32][file_index:u32][block_size:u32][count:u32][rolling:u32 × N][strong:u64 × N]
+pub const BlockChecksumsMsg = struct {
+    transfer_id: u32,
+    file_index: u32,
+    block_size: u32,
+    checksums: []BlockChecksum,
+};
+
+pub fn parseBlockChecksums(allocator: Allocator, data: []const u8) !BlockChecksumsMsg {
+    if (data.len < 17) return error.MessageTooShort;
+
+    var offset: usize = 1; // Skip msg type
+
+    const transfer_id = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+    const file_index = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+    const block_size = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+    const count = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+
+    // Each checksum: rolling:u32 + strong:u64 = 12 bytes
+    const needed = @as(usize, count) * 12;
+    if (data.len < offset + needed) return error.MessageTooShort;
+
+    const checksums = try allocator.alloc(BlockChecksum, count);
+    for (0..count) |i| {
+        checksums[i] = .{
+            .rolling = std.mem.readInt(u32, data[offset..][0..4], .little),
+            .strong = std.mem.readInt(u64, data[offset + 4 ..][0..8], .little),
+        };
+        offset += 12;
+    }
+
+    return .{
+        .transfer_id = transfer_id,
+        .file_index = file_index,
+        .block_size = block_size,
+        .checksums = checksums,
+    };
+}
+
+/// Build SYNC_FILE_LIST message.
+/// [0x38][transfer_id:u32][file_count:u32][total_bytes:u64][entries...]
+/// entry: [path_len:u16][path][size:u64][mtime:u64][hash:u64][is_dir:u8]
+pub fn buildSyncFileList(allocator: Allocator, session: *const TransferSession) ![]u8 {
+    // Same format as FILE_LIST but with sync_file_list type
+    var total_len: usize = 1 + 4 + 4 + 8;
+    for (session.files.items) |entry| {
+        total_len += 2 + entry.path.len + 8 + 8 + 8 + 1;
+    }
+
+    var msg = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    msg[offset] = @intFromEnum(ServerMsgType.sync_file_list);
+    offset += 1;
+
+    std.mem.writeInt(u32, msg[offset..][0..4], session.id, .little);
+    offset += 4;
+    std.mem.writeInt(u32, msg[offset..][0..4], @intCast(session.files.items.len), .little);
+    offset += 4;
+    std.mem.writeInt(u64, msg[offset..][0..8], session.total_bytes, .little);
+    offset += 8;
+
+    for (session.files.items) |entry| {
+        std.mem.writeInt(u16, msg[offset..][0..2], @intCast(entry.path.len), .little);
+        offset += 2;
+        @memcpy(msg[offset..][0..entry.path.len], entry.path);
+        offset += entry.path.len;
+        std.mem.writeInt(u64, msg[offset..][0..8], entry.size, .little);
+        offset += 8;
+        std.mem.writeInt(u64, msg[offset..][0..8], entry.mtime, .little);
+        offset += 8;
+        std.mem.writeInt(u64, msg[offset..][0..8], entry.hash, .little);
+        offset += 8;
+        msg[offset] = if (entry.is_dir) 1 else 0;
+        offset += 1;
+    }
+
+    return msg;
+}
+
+/// Build DELTA_DATA message for a file.
+/// [0x39][transfer_id:u32][file_index:u32][compressed_delta...]
+/// Delta payload (before compression): sequence of commands:
+///   COPY:    [0x00][offset:u64][length:u32]
+///   LITERAL: [0x01][length:u32][data...]
+pub fn buildDeltaData(
+    allocator: Allocator,
+    session: *TransferSession,
+    file_index: u32,
+    delta_payload: []const u8,
+) ![]u8 {
+    // Compress the delta payload
+    const compressed = try session.compress(delta_payload);
+    defer allocator.free(compressed);
+
+    const header_len: usize = 1 + 4 + 4 + 4; // type + transfer_id + file_index + uncompressed_size
+    var msg = try allocator.alloc(u8, header_len + compressed.len);
+
+    msg[0] = @intFromEnum(ServerMsgType.delta_data);
+    std.mem.writeInt(u32, msg[1..5], session.id, .little);
+    std.mem.writeInt(u32, msg[5..9], file_index, .little);
+    std.mem.writeInt(u32, msg[9..13], @intCast(delta_payload.len), .little);
+    @memcpy(msg[13..], compressed);
+
+    return msg;
+}
+
+/// Build SYNC_COMPLETE message.
+/// [0x3A][transfer_id:u32][files_synced:u32][bytes_transferred:u64]
+pub fn buildSyncComplete(allocator: Allocator, transfer_id: u32, files_synced: u32, bytes_transferred: u64) ![]u8 {
+    var msg = try allocator.alloc(u8, 17);
+    msg[0] = @intFromEnum(ServerMsgType.sync_complete);
+    std.mem.writeInt(u32, msg[1..5], transfer_id, .little);
+    std.mem.writeInt(u32, msg[5..9], files_synced, .little);
+    std.mem.writeInt(u64, msg[9..17], bytes_transferred, .little);
+    return msg;
+}
+
+/// Compute delta between server file and client's block checksums.
+/// Returns a delta payload (sequence of COPY/LITERAL commands).
+pub fn computeDelta(
+    allocator: Allocator,
+    server_data: []const u8,
+    client_checksums: []const BlockChecksum,
+    block_size: u32,
+) ![]u8 {
+    // Build hash table of client checksums for O(1) rolling lookup
+    const HashEntry = struct { index: u32, strong: u64 };
+    var hash_table = std.AutoHashMap(u32, std.ArrayListUnmanaged(HashEntry)).init(allocator);
+    defer {
+        var iter = hash_table.valueIterator();
+        while (iter.next()) |list| {
+            list.deinit(allocator);
+        }
+        hash_table.deinit();
+    }
+
+    for (client_checksums, 0..) |cs, i| {
+        const gop = try hash_table.getOrPut(cs.rolling);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(allocator, .{ .index = @intCast(i), .strong = cs.strong });
+    }
+
+    // Build delta commands
+    var delta: std.ArrayListUnmanaged(u8) = .{};
+    defer delta.deinit(allocator);
+
+    var literal_start: usize = 0;
+    var pos: usize = 0;
+
+    while (pos + block_size <= server_data.len) {
+        const block = server_data[pos..][0..block_size];
+        const rolling = RollingChecksum.compute(block);
+        const rolling_hash = rolling.hash();
+
+        if (hash_table.get(rolling_hash)) |entries| {
+            // Check strong hash
+            const strong = xxh3Hash(block);
+            for (entries.items) |entry| {
+                if (entry.strong == strong) {
+                    // Match found — emit any pending literal data first
+                    if (pos > literal_start) {
+                        const literal = server_data[literal_start..pos];
+                        try delta.append(allocator, @intFromEnum(DeltaCmd.literal));
+                        var len_buf: [4]u8 = undefined;
+                        std.mem.writeInt(u32, &len_buf, @intCast(literal.len), .little);
+                        try delta.appendSlice(allocator, &len_buf);
+                        try delta.appendSlice(allocator, literal);
+                    }
+
+                    // Emit COPY command
+                    try delta.append(allocator, @intFromEnum(DeltaCmd.copy));
+                    var offset_buf: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &offset_buf, @as(u64, entry.index) * @as(u64, block_size), .little);
+                    try delta.appendSlice(allocator, &offset_buf);
+                    var copy_len_buf: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &copy_len_buf, block_size, .little);
+                    try delta.appendSlice(allocator, &copy_len_buf);
+
+                    pos += block_size;
+                    literal_start = pos;
+                    break;
+                }
+            } else {
+                pos += 1;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Emit remaining data as literal
+    if (literal_start < server_data.len) {
+        const literal = server_data[literal_start..];
+        try delta.append(allocator, @intFromEnum(DeltaCmd.literal));
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(literal.len), .little);
+        try delta.appendSlice(allocator, &len_buf);
+        try delta.appendSlice(allocator, literal);
+    }
+
+    return try allocator.dupe(u8, delta.items);
 }
 
 

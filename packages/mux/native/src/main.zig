@@ -1935,7 +1935,7 @@ const Server = struct {
             self.handleBinaryControlMessageFromClient(conn, data);
         } else if (msg_type >= 0x90 and msg_type <= 0x9F) {
             self.handleAuthMessage(conn, data);
-        } else if (msg_type >= 0x20 and msg_type <= 0x24) {
+        } else if (msg_type >= 0x20 and msg_type <= 0x27) {
             // File transfer messages: deprecated on control WS, use /ws/file instead.
             // Keep fallback for backwards compatibility with older clients.
             self.handleFileTransferMessage(conn, data);
@@ -3251,6 +3251,9 @@ const Server = struct {
             @intFromEnum(transfer.ClientMsgType.file_data) => self.handleFileData(conn, data),
             @intFromEnum(transfer.ClientMsgType.transfer_resume) => self.handleTransferResume(conn, data),
             @intFromEnum(transfer.ClientMsgType.transfer_cancel) => self.handleTransferCancel(conn, data),
+            @intFromEnum(transfer.ClientMsgType.sync_request) => self.handleSyncRequest(conn, data),
+            @intFromEnum(transfer.ClientMsgType.block_checksums) => self.handleBlockChecksums(conn, data),
+            @intFromEnum(transfer.ClientMsgType.sync_ack) => {}, // Client confirms delta applied — no server action needed
             else => std.debug.print("Unknown file transfer message type: 0x{x:0>2}\n", .{msg_type}),
         }
     }
@@ -3465,6 +3468,119 @@ const Server = struct {
         conn.user_data = null;
 
         std.debug.print("Transfer {d} cancelled\n", .{transfer_id});
+    }
+
+    // Handle SYNC_REQUEST message — incremental sync (rsync-style)
+    fn handleSyncRequest(self: *Server, conn: *ws.Connection, data: []u8) void {
+        var sync_data = transfer.parseSyncRequest(self.allocator, data) catch |err| {
+            std.debug.print("Failed to parse SYNC_REQUEST: {}\n", .{err});
+            return;
+        };
+        defer sync_data.deinit(self.allocator);
+
+        // Expand ~ in path
+        const expanded_path = self.expandPath(sync_data.path) catch sync_data.path;
+        defer if (expanded_path.ptr != sync_data.path.ptr) self.allocator.free(expanded_path);
+
+        // Create a download session for the sync
+        const session = self.transfer_manager.createSession(.download, .{}, expanded_path) catch |err| {
+            std.debug.print("Failed to create sync session: {}\n", .{err});
+            return;
+        };
+
+        // Add exclude patterns
+        for (sync_data.excludes) |pattern| {
+            session.addExcludePattern(pattern) catch {};
+        }
+
+        conn.user_data = session;
+
+        // Build file list
+        session.buildFileList() catch |err| {
+            std.debug.print("Failed to build sync file list: {}\n", .{err});
+            const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read directory") catch return;
+            defer self.allocator.free(error_msg);
+            conn.sendBinary(error_msg) catch {};
+            return;
+        };
+
+        // Send SYNC_FILE_LIST (same format as FILE_LIST but different msg type)
+        const list_msg = transfer.buildSyncFileList(self.allocator, session) catch return;
+        defer self.allocator.free(list_msg);
+        conn.sendBinary(list_msg) catch {};
+
+        std.debug.print("Sync session {d} created for {s} ({d} files)\n", .{
+            session.id,
+            expanded_path,
+            session.files.items.len,
+        });
+    }
+
+    // Handle BLOCK_CHECKSUMS message — client sends checksums of cached copy
+    fn handleBlockChecksums(self: *Server, conn: *ws.Connection, data: []u8) void {
+        const checksums_msg = transfer.parseBlockChecksums(self.allocator, data) catch |err| {
+            std.debug.print("Failed to parse BLOCK_CHECKSUMS: {}\n", .{err});
+            return;
+        };
+        defer self.allocator.free(checksums_msg.checksums);
+
+        const session = self.transfer_manager.getSession(checksums_msg.transfer_id) orelse return;
+        if (checksums_msg.file_index >= session.files.items.len) return;
+
+        const file_entry = session.files.items[checksums_msg.file_index];
+        if (file_entry.is_dir or file_entry.size == 0) return;
+
+        // Read the server's copy of the file
+        const server_data = session.readFileChunk(checksums_msg.file_index, 0, @intCast(file_entry.size)) catch |err| {
+            std.debug.print("Failed to read file for delta: {s}: {}\n", .{ file_entry.path, err });
+            return;
+        };
+
+        // Compute delta between server file and client's cached checksums
+        const block_size = if (checksums_msg.block_size > 0)
+            checksums_msg.block_size
+        else
+            transfer.computeBlockSize(file_entry.size);
+
+        const delta_payload = if (checksums_msg.checksums.len > 0)
+            transfer.computeDelta(self.allocator, server_data, checksums_msg.checksums, block_size) catch |err| {
+                std.debug.print("Failed to compute delta for {s}: {}\n", .{ file_entry.path, err });
+                // Fall back to sending full file as literal
+                self.sendFullFileAsLiteral(conn, session, checksums_msg.file_index, server_data);
+                session.closeCurrentFile();
+                return;
+            }
+        else blk: {
+            // No checksums — client has no cached copy, send full file as literal
+            self.sendFullFileAsLiteral(conn, session, checksums_msg.file_index, server_data);
+            session.closeCurrentFile();
+            break :blk null;
+        };
+
+        if (delta_payload) |payload| {
+            defer self.allocator.free(payload);
+            session.closeCurrentFile();
+
+            // Build and send DELTA_DATA message
+            const delta_msg = transfer.buildDeltaData(self.allocator, session, checksums_msg.file_index, payload) catch return;
+            defer self.allocator.free(delta_msg);
+            conn.sendBinary(delta_msg) catch {};
+        }
+    }
+
+    /// Send full file content as a DELTA_DATA with a single LITERAL command
+    fn sendFullFileAsLiteral(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession, file_index: u32, data: []const u8) void {
+        // Build literal-only delta: [LITERAL:1][length:4][data...]
+        const literal_payload = self.allocator.alloc(u8, 1 + 4 + data.len) catch return;
+        defer self.allocator.free(literal_payload);
+
+        literal_payload[0] = @intFromEnum(transfer.DeltaCmd.literal);
+        std.mem.writeInt(u32, literal_payload[1..5], @intCast(data.len), .little);
+        @memcpy(literal_payload[5..][0..data.len], data);
+
+        const delta_msg = transfer.buildDeltaData(self.allocator, session, file_index, literal_payload) catch return;
+        defer self.allocator.free(delta_msg);
+        conn.sendBinary(delta_msg) catch {};
     }
 
     /// Push all file chunks for a download transfer.
