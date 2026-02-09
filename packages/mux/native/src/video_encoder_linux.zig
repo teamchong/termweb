@@ -640,7 +640,6 @@ pub const VideoEncoder = struct {
     /// Only creates per-encoder resources (surfaces, context, coded buffer).
     pub fn init(_: std.mem.Allocator, _: u32, _: u32) CreateError!*VideoEncoder {
         // Must use initWithShared() with a SharedVaContext instead
-        std.debug.print("ENCODER: init() without shared context not supported, use initWithShared()\n", .{});
         return error.VaDisplayFailed;
     }
 
@@ -650,7 +649,6 @@ pub const VideoEncoder = struct {
     pub fn initWithShared(allocator: std.mem.Allocator, shared: *SharedVaContext, width: u32, height: u32) CreateError!*VideoEncoder {
         // Reject zero dimensions — VA-API cannot create context for 0x0
         if (width == 0 or height == 0) {
-            std.debug.print("ENCODER: rejecting zero dimensions {}x{}\n", .{ width, height });
             return error.VaContextFailed;
         }
 
@@ -664,8 +662,6 @@ pub const VideoEncoder = struct {
         const scaled = calcAlignedDimensions(width, height, default_tier.max_pixels);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
-
-        std.debug.print("ENCODER: init {}x{} -> encode {}x{} tier={d}\n", .{ width, height, encode_width, encode_height, DEFAULT_TIER });
 
         const va_display = shared.va_display;
 
@@ -924,10 +920,6 @@ pub const VideoEncoder = struct {
         const encode_height = scaled.h;
 
         if (encode_width == self.width and encode_height == self.height) return;
-
-        std.debug.print("QUALITY: resize {d}x{d} -> {d}x{d} (source {d}x{d})\n", .{
-            self.width, self.height, encode_width, encode_height, self.source_width, self.source_height,
-        });
 
         const va_display = self.shared.va_display;
 

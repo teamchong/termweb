@@ -715,7 +715,6 @@ const Panel = struct {
     fn startStreaming(self: *Panel) void {
         self.streaming.store(true, .release);
         self.force_keyframe = true;
-        std.debug.print("FORCE_KF panel={d} reason=startStreaming\n", .{self.id});
         self.ticks_since_connect = 0;
         self.consecutive_unchanged = 0;
     }
@@ -750,7 +749,6 @@ const Panel = struct {
         // Don't resize frame_buffer here - let captureFromIOSurface do it
         // when the IOSurface actually updates to the new size (at pixel dimensions)
         self.force_keyframe = true;
-        std.debug.print("FORCE_KF panel={d} reason=resize\n", .{self.id});
     }
 
     fn pause(self: *Panel) void {
@@ -760,12 +758,10 @@ const Panel = struct {
     fn resumeStream(self: *Panel) void {
         self.streaming.store(true, .release);
         self.force_keyframe = true;
-        std.debug.print("FORCE_KF panel={d} reason=resumeStream\n", .{self.id});
     }
 
     fn requestKeyframe(self: *Panel) void {
         self.force_keyframe = true;
-        std.debug.print("FORCE_KF panel={d} reason=clientRequestKeyframe\n", .{self.id});
     }
 
     // Returns true if frame changed, false if identical to previous
@@ -793,7 +789,6 @@ const Panel = struct {
 
         // Lazy init video encoder and BGRA buffer on first frame capture
         if (self.video_encoder == null) {
-            std.debug.print("ENCODER: Creating encoder for {}x{} ({} MB)\n", .{ surf_width, surf_height, new_size / 1024 / 1024 });
             self.video_encoder = try video.VideoEncoder.init(self.allocator, surf_width, surf_height);
             self.bgra_buffer = try self.allocator.alloc(u8, new_size);
         } else if (new_size != self.bgra_buffer.?.len) {
@@ -869,12 +864,7 @@ const Panel = struct {
             self.video_encoder = try video.VideoEncoder.init(self.allocator, surf_width, surf_height);
             // Only allocate BGRA buffer if scaling is needed
             if (!self.video_encoder.?.canEncodeDirectly()) {
-                std.debug.print("ENCODER: {}x{} -> {}x{} (scaling, BGRA path)\n", .{
-                    surf_width, surf_height, self.video_encoder.?.width, self.video_encoder.?.height,
-                });
                 self.bgra_buffer = try self.allocator.alloc(u8, new_size);
-            } else {
-                std.debug.print("ENCODER: {}x{} (zero-copy path)\n", .{ surf_width, surf_height });
             }
         } else if (surf_width != self.video_encoder.?.source_width or surf_height != self.video_encoder.?.source_height) {
             // Resize encoder if needed
@@ -1444,19 +1434,9 @@ const Panel = struct {
         if (payload.len < 4) return;
 
         const health = payload[0]; // 0-100: buffer health (100 = all frames consumed)
-        const fps = payload[1]; // Received FPS at client
-        const buffer_ms = std.mem.readInt(u16, payload[2..4], .little);
 
         if (self.video_encoder) |encoder| {
-            const old_level = encoder.quality_level;
             encoder.adjustQuality(health);
-
-            // Log tier changes (adjustQuality handles AIMD internally)
-            if (encoder.quality_level != old_level) {
-                std.debug.print("ADAPTIVE panel={d}: tier {d}->{d} health={d} fps={d} buf={d}ms\n", .{
-                    self.id, old_level, encoder.quality_level, health, fps, buffer_ms,
-                });
-            }
         }
     }
 };
@@ -1666,7 +1646,6 @@ const Server = struct {
 
         self.app = app;
         self.config = config;
-        std.debug.print("Ghostty initialized (first panel created)\n", .{});
     }
 
     // Free ghostty when last panel is closed (scale to zero)
@@ -1693,7 +1672,6 @@ const Server = struct {
         // Free outside mutex to avoid blocking panel creation
         c.ghostty_app_free(app);
         c.ghostty_config_free(cfg);
-        std.debug.print("Ghostty freed (all panels closed)\n", .{});
     }
 
     fn deinit(self: *Server) void {
@@ -2017,13 +1995,11 @@ const Server = struct {
         while (panel_it.next()) |panel_ptr| {
             const panel = panel_ptr.*;
             panel.force_keyframe = true;
-            std.debug.print("FORCE_KF panel={d} reason=h264ClientConnected\n", .{panel.id});
             panel.ticks_since_connect = 100; // Skip initial render delay
         }
         self.mutex.unlock();
 
         self.wake_signal.notify();
-        std.debug.print("H264 client connected\n", .{});
     }
 
     fn onH264Message(_: *ws.Connection, _: []u8, _: bool) void {
@@ -2041,8 +2017,6 @@ const Server = struct {
             }
         }
         self.mutex.unlock();
-
-        std.debug.print("H264 client disconnected\n", .{});
     }
 
     // Send H264 frame to all H264 clients with [panel_id:u32][frame_data...] prefix.
@@ -2184,7 +2158,6 @@ const Server = struct {
             return;
         } else if (inner_type == @intFromEnum(ClientMsg.request_keyframe)) {
             p.force_keyframe = true;
-            std.debug.print("FORCE_KF panel={d} reason=clientRequestKeyframe_onPanelMsg\n", .{p.id});
             self.wake_signal.notify();
             return;
         }
@@ -2290,7 +2263,6 @@ const Server = struct {
                     for (panel_ids.items) |pid| {
                         if (self.panels.get(pid)) |panel| {
                             panel.force_keyframe = true;
-                            std.debug.print("FORCE_KF panel={d} reason=focusTabSwitch\n", .{panel.id});
                         }
                     }
                 }
@@ -4085,7 +4057,6 @@ const Server = struct {
                         } else {
                             // All sends failed — force keyframe for recovery
                             panel.force_keyframe = true;
-                            std.debug.print("FORCE_KF panel={d} reason=allSendsFailed\n", .{panel.id});
                             frames_dropped += 1;
                             send_failed = true;
                         }
