@@ -19,22 +19,6 @@
     }
   }
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') {
-      e.stopPropagation();
-      onClose?.();
-    }
-  }
-
-  // Only attach window listener when open
-  $effect(() => {
-    if (isOpen) {
-      window.addEventListener('keydown', handleKeydown);
-      return () => {
-        window.removeEventListener('keydown', handleKeydown);
-      };
-    }
-  });
 
   // Export container for parent to use
   export function getContainer(): HTMLElement | undefined {
