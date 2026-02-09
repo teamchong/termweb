@@ -117,6 +117,7 @@ export async function initWebGPURenderer(
             device.destroy();
           }
 
+          console.log('[Renderer] using WebGPU');
           return { renderFrame, dispose };
         }
       }
@@ -126,5 +127,7 @@ export async function initWebGPURenderer(
   }
 
   // Fall back to Canvas 2D (iOS Safari, older browsers)
-  return initCanvas2DFallback(canvas);
+  const fallback = initCanvas2DFallback(canvas);
+  if (fallback) console.log('[Renderer] using Canvas 2D fallback');
+  return fallback;
 }

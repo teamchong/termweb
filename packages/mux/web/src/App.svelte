@@ -505,6 +505,9 @@
     }
 
     // Forward all other keys to active panel
+    // Skip if a mobile-input textarea has focus (it handles its own input)
+    if ((e.target as HTMLElement)?.classList?.contains('mobile-input')) return;
+
     const activePanel = muxClient?.getActivePanel();
     if (activePanel) {
       e.preventDefault();
@@ -526,6 +529,9 @@
 
     // Don't forward Cmd key releases (they're handled by shortcuts)
     if (e.metaKey) return;
+
+    // Skip if a mobile-input textarea has focus
+    if ((e.target as HTMLElement)?.classList?.contains('mobile-input')) return;
 
     // Forward keyup to active panel
     const activePanel = muxClient?.getActivePanel();

@@ -74,6 +74,7 @@
   let canvasEl: HTMLCanvasElement | undefined = $state();
   let loadingEl: HTMLElement | undefined = $state();
   let inspectorEl: HTMLElement | undefined = $state();
+  let mobileInputEl: HTMLTextAreaElement | undefined = $state();
 
   // ============================================================================
   // Internal State (non-reactive for performance)
@@ -689,7 +690,12 @@
   }
 
   function handleMouseDown(e: MouseEvent): void {
-    panelEl?.focus();
+    // On touch devices, focus goes to the hidden textarea — don't steal it
+    if (isTouchDevice) {
+      focusMobileInput();
+    } else {
+      panelEl?.focus();
+    }
     onActivate?.();
     sendMouseButton(e, true);
   }
@@ -764,6 +770,185 @@
 
   function handleContextMenu(e: Event): void {
     e.preventDefault();
+  }
+
+  // ============================================================================
+  // Mobile / Touch Input
+  // ============================================================================
+
+  const isTouchDevice = typeof window !== 'undefined' && !window.matchMedia('(hover: hover)').matches;
+
+  // Track touch state for gesture detection
+  let touchStartTime = 0;
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let lastTouchX = 0;
+  let lastTouchY = 0;
+
+  function focusMobileInput(): void {
+    if (isTouchDevice && mobileInputEl) {
+      // Reset textarea content to a single space — iOS needs non-empty content
+      // to fire deleteContentBackward for Backspace detection
+      mobileInputEl.value = ' ';
+      mobileInputEl.setSelectionRange(1, 1);
+      mobileInputEl.focus();
+    }
+  }
+
+  function charToKeyCode(char: string): string {
+    const c = char.charCodeAt(0);
+    const lower = char.toLowerCase();
+    if (c >= 65 && c <= 90 || c >= 97 && c <= 122) return `Key${lower.toUpperCase()}`;
+    if (c >= 48 && c <= 57) return `Digit${char}`;
+    switch (char) {
+      case ' ': return 'Space';
+      case '-': case '_': return 'Minus';
+      case '=': case '+': return 'Equal';
+      case '[': case '{': return 'BracketLeft';
+      case ']': case '}': return 'BracketRight';
+      case '\\': case '|': return 'Backslash';
+      case ';': case ':': return 'Semicolon';
+      case "'": case '"': return 'Quote';
+      case '`': case '~': return 'Backquote';
+      case ',': case '<': return 'Comma';
+      case '.': case '>': return 'Period';
+      case '/': case '?': return 'Slash';
+      default: return '';
+    }
+  }
+
+  function sendKeyPress(code: string, text: string, mods: number): void {
+    if (!canSendInput()) return;
+    const codeBytes = sharedTextEncoder.encode(code);
+    const textBytes = sharedTextEncoder.encode(text);
+    const buf = new ArrayBuffer(5 + codeBytes.length + textBytes.length);
+    const view = new Uint8Array(buf);
+    view[0] = ClientMsg.KEY_INPUT;
+    view[1] = 1; // press
+    view[2] = mods;
+    view[3] = codeBytes.length;
+    view.set(codeBytes, 4);
+    view[4 + codeBytes.length] = textBytes.length;
+    view.set(textBytes, 5 + codeBytes.length);
+    sendInput(buf);
+  }
+
+  function handleMobileInput(e: Event): void {
+    const textarea = e.target as HTMLTextAreaElement;
+    const val = textarea.value;
+
+    if (val.length > 1) {
+      // New text was typed — send each character as KEY_INPUT so ghostty
+      // processes it through its input handler (cursor style, key mapping, etc.)
+      const typed = val.slice(1);
+      if (canSendInput()) {
+        for (const char of typed) {
+          const code = charToKeyCode(char);
+          if (code) {
+            sendKeyPress(code, char, 0);
+          } else {
+            // Non-ASCII or unmapped — fall back to TEXT_INPUT
+            sendTextInput(char);
+          }
+        }
+      }
+    } else if (val.length === 0) {
+      // Backspace deleted the sentinel space
+      sendKeyPress('Backspace', '', 0);
+    }
+
+    // Reset to sentinel space
+    textarea.value = ' ';
+    textarea.setSelectionRange(1, 1);
+  }
+
+  function handleMobileKeydown(e: KeyboardEvent): void {
+    // iOS sends reliable keydown for special keys — forward them directly
+    const special = ['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+    if (special.includes(e.key)) {
+      e.preventDefault();
+      const text = (e.key.length === 1) ? e.key : '';
+      sendKeyPress(e.code || e.key, text, getModifiers(e));
+    }
+  }
+
+  function handleTouchStart(e: TouchEvent): void {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      touchStartTime = Date.now();
+      touchStartX = t.clientX;
+      touchStartY = t.clientY;
+      lastTouchX = t.clientX;
+      lastTouchY = t.clientY;
+    }
+  }
+
+  function handleTouchMove(e: TouchEvent): void {
+    if (e.touches.length === 1 && canSendInput() && canvasEl) {
+      const t = e.touches[0];
+      const rect = canvasEl.getBoundingClientRect();
+      const x = t.clientX - rect.left;
+      const y = t.clientY - rect.top;
+      lastTouchX = t.clientX;
+      lastTouchY = t.clientY;
+      throttledSendMouseMove?.(x, y, 0);
+    } else if (e.touches.length === 2 && canSendInput() && canvasEl) {
+      // Two-finger scroll
+      e.preventDefault();
+      const t0 = e.touches[0];
+      const t1 = e.touches[1];
+      const midX = (t0.clientX + t1.clientX) / 2;
+      const midY = (t0.clientY + t1.clientY) / 2;
+      const rect = canvasEl.getBoundingClientRect();
+      const x = midX - rect.left;
+      const y = midY - rect.top;
+      const dy = ((lastTouchY - t0.clientY) + (lastTouchY - t1.clientY)) / 2;
+
+      wheelView.setUint8(0, ClientMsg.MOUSE_SCROLL);
+      wheelView.setFloat64(1, x, true);
+      wheelView.setFloat64(9, y, true);
+      wheelView.setFloat64(17, 0, true);
+      wheelView.setFloat64(25, dy * 2, true);
+      wheelView.setUint8(33, 0);
+      sendInput(wheelBuffer);
+
+      lastTouchY = (t0.clientY + t1.clientY) / 2;
+    }
+  }
+
+  function handleTouchEnd(e: TouchEvent): void {
+    if (e.changedTouches.length === 1 && canvasEl) {
+      const t = e.changedTouches[0];
+      const elapsed = Date.now() - touchStartTime;
+      const dx = Math.abs(t.clientX - touchStartX);
+      const dy = Math.abs(t.clientY - touchStartY);
+
+      // Tap detection: short duration, minimal movement
+      if (elapsed < 300 && dx < 10 && dy < 10) {
+        // Prevent synthetic mousedown/mouseup from stealing focus
+        e.preventDefault();
+
+        const rect = canvasEl.getBoundingClientRect();
+        const x = t.clientX - rect.left;
+        const y = t.clientY - rect.top;
+
+        // Send mouse click (down + up)
+        mouseButtonView.setUint8(0, ClientMsg.MOUSE_INPUT);
+        mouseButtonView.setFloat64(1, x, true);
+        mouseButtonView.setFloat64(9, y, true);
+        mouseButtonView.setUint8(17, 0); // left button
+        mouseButtonView.setUint8(18, 1); // pressed
+        mouseButtonView.setUint8(19, 0);
+        sendInput(mouseButtonBuffer);
+
+        mouseButtonView.setUint8(18, 0); // released
+        sendInput(mouseButtonBuffer);
+
+        // Focus the hidden textarea to show virtual keyboard
+        onActivate?.();
+        focusMobileInput();
+      }
+    }
   }
 
   // ============================================================================
@@ -1098,7 +1283,23 @@
       onmousemove={handleMouseMove}
       onwheel={handleWheel}
       oncontextmenu={handleContextMenu}
+      ontouchstart={handleTouchStart}
+      ontouchmove={handleTouchMove}
+      ontouchend={handleTouchEnd}
     ></canvas>
+    {#if isTouchDevice}
+      <textarea
+        class="mobile-input"
+        bind:this={mobileInputEl}
+        oninput={handleMobileInput}
+        onkeydown={handleMobileKeydown}
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="off"
+        spellcheck={false}
+        style="top:{cursorPct ? cursorPct.top : 50}%;left:{cursorPct ? cursorPct.left : 0}%"
+      ></textarea>
+    {/if}
     {#if cursorSurfW > 0 && cursorSurfH > 0}
       <div class="cursor-container" style="--fw:{cursorSurfW};--fh:{cursorSurfH}">
         <div class="cursor-viewport">
@@ -1246,6 +1447,29 @@
     object-position: top left;
     background: var(--bg);
     outline: none;
+    touch-action: pinch-zoom;
+  }
+
+  .mobile-input {
+    position: absolute;
+    /* Position set via inline style to track cursor location */
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    padding: 0;
+    border: 0;
+    margin: 0;
+    outline: none;
+    resize: none;
+    overflow: hidden;
+    /* Prevent iOS zoom on focus (must be >= 16px) */
+    font-size: 16px;
+    /* Hide the caret and any text rendering */
+    caret-color: transparent;
+    color: transparent;
+    background: transparent;
+    /* Allow programmatic focus but don't block touch on canvas */
+    pointer-events: none;
   }
 
   .cursor-container {
