@@ -134,6 +134,7 @@
 <style>
   .menu {
     position: relative;
+    user-select: none;
   }
 
   .menu-label {
