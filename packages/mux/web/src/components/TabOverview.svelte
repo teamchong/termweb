@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tabs, activeTabId } from '../stores/index';
   import type { MuxClient } from '../services/mux';
+  import { initWebGPURenderer, type WebGPUFrameRenderer } from '../webgpu-renderer';
   import { PANEL } from '../constants';
   import { NAL } from '../constants';
 
@@ -31,7 +32,8 @@
 
   // Per-panel decoders for live preview
   let panelDecoders = new Map<number, VideoDecoder>();
-  let panelContexts = new Map<number, CanvasRenderingContext2D>();
+  let panelRenderers = new Map<number, WebGPUFrameRenderer>();
+  let panelRendererPending = new Set<number>();
   let panelDecoderConfigured = new Map<number, boolean>();
   let panelLastCodec = new Map<number, string>();
   let panelGotFirstKeyframe = new Map<number, boolean>();
@@ -131,6 +133,45 @@
     return `avc1.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
   }
 
+  function convertAnnexBToAvcc(data: Uint8Array): void {
+    const positions: number[] = [];
+    for (let i = 0; i < data.length - 3; i++) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+        positions.push(i);
+        i += 3;
+      }
+    }
+    for (let k = 0; k < positions.length; k++) {
+      const pos = positions[k];
+      const end = k + 1 < positions.length ? positions[k + 1] : data.length;
+      const nalLen = end - pos - 4;
+      data[pos]     = (nalLen >>> 24) & 0xFF;
+      data[pos + 1] = (nalLen >>> 16) & 0xFF;
+      data[pos + 2] = (nalLen >>> 8) & 0xFF;
+      data[pos + 3] = nalLen & 0xFF;
+    }
+  }
+
+  function buildAvcDescription(sps: Uint8Array, pps: Uint8Array): Uint8Array {
+    const size = 6 + 2 + sps.length + 1 + 2 + pps.length;
+    const desc = new Uint8Array(size);
+    let o = 0;
+    desc[o++] = 1;                           // configurationVersion
+    desc[o++] = sps[1];                      // AVCProfileIndication
+    desc[o++] = sps[2];                      // profile_compatibility
+    desc[o++] = sps[3];                      // AVCLevelIndication
+    desc[o++] = 0xFF;                        // reserved(6) + lengthSizeMinusOne(2)
+    desc[o++] = 0xE1;                        // reserved(3) + numSPS(5) = 1
+    desc[o++] = (sps.length >> 8) & 0xFF;
+    desc[o++] = sps.length & 0xFF;
+    desc.set(sps, o); o += sps.length;
+    desc[o++] = 1;                           // numPPS
+    desc[o++] = (pps.length >> 8) & 0xFF;
+    desc[o++] = pps.length & 0xFF;
+    desc.set(pps, o);
+    return desc;
+  }
+
   function getOrCreateDecoder(panelId: number): VideoDecoder | null {
     if (panelDecoders.has(panelId)) return panelDecoders.get(panelId)!;
 
@@ -145,13 +186,15 @@
           canvas.width = frame.displayWidth;
           canvas.height = frame.displayHeight;
         }
-        let ctx = panelContexts.get(panelId);
-        if (!ctx) {
-          ctx = canvas.getContext('2d') ?? undefined;
-          if (ctx) panelContexts.set(panelId, ctx);
-        }
-        if (ctx) {
-          ctx.drawImage(frame, 0, 0);
+        const renderer = panelRenderers.get(panelId);
+        if (renderer) {
+          renderer.renderFrame(frame);
+        } else if (!panelRendererPending.has(panelId)) {
+          panelRendererPending.add(panelId);
+          initWebGPURenderer(canvas).then((r) => {
+            panelRendererPending.delete(panelId);
+            if (r) panelRenderers.set(panelId, r);
+          });
         }
         frame.close();
       },
@@ -172,15 +215,17 @@
     const nalUnits = parseNalUnits(frameData);
     let isKeyframe = false;
     let sps: Uint8Array | null = null;
+    let pps: Uint8Array | null = null;
 
     for (const nal of nalUnits) {
       if (nal.length === 0) continue;
       const nalType = nal[0] & NAL.TYPE_MASK;
       if (nalType === NAL.TYPE_SPS) sps = nal;
+      else if (nalType === NAL.TYPE_PPS) pps = nal;
       else if (nalType === NAL.TYPE_IDR) isKeyframe = true;
     }
 
-    if (sps) {
+    if (sps && pps) {
       const codec = getCodecFromSps(sps);
       const lastCodec = panelLastCodec.get(panelId);
       const configured = panelDecoderConfigured.get(panelId);
@@ -190,7 +235,11 @@
             decoder.reset();
             panelGotFirstKeyframe.delete(panelId);
           }
-          decoder.configure({ codec, optimizeForLatency: true });
+          decoder.configure({
+            codec,
+            optimizeForLatency: true,
+            description: buildAvcDescription(sps, pps),
+          });
           panelDecoderConfigured.set(panelId, true);
           panelLastCodec.set(panelId, codec);
         } catch (e) {
@@ -210,6 +259,7 @@
     // Skip frames if decoder is backed up
     if (!isKeyframe && decoder.decodeQueueSize > 2) return;
 
+    convertAnnexBToAvcc(frameData);
     const timestamp = performance.now() * 1000;
     try {
       const chunk = new EncodedVideoChunk({
@@ -252,7 +302,11 @@
       } catch { /* ignore */ }
     }
     panelDecoders.clear();
-    panelContexts.clear();
+    for (const [, renderer] of panelRenderers) {
+      renderer.dispose();
+    }
+    panelRenderers.clear();
+    panelRendererPending.clear();
     panelDecoderConfigured.clear();
     panelLastCodec.clear();
     panelGotFirstKeyframe.clear();

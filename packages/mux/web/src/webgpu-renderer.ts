@@ -29,91 +29,102 @@ fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
 }
 `;
 
+function initCanvas2DFallback(canvas: HTMLCanvasElement): WebGPUFrameRenderer | null {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  return {
+    renderFrame(frame: VideoFrame): void {
+      ctx.drawImage(frame as any, 0, 0, canvas.width, canvas.height);
+    },
+    dispose(): void { /* nothing to clean up */ },
+  };
+}
+
 export async function initWebGPURenderer(
   canvas: HTMLCanvasElement,
 ): Promise<WebGPUFrameRenderer | null> {
+  // Try WebGPU first
   try {
-    if (!navigator.gpu) return null;
+    if (navigator.gpu) {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) {
+        const device = await adapter.requestDevice();
+        const gpuCtx = canvas.getContext('webgpu');
+        if (gpuCtx) {
+          const format = navigator.gpu.getPreferredCanvasFormat();
+          gpuCtx.configure({ device, format, alphaMode: 'opaque' });
 
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) return null;
+          const shaderModule = device.createShaderModule({ code: SHADER });
 
-    const device = await adapter.requestDevice();
+          const pipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: { module: shaderModule, entryPoint: 'vs' },
+            fragment: {
+              module: shaderModule,
+              entryPoint: 'fs',
+              targets: [{ format }],
+            },
+            primitive: { topology: 'triangle-strip', stripIndexFormat: undefined },
+          });
 
-    const gpuCtx = canvas.getContext('webgpu');
-    if (!gpuCtx) return null;
+          const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+          const bindGroupLayout = pipeline.getBindGroupLayout(0);
 
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    gpuCtx.configure({ device, format, alphaMode: 'opaque' });
+          let configuredWidth = canvas.width;
+          let configuredHeight = canvas.height;
 
-    const shaderModule = device.createShaderModule({ code: SHADER });
+          function renderFrame(frame: VideoFrame): void {
+            if (canvas.width !== configuredWidth || canvas.height !== configuredHeight) {
+              gpuCtx!.configure({ device, format, alphaMode: 'opaque' });
+              configuredWidth = canvas.width;
+              configuredHeight = canvas.height;
+            }
 
-    const pipeline = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module: shaderModule, entryPoint: 'vs' },
-      fragment: {
-        module: shaderModule,
-        entryPoint: 'fs',
-        targets: [{ format }],
-      },
-      primitive: { topology: 'triangle-strip', stripIndexFormat: undefined },
-    });
+            const externalTexture = device.importExternalTexture({ source: frame as any });
 
-    const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-    const bindGroupLayout = pipeline.getBindGroupLayout(0);
+            const bindGroup = device.createBindGroup({
+              layout: bindGroupLayout,
+              entries: [
+                { binding: 0, resource: sampler },
+                { binding: 1, resource: externalTexture },
+              ],
+            });
 
-    // Track configured canvas size to reconfigure context on resize
-    let configuredWidth = canvas.width;
-    let configuredHeight = canvas.height;
+            const commandEncoder = device.createCommandEncoder();
+            const textureView = gpuCtx!.getCurrentTexture().createView();
 
-    function renderFrame(frame: VideoFrame): void {
-      // Reconfigure the WebGPU context if canvas dimensions changed.
-      // Without this, the backing texture from the initial configure()
-      // doesn't match the canvas size, causing a blank frame.
-      if (canvas.width !== configuredWidth || canvas.height !== configuredHeight) {
-        gpuCtx!.configure({ device, format, alphaMode: 'opaque' });
-        configuredWidth = canvas.width;
-        configuredHeight = canvas.height;
+            const passEncoder = commandEncoder.beginRenderPass({
+              colorAttachments: [
+                {
+                  view: textureView,
+                  clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                  loadOp: 'clear' as GPULoadOp,
+                  storeOp: 'store' as GPUStoreOp,
+                },
+              ],
+            });
+
+            passEncoder.setPipeline(pipeline);
+            passEncoder.setBindGroup(0, bindGroup);
+            passEncoder.draw(4);
+            passEncoder.end();
+
+            device.queue.submit([commandEncoder.finish()]);
+          }
+
+          function dispose(): void {
+            device.destroy();
+          }
+
+          return { renderFrame, dispose };
+        }
       }
-
-      const externalTexture = device.importExternalTexture({ source: frame as any });
-
-      const bindGroup = device.createBindGroup({
-        layout: bindGroupLayout,
-        entries: [
-          { binding: 0, resource: sampler },
-          { binding: 1, resource: externalTexture },
-        ],
-      });
-
-      const commandEncoder = device.createCommandEncoder();
-      const textureView = gpuCtx!.getCurrentTexture().createView();
-
-      const passEncoder = commandEncoder.beginRenderPass({
-        colorAttachments: [
-          {
-            view: textureView,
-            clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            loadOp: 'clear' as GPULoadOp,
-            storeOp: 'store' as GPUStoreOp,
-          },
-        ],
-      });
-
-      passEncoder.setPipeline(pipeline);
-      passEncoder.setBindGroup(0, bindGroup);
-      passEncoder.draw(4);
-      passEncoder.end();
-
-      device.queue.submit([commandEncoder.finish()]);
     }
-
-    function dispose(): void {
-      device.destroy();
-    }
-
-    return { renderFrame, dispose };
   } catch {
-    return null;
+    // WebGPU failed, fall through to Canvas 2D
   }
+
+  // Fall back to Canvas 2D (iOS Safari, older browsers)
+  return initCanvas2DFallback(canvas);
 }

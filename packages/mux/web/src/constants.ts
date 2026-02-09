@@ -52,8 +52,8 @@ export const PANEL = {
   MAX_INSPECTOR_HEIGHT_RATIO: 0.6,
   /** Canvas tabIndex for focus */
   CANVAS_TAB_INDEX: 1,
-  /** Default H.264 codec string (baseline profile 3.1, avc3 = in-band SPS/PPS) */
-  DEFAULT_H264_CODEC: 'avc3.42E01F',
+  /** Default H.264 codec string (baseline profile 3.1) */
+  DEFAULT_H264_CODEC: 'avc1.42E01F',
   /** Assumed FPS for timestamp calculation */
   ASSUMED_FPS: 30,
   /** Maximum latency samples to keep */

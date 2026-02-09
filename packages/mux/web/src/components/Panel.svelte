@@ -327,7 +327,48 @@
     const profile = sps[1];
     const constraints = sps[2];
     const level = sps[3];
-    return `avc3.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
+    return `avc1.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
+  }
+
+  // Convert Annex B (start-code prefixed) to AVCC (length-prefixed) in-place.
+  // Both use 4-byte prefixes so this is a zero-allocation swap.
+  function convertAnnexBToAvcc(data: Uint8Array): void {
+    const positions: number[] = [];
+    for (let i = 0; i < data.length - 3; i++) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+        positions.push(i);
+        i += 3;
+      }
+    }
+    for (let k = 0; k < positions.length; k++) {
+      const pos = positions[k];
+      const end = k + 1 < positions.length ? positions[k + 1] : data.length;
+      const nalLen = end - pos - 4;
+      data[pos]     = (nalLen >>> 24) & 0xFF;
+      data[pos + 1] = (nalLen >>> 16) & 0xFF;
+      data[pos + 2] = (nalLen >>> 8) & 0xFF;
+      data[pos + 3] = nalLen & 0xFF;
+    }
+  }
+
+  function buildAvcDescription(sps: Uint8Array, pps: Uint8Array): Uint8Array {
+    const size = 6 + 2 + sps.length + 1 + 2 + pps.length;
+    const desc = new Uint8Array(size);
+    let o = 0;
+    desc[o++] = 1;                           // configurationVersion
+    desc[o++] = sps[1];                      // AVCProfileIndication
+    desc[o++] = sps[2];                      // profile_compatibility
+    desc[o++] = sps[3];                      // AVCLevelIndication
+    desc[o++] = 0xFF;                        // reserved(6) + lengthSizeMinusOne(2)
+    desc[o++] = 0xE1;                        // reserved(3) + numSPS(5) = 1
+    desc[o++] = (sps.length >> 8) & 0xFF;
+    desc[o++] = sps.length & 0xFF;
+    desc.set(sps, o); o += sps.length;
+    desc[o++] = 1;                           // numPPS
+    desc[o++] = (pps.length >> 8) & 0xFF;
+    desc[o++] = pps.length & 0xFF;
+    desc.set(pps, o);
+    return desc;
   }
 
   function handleFrame(data: ArrayBuffer): void {
@@ -361,16 +402,18 @@
     const nalUnits = parseNalUnits(frameData);
     let isKeyframe = false;
     let sps: Uint8Array | null = null;
+    let pps: Uint8Array | null = null;
 
     for (const nal of nalUnits) {
       if (nal.length === 0) continue;
       const nalType = nal[0] & NAL.TYPE_MASK;
       if (nalType === NAL.TYPE_SPS) sps = nal;
+      else if (nalType === NAL.TYPE_PPS) pps = nal;
       else if (nalType === NAL.TYPE_IDR) isKeyframe = true;
     }
 
-    // Configure decoder with avc3 codec (SPS/PPS in-band via Annex B, no description needed).
-    if (sps) {
+    // Configure decoder with avc1 codec + AVCDecoderConfigurationRecord description.
+    if (sps && pps) {
       const codec = getCodecFromSps(sps);
       const needReconfigure = !decoderConfigured || codec !== lastCodec;
       if (needReconfigure) {
@@ -383,8 +426,8 @@
             codec,
             optimizeForLatency: true,
             hardwareAcceleration: 'prefer-hardware',
-            avc: { format: 'annexb' },
-          } as VideoDecoderConfig);
+            description: buildAvcDescription(sps, pps),
+          });
           decoderConfigured = true;
           lastCodec = codec;
           console.log(`[Panel] decoder configured: ${codec}`);
@@ -413,6 +456,7 @@
       keyframeRequested = false;
     }
 
+    convertAnnexBToAvcc(frameData);
     decodeFrame(frameData, isKeyframe);
     checkBufferHealth();
   }
@@ -923,9 +967,8 @@
   // ============================================================================
 
   onMount(() => {
-    if (!canvasEl || !navigator.gpu) {
+    if (!canvasEl) {
       setStatus('error');
-      console.error('WebGPU is required but not available in this browser.');
       return;
     }
 
