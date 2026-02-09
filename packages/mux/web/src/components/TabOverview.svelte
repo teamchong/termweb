@@ -147,7 +147,7 @@
         }
         let ctx = panelContexts.get(panelId);
         if (!ctx) {
-          ctx = canvas.getContext('2d', { alpha: false }) ?? undefined;
+          ctx = canvas.getContext('2d') ?? undefined;
           if (ctx) panelContexts.set(panelId, ctx);
         }
         if (ctx) {
@@ -322,6 +322,13 @@
             class="tab-preview-content"
             style="width: {previewWidth}px; height: {previewHeight}px;"
           >
+            {#if snapshots.has(tab.id)}
+              <img
+                src={snapshots.get(tab.id)}
+                alt={tab.title || 'Tab preview'}
+                class="tab-preview-image"
+              />
+            {/if}
             {#if tabPanelMap.has(tab.id)}
               {#each tabPanelMap.get(tab.id) ?? [] as serverId (serverId)}
                 <canvas
@@ -329,12 +336,6 @@
                   class="tab-preview-canvas"
                 ></canvas>
               {/each}
-            {:else if snapshots.has(tab.id)}
-              <img
-                src={snapshots.get(tab.id)}
-                alt={tab.title || 'Tab preview'}
-                class="tab-preview-image"
-              />
             {/if}
           </div>
         </div>
@@ -472,6 +473,9 @@
   }
 
   .tab-preview-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
     width: 100%;
     height: 100%;
     object-fit: contain;

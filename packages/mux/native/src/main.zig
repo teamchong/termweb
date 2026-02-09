@@ -2314,8 +2314,18 @@ const Server = struct {
         } else if (msg_type == 0x89) { // set_overview
             if (data.len < 2) return;
             self.mutex.lock();
+            const was_open = self.overview_open;
             self.overview_open = data[1] != 0;
+            // Force keyframe on all panels when overview opens so idle panels
+            // send a fresh frame (otherwise the idle-skip logic prevents encoding)
+            if (self.overview_open and !was_open) {
+                var it = self.panels.valueIterator();
+                while (it.next()) |panel| {
+                    panel.*.force_keyframe = true;
+                }
+            }
             self.mutex.unlock();
+            self.wake_signal.notify();
             // Broadcast to all control connections so other clients can sync
             self.broadcastOverviewState();
         } else if (msg_type == 0x8A) { // set_quick_terminal
@@ -3863,9 +3873,11 @@ const Server = struct {
                     // Adaptive idle mode: when terminal content is unchanged for ~1s,
                     // reduce tick rate to save CPU/GPU (cursor/spinner checks only).
                     // Input or force_keyframe (reconnection) resets immediately.
+                    // Bypass when overview is open so all panels stream live.
                     if (panel.consecutive_unchanged >= Panel.IDLE_THRESHOLD and
                         !panel.force_keyframe and
-                        !panel.has_pending_input.load(.acquire))
+                        !panel.has_pending_input.load(.acquire) and
+                        !is_overview)
                     {
                         if (panel.consecutive_unchanged % Panel.IDLE_DIVISOR != 0) {
                             panel.consecutive_unchanged += 1;

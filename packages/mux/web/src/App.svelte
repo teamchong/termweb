@@ -363,15 +363,15 @@
       return;
     } else if (e.metaKey && e.shiftKey && key === '.') {
       e.preventDefault();
-      handleCommand('_close_window');
+      if (!e.repeat) handleCommand('_close_window');
       return;
     } else if (e.metaKey && e.altKey && key === '.') {
       e.preventDefault();
-      handleCommand('_close_tab');
+      if (!e.repeat) handleCommand('_close_tab');
       return;
     } else if (e.metaKey && key === '.') {
       e.preventDefault();
-      handleCommand('_close');
+      if (!e.repeat) handleCommand('_close');
       return;
     } else if (e.metaKey && key === 'd') {
       e.preventDefault();

@@ -190,6 +190,23 @@ export class SplitContainer {
     return null;
   }
 
+  /** Find the nearest sibling panel (the first leaf of the other branch at the closest split). */
+  findAdjacentPanel(panel: PanelLike): PanelLike | null {
+    const container = this.findContainer(panel);
+    if (!container || !container.parent) return null;
+    const parent = container.parent;
+    const sibling = parent.first === container ? parent.second : parent.first;
+    if (!sibling) return null;
+    return sibling.getFirstLeaf();
+  }
+
+  private getFirstLeaf(): PanelLike | null {
+    if (this.panel) return this.panel;
+    if (this.first) return this.first.getFirstLeaf();
+    if (this.second) return this.second.getFirstLeaf();
+    return null;
+  }
+
   getAllPanels(): PanelLike[] {
     const panels: PanelLike[] = [];
     if (this.panel) {
@@ -256,7 +273,12 @@ export class SplitContainer {
 
       this.element = document.createElement('div');
       this.element.className = 'split-pane';
-      this.element.style.flex = '1';
+      // Preserve flex value from the old element so parent's applyRatio is maintained
+      if (oldElement.style.flex) {
+        this.element.style.flex = oldElement.style.flex;
+      } else {
+        this.element.style.flex = '1';
+      }
       if (this.panel && this.panel.element.parentElement) {
         this.panel.element.parentElement.removeChild(this.panel.element);
       }
@@ -268,6 +290,25 @@ export class SplitContainer {
         parent.replaceChild(this.element, oldElement);
       }
     }
+  }
+
+  debugTree(indent = 0): string {
+    const pad = '  '.repeat(indent);
+    if (this.panel) {
+      return `${pad}leaf(${this.panel.id}, sid=${this.panel.serverId}, flex="${this.element.style.flex}", cls="${this.element.className}")`;
+    }
+    const lines = [`${pad}split(dir=${this.direction}, ratio=${this.ratio.toFixed(2)}, flex="${this.element.style.flex}", cls="${this.element.className}")`];
+    if (this.first) lines.push(this.first.debugTree(indent + 1));
+    if (this.second) lines.push(this.second.debugTree(indent + 1));
+    return lines.join('\n');
+  }
+
+  /** Walk up to the root and dump the entire tree */
+  rootTree(): string {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    let root: SplitContainer = this;
+    while (root.parent) root = root.parent;
+    return root.debugTree();
   }
 
   destroy(): void {

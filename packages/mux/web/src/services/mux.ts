@@ -94,6 +94,7 @@ export class MuxClient {
   private quickTerminalPanel: PanelInstance | null = null;
   private previousActivePanel: PanelInstance | null = null;
   private bellTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
+  private closeInProgress = false;
   private panelsEl: HTMLElement | null = null;
   private initialPanelListResolve: (() => void) | null = null;
   private h264Ws: WebSocket | null = null;
@@ -369,7 +370,7 @@ export class MuxClient {
     };
 
     this.controlWs.onclose = () => {
-      console.log('Control channel disconnected');
+      console.log('[MUX] Control channel disconnected');
       connectionStatus.set('disconnected');
       if (!this.destroyed) {
         const jitter = Math.random() * 0.3 * this.reconnectDelay;
@@ -663,7 +664,46 @@ export class MuxClient {
   }
 
   private handleLayoutUpdate(layout: LayoutData): void {
-    console.log('Layout update from server:', layout);
+    // Reconcile client tree with server's authoritative layout
+    for (const tabLayout of layout.tabs) {
+      const tabId = String(tabLayout.id);
+      const tab = this.tabInstances.get(tabId);
+      if (tab) {
+        const mismatches = this.reconcileTree(tab.root, tabLayout.root);
+        if (mismatches > 0) {
+          console.log(`[MUX] Reconciled ${mismatches} direction/ratio mismatches from server layout`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Walk client and server trees in parallel, fixing direction/ratio mismatches.
+   * Returns the number of fixes applied.
+   */
+  private reconcileTree(container: SplitContainer, node: LayoutNode): number {
+    let fixes = 0;
+
+    if (node.type === 'split' && container.direction !== null && node.first && node.second) {
+      // Both are splits - check direction
+      const expectedDirection: 'horizontal' | 'vertical' = node.direction === 'horizontal' ? 'horizontal' : 'vertical';
+      if (container.direction !== expectedDirection) {
+        console.log(`[MUX] Direction mismatch: client=${container.direction}, server=${expectedDirection}`);
+        container.direction = expectedDirection;
+        container.element.className = `split-container ${expectedDirection}`;
+        fixes++;
+      }
+      // Fix ratio
+      if (node.ratio !== undefined && Math.abs(container.ratio - node.ratio) > 0.001) {
+        container.ratio = node.ratio;
+        container.applyRatio();
+        fixes++;
+      }
+      // Recurse into children
+      if (container.first) fixes += this.reconcileTree(container.first, node.first);
+      if (container.second) fixes += this.reconcileTree(container.second, node.second);
+    }
+    return fixes;
   }
 
   private handlePanelList(panelList: Array<{ panel_id: number; title: string }>, layout: unknown): void {
@@ -989,6 +1029,11 @@ export class MuxClient {
   }
 
   closePanel(panelId: string): void {
+    // Guard against double-fire (e.g. Svelte event delegation dispatching twice)
+    if (this.closeInProgress) return;
+    this.closeInProgress = true;
+    setTimeout(() => { this.closeInProgress = false; }, 0);
+
     const panel = this.panelInstances.get(panelId);
     if (!panel) return;
     if (panel.serverId !== null) {
@@ -1014,19 +1059,31 @@ export class MuxClient {
     if (allPanels.length === 1) {
       this.closeTab(tabId);
     } else {
+      // Find the adjacent sibling BEFORE removing, so it becomes the new active panel
+      const adjacentPanel = tab.root.findAdjacentPanel(panel) as PanelInstance | null;
+
       // Send close message to server (optimistic update - frontend updates immediately)
       if (panel.serverId !== null) {
         this.sendClosePanel(panel.serverId);
-
         this.panelsByServerId.delete(panel.serverId);
       }
       tab.root.removePanel(panel);
       this.panelInstances.delete(panelId);
       panels.remove(panelId);
       panel.destroy();
+
+      // Activate the sibling panel (falls back to first remaining if sibling not found)
       const remainingPanels = tab.root.getAllPanels();
-      if (remainingPanels.length > 0) {
-        this.setActivePanel(remainingPanels[0] as PanelInstance);
+      const nextActive = (adjacentPanel && this.panelInstances.has(adjacentPanel.id)
+        ? adjacentPanel
+        : remainingPanels[0] as PanelInstance | undefined) ?? null;
+      if (nextActive) {
+        this.setActivePanel(nextActive);
+        const panelInfo = panels.get(nextActive.id);
+        if (panelInfo?.title) {
+          tabs.updateTab(tabId, { title: panelInfo.title });
+          document.title = panelInfo.title;
+        }
       }
     }
   }
@@ -1110,6 +1167,7 @@ export class MuxClient {
   }
 
   private restoreLayoutFromServer(layout: LayoutData): void {
+    console.log('[MUX] restoreLayoutFromServer: rebuilding from server layout');
     for (const tabId of Array.from(this.tabInstances.keys())) {
       this.closeTab(tabId);
     }
@@ -1278,8 +1336,6 @@ export class MuxClient {
         const view = new DataView(e.data);
         const panelId = view.getUint32(0, true);
         const frameData = new Uint8Array(e.data, 4);
-        // DEBUG: track H264 frame arrival
-        console.debug(`[H264] frame panelId=${panelId} size=${frameData.length} found=${this.panelsByServerId.has(panelId)}`);
         // Route to override handler (overview) if set
         if (this.h264OverrideHandler) {
           this.h264OverrideHandler(panelId, frameData);
