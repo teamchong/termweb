@@ -4100,7 +4100,8 @@ const Server = struct {
                         const surf_total_h: u16 = @intCast(size.height_px);
 
                         // Broadcast surface dims only when they change (resize)
-                        if (surf_total_w != panel.last_surf_w or surf_total_h != panel.last_surf_h) {
+                        const surface_changed = surf_total_w != panel.last_surf_w or surf_total_h != panel.last_surf_h;
+                        if (surface_changed) {
                             panel.last_surf_w = surf_total_w;
                             panel.last_surf_h = surf_total_h;
                             const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
@@ -4111,7 +4112,11 @@ const Server = struct {
                             }
                         }
 
-                        if (cur_col != panel.last_cursor_col or
+                        // Re-send cursor when surface dims change: padding and pixel
+                        // coordinates are recalculated against the new surface layout,
+                        // even if the cursor's grid col/row haven't moved.
+                        if (surface_changed or
+                            cur_col != panel.last_cursor_col or
                             cur_row != panel.last_cursor_row or
                             cur_style != panel.last_cursor_style or
                             cur_visible != panel.last_cursor_visible)
