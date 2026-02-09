@@ -100,6 +100,7 @@
   let lastReportedHeight = 0;
   let resizeObserver: ResizeObserver | null = null;
   let lastBufferReport = 0;
+  let bufferStatsIntervalId: ReturnType<typeof setInterval> | null = null;
   let frameTimestamps = new CircularBuffer<number>(60);
   let decodeLatencies = new CircularBuffer<number>(PANEL.MAX_LATENCY_SAMPLES);
   let lastDecodeStart = 0;
@@ -590,8 +591,13 @@
       _initialSize = null;
     } else if (panelEl) {
       const rect = panelEl.getBoundingClientRect();
-      width = Math.floor(rect.width) || PANEL.DEFAULT_WIDTH;
-      height = Math.floor(rect.height) || PANEL.DEFAULT_HEIGHT;
+      width = Math.floor(rect.width);
+      height = Math.floor(rect.height);
+      if (width === 0 || height === 0) {
+        // Element not laid out yet (parent may have display:none) — retry after layout
+        requestAnimationFrame(() => sendCreatePanel());
+        return;
+      }
     } else {
       width = PANEL.DEFAULT_WIDTH;
       height = PANEL.DEFAULT_HEIGHT;
@@ -622,8 +628,13 @@
       _initialSize = null;
     } else if (panelEl) {
       const rect = panelEl.getBoundingClientRect();
-      width = Math.floor(rect.width) || PANEL.DEFAULT_WIDTH;
-      height = Math.floor(rect.height) || PANEL.DEFAULT_HEIGHT;
+      width = Math.floor(rect.width);
+      height = Math.floor(rect.height);
+      if (width === 0 || height === 0) {
+        // Element not laid out yet (parent may have display:none) — retry after layout
+        requestAnimationFrame(() => sendSplitPanel());
+        return;
+      }
     } else {
       width = PANEL.DEFAULT_WIDTH;
       height = PANEL.DEFAULT_HEIGHT;
@@ -1276,6 +1287,14 @@
       resizeObserver.observe(panelEl);
     }
 
+    // Periodic buffer stats so server can recover quality tiers during idle periods.
+    // Without this, stats are only sent on frame arrival, so idle terminals after
+    // heavy output (e.g. lsd) stay stuck at a degraded quality tier forever.
+    bufferStatsIntervalId = setInterval(() => {
+      if (destroyed || paused) return;
+      checkBufferHealth();
+    }, TIMING.BUFFER_STATS_INTERVAL);
+
     // Document click handler for dock menu
     document.addEventListener('click', handleDocumentClick);
   });
@@ -1283,10 +1302,14 @@
   onDestroy(() => {
     destroyed = true;
 
-    // Clear pending timeouts
+    // Clear pending timeouts/intervals
     if (connectTimeoutId) {
       clearTimeout(connectTimeoutId);
       connectTimeoutId = null;
+    }
+    if (bufferStatsIntervalId) {
+      clearInterval(bufferStatsIntervalId);
+      bufferStatsIntervalId = null;
     }
     // Cleanup resize observer
     if (resizeObserver) {
