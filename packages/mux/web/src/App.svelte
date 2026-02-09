@@ -80,14 +80,14 @@
   let viewMenuItems = $derived<MenuItem[]>([
     { label: 'Show All Tabs', action: '_show_all_tabs', shortcut: '⌘⇧A', icon: '⊞', disabled: !hasTabs },
     { separator: true },
-    { label: 'Increase Font', action: 'zoom-in', shortcut: '⌘=', icon: 'A+', disabled: !hasTabs },
-    { label: 'Decrease Font', action: 'zoom-out', shortcut: '⌘-', icon: 'A−', disabled: !hasTabs },
-    { label: 'Reset Font', action: 'zoom-reset', shortcut: '⌘0', icon: 'A', disabled: !hasTabs },
+    { label: 'Increase Font', action: 'increase_font_size:1', shortcut: '⌘=', icon: 'A+', disabled: !hasTabs },
+    { label: 'Decrease Font', action: 'decrease_font_size:1', shortcut: '⌘-', icon: 'A−', disabled: !hasTabs },
+    { label: 'Reset Font', action: 'reset_font_size', shortcut: '⌘0', icon: 'A', disabled: !hasTabs },
     { separator: true },
     { label: 'Command Palette', action: '_command_palette', shortcut: '⌘⇧P', icon: '⌘' },
     { label: 'Change Title...', action: '_change_title', icon: '✎', disabled: !hasTabs },
     { separator: true },
-    { label: 'Quick Terminal', action: '_quick_terminal', shortcut: '⌥⌘`', icon: '▼' },
+    { label: 'Quick Terminal', action: '_quick_terminal', shortcut: '⌥⌘\\', icon: '▼' },
     { separator: true },
     { label: 'Toggle Inspector', action: '_toggle_inspector', shortcut: '⌥⌘I', icon: '🔍', disabled: !hasTabs },
   ]);
@@ -397,7 +397,7 @@
       e.preventDefault();
       handleCommand('_toggle_fullscreen');
       return;
-    } else if (e.metaKey && e.altKey && key === '`') {
+    } else if (e.metaKey && e.altKey && e.code === 'Backslash') {
       e.preventDefault();
       handleCommand('_quick_terminal');
       return;
@@ -443,21 +443,21 @@
         handleCommand('_select_split_right');
         return;
       }
-    } else if (e.metaKey && e.altKey && key === 'i') {
+    } else if (e.metaKey && e.altKey && e.code === 'KeyI') {
       e.preventDefault();
       handleCommand('_toggle_inspector');
       return;
     } else if (e.metaKey && key === '=') {
       e.preventDefault();
-      handleCommand('zoom-in');
+      handleCommand('increase_font_size:1');
       return;
     } else if (e.metaKey && key === '-') {
       e.preventDefault();
-      handleCommand('zoom-out');
+      handleCommand('decrease_font_size:1');
       return;
     } else if (e.metaKey && key === '0') {
       e.preventDefault();
-      handleCommand('zoom-reset');
+      handleCommand('reset_font_size');
       return;
     } else if (e.metaKey && key >= '1' && key <= '9') {
       // Tab switching with Cmd+1-9
