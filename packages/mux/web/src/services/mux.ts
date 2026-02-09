@@ -1138,6 +1138,19 @@ export class MuxClient {
     tabs.updateTab(tabId, { panelIds: allPanels.map(p => p.id) });
   }
 
+  selectAdjacentSplit(direction: 1 | -1): void {
+    const activeTabId = get(activeTabIdStore);
+    if (!activeTabId || !this.currentActivePanel) return;
+    const tab = this.tabInstances.get(activeTabId);
+    if (!tab) return;
+    const allPanels = tab.root.getAllPanels() as PanelInstance[];
+    if (allPanels.length < 2) return;
+    const currentIndex = allPanels.findIndex(p => p.id === this.currentActivePanel?.id);
+    if (currentIndex === -1) return;
+    const nextIndex = (currentIndex + direction + allPanels.length) % allPanels.length;
+    this.setActivePanel(allPanels[nextIndex]);
+  }
+
   zoomSplit(): void {
     const activeTabId = get(activeTabIdStore);
     if (!activeTabId || !this.currentActivePanel) return;
@@ -1193,6 +1206,38 @@ export class MuxClient {
         el.style.visibility = '';
       }
     });
+  }
+
+  equalizeSplits(): void {
+    const activeTabId = get(activeTabIdStore);
+    if (!activeTabId) return;
+    const tab = this.tabInstances.get(activeTabId);
+    if (!tab) return;
+    tab.root.equalize();
+  }
+
+  selectSplitInDirection(direction: 'up' | 'down' | 'left' | 'right'): void {
+    const activeTabId = get(activeTabIdStore);
+    if (!activeTabId || !this.currentActivePanel) return;
+    const tab = this.tabInstances.get(activeTabId);
+    if (!tab) return;
+    const target = tab.root.selectSplitInDirection(direction, this.currentActivePanel.id);
+    if (target) {
+      const panel = this.panelInstances.get(target.id);
+      if (panel) this.setActivePanel(panel);
+    }
+  }
+
+  resizeSplit(direction: 'up' | 'down' | 'left' | 'right'): void {
+    if (!this.currentActivePanel) return;
+    const activeTabId = get(activeTabIdStore);
+    if (!activeTabId) return;
+    const tab = this.tabInstances.get(activeTabId);
+    if (!tab) return;
+    const container = tab.root.findContainer(this.currentActivePanel as PanelLike);
+    if (container) {
+      container.resizeSplit(direction, 50);
+    }
   }
 
   private restoreLayoutFromServer(layout: LayoutData): void {

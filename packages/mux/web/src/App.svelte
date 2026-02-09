@@ -284,20 +284,40 @@
         break;
       }
       case '_previous_split':
+        muxClient?.selectAdjacentSplit(-1);
+        break;
       case '_next_split':
+        muxClient?.selectAdjacentSplit(1);
+        break;
       case '_zoom_split':
         muxClient?.zoomSplit();
         break;
       case '_equalize_splits':
+        muxClient?.equalizeSplits();
+        break;
       case '_select_split_up':
+        muxClient?.selectSplitInDirection('up');
+        break;
       case '_select_split_down':
+        muxClient?.selectSplitInDirection('down');
+        break;
       case '_select_split_left':
+        muxClient?.selectSplitInDirection('left');
+        break;
       case '_select_split_right':
+        muxClient?.selectSplitInDirection('right');
+        break;
       case '_resize_split_up':
+        muxClient?.resizeSplit('up');
+        break;
       case '_resize_split_down':
+        muxClient?.resizeSplit('down');
+        break;
       case '_resize_split_left':
+        muxClient?.resizeSplit('left');
+        break;
       case '_resize_split_right':
-        // TODO: implement split navigation in muxClient
+        muxClient?.resizeSplit('right');
         break;
       case 'paste_from_clipboard':
         navigator.clipboard.readText().then(text => {
