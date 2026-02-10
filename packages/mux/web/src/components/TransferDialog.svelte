@@ -6,6 +6,7 @@
     serverPath: string;
     excludes: string[];
     deleteExtra: boolean;
+    useGitignore: boolean;
     dirHandle?: FileSystemDirectoryHandle;
     files?: File[];
   }
@@ -36,6 +37,7 @@
   let serverPath = $state('');
   let excludesText = $state('');
   let deleteExtra = $state(false);
+  let useGitignore = $state(true);
   let previewReport: DryRunReport | null = $state(null);
   let isLoading = $state(false);
   let errorMsg = $state('');
@@ -54,9 +56,11 @@
       serverPath = defaultPath || '';
       excludesText = '';
       deleteExtra = false;
+      useGitignore = true;
       previewReport = null;
       isLoading = false;
       errorMsg = '';
+      isSubmitting = false; // Reset submit guard
       // Initialize upload source from props
       dirHandle = initialDirHandle;
       uploadFiles = initialFiles;
@@ -85,7 +89,7 @@
       .split(',')
       .map(s => s.trim())
       .filter(s => s.length > 0);
-    return { serverPath: path, excludes, deleteExtra, dirHandle, files: uploadFiles };
+    return { serverPath: path, excludes, deleteExtra, useGitignore, dirHandle, files: uploadFiles };
   }
 
   let canSubmit = $derived(
@@ -94,10 +98,14 @@
       : !!serverPath.trim() && !!(dirHandle || uploadFiles)
   );
 
+  let isSubmitting = $state(false);
+
   function handleTransfer() {
+    if (isSubmitting) return; // Prevent double-submission
     const config = getConfig();
     if (!config.serverPath) return;
     if (mode === 'upload' && !config.dirHandle && !config.files) return;
+    isSubmitting = true;
     onTransfer?.(config);
     onClose?.();
   }
@@ -259,6 +267,11 @@
           />
         </div>
 
+        <label class="checkbox-label">
+          <input type="checkbox" bind:checked={useGitignore} />
+          Use .gitignore
+        </label>
+
         {#if mode === 'upload'}
           <label class="checkbox-label">
             <input type="checkbox" bind:checked={deleteExtra} />
@@ -277,7 +290,7 @@
             type="button"
             class="btn btn-secondary"
             onclick={handlePreview}
-            disabled={!canSubmit || isLoading}
+            disabled={!canSubmit || isLoading || isSubmitting}
           >
             {isLoading ? 'Loading...' : 'Preview'}
           </button>
@@ -285,13 +298,14 @@
             type="button"
             class="btn btn-primary"
             onclick={handleTransfer}
-            disabled={!canSubmit || isLoading}
+            disabled={!canSubmit || isLoading || isSubmitting}
           >
             {modeLabel}
           </button>
         </div>
 
       {:else if stage === 'preview' && previewReport}
+        {@const totalSize = previewReport.entries.reduce((sum, e) => sum + (e.action !== 'delete' ? e.size : 0), 0)}
         <div class="preview-summary">
           {#if previewReport.newCount > 0}
             <span class="badge badge-new">+{previewReport.newCount} new</span>
@@ -304,6 +318,9 @@
           {/if}
           {#if previewReport.newCount === 0 && previewReport.updateCount === 0 && previewReport.deleteCount === 0}
             <span class="badge badge-none">No changes</span>
+          {/if}
+          {#if totalSize > 0}
+            <span class="badge badge-size">{formatBytes(totalSize)}</span>
           {/if}
         </div>
 
@@ -513,6 +530,11 @@
   .badge-none {
     background: rgba(128, 128, 128, 0.2);
     color: var(--text-dim);
+  }
+
+  .badge-size {
+    background: rgba(128, 160, 255, 0.15);
+    color: rgba(128, 160, 255, 0.9);
   }
 
   .file-list {

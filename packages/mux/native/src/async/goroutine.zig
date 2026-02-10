@@ -15,7 +15,7 @@ pub const Goroutine = struct {
     state: State,
     context: context_mod.Context,
     stack: []align(16) u8,
-    func: *const fn (*anyopaque) void,
+    func: *const fn (*anyopaque) callconv(.c) void,
     arg: *anyopaque,
 
     /// Result of an async I/O operation (set by poller before unpark).
@@ -51,7 +51,7 @@ pub const Goroutine = struct {
     pub fn init(
         allocator: Allocator,
         id: u64,
-        func: *const fn (*anyopaque) void,
+        func: *const fn (*anyopaque) callconv(.c) void,
         arg: *anyopaque,
     ) !*Goroutine {
         const stack = try allocator.alignedAlloc(u8, .@"16", stack_size);

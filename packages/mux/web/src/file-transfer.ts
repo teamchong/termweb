@@ -56,12 +56,23 @@ export interface TransferState {
   syncFilesProcessed?: number;
   /** Resume position from server (set by handleTransferReady, consumed by handleFileList) */
   resumePosition?: { fileIndex: number; fileOffset: number; bytesTransferred: number };
+  /** When true, files are being written to OPFS temp for zip creation (multi-file downloads) */
+  useZipMode?: boolean;
+  /** Count of files written to OPFS temp (for tracking progress) */
+  filesCompleted?: number;
+  /** True when TRANSFER_COMPLETE received but zip not yet created (waiting for async writes) */
+  zipPending?: boolean;
+  /** Timeout ID for fallback zip creation when files stop arriving */
+  zipFallbackTimer?: ReturnType<typeof setTimeout>;
+  /** True when zip creation has started (prevents multiple zip creations) */
+  zipCreating?: boolean;
 }
 
 export interface TransferOptions {
   deleteExtra?: boolean;
   dryRun?: boolean;
   excludes?: string[];
+  useGitignore?: boolean;
 }
 
 export interface DryRunReport {
@@ -95,7 +106,11 @@ export class FileTransferHandler {
 
   onTransferComplete?: (transferId: number, totalBytes: number) => void;
   onTransferError?: (transferId: number, error: string) => void;
+  onTransferCancelled?: (transferId: number) => void;
   onDryRunReport?: (transferId: number, report: DryRunReport) => void;
+  onTransferStart?: (transferId: number, path: string, direction: 'upload' | 'download', totalFiles: number, totalBytes: number) => void;
+  onDownloadProgress?: (transferId: number, filesCompleted: number, totalFiles: number, bytesTransferred: number, totalBytes: number) => void;
+  onConnectionShouldClose?: () => void;
 
   constructor() {
     this.workerInitPromise = this.initWorker();
@@ -104,7 +119,8 @@ export class FileTransferHandler {
   private initWorker(): Promise<void> {
     return new Promise<void>((resolve) => {
       try {
-        this.worker = new Worker('/file-worker.js');
+        // Add version param to bust worker cache
+        this.worker = new Worker('/file-worker.js?v=2');
         this.worker.onmessage = (e) => this.handleWorkerMessage(e);
         this.worker.onerror = () => {
           this.worker = null;
@@ -180,6 +196,11 @@ export class FileTransferHandler {
         break;
 
       case 'cleanup-done':
+        break;
+
+      case 'zip-created':
+        console.log('[FT] Received zip-created message from worker');
+        this.onZipCreated(msg);
         break;
 
       case 'error':
@@ -303,6 +324,15 @@ export class FileTransferHandler {
     const view = new DataView(data);
     const msgType = view.getUint8(0);
 
+    // Log FILE_REQUEST and TRANSFER_COMPLETE messages specifically
+    if (msgType === TransferMsgType.FILE_REQUEST) {
+      const fileIndex = view.getUint32(PROTO_FILE_REQUEST.FILE_INDEX, true);
+      console.log(`[FT] *** Received FILE_REQUEST message (0x${msgType.toString(16)}) for fileIndex=${fileIndex} ***`);
+    }
+    if (msgType === TransferMsgType.TRANSFER_COMPLETE) {
+      console.log(`[FT] *** Received TRANSFER_COMPLETE message (0x${msgType.toString(16)}) ***`);
+    }
+
     try {
       switch (msgType) {
         case TransferMsgType.TRANSFER_READY:
@@ -363,10 +393,11 @@ export class FileTransferHandler {
     }
 
     const isResume = resumeFileIndex > 0 || resumeFileOffset > 0 || resumeBytesTransferred > 0;
-    console.log(`Transfer ${transferId} ready${isResume ? ` (resume: file=${resumeFileIndex}, offset=${resumeFileOffset}, transferred=${resumeBytesTransferred})` : ''}`);
+    console.log(`[FT] TRANSFER_READY: transferId=${transferId}${isResume ? ` (resume: file=${resumeFileIndex}, offset=${resumeFileOffset}, transferred=${resumeBytesTransferred})` : ''}`);
 
     // Move pending transfer to active with the server's assigned ID
     if (this.pendingTransfer) {
+      console.log(`[FT] Moving pending transfer to active with ID ${transferId}`);
       this.pendingTransfer.id = transferId;
       this.activeTransfers.set(transferId, this.pendingTransfer);
       this.pendingTransfer = null;
@@ -401,7 +432,10 @@ export class FileTransferHandler {
     const totalBytes = Number(view.getBigUint64(PROTO_FILE_LIST.TOTAL_BYTES, true));
     let offset = PROTO_FILE_LIST.PAYLOAD;
 
+    console.log(`[FT] FILE_LIST: transferId=${transferId}, fileCount=${fileCount}, totalBytes=${totalBytes}`);
+
     const files: TransferFile[] = [];
+    let dirCount = 0;
     for (let i = 0; i < fileCount; i++) {
       const pathLen = view.getUint16(offset, true); offset += PROTO_SIZE.UINT16;
       const path = sharedTextDecoder.decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
@@ -410,14 +444,23 @@ export class FileTransferHandler {
       const hash = view.getBigUint64(offset, true); offset += PROTO_SIZE.UINT64;
       const isDir = bytes[offset] !== 0; offset += PROTO_SIZE.UINT8;
 
+      if (isDir) dirCount++;
       files.push({ path, size, mtime, hash, isDir });
     }
+
+    const nonDirCount = fileCount - dirCount;
+    console.log(`[FT] FILE_LIST parsed: ${fileCount} total entries (${nonDirCount} files, ${dirCount} dirs)`);
 
     const transfer = this.activeTransfers.get(transferId);
     if (transfer) {
       transfer.files = files;
       transfer.totalBytes = totalBytes;
       transfer.state = 'transferring';
+
+      // Notify that transfer has started with full details
+      const nonDirFiles = files.filter(f => !f.isDir);
+      console.log(`[FT] Calling onTransferStart: transferId=${transferId}, path=${transfer.path}, files=${nonDirFiles.length}`);
+      this.onTransferStart?.(transferId, transfer.path, transfer.direction, nonDirFiles.length, totalBytes);
 
       // Apply resume position if set (from handleTransferReady during resume)
       if (transfer.resumePosition) {
@@ -431,6 +474,12 @@ export class FileTransferHandler {
       }
 
       if (transfer.direction === 'download') {
+        // Enable zip mode for multi-file downloads (stream to OPFS temp)
+        const nonDirFiles = files.filter(f => !f.isDir).length;
+        if (nonDirFiles > 1) {
+          transfer.useZipMode = true;
+          transfer.filesCompleted = 0;
+        }
         this.requestNextFile(transferId);
       } else if (transfer.direction === 'upload' && transfer.files) {
         // Resume upload — start sending from resume position
@@ -452,15 +501,27 @@ export class FileTransferHandler {
     const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
     const fileIndex = view.getUint32(PROTO_FILE_REQUEST.FILE_INDEX, true);
     const chunkOffset = Number(view.getBigUint64(PROTO_FILE_REQUEST.CHUNK_OFFSET, true));
+    const uncompressedSize = view.getUint32(PROTO_FILE_REQUEST.UNCOMPRESSED_SIZE, true);
     const compressedData = bytes.slice(PROTO_FILE_REQUEST.DATA);
 
+    console.log(`[FT] FILE_REQUEST: transferId=${transferId}, fileIndex=${fileIndex}, chunkOffset=${chunkOffset}, uncompressedSize=${uncompressedSize}, compressedSize=${compressedData.length}`);
+
     const transfer = this.activeTransfers.get(transferId);
-    if (!transfer || !transfer.files) return;
-    if (fileIndex >= transfer.files.length) return;
+    if (!transfer || !transfer.files) {
+      console.warn(`[FT] FILE_REQUEST: No transfer found for ID ${transferId}`);
+      return;
+    }
+    if (fileIndex >= transfer.files.length) {
+      console.warn(`[FT] FILE_REQUEST: Invalid fileIndex ${fileIndex} >= ${transfer.files.length}`);
+      return;
+    }
 
     const file = transfer.files[fileIndex];
+    console.log(`[FT] FILE_REQUEST: Processing file ${file.path} (${fileIndex}/${transfer.files.length})`);
+
 
     if (this.worker && this.workerReady) {
+      console.log(`[FT] → Sending decompress-and-write to worker: fileIndex=${fileIndex}, path=${file.path}, offset=${chunkOffset}`);
       // Delegate to Worker: decompress + OPFS write (or decompress-only fallback)
       const buffer = compressedData.buffer.slice(
         compressedData.byteOffset,
@@ -476,6 +537,8 @@ export class FileTransferHandler {
         fileSize: file.size,
       }, [buffer]);
     } else {
+      console.log(`[FT] Worker not ready, using fallback for fileIndex=${fileIndex}`);
+
       // Fallback: decompress on main thread, accumulate in memory
       try {
         const fileData = await this.decompress(compressedData);
@@ -496,8 +559,13 @@ export class FileTransferHandler {
     const uncompressedSize = view.getUint32(PROTO_BATCH_DATA.UNCOMPRESSED_SIZE, true);
     const compressedData = bytes.slice(PROTO_BATCH_DATA.DATA);
 
+    console.log(`[FT] BATCH_DATA: transferId=${transferId}, uncompressedSize=${uncompressedSize}`);
+
     const transfer = this.activeTransfers.get(transferId);
-    if (!transfer || !transfer.files) return;
+    if (!transfer || !transfer.files) {
+      console.warn(`[FT] BATCH_DATA: No transfer found for ID ${transferId}`);
+      return;
+    }
 
     let payload: Uint8Array;
     try {
@@ -517,6 +585,8 @@ export class FileTransferHandler {
     let offset = 0;
     const fileCount = batchView.getUint16(offset, true); offset += 2;
 
+    console.log(`[FT] BATCH_DATA contains ${fileCount} files`);
+
     for (let i = 0; i < fileCount; i++) {
       if (offset + 8 > payload.length) break;
 
@@ -535,20 +605,25 @@ export class FileTransferHandler {
       const file = transfer.files[fileIndex];
       transfer.bytesTransferred += fileData.length;
 
-      // Small batched files are always complete — save directly
-      this.saveFile(file.path, fileData);
+      // Small batched files are always complete — save or collect for zip
+      this.handleCompletedFile(transferId, file.path, fileData);
       this.cacheDownloadedFile(transfer, file.path, fileData);
     }
   }
 
   /** Worker callback: chunk decompressed and written to OPFS */
   private onChunkWrittenToOPFS(msg: { transferId: number; fileIndex: number; filePath: string; bytesWritten: number; complete: boolean }): void {
+    console.log(`[FT] ← onChunkWrittenToOPFS: fileIndex=${msg.fileIndex}, path=${msg.filePath}, bytes=${msg.bytesWritten}, complete=${msg.complete}`);
     const transfer = this.activeTransfers.get(msg.transferId);
-    if (!transfer || !transfer.files) return;
+    if (!transfer || !transfer.files) {
+      console.warn(`[FT] onChunkWrittenToOPFS: No transfer found`);
+      return;
+    }
 
     transfer.bytesTransferred += msg.bytesWritten;
 
     if (msg.complete) {
+      console.log(`[FT] File complete in OPFS, requesting read-back: ${msg.filePath}`);
       // File fully written to OPFS — read it back for browser download
       this.worker!.postMessage({
         type: 'get-file',
@@ -561,16 +636,21 @@ export class FileTransferHandler {
 
   /** Worker callback: no OPFS available, decompressed data returned */
   private onChunkDecompressedNoOPFS(msg: { transferId: number; fileIndex: number; filePath: string; offset: number; data: ArrayBuffer; bytesWritten: number }): void {
+    console.log(`[FT] ← onChunkDecompressedNoOPFS: fileIndex=${msg.fileIndex}, path=${msg.filePath}, offset=${msg.offset}, bytes=${msg.bytesWritten}`);
     this.accumulateAndSave(msg.transferId, msg.fileIndex, msg.offset, new Uint8Array(msg.data));
   }
 
   /** Worker callback: file data read from OPFS for browser download */
   private onFileDataFromOPFS(msg: { transferId: number; filePath: string; data: ArrayBuffer }): void {
+    console.log(`[FT] ← onFileDataFromOPFS: path=${msg.filePath}, size=${msg.data.byteLength}`);
     const transfer = this.activeTransfers.get(msg.transferId);
-    if (!transfer) return;
+    if (!transfer) {
+      console.warn(`[FT] onFileDataFromOPFS: No transfer found`);
+      return;
+    }
 
     const data = new Uint8Array(msg.data);
-    this.saveFile(msg.filePath, data);
+    this.handleCompletedFile(msg.transferId, msg.filePath, data);
     this.cacheDownloadedFile(transfer, msg.filePath, data);
   }
 
@@ -604,7 +684,7 @@ export class FileTransferHandler {
         writeOffset += chunk.data.length;
       }
 
-      if (!this.saveFile(file.path, fullData)) {
+      if (!this.handleCompletedFile(transferId, file.path, fullData)) {
         this.failTransfer(transferId, `Failed to save file: ${file.path}`);
         return;
       }
@@ -628,6 +708,13 @@ export class FileTransferHandler {
       mtime: fileEntry.mtime ?? 0,
       hash: fileEntry.hash?.toString() ?? '0',
     }).catch(() => { /* cache is best-effort */ });
+  }
+
+  /** Clear OPFS cache for a specific server path after successful download */
+  private clearCacheForPath(serverPath: string): void {
+    if (!this.cache) return;
+    // Remove cached files for this path by clearing all files in the cache dir
+    this.worker?.postMessage({ type: 'cache-clear-path', serverPath });
   }
 
   /** Mark a transfer as failed and clean up */
@@ -660,17 +747,67 @@ export class FileTransferHandler {
     const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
     const totalBytes = Number(view.getBigUint64(PROTO_TRANSFER_COMPLETE.TOTAL_BYTES, true));
 
-    console.log(`Transfer ${transferId} complete`);
+    console.log(`[FT] ====== TRANSFER_COMPLETE RECEIVED ======`);
+    console.log(`[FT] transferId=${transferId}, totalBytes=${totalBytes}`);
 
     const transfer = this.activeTransfers.get(transferId);
-    if (transfer) {
-      transfer.state = 'complete';
+    if (!transfer) {
+      console.error(`[FT] TRANSFER_COMPLETE: No active transfer found for ID ${transferId}`);
+      return;
     }
+
+    console.log(`[FT] Transfer state: ${transfer.state}, useZipMode: ${transfer.useZipMode}, direction: ${transfer.direction}`);
+    transfer.state = 'complete';
+
+    // Zip mode: check if all files are written to OPFS temp
+    if (transfer.useZipMode) {
+      const totalFiles = transfer.files?.filter(f => !f.isDir).length ?? 0;
+      const filesCompleted = transfer.filesCompleted ?? 0;
+      console.log(`[FT] Zip mode: ${filesCompleted}/${totalFiles} files written to OPFS (totalEntries=${transfer.files?.length})`);
+      console.log(`[FT] Checking if ready to create zip: filesCompleted (${filesCompleted}) >= totalFiles (${totalFiles}) = ${filesCompleted >= totalFiles}`);
+      if (filesCompleted >= totalFiles) {
+        // All files already written — create zip from OPFS now
+        console.log('[FT] All files written, creating zip from OPFS...');
+        transfer.zipCreating = true; // Prevent multiple zip creations
+        this.createZipFromOPFS(transferId);
+        return; // Don't delete transfer yet — createZipFromOPFS will handle cleanup
+      } else {
+        // Files still pending (async writes) — defer zip creation
+        console.log('[FT] Files still pending, setting zipPending flag');
+        transfer.zipPending = true;
+
+        // Fallback: if no new files complete for 2 seconds, assume all files received and create zip
+        // This handles cases where server declares N files but only sends N-1
+        transfer.zipFallbackTimer = setTimeout(() => {
+          const t = this.activeTransfers.get(transferId);
+          if (t?.zipPending && !t.zipCreating) {
+            console.log(`[FT] Timeout fallback: creating zip with ${t.filesCompleted}/${totalFiles} files`);
+            t.zipCreating = true; // Prevent multiple zip creations
+            this.createZipFromOPFS(transferId);
+          }
+        }, 2000);
+
+        return; // Don't delete transfer yet — handleCompletedFile will finish it
+      }
+    } else {
+      console.log('[FT] Not in zip mode (single file download)');
+    }
+
     this.activeTransfers.delete(transferId);
     this.onTransferComplete?.(transferId, totalBytes);
 
     // Clean up OPFS temp files for this transfer
     this.worker?.postMessage({ type: 'cleanup', transferId });
+
+    // Clean up OPFS cache after successful download
+    if (transfer?.serverPath) {
+      this.clearCacheForPath(transfer.serverPath);
+    }
+
+    // Close the file WebSocket connection only if no more active transfers
+    if (this.activeTransfers.size === 0) {
+      this.onConnectionShouldClose?.();
+    }
   }
 
   private handleTransferError(data: ArrayBuffer): void {
@@ -708,6 +845,7 @@ export class FileTransferHandler {
       entries.push({ action: action < DRY_RUN_ACTION.length ? DRY_RUN_ACTION[action] : 'unknown', path, size });
     }
 
+    entries.sort((a, b) => a.path.localeCompare(b.path));
     const report = { newCount, updateCount, deleteCount, entries };
     this.onDryRunReport?.(transferId, report);
   }
@@ -723,7 +861,7 @@ export class FileTransferHandler {
       return;
     }
 
-    const { deleteExtra = false, dryRun = false, excludes = [] } = options;
+    const { deleteExtra = false, dryRun = false, excludes = [], useGitignore = false } = options;
 
     let files: Awaited<ReturnType<typeof this.collectFilesFromHandle>>;
     try {
@@ -746,7 +884,7 @@ export class FileTransferHandler {
     let offset = 0;
     view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
     view.setUint8(offset, 0); offset += 1; // direction: upload
-    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0)); offset += 1;
+    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0) | (useGitignore ? 4 : 0)); offset += 1;
     view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;
@@ -782,7 +920,7 @@ export class FileTransferHandler {
       return;
     }
 
-    const { deleteExtra = false, dryRun = false, excludes = [] } = options;
+    const { deleteExtra = false, dryRun = false, excludes = [], useGitignore = false } = options;
 
     const transferFiles: TransferFile[] = files.map(f => ({
       path: f.name,
@@ -803,7 +941,7 @@ export class FileTransferHandler {
     let offset = 0;
     view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
     view.setUint8(offset, 0); offset += 1; // direction: upload
-    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0)); offset += 1;
+    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0) | (useGitignore ? 4 : 0)); offset += 1;
     view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;
@@ -828,14 +966,23 @@ export class FileTransferHandler {
   }
 
   async startFolderDownload(serverPath: string, options: TransferOptions = {}): Promise<void> {
+    console.log(`[FT] startFolderDownload: path="${serverPath}", canSend=${this.canSend()}, hasPendingTransfer=${!!this.pendingTransfer}`);
+
     if (!this.canSend()) {
-      console.error('File transfer not connected');
+      console.error('[FT] File transfer not connected - aborting');
       this.onTransferError?.(0, 'File transfer connection not available');
       return;
     }
 
-    const { deleteExtra = false, dryRun = false, excludes = [] } = options;
-    const flagsByte = (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0);
+    // Check if there's already a pending transfer
+    if (this.pendingTransfer) {
+      console.error('[FT] Already have a pending transfer - cannot start new one');
+      this.onTransferError?.(0, 'Transfer already in progress');
+      return;
+    }
+
+    const { deleteExtra = false, dryRun = false, excludes = [], useGitignore = false } = options;
+    const flagsByte = (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0) | (useGitignore ? 4 : 0);
 
     const pathBytes = sharedTextEncoder.encode(serverPath);
     const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
@@ -859,7 +1006,10 @@ export class FileTransferHandler {
       bytes.set(exclude, offset); offset += exclude.length;
     }
 
+    console.log(`[FT] Sending TRANSFER_INIT: msgLen=${msgLen}`);
     this.send(msg);
+    console.log(`[FT] TRANSFER_INIT sent, now creating pendingTransfer`);
+
 
     // Store as pending — server will assign the real ID in TRANSFER_READY
     this.pendingTransfer = {
@@ -867,10 +1017,34 @@ export class FileTransferHandler {
       direction: 'download',
       serverPath,
       options,
+      path: serverPath,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
     };
+  }
+
+  /** Cancel an active transfer */
+  cancelTransfer(transferId: number): void {
+    const transfer = this.activeTransfers.get(transferId);
+    if (transfer) {
+      console.log(`Cancelling transfer ${transferId}`);
+      transfer.state = 'error';
+      transfer.receivedFiles?.clear();
+      this.activeTransfers.delete(transferId);
+      this.onTransferCancelled?.(transferId);
+
+      // Clean up OPFS temp files
+      this.worker?.postMessage({ type: 'cleanup-temp', transferId });
+    }
+  }
+
+  /** Cancel all active transfers */
+  cancelAllTransfers(): void {
+    const transferIds = Array.from(this.activeTransfers.keys());
+    for (const id of transferIds) {
+      this.cancelTransfer(id);
+    }
   }
 
   private async collectFilesFromHandle(
@@ -1266,6 +1440,134 @@ export class FileTransferHandler {
     return Math.max(512, Math.min(65536, size));
   }
 
+  /** Either write to OPFS temp for zip (multi-file) or save immediately (single file). */
+  private handleCompletedFile(transferId: number, path: string, data: Uint8Array): boolean {
+    console.log(`[FT] handleCompletedFile: transferId=${transferId}, path=${path}, size=${data.length}`);
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer) {
+      console.error(`[FT] No transfer found for ID ${transferId} in handleCompletedFile`);
+      return false;
+    }
+    if (transfer?.useZipMode) {
+      // Write to OPFS temp directory for streaming zip creation
+      // IMPORTANT: Clone the data before transferring to keep original intact for caching
+      const dataCopy = new Uint8Array(data);
+      this.worker?.postMessage({
+        type: 'write-temp-file',
+        transferId,
+        path,
+        data: dataCopy.buffer
+      }, [dataCopy.buffer]);
+
+      transfer.filesCompleted = (transfer.filesCompleted ?? 0) + 1;
+      const totalFiles = transfer.files?.filter(f => !f.isDir).length ?? 0;
+      console.log(`[FT] File completed: ${path} (${transfer.filesCompleted}/${totalFiles}), calling onDownloadProgress with transferId=${transferId}`);
+      this.onDownloadProgress?.(transferId, transfer.filesCompleted, totalFiles, transfer.bytesTransferred, transfer.totalBytes ?? 0);
+
+      // If TRANSFER_COMPLETE already received and all files written, create zip
+      if (transfer.zipPending && !transfer.zipCreating) {
+        if (transfer.filesCompleted >= totalFiles) {
+          console.log('All files written after zipPending, creating zip from OPFS...');
+          // Clear fallback timer since we're creating zip now
+          if (transfer.zipFallbackTimer) {
+            clearTimeout(transfer.zipFallbackTimer);
+            transfer.zipFallbackTimer = undefined;
+          }
+          transfer.zipCreating = true; // Prevent multiple zip creations
+          this.createZipFromOPFS(transferId);
+        } else {
+          // Reset timeout on each file completion to give more files a chance to arrive
+          console.log(`[FT] zipPending active, ${transfer.filesCompleted}/${totalFiles} files done, resetting timer...`);
+          if (transfer.zipFallbackTimer) {
+            clearTimeout(transfer.zipFallbackTimer);
+          }
+          transfer.zipFallbackTimer = setTimeout(() => {
+            const t = this.activeTransfers.get(transferId);
+            if (t?.zipPending && !t.zipCreating) {
+              const tf = t.files?.filter(f => !f.isDir).length ?? 0;
+              console.log(`[FT] Timeout fallback: creating zip with ${t.filesCompleted}/${tf} files`);
+              t.zipCreating = true; // Prevent multiple zip creations
+              this.createZipFromOPFS(transferId);
+            }
+          }, 2000);
+        }
+      }
+      return true;
+    }
+    console.log(`File completed (not in zip mode): ${path}`);
+    return this.saveFile(path, data);
+  }
+
+  /** Create zip from OPFS temp files and trigger browser download. */
+  private async createZipFromOPFS(transferId: number): Promise<void> {
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer) {
+      console.error(`[FT] createZipFromOPFS: No transfer found for ID ${transferId}`);
+      return;
+    }
+
+    console.log(`[FT] createZipFromOPFS: requesting zip from worker, transferId=${transferId}`);
+
+    // Extract folder name from server path for zip filename
+    const pathParts = transfer.path.split('/').filter(p => p);
+    const folderName = pathParts[pathParts.length - 1] || 'download';
+    console.log(`[FT] Zip filename will be: ${folderName}.zip`);
+
+    if (!this.worker) {
+      console.error('[FT] No worker available for zip creation!');
+      return;
+    }
+
+    // Request worker to list all temp files and send them back
+    this.worker.postMessage({ type: 'create-zip-from-temp', transferId, folderName });
+    console.log('[FT] Sent create-zip-from-temp message to worker');
+    // Worker will send 'zip-created' message with the zip data
+  }
+
+  private onZipCreated(msg: { transferId: number; zipData: ArrayBuffer; filename: string }): void {
+    console.log(`[FT] onZipCreated: transferId=${msg.transferId}, size=${msg.zipData.byteLength} bytes, filename=${msg.filename}`);
+
+    // Ignore duplicate zip-created messages (happens when multiple files complete after threshold)
+    const transfer = this.activeTransfers.get(msg.transferId);
+    if (!transfer) {
+      console.log(`[FT] Ignoring duplicate zip-created message for transfer ${msg.transferId}`);
+      return;
+    }
+
+    const blob = new Blob([msg.zipData]);
+    const url = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = msg.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      console.log('[FT] Zip download triggered successfully');
+    } catch (err) {
+      console.error('[FT] Failed to save zip:', msg.filename, err);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+
+    // Clean up transfer and temp files
+    console.log(`[FT] Cleaning up transfer ${msg.transferId}`);
+    this.activeTransfers.delete(msg.transferId);
+    this.onTransferComplete?.(msg.transferId, transfer.totalBytes ?? 0);
+    console.log(`[FT] Sending cleanup-temp message to worker for transfer ${msg.transferId}`);
+    this.worker?.postMessage({ type: 'cleanup-temp', transferId: msg.transferId });
+
+    // Clean up OPFS cache
+    if (transfer.serverPath) {
+      this.clearCacheForPath(transfer.serverPath);
+    }
+
+    // Close the file WebSocket connection only if no more active transfers
+    if (this.activeTransfers.size === 0) {
+      this.onConnectionShouldClose?.();
+    }
+  }
+
   private saveFile(path: string, data: Uint8Array): boolean {
     const filename = path.split('/').pop() || path;
     // Ensure data is backed by regular ArrayBuffer (not SharedArrayBuffer)
@@ -1286,4 +1588,98 @@ export class FileTransferHandler {
       URL.revokeObjectURL(url);
     }
   }
+}
+
+// CRC-32 lookup table
+const CRC32_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+  let c = i;
+  for (let j = 0; j < 8; j++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+  CRC32_TABLE[i] = c;
+}
+
+function crc32(data: Uint8Array): number {
+  let crc = ~0;
+  for (let i = 0; i < data.length; i++) {
+    crc = CRC32_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return ~crc >>> 0;
+}
+
+/** Create a ZIP file from a map of path → data entries (stored, no compression). */
+function createZip(files: Map<string, Uint8Array>): Uint8Array {
+  const encoder = new TextEncoder();
+  const entries: Array<{ name: Uint8Array; data: Uint8Array; crc: number; offset: number }> = [];
+
+  // Calculate total size
+  let totalSize = 22; // end of central directory
+  for (const [name, data] of files) {
+    const nameBytes = encoder.encode(name);
+    totalSize += 30 + nameBytes.length + data.length; // local header + data
+    totalSize += 46 + nameBytes.length; // central directory entry
+  }
+
+  const zip = new Uint8Array(totalSize);
+  const view = new DataView(zip.buffer);
+  let pos = 0;
+
+  // Write local file headers + data
+  for (const [name, data] of files) {
+    const nameBytes = encoder.encode(name);
+    const fileCrc = crc32(data);
+    const localOffset = pos;
+
+    // Local file header signature
+    view.setUint32(pos, 0x04034b50, true); pos += 4;
+    view.setUint16(pos, 20, true); pos += 2;   // version needed
+    view.setUint16(pos, 0, true); pos += 2;    // flags
+    view.setUint16(pos, 0, true); pos += 2;    // compression: stored
+    view.setUint16(pos, 0, true); pos += 2;    // mod time
+    view.setUint16(pos, 0, true); pos += 2;    // mod date
+    view.setUint32(pos, fileCrc, true); pos += 4;
+    view.setUint32(pos, data.length, true); pos += 4; // compressed size
+    view.setUint32(pos, data.length, true); pos += 4; // uncompressed size
+    view.setUint16(pos, nameBytes.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;    // extra field length
+    zip.set(nameBytes, pos); pos += nameBytes.length;
+    zip.set(data, pos); pos += data.length;
+
+    entries.push({ name: nameBytes, data, crc: fileCrc, offset: localOffset });
+  }
+
+  // Write central directory
+  const centralDirOffset = pos;
+  for (const entry of entries) {
+    view.setUint32(pos, 0x02014b50, true); pos += 4; // signature
+    view.setUint16(pos, 20, true); pos += 2;   // version made by
+    view.setUint16(pos, 20, true); pos += 2;   // version needed
+    view.setUint16(pos, 0, true); pos += 2;    // flags
+    view.setUint16(pos, 0, true); pos += 2;    // compression
+    view.setUint16(pos, 0, true); pos += 2;    // mod time
+    view.setUint16(pos, 0, true); pos += 2;    // mod date
+    view.setUint32(pos, entry.crc, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint16(pos, entry.name.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;    // extra field length
+    view.setUint16(pos, 0, true); pos += 2;    // file comment length
+    view.setUint16(pos, 0, true); pos += 2;    // disk number
+    view.setUint16(pos, 0, true); pos += 2;    // internal attrs
+    view.setUint32(pos, 0, true); pos += 4;    // external attrs
+    view.setUint32(pos, entry.offset, true); pos += 4;
+    zip.set(entry.name, pos); pos += entry.name.length;
+  }
+  const centralDirSize = pos - centralDirOffset;
+
+  // End of central directory
+  view.setUint32(pos, 0x06054b50, true); pos += 4;
+  view.setUint16(pos, 0, true); pos += 2;      // disk number
+  view.setUint16(pos, 0, true); pos += 2;      // central dir disk
+  view.setUint16(pos, entries.length, true); pos += 2;
+  view.setUint16(pos, entries.length, true); pos += 2;
+  view.setUint32(pos, centralDirSize, true); pos += 4;
+  view.setUint32(pos, centralDirOffset, true); pos += 4;
+  view.setUint16(pos, 0, true); pos += 2;      // comment length
+
+  return zip.slice(0, pos);
 }

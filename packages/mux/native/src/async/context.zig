@@ -56,10 +56,12 @@ pub inline fn swapContext(save: *Context, restore: *const Context) void {
 
 /// Initialize a context so that swapContext(_, ctx) starts executing
 /// `func(arg)` on the provided stack. When func returns, on_exit is called.
+/// func MUST use callconv(.c) because the trampoline passes arg via
+/// rdi (x86_64) / x0 (aarch64) — the C ABI first-argument register.
 pub fn makeContext(
     ctx: *Context,
     stack: []align(16) u8,
-    func: *const fn (*anyopaque) void,
+    func: *const fn (*anyopaque) callconv(.c) void,
     arg: *anyopaque,
     on_exit: *const fn () callconv(.c) noreturn,
 ) void {
@@ -107,7 +109,7 @@ fn swapContextX86_64(save: *Context, restore: *const Context) void {
 fn makeContextX86_64(
     ctx: *Context,
     stack: []align(16) u8,
-    func: *const fn (*anyopaque) void,
+    func: *const fn (*anyopaque) callconv(.c) void,
     arg: *anyopaque,
     on_exit: *const fn () callconv(.c) noreturn,
 ) void {
@@ -181,7 +183,7 @@ fn swapContextAarch64(save: *Context, restore: *const Context) void {
 fn makeContextAarch64(
     ctx: *Context,
     stack: []align(16) u8,
-    func: *const fn (*anyopaque) void,
+    func: *const fn (*anyopaque) callconv(.c) void,
     arg: *anyopaque,
     on_exit: *const fn () callconv(.c) noreturn,
 ) void {

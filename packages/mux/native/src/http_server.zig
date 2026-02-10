@@ -54,12 +54,15 @@ const embedded_zstd_wasm = web_assets.zstd_wasm;
 // - COOP/COEP for SharedArrayBuffer support (required for Web Workers with shared memory)
 // - CORP cross-origin: allows this page to be loaded in cross-origin iframes with COEP
 // - CSP frame-ancestors *: allow embedding in iframes from any origin
-// - Cache-Control: no-store to prevent browsers from caching terminal client (security)
+// - Cache-Control: aggressive no-cache to prevent browsers from caching (security + dev workflow)
+// - Pragma/Expires: legacy cache-busting for HTTP/1.0 and old browsers
 const cross_origin_headers = "Cross-Origin-Opener-Policy: same-origin\r\n" ++
     "Cross-Origin-Embedder-Policy: require-corp\r\n" ++
     "Cross-Origin-Resource-Policy: cross-origin\r\n" ++
     "Content-Security-Policy: frame-ancestors *\r\n" ++
-    "Cache-Control: no-store\r\n";
+    "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n" ++
+    "Pragma: no-cache\r\n" ++
+    "Expires: 0\r\n";
 
 // Color struct matching ghostty_config_color_s
 const Color = extern struct {

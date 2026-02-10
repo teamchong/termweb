@@ -115,6 +115,7 @@ export class MuxClient {
   onUploadRequest?: () => void;
   onDownloadRequest?: () => void;
   onFileDropRequest?: (panel: PanelInstance, files: File[]) => void;
+  onDownloadProgress?: (transferId: number, filesCompleted: number, totalFiles: number, bytesTransferred: number, totalBytes: number) => void;
 
   constructor() {
     this.fileTransfer = new FileTransferHandler();
@@ -129,6 +130,14 @@ export class MuxClient {
     this.fileTransfer.onDryRunReport = (transferId, report) => {
       console.log(`Transfer ${transferId} dry run: ${report.newCount} new, ${report.updateCount} update, ${report.deleteCount} delete`);
       this.resetFileWsIdleTimer();
+    };
+    this.fileTransfer.onDownloadProgress = (transferId, filesCompleted, totalFiles, bytesTransferred, totalBytes) => {
+      console.log(`[MuxClient] onDownloadProgress wrapper: transferId=${transferId}, filesCompleted=${filesCompleted}, callback=${this.onDownloadProgress ? 'defined' : 'undefined'}`);
+      this.onDownloadProgress?.(transferId, filesCompleted, totalFiles, bytesTransferred, totalBytes);
+    };
+    this.fileTransfer.onConnectionShouldClose = () => {
+      console.log('[MuxClient] Transfer complete, closing file WebSocket to prevent zombie state');
+      this.closeFileWs();
     };
   }
 
@@ -160,10 +169,10 @@ export class MuxClient {
       };
 
       const timeout = setTimeout(() => {
-        console.warn('[DryRun] Timeout — no response in 30s');
+        console.warn('[DryRun] Timeout — no response in 120s');
         cleanup();
         resolve(null);
-      }, 30000);
+      }, 120000);
 
       this.fileTransfer.onDryRunReport = (_transferId, report) => {
         cleanup();
@@ -204,17 +213,22 @@ export class MuxClient {
   /** Lazy file WS — connects on first transfer, not on page load.
    *  Returns a promise that resolves when the WS is open and ready to send. */
   ensureFileWs(): Promise<void> {
+    console.log(`[ensureFileWs] Called, fileWs exists: ${!!this.fileWs}, readyState: ${this.fileWs?.readyState}`);
+
     // Already open — just reset idle timer
     if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
+      console.log('[ensureFileWs] WS already OPEN, resetting idle timer');
       this.resetFileWsIdleTimer();
       return Promise.resolve();
     }
     // Already connecting — return the existing ready promise
     if (this.fileWs && this.fileWs.readyState === WebSocket.CONNECTING && this.fileWsReady) {
+      console.log('[ensureFileWs] WS already CONNECTING, returning existing promise');
       return this.fileWsReady;
     }
 
     // Clean up any stale WS in CLOSING/CLOSED state
+    console.log('[ensureFileWs] Cleaning up stale WS and creating new connection');
     this.closeFileWs();
 
     const wsUrl = getWsUrl(WS_PATHS.FILE);
@@ -229,13 +243,21 @@ export class MuxClient {
         console.log('File transfer channel connected');
         this.fileTransfer.setSend((data) => {
           if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
-            // Prepend zstd framing flag (0x00 = uncompressed)
-            // File data is already zstd-compressed at the application level
-            const frame = new Uint8Array(1 + data.length);
-            frame[0] = 0x00;
-            frame.set(data, 1);
-            this.fileWs.send(frame);
-            this.resetFileWsIdleTimer();
+            try {
+              // Prepend zstd framing flag (0x00 = uncompressed)
+              // File data is already zstd-compressed at the application level
+              const frame = new Uint8Array(1 + data.length);
+              frame[0] = 0x00;
+              frame.set(data, 1);
+              this.fileWs.send(frame);
+              this.resetFileWsIdleTimer();
+            } catch (err) {
+              console.error('[FileWS] Send failed, connection is dead:', err);
+              // Connection is broken - close and force reconnection
+              this.closeFileWs();
+            }
+          } else {
+            console.warn('[FileWS] Cannot send - WebSocket not open, readyState:', this.fileWs?.readyState);
           }
         });
         this.resetFileWsIdleTimer();

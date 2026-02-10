@@ -629,12 +629,13 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.stop(); // Also closes listener and signals shutdown fd
-        // Wait for all active connection threads to finish
+        // Wait for active connection threads to finish (3s timeout gives
+        // transfer goroutines time to notice cancellation and clean up)
         var wait_count: u32 = 0;
         while (self.active_connections.load(.acquire) > 0) {
             std.Thread.sleep(10 * std.time.ns_per_ms);
             wait_count += 1;
-            if (wait_count > 100) break; // 1s timeout (threads should exit immediately)
+            if (wait_count > 300) break;
         }
         // Close shutdown fds
         posix.close(self.shutdown_fd);

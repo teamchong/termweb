@@ -1693,6 +1693,13 @@ const Server = struct {
     fn deinit(self: *Server) void {
         self.running.store(false, .release);
 
+        // Cancel all active file transfers so goroutines and handler threads exit
+        self.transfer_manager.cancelAll();
+
+        // Signal goroutine runtime shutdown early so GChannel operations
+        // on OS threads return immediately (unblocks handler threads)
+        self.goroutine_rt.signalShutdown();
+
         // Close channels to unblock any blocked senders before WS server shutdown
         self.pending_panels_ch.close();
         self.pending_destroys_ch.close();
@@ -3650,17 +3657,26 @@ const Server = struct {
     };
 
     /// Goroutine entry point: reads a file, compresses it, sends result to channel.
-    fn processFileGoroutine(arg: *anyopaque) void {
+    /// Must use .c calling convention because the goroutine trampoline passes
+    /// arg via rdi (x86_64) / x0 (aarch64) using the C ABI.
+    fn processFileGoroutine(arg: *anyopaque) callconv(.c) void {
         const ctx: *FileGoroutineCtx = @ptrCast(@alignCast(arg));
+        std.debug.print("[Goroutine] START: file_index={d}, path={s}\n", .{ ctx.file_index, ctx.file_path });
         // Save done_counter before ctx.deinit frees the struct.
         // Defers execute LIFO: deinit runs first, then fetchAdd signals completion.
         const done_counter = ctx.done_counter;
         defer _ = done_counter.fetchAdd(1, .release);
         defer ctx.deinit();
 
-        if (!@atomicLoad(bool, ctx.is_active, .acquire)) return;
+        if (!@atomicLoad(bool, ctx.is_active, .acquire)) {
+            std.debug.print("[Goroutine] INACTIVE: file_index={d}\n", .{ctx.file_index});
+            return;
+        }
 
-        const data = readFileForGoroutine(ctx.allocator, ctx.base_path, ctx.file_path, ctx.file_size) orelse return;
+        const data = readFileForGoroutine(ctx.allocator, ctx.base_path, ctx.file_path, ctx.file_size) orelse {
+            std.debug.print("[Goroutine] READ FAILED: file_index={d}\n", .{ctx.file_index});
+            return;
+        };
         defer ctx.allocator.free(data);
 
         if (!@atomicLoad(bool, ctx.is_active, .acquire)) return;
@@ -3669,14 +3685,20 @@ const Server = struct {
             ctx.allocator,
             data,
             3,
-        ) catch return;
+        ) catch {
+            std.debug.print("[Goroutine] COMPRESS FAILED: file_index={d}\n", .{ctx.file_index});
+            return;
+        };
 
         if (!ctx.send_ch.send(.{
             .file_index = ctx.file_index,
             .file_size = ctx.file_size,
             .chunks = chunks,
         })) {
+            std.debug.print("[Goroutine] SEND FAILED (channel closed): file_index={d}\n", .{ctx.file_index});
             transfer.ParallelCompressor.freeChunks(ctx.allocator, chunks);
+        } else {
+            std.debug.print("[Goroutine] SUCCESS: file_index={d}\n", .{ctx.file_index});
         }
     }
 
@@ -3707,6 +3729,7 @@ const Server = struct {
     /// concurrently via goroutines (read + compress in parallel, send results
     /// through a channel to the WS handler thread).
     fn pushDownloadFiles(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
+        std.debug.print("[pushDownloadFiles] START: transferId={d}, total files={d}\n", .{ session.id, session.files.items.len });
         const chunk_size: usize = 256 * 1024;
         var bytes_sent: u64 = 0;
 
@@ -3766,18 +3789,17 @@ const Server = struct {
                 small_sizes.append(self.allocator, entry.size) catch continue;
                 small_bytes += entry.size;
 
-                if (small_bytes >= chunk_size or small_indices.items.len >= 64) {
-                    self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
-                }
+                // Accumulate all small files - flush only when hitting a large file or at the end
+                // This prevents sending many tiny BATCH_DATA messages
                 continue;
             }
 
+            // Flush accumulated small files before processing large file
             if (small_indices.items.len > 0) {
                 self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
             }
-            if (batch_entries.items.len > 0) {
-                self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
-            }
+            // Don't flush batch_entries here - accumulate all small files into one big batch
+            // Only flush at the end to avoid sending many tiny BATCH_DATA messages
 
             const file_path_copy = self.allocator.dupe(u8, entry.path) catch continue;
             const ctx = self.allocator.create(FileGoroutineCtx) catch {
@@ -3803,6 +3825,7 @@ const Server = struct {
         }
 
         // Flush remaining small files
+        std.debug.print("[pushDownloadFiles] Flushing remaining: small_indices={d}, batch_entries={d}, large_file_count={d}\n", .{ small_indices.items.len, batch_entries.items.len, large_file_count });
         if (small_indices.items.len > 0) {
             self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
         }
@@ -3812,6 +3835,7 @@ const Server = struct {
 
         // Receive compressed results from goroutines on this (WS handler) thread.
         // GChannel's recv() uses condition variable fallback for OS threads.
+        std.debug.print("[pushDownloadFiles] Waiting for {d} large files from goroutines\n", .{large_file_count});
         var files_done: usize = 0;
         while (files_done < large_file_count) {
             if (!session.is_active) {
@@ -3844,13 +3868,24 @@ const Server = struct {
                 bytes_sent += this_chunk;
             }
             files_done += 1;
+            std.debug.print("[pushDownloadFiles] Received large file from goroutine: {d}/{d}\n", .{ files_done, large_file_count });
         }
 
+        std.debug.print("[pushDownloadFiles] All large files received, sending TRANSFER_COMPLETE\n", .{});
+        std.debug.print("[pushDownloadFiles] Summary: transferId={d}, total_entries={d}, large_files={d}, bytes_sent={d}\n", .{ session.id, session.files.items.len, large_file_count, bytes_sent });
         const complete_msg = transfer.buildTransferComplete(self.allocator, session.id, bytes_sent) catch return;
         defer self.allocator.free(complete_msg);
-        conn.sendBinary(complete_msg) catch {};
+        conn.sendBinary(complete_msg) catch |err| {
+            std.debug.print("[pushDownloadFiles] ERROR sending TRANSFER_COMPLETE: {}\n", .{err});
+            return;
+        };
+        std.debug.print("[pushDownloadFiles] TRANSFER_COMPLETE sent successfully (msg_size={d})\n", .{complete_msg.len});
 
         std.debug.print("Download complete: {d} bytes sent across {d} files ({d} large via goroutines)\n", .{ bytes_sent, session.files.items.len, large_file_count });
+
+        // Clean up session after successful download
+        self.transfer_manager.removeSession(session.id);
+        conn.user_data = null;
     }
 
     /// Serial fallback for pushDownloadFiles (used when goroutine channel creation fails).
@@ -3974,6 +4009,10 @@ const Server = struct {
         defer self.allocator.free(complete_msg);
         conn.sendBinary(complete_msg) catch {};
         std.debug.print("Download complete (serial fallback): {d} bytes sent\n", .{bytes_sent});
+
+        // Clean up session after successful download
+        self.transfer_manager.removeSession(session.id);
+        conn.user_data = null;
     }
 
     fn flushBatch(
@@ -3986,6 +4025,13 @@ const Server = struct {
         bytes_sent: *u64,
     ) void {
         if (batch_entries.items.len == 0) return;
+
+        std.debug.print("[flushBatch] Sending {d} files: indices ", .{batch_entries.items.len});
+        for (batch_entries.items, 0..) |entry, i| {
+            if (i < 10) std.debug.print("{d} ", .{entry.file_index});
+        }
+        if (batch_entries.items.len > 10) std.debug.print("... ({d} more)", .{batch_entries.items.len - 10});
+        std.debug.print("\n", .{});
 
         const msg = transfer.buildBatchData(self.allocator, session, batch_entries.items) catch |err| {
             std.debug.print("Failed to build batch: {}\n", .{err});
@@ -4001,7 +4047,9 @@ const Server = struct {
         };
         defer self.allocator.free(msg);
 
-        conn.sendBinary(msg) catch {};
+        conn.sendBinary(msg) catch |err| {
+            std.debug.print("[flushBatch] ERROR sending batch: {}\n", .{err});
+        };
         bytes_sent.* += batch_bytes.*;
         self.clearBatch(batch_entries, batch_data_bufs, batch_bytes);
     }
@@ -4023,7 +4071,7 @@ const Server = struct {
     /// No fallback — each platform compiles only its optimal path.
     fn flushSmallBatch(
         self: *Server,
-        conn: *ws.Connection,
+        _: *ws.Connection,
         session: *transfer.TransferSession,
         small_indices: *std.ArrayListUnmanaged(u32),
         small_sizes: *std.ArrayListUnmanaged(u64),
@@ -4031,8 +4079,8 @@ const Server = struct {
         batch_entries: *std.ArrayListUnmanaged(transfer.BatchEntry),
         batch_data_bufs: *std.ArrayListUnmanaged([]const u8),
         batch_bytes: *u64,
-        bytes_sent: *u64,
-        chunk_size: usize,
+        _: *u64,
+        _: usize,
     ) void {
         const count = small_indices.items.len;
         if (count == 0) return;
@@ -4102,10 +4150,8 @@ const Server = struct {
             batch_bytes.* += session.files.items[fi].size;
         }
 
-        // Flush to network if accumulated enough
-        if (batch_bytes.* >= chunk_size or batch_entries.items.len >= 256) {
-            self.flushBatch(conn, session, batch_entries, batch_data_bufs, batch_bytes, bytes_sent);
-        }
+        // Don't flush here - let caller decide when to flush to avoid sending too many small batches
+        // This accumulates files into batch_entries for efficient batching
     }
 
     /// Prefetch a file into memory using madvise(WILLNEED).
@@ -4174,6 +4220,10 @@ const Server = struct {
         conn.sendBinary(report_msg) catch |err| {
             std.debug.print("Failed to send dry run report: {}\n", .{err});
         };
+
+        // Clean up session after sending dry run report
+        self.transfer_manager.removeSession(session.id);
+        conn.user_data = null;
     }
 
     /// Resolve a client-supplied path to an absolute path.
@@ -5582,7 +5632,12 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer {
+        const status = gpa.deinit();
+        if (status == .leak) {
+            std.debug.print("\n=== GPA LEAK DETECTED ===\n", .{});
+        }
+    }
     const allocator = gpa.allocator();
 
     const args = try parseArgs(allocator);

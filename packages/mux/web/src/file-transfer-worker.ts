@@ -15,6 +15,8 @@ interface ZstdExports {
 let wasm: ZstdExports | null = null;
 let opfsRoot: FileSystemDirectoryHandle | null = null;
 const openHandles = new Map<string, FileSystemSyncAccessHandle>();
+// Queue for serializing chunk writes per file (prevents concurrent access handle creation)
+const fileQueues = new Map<string, Promise<void>>();
 
 const MAX_DECOMPRESSED_SIZE = 16 * 1024 * 1024;
 
@@ -191,6 +193,217 @@ async function cleanupTransfer(transferId: number): Promise<void> {
   }
 }
 
+// ── Temp file storage for zip creation (avoids keeping files in memory) ──
+
+const TEMP_ROOT = 'termweb-temp';
+
+async function writeTempFile(transferId: number, path: string, data: ArrayBuffer): Promise<void> {
+  if (!opfsRoot) return;
+
+  // Retry up to 3 times if we get access handle conflicts
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const tempDir = await opfsRoot.getDirectoryHandle(TEMP_ROOT, { create: true });
+      const transferDir = await tempDir.getDirectoryHandle(String(transferId), { create: true });
+
+      // Create nested directories for path
+      const parts = path.split('/').filter(p => p);
+      let dir = transferDir;
+      for (let i = 0; i < parts.length - 1; i++) {
+        dir = await dir.getDirectoryHandle(parts[i], { create: true });
+      }
+
+      // Write file using sync access handle (available in workers)
+      const fileName = parts[parts.length - 1];
+      const fileHandle = await dir.getFileHandle(fileName, { create: true });
+
+      let accessHandle: any = null;
+      try {
+        // @ts-ignore - createSyncAccessHandle exists in workers but TypeScript doesn't know
+        accessHandle = await fileHandle.createSyncAccessHandle();
+        accessHandle.truncate(0);
+        accessHandle.write(new Uint8Array(data), { at: 0 });
+        accessHandle.flush();
+        return; // Success!
+      } finally {
+        // Ensure handle is closed even if write fails
+        if (accessHandle) {
+          try {
+            accessHandle.close();
+          } catch (closeErr) {
+            console.warn('Failed to close access handle:', closeErr);
+          }
+        }
+      }
+    } catch (err) {
+      lastError = err;
+      const errMsg = err instanceof Error ? err.message : String(err);
+
+      // If it's an access handle conflict, wait and retry
+      if (errMsg.includes('Access Handle') || errMsg.includes('access handle')) {
+        console.warn(`Write temp file attempt ${attempt + 1}/3 failed for ${path}, retrying...`, errMsg);
+        // Exponential backoff: 10ms, 50ms, 100ms
+        await new Promise(resolve => setTimeout(resolve, 10 * Math.pow(5, attempt)));
+        continue;
+      }
+
+      // For other errors, log and give up
+      console.error('Failed to write temp file:', path, err);
+      return;
+    }
+  }
+
+  // All retries exhausted
+  console.error('Failed to write temp file after 3 attempts:', path, lastError);
+}
+
+async function createZipFromTemp(transferId: number, folderName?: string): Promise<{ zipData: ArrayBuffer; filename: string }> {
+  if (!opfsRoot) throw new Error('OPFS not available');
+
+  console.log(`[Worker] createZipFromTemp: Getting temp dir for transfer ${transferId}`);
+  const tempDir = await opfsRoot.getDirectoryHandle(TEMP_ROOT);
+  const transferDir = await tempDir.getDirectoryHandle(String(transferId));
+
+  // Collect all files recursively
+  const files = new Map<string, Uint8Array>();
+
+  async function walkDir(dir: FileSystemDirectoryHandle, prefix: string): Promise<void> {
+    for await (const [name, handle] of dir as unknown as AsyncIterable<[string, FileSystemHandle]>) {
+      const path = prefix ? `${prefix}/${name}` : name;
+
+      if (handle.kind === 'file') {
+        const fileHandle = handle as FileSystemFileHandle;
+        const file = await fileHandle.getFile();
+        const data = new Uint8Array(await file.arrayBuffer());
+        files.set(path, data);
+      } else if (handle.kind === 'directory') {
+        await walkDir(handle as FileSystemDirectoryHandle, path);
+      }
+    }
+  }
+
+  await walkDir(transferDir, '');
+  console.log(`[Worker] Collected ${files.size} files from OPFS temp`);
+
+  // Create zip from collected files
+  const zipData = createZipInWorker(files);
+  console.log(`[Worker] Created zip: ${zipData.length} bytes`);
+
+  // Use provided folder name or extract from first file path
+  const filename = folderName ? `${folderName}.zip` : `${Array.from(files.keys())[0]?.split('/')[0] || 'download'}.zip`;
+  console.log(`[Worker] Zip filename: ${filename}`);
+
+  return { zipData: zipData.buffer as ArrayBuffer, filename };
+}
+
+async function cleanupTempFiles(transferId: number): Promise<void> {
+  if (!opfsRoot) return;
+
+  try {
+    const tempDir = await opfsRoot.getDirectoryHandle(TEMP_ROOT);
+    await tempDir.removeEntry(String(transferId), { recursive: true });
+  } catch {
+    // Directory might not exist
+  }
+}
+
+// CRC32 table for ZIP checksums
+const CRC32_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+  let c = i;
+  for (let k = 0; k < 8; k++) {
+    c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  }
+  CRC32_TABLE[i] = c;
+}
+
+function crc32(data: Uint8Array): number {
+  let crc = ~0;
+  for (let i = 0; i < data.length; i++) {
+    crc = CRC32_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return ~crc >>> 0;
+}
+
+/** Create a ZIP file from a map of path → data entries (stored, no compression). */
+function createZipInWorker(files: Map<string, Uint8Array>): Uint8Array {
+  const encoder = new TextEncoder();
+  const entries: Array<{ name: Uint8Array; data: Uint8Array; crc: number; offset: number }> = [];
+
+  // Calculate total size
+  let totalSize = 22; // end of central directory
+  for (const [name, data] of files) {
+    const nameBytes = encoder.encode(name);
+    totalSize += 30 + nameBytes.length + data.length; // local header + data
+    totalSize += 46 + nameBytes.length; // central directory entry
+  }
+
+  const zip = new Uint8Array(totalSize);
+  const view = new DataView(zip.buffer);
+  let pos = 0;
+
+  // Write local file headers + data
+  for (const [name, data] of files) {
+    const nameBytes = encoder.encode(name);
+    const fileCrc = crc32(data);
+    const localOffset = pos;
+
+    // Local file header signature
+    view.setUint32(pos, 0x04034b50, true); pos += 4;
+    view.setUint16(pos, 20, true); pos += 2;   // version needed
+    view.setUint16(pos, 0, true); pos += 2;    // flags
+    view.setUint16(pos, 0, true); pos += 2;    // compression: stored
+    view.setUint16(pos, 0, true); pos += 2;    // mod time
+    view.setUint16(pos, 0, true); pos += 2;    // mod date
+    view.setUint32(pos, fileCrc, true); pos += 4;
+    view.setUint32(pos, data.length, true); pos += 4; // compressed size
+    view.setUint32(pos, data.length, true); pos += 4; // uncompressed size
+    view.setUint16(pos, nameBytes.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;    // extra field length
+    zip.set(nameBytes, pos); pos += nameBytes.length;
+    zip.set(data, pos); pos += data.length;
+
+    entries.push({ name: nameBytes, data, crc: fileCrc, offset: localOffset });
+  }
+
+  // Write central directory
+  const centralDirOffset = pos;
+  for (const entry of entries) {
+    view.setUint32(pos, 0x02014b50, true); pos += 4; // signature
+    view.setUint16(pos, 20, true); pos += 2;   // version made by
+    view.setUint16(pos, 20, true); pos += 2;   // version needed
+    view.setUint16(pos, 0, true); pos += 2;    // flags
+    view.setUint16(pos, 0, true); pos += 2;    // compression
+    view.setUint16(pos, 0, true); pos += 2;    // mod time
+    view.setUint16(pos, 0, true); pos += 2;    // mod date
+    view.setUint32(pos, entry.crc, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4; // compressed size
+    view.setUint32(pos, entry.data.length, true); pos += 4; // uncompressed size
+    view.setUint16(pos, entry.name.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;    // extra field length
+    view.setUint16(pos, 0, true); pos += 2;    // file comment length
+    view.setUint16(pos, 0, true); pos += 2;    // disk number
+    view.setUint16(pos, 0, true); pos += 2;    // internal file attributes
+    view.setUint32(pos, 0, true); pos += 4;    // external file attributes
+    view.setUint32(pos, entry.offset, true); pos += 4; // local header offset
+    zip.set(entry.name, pos); pos += entry.name.length;
+  }
+
+  // Write end of central directory
+  const centralDirSize = pos - centralDirOffset;
+  view.setUint32(pos, 0x06054b50, true); pos += 4; // signature
+  view.setUint16(pos, 0, true); pos += 2;    // disk number
+  view.setUint16(pos, 0, true); pos += 2;    // disk with central dir
+  view.setUint16(pos, entries.length, true); pos += 2; // entries on this disk
+  view.setUint16(pos, entries.length, true); pos += 2; // total entries
+  view.setUint32(pos, centralDirSize, true); pos += 4;
+  view.setUint32(pos, centralDirOffset, true); pos += 4;
+  view.setUint16(pos, 0, true); // comment length
+
+  return zip;
+}
+
 // ── OPFS Cache (persistent storage for delta sync) ──
 
 const CACHE_ROOT = 'termweb-cache';
@@ -310,6 +523,28 @@ async function cacheClearAll(): Promise<void> {
   if (!opfsRoot) return;
   try {
     await opfsRoot.removeEntry(CACHE_ROOT, { recursive: true });
+  } catch {
+    // Directory might not exist
+  }
+}
+
+/** Clear cache for a specific server path */
+async function cacheClearPath(serverPath: string): Promise<void> {
+  if (!opfsRoot) return;
+  try {
+    const cacheDir = await opfsRoot.getDirectoryHandle(CACHE_ROOT);
+    const cleanPath = serverPath.replace(/^\/+/, '');
+    if (cleanPath) {
+      // Navigate to parent directory and remove the target
+      const parts = cleanPath.split('/').filter(p => p);
+      if (parts.length === 0) return;
+
+      let dir = cacheDir;
+      for (let i = 0; i < parts.length - 1; i++) {
+        dir = await dir.getDirectoryHandle(parts[i]);
+      }
+      await dir.removeEntry(parts[parts.length - 1], { recursive: true });
+    }
   } catch {
     // Directory might not exist
   }
@@ -464,34 +699,65 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'decompress-and-write': {
-        const { transferId, filePath, offset, compressedData, fileSize } = msg;
-        const decompressed = decompressData(new Uint8Array(compressedData));
+        const { transferId, fileIndex, filePath, offset, compressedData, fileSize } = msg;
+        console.log(`[Worker] decompress-and-write: idx=${fileIndex}, path=${filePath}, offset=${offset}, size=${fileSize}`);
 
-        if (opfsRoot) {
-          const handle = await getOPFSHandle(transferId, filePath);
-          handle.write(decompressed, { at: offset });
+        // Queue operations per file to prevent concurrent access handle creation
+        const fileKey = `${transferId}/${filePath}`;
+        const previousOp = fileQueues.get(fileKey) || Promise.resolve();
 
-          const written = handle.getSize();
-          const complete = written >= fileSize;
-          if (complete) {
-            closeHandle(transferId, filePath);
+        const currentOp = previousOp.then(async () => {
+          try {
+            const decompressed = decompressData(new Uint8Array(compressedData));
+            console.log(`[Worker] decompressed: idx=${fileIndex}, decompressed=${decompressed.length} bytes`);
+
+            if (opfsRoot) {
+              const handle = await getOPFSHandle(transferId, filePath);
+              console.log(`[Worker] got handle: idx=${fileIndex}, current size=${handle.getSize()}`);
+
+              handle.write(decompressed, { at: offset });
+              console.log(`[Worker] wrote chunk: idx=${fileIndex}, at offset=${offset}`);
+
+              const written = handle.getSize();
+              const complete = written >= fileSize;
+              console.log(`[Worker] after write: idx=${fileIndex}, size=${written}/${fileSize}, complete=${complete}`);
+
+              if (complete) {
+                closeHandle(transferId, filePath);
+                fileQueues.delete(fileKey); // Clean up queue when file is complete
+                console.log(`[Worker] closed handle: idx=${fileIndex}`);
+              }
+
+              (self as unknown as Worker).postMessage({
+                type: 'chunk-written',
+                transferId,
+                fileIndex,
+                filePath,
+                bytesWritten: decompressed.length,
+                complete,
+              });
+              console.log(`[Worker] sent chunk-written: idx=${fileIndex}`);
+            } else {
+              // No OPFS — return decompressed data to main thread
+              const buffer = decompressed.buffer as ArrayBuffer;
+              (self as unknown as Worker).postMessage(
+                { type: 'chunk-decompressed', transferId, fileIndex, filePath, offset, data: buffer, bytesWritten: decompressed.length },
+                [buffer]
+              );
+            }
+          } catch (err) {
+            console.error(`[Worker] ERROR decompress-and-write: idx=${fileIndex}, path=${filePath}`, err);
+            (self as unknown as Worker).postMessage({
+              type: 'chunk-error',
+              transferId,
+              fileIndex,
+              filePath,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
+        });
 
-          (self as unknown as Worker).postMessage({
-            type: 'chunk-written',
-            transferId,
-            filePath,
-            bytesWritten: decompressed.length,
-            complete,
-          });
-        } else {
-          // No OPFS — return decompressed data to main thread
-          const buffer = decompressed.buffer as ArrayBuffer;
-          (self as unknown as Worker).postMessage(
-            { type: 'chunk-decompressed', transferId, filePath, offset, data: buffer, bytesWritten: decompressed.length },
-            [buffer]
-          );
-        }
+        fileQueues.set(fileKey, currentOp);
         break;
       }
 
@@ -508,6 +774,32 @@ self.onmessage = async (e: MessageEvent) => {
       case 'cleanup': {
         await cleanupTransfer(msg.transferId);
         (self as unknown as Worker).postMessage({ type: 'cleanup-done', transferId: msg.transferId });
+        break;
+      }
+
+      // ── Temp file operations for zip creation ──
+
+      case 'write-temp-file': {
+        await writeTempFile(msg.transferId, msg.path, msg.data);
+        break;
+      }
+
+      case 'create-zip-from-temp': {
+        console.log(`[Worker] create-zip-from-temp: transferId=${msg.transferId}, folderName=${msg.folderName}`);
+        const { zipData, filename } = await createZipFromTemp(msg.transferId, msg.folderName);
+        console.log(`[Worker] Zip created: size=${zipData.byteLength} bytes, filename=${filename}`);
+        (self as unknown as Worker).postMessage(
+          { type: 'zip-created', transferId: msg.transferId, zipData, filename },
+          [zipData]
+        );
+        console.log('[Worker] Sent zip-created message to main thread');
+        break;
+      }
+
+      case 'cleanup-temp': {
+        console.log(`[Worker] cleanup-temp: transferId=${msg.transferId}`);
+        await cleanupTempFiles(msg.transferId);
+        console.log('[Worker] Temp files cleaned up');
         break;
       }
 
@@ -548,6 +840,13 @@ self.onmessage = async (e: MessageEvent) => {
         const { id } = msg;
         await cacheClearAll();
         (self as unknown as Worker).postMessage({ type: 'cache-cleared', id });
+        break;
+      }
+
+      case 'cache-clear-path': {
+        const { serverPath } = msg;
+        await cacheClearPath(serverPath);
+        (self as unknown as Worker).postMessage({ type: 'cache-path-cleared', serverPath });
         break;
       }
 

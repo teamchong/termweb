@@ -154,10 +154,15 @@ pub fn GChannel(comptime T: type) type {
                     continue;
                 }
 
+                // OS thread path: timedWait with runtime shutdown check
                 while (self.size >= self.capacity and !self.closed) {
-                    self.os_not_full.wait(&self.mutex);
+                    if (self.runtime.shutdown.load(.acquire)) {
+                        self.mutex.unlock();
+                        return false;
+                    }
+                    self.os_not_full.timedWait(&self.mutex, 100 * std.time.ns_per_ms) catch {};
                 }
-                if (self.closed) {
+                if (self.closed or self.size >= self.capacity) {
                     self.mutex.unlock();
                     return false;
                 }
@@ -196,8 +201,13 @@ pub fn GChannel(comptime T: type) type {
                     continue;
                 }
 
+                // OS thread path: timedWait with runtime shutdown check
                 while (self.size == 0 and !self.closed) {
-                    self.os_not_empty.wait(&self.mutex);
+                    if (self.runtime.shutdown.load(.acquire)) {
+                        self.mutex.unlock();
+                        return null;
+                    }
+                    self.os_not_empty.timedWait(&self.mutex, 100 * std.time.ns_per_ms) catch {};
                 }
                 if (self.size == 0) {
                     self.mutex.unlock();
@@ -245,7 +255,11 @@ pub fn GChannel(comptime T: type) type {
 
             self.os_not_empty.signal();
             while (!self.rendezvous_done and !self.closed) {
-                self.os_not_full.wait(&self.mutex);
+                if (self.runtime.shutdown.load(.acquire)) {
+                    self.mutex.unlock();
+                    return false;
+                }
+                self.os_not_full.timedWait(&self.mutex, 100 * std.time.ns_per_ms) catch {};
             }
             const was_closed = self.closed;
             self.mutex.unlock();
@@ -283,8 +297,13 @@ pub fn GChannel(comptime T: type) type {
                     continue;
                 }
 
+                // OS thread path: timedWait with runtime shutdown check
                 while (self.rendezvous_value == null and !self.closed) {
-                    self.os_not_empty.wait(&self.mutex);
+                    if (self.runtime.shutdown.load(.acquire)) {
+                        self.mutex.unlock();
+                        return null;
+                    }
+                    self.os_not_empty.timedWait(&self.mutex, 100 * std.time.ns_per_ms) catch {};
                 }
                 if (self.rendezvous_value) |val| {
                     self.rendezvous_value = null;

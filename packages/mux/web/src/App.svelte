@@ -8,6 +8,7 @@
   import TabOverview from './components/TabOverview.svelte';
   import ShareDialog from './components/ShareDialog.svelte';
   import TransferDialog, { type TransferConfig } from './components/TransferDialog.svelte';
+  import DownloadProgressDialog from './components/DownloadProgressDialog.svelte';
   import { tabs, activeTabId, activeTab, ui } from './stores/index';
   import { connectionStatus, initialLayoutLoaded, initMuxClient, type MuxClient } from './services/mux';
 
@@ -36,11 +37,29 @@
   let transferDialogInitialDirHandle: FileSystemDirectoryHandle | undefined = $state();
   let transferDialogInitialFiles: File[] | undefined = $state();
 
+  // Download progress dialog state
+  let downloadProgressOpen = $state(false);
+
   // Quick terminal ref
   let quickTerminalRef: QuickTerminal | undefined = $state();
 
   // Tab overview state (synced with server via ui store)
   let tabOverviewOpen = $derived($ui.overviewOpen);
+
+  // Download progress state (supports multiple concurrent downloads)
+  let activeDownloads = $state(new Map<number, {
+    files: number;
+    total: number;
+    bytes: number;
+    totalBytes: number;
+    path?: string;
+    status: 'active' | 'complete' | 'error';
+    startTime: number;
+    endTime?: number;
+  }>());
+  let pendingTransferPath = $state<string | null>(null);
+  let opfsUsageBytes = $state(0);
+  let opfsFileCount = $state(0);
 
   // Subscribe to connection status
   let status = $derived($connectionStatus);
@@ -64,7 +83,7 @@
     { separator: true },
     { label: 'Upload...', action: '_upload', shortcut: '⌘U', icon: '⬆', disabled: !hasTabs },
     { label: 'Download...', action: '_download', shortcut: '⌘⇧S', icon: '⬇', disabled: !hasTabs },
-    { label: 'Storage...', action: '_storage', icon: '⛃' },
+    { label: 'Transfer Monitor', action: '_transfer_monitor', icon: '⚡' },
     { separator: true },
     { label: 'Split Right', action: '_split_right', shortcut: '⌘D', icon: '⬚▐', disabled: !hasTabs },
     { label: 'Split Down', action: '_split_down', shortcut: '⌘⇧D', icon: '⬚▄', disabled: !hasTabs },
@@ -199,6 +218,7 @@
     transferDialogDefaultPath = muxClient?.getActivePanelPwd() || '';
     transferDialogInitialDirHandle = undefined;
     transferDialogInitialFiles = undefined;
+    downloadProgressOpen = false; // Close transfer monitor when opening upload dialog
     transferDialogOpen = true;
   }
 
@@ -207,6 +227,7 @@
     transferDialogDefaultPath = muxClient?.getActivePanelPwd() || '';
     transferDialogInitialDirHandle = undefined;
     transferDialogInitialFiles = undefined;
+    downloadProgressOpen = false; // Close transfer monitor when opening download dialog
     transferDialogOpen = true;
   }
 
@@ -215,15 +236,33 @@
     transferDialogDefaultPath = muxClient?.getActivePanelPwd() || '';
     transferDialogInitialDirHandle = undefined;
     transferDialogInitialFiles = files;
+    downloadProgressOpen = false; // Close transfer monitor when opening file drop dialog
     transferDialogOpen = true;
   }
 
   async function handleTransferExecute(config: TransferConfig) {
     if (!muxClient) return;
     const ft = muxClient.getFileTransfer();
-    const options = { excludes: config.excludes, deleteExtra: config.deleteExtra };
+    const options = { excludes: config.excludes, deleteExtra: config.deleteExtra, useGitignore: config.useGitignore };
+
+    console.log('[App] handleTransferExecute START:', {
+      mode: transferDialogMode,
+      path: config.serverPath,
+      hasPendingTransfer: !!ft['pendingTransfer'],
+      activeTransfersCount: ft['activeTransfers'].size,
+    });
+
     try {
       await muxClient.ensureFileWs();
+
+      // Close config dialog and open progress dialog immediately
+      transferDialogOpen = false;
+      downloadProgressOpen = true;
+
+      // Store pending path to display while waiting for first progress callback
+      pendingTransferPath = config.serverPath;
+      console.log('[App] Set pendingTransferPath:', pendingTransferPath);
+
       if (transferDialogMode === 'upload') {
         if (config.dirHandle) {
           await ft.startFolderUpload(config.dirHandle, config.serverPath, options);
@@ -231,16 +270,19 @@
           await ft.startFilesUpload(config.files, config.serverPath, options);
         }
       } else {
+        console.log('[App] Calling startFolderDownload...');
         await ft.startFolderDownload(config.serverPath, options);
+        console.log('[App] startFolderDownload returned, hasPendingTransfer:', !!ft['pendingTransfer']);
       }
     } catch (err) {
-      console.error('Transfer failed:', err);
+      console.error('[App] Transfer failed:', err);
+      pendingTransferPath = null;
     }
   }
 
   async function handleTransferPreview(config: TransferConfig) {
     if (!muxClient) return null;
-    const options = { excludes: config.excludes, deleteExtra: config.deleteExtra };
+    const options = { excludes: config.excludes, deleteExtra: config.deleteExtra, useGitignore: config.useGitignore };
     return muxClient.requestDryRun(
       transferDialogMode,
       config.serverPath,
@@ -304,8 +346,8 @@
       case '_download':
         openDownloadDialog();
         break;
-      case '_storage':
-        muxClient?.showStorageDialog();
+      case '_transfer_monitor':
+        downloadProgressOpen = true;
         break;
       case '_close_window':
         // Close all tabs (close window)
@@ -420,12 +462,142 @@
         muxClient.onUploadRequest = () => openUploadDialog();
         muxClient.onDownloadRequest = () => openDownloadDialog();
         muxClient.onFileDropRequest = (_panel, files) => openFileDropDialog(files);
+
+        // Initialize download entry when transfer starts (creates single entry with correct totals)
+        muxClient.getFileTransfer().onTransferStart = (transferId, path, direction, totalFiles, totalBytes) => {
+          console.log(`[App] onTransferStart: id=${transferId}, direction=${direction}, files=${totalFiles}, bytes=${totalBytes}, path=${path}`);
+          if (direction === 'download') {
+            // Open the progress dialog automatically
+            downloadProgressOpen = true;
+
+            // Create the download entry - create new Map to trigger Svelte 5 reactivity
+            activeDownloads.set(transferId, {
+              files: 0,
+              total: totalFiles,
+              bytes: 0,
+              totalBytes: totalBytes,
+              path: path,
+              status: 'active',
+              startTime: Date.now(),
+            });
+            activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
+            console.log(`[App] Created download entry for transfer ${transferId}, map size: ${activeDownloads.size}`);
+
+            // Clear pending path since we now have the actual transfer
+            if (pendingTransferPath) {
+              console.log('[App] Clearing pendingTransferPath');
+              pendingTransferPath = null;
+            }
+          }
+        };
+
+        console.log('[App] Setting muxClient.onDownloadProgress callback');
+        muxClient.onDownloadProgress = (transferId, filesCompleted, totalFiles, bytesTransferred, totalBytes) => {
+          console.log(`[App] onDownloadProgress called: transferId=${transferId}, filesCompleted=${filesCompleted}, map size=${activeDownloads.size}`);
+          // Update existing download entry (created by onTransferStart)
+          const existing = activeDownloads.get(transferId);
+          if (existing) {
+            existing.files = filesCompleted;
+            existing.total = totalFiles;
+            existing.bytes = bytesTransferred;
+            existing.totalBytes = totalBytes;
+            existing.status = 'active';
+            activeDownloads.set(transferId, existing);
+            activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
+
+            // Update window title with overall progress (only for active transfers)
+            const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
+            const pct = totalBytes > 0 ? Math.round((bytesTransferred / totalBytes) * 100) : 0;
+            if (activeCount === 1) {
+              document.title = `⬇ ${filesCompleted}/${totalFiles} (${pct}%) — termweb`;
+            } else if (activeCount > 1) {
+              document.title = `⬇ ${activeCount} downloads — termweb`;
+            } else {
+              document.title = 'termweb';
+            }
+          } else {
+            console.warn(`[App] onDownloadProgress for unknown transfer ${transferId}, map size: ${activeDownloads.size}`);
+          }
+        };
+
+        // Mark completed downloads (don't delete - keep for history)
+        const originalOnTransferComplete = muxClient.getFileTransfer().onTransferComplete;
+        muxClient.getFileTransfer().onTransferComplete = (transferId, totalBytes) => {
+          console.log(`[App] onTransferComplete: transferId=${transferId}, totalBytes=${totalBytes}`);
+          originalOnTransferComplete?.(transferId, totalBytes);
+          const existing = activeDownloads.get(transferId);
+          if (existing) {
+            console.log(`[App] Setting transfer ${transferId} status to 'complete'`);
+            existing.status = 'complete';
+            existing.endTime = Date.now();
+            activeDownloads.set(transferId, existing);
+            activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
+          } else {
+            console.warn(`[App] onTransferComplete: transfer ${transferId} not found in activeDownloads`);
+          }
+
+          // Update title based on remaining active transfers
+          const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
+          if (activeCount === 0) {
+            setTimeout(() => { document.title = 'termweb'; }, 2000);
+          }
+        };
+
+        // Handle cancelled transfers
+        muxClient.getFileTransfer().onTransferCancelled = (transferId) => {
+          activeDownloads.delete(transferId);
+          activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
+
+          // Update title based on remaining active transfers
+          const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
+          if (activeCount === 0) {
+            document.title = 'termweb';
+          }
+        };
+
+        // Handle transfer errors
+        const originalOnTransferError = muxClient.getFileTransfer().onTransferError;
+        muxClient.getFileTransfer().onTransferError = (transferId, error) => {
+          console.error(`[App] Transfer error: transferId=${transferId}, error=${error}`);
+          originalOnTransferError?.(transferId, error);
+
+          // Clear pending path on error
+          if (pendingTransferPath) {
+            console.log('[App] Error handler clearing pendingTransferPath');
+            pendingTransferPath = null;
+          }
+
+          // Mark transfer as error or remove it
+          const existing = activeDownloads.get(transferId);
+          if (existing) {
+            existing.status = 'error';
+            activeDownloads.set(transferId, existing);
+            activeDownloads = new Map(activeDownloads);
+          }
+
+          // Update title
+          const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
+          if (activeCount === 0) {
+            document.title = 'termweb';
+          }
+        };
       } catch (err) {
         console.error('Failed to initialize MuxClient:', err);
       } finally {
         showLoading = false;
       }
     }
+
+    // Poll OPFS usage every 5 seconds when dialog is open
+    const usageInterval = setInterval(async () => {
+      if (downloadProgressOpen && muxClient) {
+        const usage = await muxClient.getFileTransfer().getCacheUsage();
+        opfsUsageBytes = usage.totalBytes;
+        opfsFileCount = usage.fileCount;
+      }
+    }, 5000);
+
+    return () => clearInterval(usageInterval);
   });
 
   onDestroy(() => {
@@ -702,6 +874,64 @@
     onTransfer={handleTransferExecute}
     onPreview={handleTransferPreview}
     onClose={() => transferDialogOpen = false}
+  />
+
+  <!-- Download/Upload Progress Dialog -->
+  <DownloadProgressDialog
+    downloads={activeDownloads}
+    pendingPath={pendingTransferPath}
+    opfsUsageBytes={opfsUsageBytes}
+    opfsFileCount={opfsFileCount}
+    open={downloadProgressOpen}
+    onClose={() => {
+      downloadProgressOpen = false;
+      // Reset title when dialog is closed
+      const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
+      if (activeCount === 0) {
+        document.title = 'termweb';
+      }
+    }}
+    onCancel={async (id) => {
+      const transfer = activeDownloads.get(id);
+      // Only cancel if transfer is still active
+      if (transfer?.status === 'active') {
+        muxClient?.getFileTransfer().cancelTransfer(id);
+        // Clear cache when canceling to remove temp files
+        await muxClient?.getFileTransfer().clearCache();
+        // Refresh usage display
+        const usage = await muxClient?.getFileTransfer().getCacheUsage();
+        if (usage) {
+          opfsUsageBytes = usage.totalBytes;
+          opfsFileCount = usage.fileCount;
+        }
+      }
+      // Remove from activeDownloads regardless
+      activeDownloads.delete(id);
+      activeDownloads = new Map(activeDownloads);
+    }}
+    onClearStorage={async () => {
+      // Cancel all active transfers first
+      muxClient?.getFileTransfer().cancelAllTransfers();
+      // Then clear the cache
+      await muxClient?.getFileTransfer().clearCache();
+      // Refresh usage display
+      const usage = await muxClient?.getFileTransfer().getCacheUsage();
+      if (usage) {
+        opfsUsageBytes = usage.totalBytes;
+        opfsFileCount = usage.fileCount;
+      }
+    }}
+    onClearCompleted={() => {
+      // Filter out completed transfers
+      const filtered = new Map();
+      for (const [id, transfer] of activeDownloads) {
+        if (transfer.status !== 'complete') {
+          filtered.set(id, transfer);
+        }
+      }
+      activeDownloads = filtered;
+      console.log('[App] Cleared completed transfers, remaining:', activeDownloads.size);
+    }}
   />
 </div>
 

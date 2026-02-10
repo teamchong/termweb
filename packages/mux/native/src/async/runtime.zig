@@ -107,12 +107,17 @@ pub const Runtime = struct {
         return rt;
     }
 
-    pub fn deinit(self: *Runtime) void {
-        // Signal shutdown
+    /// Signal shutdown without waiting. Sets the shutdown flag and wakes
+    /// processors and GChannel waiters. Call early in the shutdown sequence
+    /// so OS threads blocked on channel operations can unblock.
+    pub fn signalShutdown(self: *Runtime) void {
         self.shutdown.store(true, .release);
-
-        // Wake all idle processors
         self.wake_cond.broadcast();
+    }
+
+    pub fn deinit(self: *Runtime) void {
+        // Signal shutdown (idempotent if already signaled)
+        self.signalShutdown();
 
         // Join all processor threads (skip P0)
         for (self.processors[1..]) |*p| {
@@ -128,12 +133,18 @@ pub const Runtime = struct {
             self.drainQueue(&p.local_queue);
         }
 
-        // Cleanup io_uring
+        // Cleanup io_uring and free goroutines blocked on I/O
         if (comptime is_linux) {
+            // Free goroutines that were parked waiting for io_uring completions
+            var io_iter = self.io_pending.valueIterator();
+            while (io_iter.next()) |g| {
+                g.*.deinit(self.allocator);
+            }
+            self.io_pending.deinit();
+
             if (self.io_ring) |*ring| {
                 ring.deinit();
             }
-            self.io_pending.deinit();
         }
 
         self.allocator.free(self.processors);
@@ -148,7 +159,7 @@ pub const Runtime = struct {
 
     /// Spawn a new goroutine. The goroutine is placed on the current processor's
     /// local queue (if called from a processor thread) or the global queue.
-    pub fn go(self: *Runtime, func: *const fn (*anyopaque) void, arg: *anyopaque) !*Goroutine {
+    pub fn go(self: *Runtime, func: *const fn (*anyopaque) callconv(.c) void, arg: *anyopaque) !*Goroutine {
         const id = self.next_id.fetchAdd(1, .monotonic);
         const g = try Goroutine.init(self.allocator, id, func, arg);
         g.prepare(&goroutineExit);

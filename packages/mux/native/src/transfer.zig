@@ -1046,7 +1046,8 @@ pub const TransferDirection = enum(u8) {
 pub const TransferFlags = packed struct {
     delete_extra: bool = false,  // Delete files not in source
     dry_run: bool = false,       // Preview only, don't transfer
-    _reserved: u6 = 0,
+    use_gitignore: bool = false, // Apply .gitignore patterns from base directory
+    _reserved: u5 = 0,
 };
 
 // File entry in file list
@@ -1079,6 +1080,7 @@ pub const TransferSession = struct {
     flags: TransferFlags,
     base_path: []const u8,       // Server-side base path
     exclude_patterns: std.ArrayListUnmanaged([]const u8),
+    include_pattern: ?[]const u8, // Glob pattern for filtering files (e.g., "*.md", "**/*.ts")
 
     // File list
     files: std.ArrayListUnmanaged(FileEntry),
@@ -1108,6 +1110,7 @@ pub const TransferSession = struct {
             .flags = flags,
             .base_path = try allocator.dupe(u8, base_path),
             .exclude_patterns = .{},
+            .include_pattern = null,
             .files = .{},
             .total_bytes = 0,
             .current_file_index = 0,
@@ -1134,6 +1137,8 @@ pub const TransferSession = struct {
             self.allocator.free(pattern);
         }
         self.exclude_patterns.deinit(self.allocator);
+
+        if (self.include_pattern) |p| self.allocator.free(p);
 
         for (self.files.items) |*entry| {
             entry.deinit(self.allocator);
@@ -1166,10 +1171,169 @@ pub const TransferSession = struct {
         return false;
     }
 
+    /// Check if a directory should be skipped during walks.
+    /// Skips .git directories (never useful for file transfers) and checks
+    /// exclude patterns against both the full relative path and the directory
+    /// name alone (so "node_modules" excludes "packages/web/node_modules" too).
+    fn isDirExcluded(self: *const TransferSession, name: []const u8, rel_path: []const u8) bool {
+        // .git directories are never useful for file transfers
+        if (std.mem.eql(u8, name, ".git")) return true;
+
+        // Check full relative path
+        if (self.isExcluded(rel_path)) return true;
+
+        // Check directory name alone against exclude patterns
+        // (so "node_modules" matches "packages/web/node_modules")
+        if (rel_path.len != name.len) {
+            for (self.exclude_patterns.items) |pattern| {
+                if (matchGlob(pattern, name)) return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Check if path matches the include pattern (returns true if no pattern set).
+    pub fn isIncluded(self: *const TransferSession, path: []const u8) bool {
+        const pattern = self.include_pattern orelse return true;
+        return matchGlobPath(pattern, path);
+    }
+
+    /// If base_path contains glob characters, split it into the actual base
+    /// directory and an include pattern. Updates base_path and include_pattern.
+    fn resolveGlobPattern(self: *TransferSession) !void {
+        if (!containsGlobChars(self.base_path)) return;
+
+        const split = splitGlobPath(self.base_path);
+        if (split.pattern) |p| {
+            const new_base = try self.allocator.dupe(u8, split.base);
+            const new_pattern = try self.allocator.dupe(u8, p);
+            self.allocator.free(self.base_path);
+            if (self.include_pattern) |old| self.allocator.free(old);
+            self.base_path = new_base;
+            self.include_pattern = new_pattern;
+            std.debug.print("  glob split: base='{s}' include='{s}'\n", .{ new_base, new_pattern });
+        }
+    }
+
+    /// Load .gitignore patterns from base_path and add them as exclude patterns.
+    /// Supports basic patterns: globs, directory markers (trailing /), comments (#).
+    /// Negation patterns (!) are skipped.
+    fn loadGitignore(self: *TransferSession) void {
+        // Load global gitignore using git config
+        self.loadGlobalGitignore();
+
+        // Load project .gitignore
+        const gitignore_path = std.fmt.allocPrint(self.allocator, "{s}/.gitignore", .{self.base_path}) catch return;
+        defer self.allocator.free(gitignore_path);
+        self.loadGitignoreFile(gitignore_path);
+    }
+
+    /// Load global gitignore file using git config core.excludesfile.
+    /// Falls back to standard locations if git config fails.
+    fn loadGlobalGitignore(self: *TransferSession) void {
+        // Try git config first
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{ "git", "config", "--get", "core.excludesfile" },
+        }) catch {
+            self.loadGlobalGitignoreFallback();
+            return;
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        if (result.term.Exited == 0 and result.stdout.len > 0) {
+            // Trim trailing newline
+            var path = result.stdout;
+            while (path.len > 0 and (path[path.len - 1] == '\n' or path[path.len - 1] == '\r')) {
+                path = path[0 .. path.len - 1];
+            }
+
+            // Expand ~ to home directory
+            if (path.len > 0 and path[0] == '~') {
+                if (std.posix.getenv("HOME")) |home| {
+                    const expanded = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home, path[1..] }) catch return;
+                    defer self.allocator.free(expanded);
+                    self.loadGitignoreFile(expanded);
+                    return;
+                }
+            }
+
+            self.loadGitignoreFile(path);
+        } else {
+            self.loadGlobalGitignoreFallback();
+        }
+    }
+
+    /// Fallback when git config is unavailable: check standard locations.
+    fn loadGlobalGitignoreFallback(self: *TransferSession) void {
+        if (std.posix.getenv("HOME")) |home| {
+            // Try ~/.gitignore_global first (common default)
+            const global_default = std.fmt.allocPrint(self.allocator, "{s}/.gitignore_global", .{home}) catch null;
+            if (global_default) |p| {
+                defer self.allocator.free(p);
+                self.loadGitignoreFile(p);
+            }
+
+            // Try XDG location
+            const xdg_config = std.posix.getenv("XDG_CONFIG_HOME");
+            if (xdg_config) |xdg| {
+                const global_path = std.fmt.allocPrint(self.allocator, "{s}/git/ignore", .{xdg}) catch null;
+                if (global_path) |p| {
+                    defer self.allocator.free(p);
+                    self.loadGitignoreFile(p);
+                }
+            } else {
+                const global_path = std.fmt.allocPrint(self.allocator, "{s}/.config/git/ignore", .{home}) catch null;
+                if (global_path) |p| {
+                    defer self.allocator.free(p);
+                    self.loadGitignoreFile(p);
+                }
+            }
+        }
+    }
+
+    /// Parse a single gitignore file and add its patterns to the exclude list.
+    fn loadGitignoreFile(self: *TransferSession, path: []const u8) void {
+        const file = fs.openFileAbsolute(path, .{}) catch return;
+        defer file.close();
+
+        var buf: [4096]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch return;
+        const content = buf[0..bytes_read];
+
+        var start: usize = 0;
+        for (content, 0..) |c, i| {
+            if (c == '\n' or i == content.len - 1) {
+                var line = content[start..if (c == '\n') i else i + 1];
+                start = i + 1;
+
+                // Trim trailing whitespace and CR
+                while (line.len > 0 and (line[line.len - 1] == ' ' or line[line.len - 1] == '\r' or line[line.len - 1] == '\t')) {
+                    line = line[0 .. line.len - 1];
+                }
+                // Skip empty lines, comments, negation patterns
+                if (line.len == 0 or line[0] == '#' or line[0] == '!') continue;
+
+                // Strip trailing / (directory marker — we match both files and dirs)
+                var pattern = line;
+                if (pattern.len > 1 and pattern[pattern.len - 1] == '/') {
+                    pattern = pattern[0 .. pattern.len - 1];
+                }
+
+                self.addExcludePattern(pattern) catch continue;
+            }
+        }
+    }
+
     // Build file list from directory or single file (for downloads)
     pub fn buildFileList(self: *TransferSession) !void {
         self.files.clearRetainingCapacity();
         self.total_bytes = 0;
+
+        try self.resolveGlobPattern();
+        if (self.flags.use_gitignore) self.loadGitignore();
 
         var dir = fs.openDirAbsolute(self.base_path, .{ .iterate = true }) catch |err| {
             if (err == error.NotDir) {
@@ -1186,6 +1350,12 @@ pub const TransferSession = struct {
     }
 
     fn walkDirectory(self: *TransferSession, dir: fs.Dir, prefix: []const u8) !void {
+        const has_include = self.include_pattern != null;
+        const should_recurse = if (self.include_pattern) |p|
+            containsDoublestar(p) or std.mem.indexOfScalar(u8, p, '/') != null
+        else
+            true;
+
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             // Build relative path
@@ -1194,32 +1364,50 @@ pub const TransferSession = struct {
             else
                 try self.allocator.dupe(u8, entry.name);
 
-            // Check exclusion
-            if (self.isExcluded(rel_path)) {
-                self.allocator.free(rel_path);
-                continue;
-            }
-
             if (entry.kind == .directory) {
-                // Add directory entry
-                try self.files.append(self.allocator, .{
-                    .path = rel_path,
-                    .size = 0,
-                    .mtime = 0,
-                    .hash = 0,
-                    .is_dir = true,
-                });
+                // Check directory exclusion (includes .git auto-skip and name matching)
+                if (self.isDirExcluded(entry.name, rel_path)) {
+                    self.allocator.free(rel_path);
+                    continue;
+                }
 
-                // Recurse into subdirectory
-                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-                defer subdir.close();
-                try self.walkDirectory(subdir, rel_path);
+                if (has_include) {
+                    if (should_recurse) {
+                        var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch {
+                            self.allocator.free(rel_path);
+                            continue;
+                        };
+                        defer subdir.close();
+                        try self.walkDirectory(subdir, rel_path);
+                    }
+                    self.allocator.free(rel_path);
+                } else {
+                    try self.files.append(self.allocator, .{
+                        .path = rel_path,
+                        .size = 0,
+                        .mtime = 0,
+                        .hash = 0,
+                        .is_dir = true,
+                    });
+
+                    var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                    defer subdir.close();
+                    try self.walkDirectory(subdir, rel_path);
+                }
             } else if (entry.kind == .file) {
-                // Get file stats
+                // Check file exclusion
+                if (self.isExcluded(rel_path)) {
+                    self.allocator.free(rel_path);
+                    continue;
+                }
+
+                if (has_include and !self.isIncluded(rel_path)) {
+                    self.allocator.free(rel_path);
+                    continue;
+                }
+
                 const stat = dir.statFile(entry.name) catch continue;
                 const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
-
-                // Hash file using mmap for zero-copy
                 const hash = self.hashFileMmap(dir, entry.name) catch 0;
 
                 try self.files.append(self.allocator, .{
@@ -1258,6 +1446,9 @@ pub const TransferSession = struct {
     pub fn buildFileListAsync(self: *TransferSession) !void {
         self.files.clearRetainingCapacity();
         self.total_bytes = 0;
+
+        try self.resolveGlobPattern();
+        if (self.flags.use_gitignore) self.loadGitignore();
 
         var dir = fs.openDirAbsolute(self.base_path, .{ .iterate = true }) catch |err| {
             if (err == error.NotDir) {
@@ -1326,7 +1517,16 @@ pub const TransferSession = struct {
     }
 
     /// Walk directory tree without hashing (deferred for batch hashing).
+    /// When include_pattern is set, only files matching the pattern are included,
+    /// directory entries are omitted, and recursion is skipped unless the pattern
+    /// contains `**` or `/`.
     fn walkDirectoryNoHash(self: *TransferSession, dir: fs.Dir, prefix: []const u8) !void {
+        const has_include = self.include_pattern != null;
+        const should_recurse = if (self.include_pattern) |p|
+            containsDoublestar(p) or std.mem.indexOfScalar(u8, p, '/') != null
+        else
+            true;
+
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             const rel_path = if (prefix.len > 0)
@@ -1334,24 +1534,49 @@ pub const TransferSession = struct {
             else
                 try self.allocator.dupe(u8, entry.name);
 
-            if (self.isExcluded(rel_path)) {
-                self.allocator.free(rel_path);
-                continue;
-            }
-
             if (entry.kind == .directory) {
-                try self.files.append(self.allocator, .{
-                    .path = rel_path,
-                    .size = 0,
-                    .mtime = 0,
-                    .hash = 0,
-                    .is_dir = true,
-                });
+                // Check directory exclusion (includes .git auto-skip and name matching)
+                if (self.isDirExcluded(entry.name, rel_path)) {
+                    self.allocator.free(rel_path);
+                    continue;
+                }
 
-                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-                defer subdir.close();
-                try self.walkDirectoryNoHash(subdir, rel_path);
+                if (has_include) {
+                    // Glob mode: skip directory entries, only recurse if pattern needs it
+                    if (should_recurse) {
+                        var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch {
+                            self.allocator.free(rel_path);
+                            continue;
+                        };
+                        defer subdir.close();
+                        try self.walkDirectoryNoHash(subdir, rel_path);
+                    }
+                    self.allocator.free(rel_path);
+                } else {
+                    try self.files.append(self.allocator, .{
+                        .path = rel_path,
+                        .size = 0,
+                        .mtime = 0,
+                        .hash = 0,
+                        .is_dir = true,
+                    });
+
+                    var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                    defer subdir.close();
+                    try self.walkDirectoryNoHash(subdir, rel_path);
+                }
             } else if (entry.kind == .file) {
+                // Check file exclusion
+                if (self.isExcluded(rel_path)) {
+                    self.allocator.free(rel_path);
+                    continue;
+                }
+                // Check include pattern
+                if (has_include and !self.isIncluded(rel_path)) {
+                    self.allocator.free(rel_path);
+                    continue;
+                }
+
                 const stat = dir.statFile(entry.name) catch continue;
                 const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
 
@@ -1677,6 +1902,7 @@ pub const TransferSession = struct {
             .flags = flags,
             .base_path = base_path,
             .exclude_patterns = .{},
+            .include_pattern = null,
             .files = .{},
             .total_bytes = 0,
             .current_file_index = current_file_index,
@@ -2223,6 +2449,95 @@ fn matchGlob(pattern: []const u8, path: []const u8) bool {
     return p_idx == pattern.len;
 }
 
+/// Check if a path string contains glob metacharacters.
+fn containsGlobChars(path: []const u8) bool {
+    for (path) |c| {
+        if (c == '*' or c == '?' or c == '[') return true;
+    }
+    return false;
+}
+
+/// Check if a glob pattern contains `**` (recursive directory match).
+fn containsDoublestar(pattern: []const u8) bool {
+    if (pattern.len < 2) return false;
+    var i: usize = 0;
+    while (i + 1 < pattern.len) : (i += 1) {
+        if (pattern[i] == '*' and pattern[i + 1] == '*') return true;
+    }
+    return false;
+}
+
+/// Split a path with glob characters into base directory and glob pattern.
+/// E.g., "/home/user/*.md" → { .base = "/home/user", .pattern = "*.md" }
+/// E.g., "/tmp/**/*.ts" → { .base = "/tmp", .pattern = "**/*.ts" }
+fn splitGlobPath(path: []const u8) struct { base: []const u8, pattern: ?[]const u8 } {
+    var last_sep: usize = 0;
+    var found_sep = false;
+    for (path, 0..) |c, i| {
+        if (c == '/') {
+            last_sep = i;
+            found_sep = true;
+        }
+        if (c == '*' or c == '?' or c == '[') {
+            // Base is everything up to the last `/` before the first glob char
+            const base = if (found_sep) (if (last_sep == 0) path[0..1] else path[0..last_sep]) else path[0..0];
+            const pat_start = if (found_sep) last_sep + 1 else 0;
+            return .{
+                .base = if (base.len == 0) "/" else base,
+                .pattern = if (pat_start < path.len) path[pat_start..] else null,
+            };
+        }
+    }
+    return .{ .base = path, .pattern = null };
+}
+
+/// Match a glob pattern against a path with proper path semantics:
+/// - `*` matches any character except `/`
+/// - `**` matches zero or more path segments (crosses `/`)
+/// - `?` matches any single character except `/`
+fn matchGlobPath(pattern: []const u8, path: []const u8) bool {
+    var p: usize = 0;
+    var s: usize = 0;
+
+    while (p < pattern.len) {
+        if (pattern[p] == '*') {
+            if (p + 1 < pattern.len and pattern[p + 1] == '*') {
+                // ** matches zero or more path segments
+                var np = p + 2;
+                if (np < pattern.len and pattern[np] == '/') np += 1;
+                if (np >= pattern.len) return true; // trailing ** matches everything
+                // Try matching rest of pattern from every position
+                var ns = s;
+                while (ns <= path.len) : (ns += 1) {
+                    if (matchGlobPath(pattern[np..], path[ns..])) return true;
+                    if (ns == path.len) break;
+                }
+                return false;
+            }
+            // * matches zero or more non-/ characters
+            p += 1;
+            while (true) {
+                if (matchGlobPath(pattern[p..], path[s..])) return true;
+                if (s >= path.len or path[s] == '/') break;
+                s += 1;
+            }
+            return false;
+        }
+
+        if (s >= path.len) return false;
+
+        if (pattern[p] == '?') {
+            if (path[s] == '/') return false;
+        } else if (pattern[p] != path[s]) {
+            return false;
+        }
+        p += 1;
+        s += 1;
+    }
+
+    return s == path.len;
+}
+
 
 // Rsync Protocol — Block-Level Delta Sync
 
@@ -2566,6 +2881,19 @@ pub const TransferManager = struct {
             .allocator = allocator,
             .mutex = .{},
         };
+    }
+
+    /// Cancel all active sessions. Sets is_active = false so goroutines and
+    /// connection threads notice and exit their loops. Call before WS server
+    /// shutdown to avoid threads blocked on channel operations.
+    pub fn cancelAll(self: *TransferManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var iter = self.sessions.valueIterator();
+        while (iter.next()) |session| {
+            @atomicStore(bool, &session.*.is_active, false, .release);
+        }
     }
 
     pub fn deinit(self: *TransferManager) void {
