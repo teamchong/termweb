@@ -19,6 +19,8 @@ const openHandles = new Map<string, FileSystemSyncAccessHandle>();
 const fileQueues = new Map<string, Promise<void>>();
 // Track files that have already been reported as complete (prevents duplicate completion)
 const completedFiles = new Set<string>();
+// Track cancelled transfers so async operations don't re-create deleted metadata
+const cancelledTransfers = new Set<number>();
 
 const MAX_DECOMPRESSED_SIZE = 128 * 1024 * 1024;
 
@@ -711,6 +713,7 @@ async function loadTransferMetadata(transferId: number): Promise<TransferMetadat
 }
 
 async function updateTransferProgress(transferId: number, filePath: string, bytesWritten: number): Promise<void> {
+  if (cancelledTransfers.has(transferId)) return;
   const meta = await loadTransferMetadata(transferId);
   if (!meta) return;
 
@@ -798,7 +801,8 @@ self.onmessage = async (e: MessageEvent) => {
 
         const currentOp = previousOp.then(async () => {
           try {
-            // Skip if this file was already completed (e.g., from OPFS cache / resume)
+            // Skip if transfer was cancelled or file already completed
+            if (cancelledTransfers.has(transferId)) return;
             if (completedFiles.has(fileKey)) {
               console.log(`[Worker] skipping already-completed file: idx=${fileIndex}, path=${filePath}`);
               return;
@@ -1008,6 +1012,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'delete-transfer-metadata': {
+        cancelledTransfers.add(msg.transferId);
         await deleteTransferMetadata(msg.transferId);
         (self as unknown as Worker).postMessage({ type: 'metadata-deleted', transferId: msg.transferId });
         break;

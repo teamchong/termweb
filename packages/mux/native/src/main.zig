@@ -3707,16 +3707,22 @@ const Server = struct {
     fn processFileGoroutine(arg: *anyopaque) callconv(.c) void {
         const ctx: *FileGoroutineCtx = @ptrCast(@alignCast(arg));
         std.debug.print("[Goroutine] START: file_index={d}, path={s}\n", .{ ctx.file_index, ctx.file_path });
-        // Save done_counter and semaphore before ctx.deinit frees the struct.
-        // Defers execute LIFO: deinit runs first, then post semaphore, then fetchAdd signals completion.
         const done_counter = ctx.done_counter;
         const semaphore = ctx.semaphore;
         defer _ = done_counter.fetchAdd(1, .release);
-        defer semaphore.post();
-        defer ctx.deinit();
+
+        // Early exit before acquiring semaphore — cancelled goroutines skip the
+        // semaphore entirely so new transfers aren't starved by queued goroutines.
+        if (!@atomicLoad(bool, ctx.is_active, .acquire)) {
+            std.debug.print("[Goroutine] INACTIVE (pre-sem): file_index={d}\n", .{ctx.file_index});
+            ctx.deinit();
+            return;
+        }
 
         // Acquire semaphore to limit concurrent large file processing (prevents OOM)
         semaphore.wait();
+        defer semaphore.post();
+        defer ctx.deinit();
 
         if (!@atomicLoad(bool, ctx.is_active, .acquire)) {
             std.debug.print("[Goroutine] INACTIVE: file_index={d}\n", .{ctx.file_index});
