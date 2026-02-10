@@ -17,6 +17,7 @@ cdp_debug.log
 termweb_input.log
 
 # Test files
+.playwright-mcp/
 test_*
 
 # Build artifacts
@@ -26,3 +27,4 @@ packages/mux/wasm/zstd.wasm
 # npm binaries (downloaded during install)
 binaries/
 node_modules/
+
