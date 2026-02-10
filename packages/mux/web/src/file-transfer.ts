@@ -66,6 +66,8 @@ export interface TransferState {
   zipFallbackTimer?: ReturnType<typeof setTimeout>;
   /** True when zip creation has started (prevents multiple zip creations) */
   zipCreating?: boolean;
+  /** Tracks file paths already marked complete (prevents duplicate completion counting) */
+  completedPaths?: Set<string>;
 }
 
 export interface TransferOptions {
@@ -722,6 +724,14 @@ export class FileTransferHandler {
     transfer.bytesTransferred += msg.bytesWritten;
 
     if (msg.complete) {
+      // Guard against duplicate completions (e.g., file already at full size in OPFS from resume)
+      if (!transfer.completedPaths) transfer.completedPaths = new Set();
+      if (transfer.completedPaths.has(msg.filePath)) {
+        console.log(`[FT] Skipping duplicate completion for: ${msg.filePath}`);
+        return;
+      }
+      transfer.completedPaths.add(msg.filePath);
+
       console.log(`[FT] File complete in OPFS, requesting read-back: ${msg.filePath}`);
       // File fully written to OPFS — read it back for browser download
       this.worker!.postMessage({

@@ -17,6 +17,8 @@ let opfsRoot: FileSystemDirectoryHandle | null = null;
 const openHandles = new Map<string, FileSystemSyncAccessHandle>();
 // Queue for serializing chunk writes per file (prevents concurrent access handle creation)
 const fileQueues = new Map<string, Promise<void>>();
+// Track files that have already been reported as complete (prevents duplicate completion)
+const completedFiles = new Set<string>();
 
 const MAX_DECOMPRESSED_SIZE = 128 * 1024 * 1024;
 
@@ -796,6 +798,12 @@ self.onmessage = async (e: MessageEvent) => {
 
         const currentOp = previousOp.then(async () => {
           try {
+            // Skip if this file was already completed (e.g., from OPFS cache / resume)
+            if (completedFiles.has(fileKey)) {
+              console.log(`[Worker] skipping already-completed file: idx=${fileIndex}, path=${filePath}`);
+              return;
+            }
+
             const decompressed = decompressData(new Uint8Array(compressedData));
             console.log(`[Worker] decompressed: idx=${fileIndex}, decompressed=${decompressed.length} bytes`);
 
@@ -811,6 +819,7 @@ self.onmessage = async (e: MessageEvent) => {
               console.log(`[Worker] after write: idx=${fileIndex}, size=${written}/${fileSize}, complete=${complete}`);
 
               if (complete) {
+                completedFiles.add(fileKey);
                 closeHandle(transferId, filePath);
                 fileQueues.delete(fileKey); // Clean up queue when file is complete
                 console.log(`[Worker] closed handle: idx=${fileIndex}`);
