@@ -1505,6 +1505,8 @@ const Server = struct {
     http_server: *http.HttpServer,
     auth_state: *auth.AuthState,  // Session and access control
     transfer_manager: transfer.TransferManager,
+    push_threads: std.ArrayList(std.Thread),  // Tracked push threads for clean shutdown
+    push_threads_mutex: std.Thread.Mutex,
     running: std.atomic.Value(bool),
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
@@ -1586,6 +1588,8 @@ const Server = struct {
             .file_ws_server = file_ws,
             .auth_state = auth_state,
             .transfer_manager = transfer.TransferManager.init(allocator),
+            .push_threads = .{},
+            .push_threads_mutex = .{},
             .running = std.atomic.Value(bool).init(false),
             .allocator = allocator,
             .mutex = .{},
@@ -1730,6 +1734,17 @@ const Server = struct {
         self.pending_destroys_ch.deinit();
         self.pending_resizes_ch.deinit();
         self.pending_splits_ch.deinit();
+
+        // Join all push threads before freeing sessions
+        // (they access session.is_active which would be use-after-free)
+        {
+            self.push_threads_mutex.lock();
+            const threads = self.push_threads.toOwnedSlice(self.allocator) catch &.{};
+            self.push_threads_mutex.unlock();
+            for (threads) |t| t.join();
+            self.allocator.free(threads);
+        }
+        self.push_threads.deinit(self.allocator);
 
         self.auth_state.deinit();
         self.transfer_manager.deinit();
@@ -3533,7 +3548,7 @@ const Server = struct {
             std.debug.print("Failed to spawn pushDownloadFiles thread for resume: {}\n", .{err});
             return;
         };
-        push_thread.detach();
+        self.trackPushThread(push_thread);
     }
 
     // Handle TRANSFER_CANCEL message
@@ -3775,6 +3790,16 @@ const Server = struct {
         return buf;
     }
 
+    /// Track a push thread handle for joining during shutdown.
+    fn trackPushThread(self: *Server, thread: std.Thread) void {
+        self.push_threads_mutex.lock();
+        defer self.push_threads_mutex.unlock();
+        self.push_threads.append(self.allocator, thread) catch {
+            // If allocation fails, detach as fallback (won't crash, just unclean exit)
+            thread.detach();
+        };
+    }
+
     /// Thread wrapper for pushDownloadFiles — spawned to avoid blocking the WebSocket receive loop
     fn pushDownloadFilesThread(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
         self.pushDownloadFiles(conn, session);
@@ -3804,7 +3829,7 @@ const Server = struct {
                 std.debug.print("Failed to spawn pushDownloadFiles thread: {}\n", .{err});
                 return;
             };
-            push_thread.detach();
+            self.trackPushThread(push_thread);
         }
     }
 
@@ -4867,49 +4892,8 @@ const Server = struct {
                         perf_read_ns += read_elapsed;
 
                         if (read_ok) {
-                            // Frame skip: hash the pixel buffer EXCLUDING the cursor cell
-                            // region to avoid sending frames when only the cursor blinks.
-                            // The frontend renders cursor via CSS overlay, so cursor
-                            // blink in the framebuffer is pure waste.
-                            const frame_hash = blk: {
-                                const surf_size = c.ghostty_surface_size(panel.surface);
-                                const cell_w: usize = @intCast(surf_size.cell_width_px);
-                                const cell_h: usize = @intCast(surf_size.cell_height_px);
-                                const pad_x: usize = @intCast(surf_size.padding_left_px);
-                                const pad_y: usize = @intCast(surf_size.padding_top_px);
-
-                                var hash_cur_col: u16 = 0;
-                                var hash_cur_row: u16 = 0;
-                                var hash_cur_style: u8 = 0;
-                                var hash_cur_vis: u8 = 0;
-                                c.ghostty_surface_cursor_info(panel.surface, &hash_cur_col, &hash_cur_row, &hash_cur_style, &hash_cur_vis);
-
-                                const cur_px_x = pad_x + @as(usize, hash_cur_col) * cell_w;
-                                const cur_px_y = pad_y + @as(usize, hash_cur_row) * cell_h;
-                                const row_stride: usize = @as(usize, pixel_width) * 4;
-                                const cur_x_byte_start = @min(cur_px_x * 4, row_stride);
-                                const cur_x_byte_end = @min((cur_px_x + cell_w) * 4, row_stride);
-                                const cur_y_end = @min(cur_px_y + cell_h, pixel_height);
-
-                                if (cell_w == 0 or cell_h == 0 or cur_x_byte_start >= cur_x_byte_end) {
-                                    // No valid cursor region; hash entire buffer
-                                    break :blk std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
-                                }
-
-                                var hasher = std.hash.XxHash64.init(0);
-                                const buf = panel.bgra_buffer.?;
-                                for (0..pixel_height) |y| {
-                                    const row_off = y * row_stride;
-                                    if (y >= cur_px_y and y < cur_y_end) {
-                                        // Row overlaps cursor: hash before and after cursor
-                                        hasher.update(buf[row_off .. row_off + cur_x_byte_start]);
-                                        hasher.update(buf[row_off + cur_x_byte_end .. row_off + row_stride]);
-                                    } else {
-                                        hasher.update(buf[row_off .. row_off + row_stride]);
-                                    }
-                                }
-                                break :blk hasher.final();
-                            };
+                            // Frame skip: hash the pixel buffer and skip encoding if unchanged
+                            const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
 
                             // Debug: log frames after input to diagnose stale pixels
                             if (panel.dbg_input_countdown > 0) {
@@ -5196,6 +5180,10 @@ const Server = struct {
         // Render loop exited (Ctrl+C or error) — cancel all transfers first
         // so goroutines and handler threads can exit quickly
         self.transfer_manager.cancelAll();
+
+        // Signal goroutine runtime shutdown so GChannel.recv() on OS threads
+        // returns null (unblocks push threads stuck waiting for goroutine results)
+        self.goroutine_rt.signalShutdown();
 
         // Stop all servers to unblock their threads. This is done here instead
         // of the signal handler because .stop() calls allocator/deinit operations
