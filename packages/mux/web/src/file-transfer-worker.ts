@@ -18,7 +18,7 @@ const openHandles = new Map<string, FileSystemSyncAccessHandle>();
 // Queue for serializing chunk writes per file (prevents concurrent access handle creation)
 const fileQueues = new Map<string, Promise<void>>();
 
-const MAX_DECOMPRESSED_SIZE = 16 * 1024 * 1024;
+const MAX_DECOMPRESSED_SIZE = 128 * 1024 * 1024;
 
 async function initWasm(): Promise<void> {
   const response = await fetch('/zstd.wasm');

@@ -654,7 +654,7 @@ export class FileTransferHandler {
     const uncompressedSize = view.getUint32(PROTO_BATCH_DATA.UNCOMPRESSED_SIZE, true);
     const compressedData = bytes.slice(PROTO_BATCH_DATA.DATA);
 
-    console.log(`[FT] BATCH_DATA: transferId=${transferId}, uncompressedSize=${uncompressedSize}`);
+    console.log(`[FT] BATCH_DATA: transferId=${transferId}, uncompressedSize=${uncompressedSize}, compressedSize=${compressedData.length}`);
 
     const transfer = this.activeTransfers.get(transferId);
     if (!transfer || !transfer.files) {
@@ -662,11 +662,15 @@ export class FileTransferHandler {
       return;
     }
 
+    console.log(`[FT] BATCH_DATA: Starting decompression of ${compressedData.length} bytes...`);
     let payload: Uint8Array;
     try {
+      const decompressStart = performance.now();
       payload = await this.decompress(compressedData);
+      const decompressMs = performance.now() - decompressStart;
+      console.log(`[FT] BATCH_DATA: Decompression complete in ${decompressMs.toFixed(0)}ms, payload size=${payload.length}`);
     } catch (err) {
-      console.error('Batch decompression failed:', err);
+      console.error('[FT] BATCH_DATA: Decompression failed:', err);
       this.failTransfer(transferId, 'Batch decompression failed');
       return;
     }
@@ -698,7 +702,7 @@ export class FileTransferHandler {
       offset += fileSize;
 
       const file = transfer.files[fileIndex];
-      transfer.bytesTransferred += fileData.length;
+      // Note: bytesTransferred is incremented in handleCompletedFile, don't double-count
 
       // Small batched files are always complete — save or collect for zip
       this.handleCompletedFile(transferId, file.path, fileData);
@@ -1576,6 +1580,12 @@ export class FileTransferHandler {
       }, [dataCopy.buffer]);
 
       transfer.filesCompleted = (transfer.filesCompleted ?? 0) + 1;
+      // Only increment bytesTransferred for small files (from BATCH_DATA)
+      // Large files already had bytes counted in onChunkWrittenToOPFS
+      const isSmallFile = data.length <= 16 * 1024; // batch_threshold = 16KB
+      if (isSmallFile) {
+        transfer.bytesTransferred += data.length;
+      }
       const totalFiles = transfer.files?.filter(f => !f.isDir).length ?? 0;
       console.log(`[FT] File completed: ${path} (${transfer.filesCompleted}/${totalFiles}), calling onDownloadProgress with transferId=${transferId}`);
       this.onDownloadProgress?.(transferId, transfer.filesCompleted, totalFiles, transfer.bytesTransferred, transfer.totalBytes ?? 0);
