@@ -3826,8 +3826,10 @@ const Server = struct {
 
         // Ensure channel outlives all goroutines: wait for completion then deinit
         defer {
-            // Wait for all goroutines to finish before freeing channel
+            // Wait for all goroutines to finish before freeing channel.
+            // Exit early if session becomes inactive (server shutdown).
             while (goroutine_done.load(.acquire) < large_file_count) {
+                if (!@atomicLoad(bool, &session.is_active, .acquire)) break;
                 std.Thread.sleep(100 * std.time.ns_per_us);
             }
             // Drain any buffered messages (free their chunks to avoid leaks)
