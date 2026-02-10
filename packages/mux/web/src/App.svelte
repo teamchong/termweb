@@ -581,6 +581,12 @@
             document.title = 'termweb';
           }
         };
+
+        // Open file WebSocket to trigger auto-resume of interrupted downloads
+        // The resume logic runs in the file WS onopen handler (in mux.ts)
+        muxClient.ensureFileWs().catch(err => {
+          console.error('[App] Failed to open file WebSocket for resume:', err);
+        });
       } catch (err) {
         console.error('Failed to initialize MuxClient:', err);
       } finally {

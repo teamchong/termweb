@@ -3678,6 +3678,7 @@ const Server = struct {
         is_active: *bool, // Pointer to session.is_active
         send_ch: *gchannel.GChannel(transfer.CompressedMsg),
         done_counter: *std.atomic.Value(usize), // Decremented when goroutine finishes
+        semaphore: *std.Thread.Semaphore, // Limits concurrent large file processing
 
         fn deinit(self: *FileGoroutineCtx) void {
             self.allocator.free(self.file_path);
@@ -3692,11 +3693,16 @@ const Server = struct {
     fn processFileGoroutine(arg: *anyopaque) callconv(.c) void {
         const ctx: *FileGoroutineCtx = @ptrCast(@alignCast(arg));
         std.debug.print("[Goroutine] START: file_index={d}, path={s}\n", .{ ctx.file_index, ctx.file_path });
-        // Save done_counter before ctx.deinit frees the struct.
-        // Defers execute LIFO: deinit runs first, then fetchAdd signals completion.
+        // Save done_counter and semaphore before ctx.deinit frees the struct.
+        // Defers execute LIFO: deinit runs first, then post semaphore, then fetchAdd signals completion.
         const done_counter = ctx.done_counter;
+        const semaphore = ctx.semaphore;
         defer _ = done_counter.fetchAdd(1, .release);
+        defer semaphore.post();
         defer ctx.deinit();
+
+        // Acquire semaphore to limit concurrent large file processing (prevents OOM)
+        semaphore.wait();
 
         if (!@atomicLoad(bool, ctx.is_active, .acquire)) {
             std.debug.print("[Goroutine] INACTIVE: file_index={d}\n", .{ctx.file_index});
@@ -3804,6 +3810,10 @@ const Server = struct {
         var goroutine_done = std.atomic.Value(usize).init(0);
         var large_file_count: usize = 0;
 
+        // Semaphore to limit concurrent large file processing (prevent OOM)
+        // Max 32 concurrent goroutines reading/compressing large files
+        var goroutine_sem = std.Thread.Semaphore{ .permits = 32 };
+
         // Ensure channel outlives all goroutines: wait for completion then deinit
         defer {
             // Wait for all goroutines to finish before freeing channel
@@ -3862,6 +3872,7 @@ const Server = struct {
                 .is_active = &session.is_active,
                 .send_ch = send_ch,
                 .done_counter = &goroutine_done,
+                .semaphore = &goroutine_sem,
             };
             _ = self.goroutine_rt.go(processFileGoroutine, @ptrCast(ctx)) catch {
                 ctx.deinit();
