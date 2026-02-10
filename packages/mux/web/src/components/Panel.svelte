@@ -185,6 +185,9 @@
   // The encoder may scale the surface down (MAX_PIXELS cap) and add 16px alignment
   // padding. Cursor coordinates are in ghostty surface space, so percentages must
   // be computed against surface dimensions to stay correct at any resolution.
+  // Key that changes on every cursor move — used by {#key} to restart CSS blink animation
+  let cursorKey = $derived(`${cursorX},${cursorY}`);
+
   let cursorPct = $derived.by(() => {
     if (!cursorVisible || cursorW === 0 || paused) return null;
     if (cursorSurfW === 0 || cursorSurfH === 0) return null;
@@ -1503,14 +1506,16 @@
       <div class="cursor-container" style="--fw:{cursorSurfW};--fh:{cursorSurfH}">
         <div class="cursor-viewport">
           {#if cursorPct}
-            <div
-              class="cursor-overlay"
-              class:cursor-bar={cursorStyle === 0}
-              class:cursor-block={cursorStyle === 1}
-              class:cursor-underline={cursorStyle === 2}
-              class:cursor-hollow={cursorStyle === 3}
-              style="left:{cursorPct.left}%;top:{cursorPct.top}%;width:{cursorPct.width}%;height:{cursorPct.height}%"
-            ></div>
+            {#key cursorKey}
+              <div
+                class="cursor-overlay"
+                class:cursor-bar={cursorStyle === 0}
+                class:cursor-block={cursorStyle === 1}
+                class:cursor-underline={cursorStyle === 2}
+                class:cursor-hollow={cursorStyle === 3}
+                style="left:{cursorPct.left}%;top:{cursorPct.top}%;width:{cursorPct.width}%;height:{cursorPct.height}%"
+              ></div>
+            {/key}
           {/if}
         </div>
       </div>
