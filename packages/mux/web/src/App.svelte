@@ -504,17 +504,6 @@
             existing.status = 'active';
             activeDownloads.set(transferId, existing);
             activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
-
-            // Update window title with overall progress (only for active transfers)
-            const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
-            const pct = totalBytes > 0 ? Math.round((bytesTransferred / totalBytes) * 100) : 0;
-            if (activeCount === 1) {
-              document.title = `⬇ ${filesCompleted}/${totalFiles} (${pct}%) — termweb`;
-            } else if (activeCount > 1) {
-              document.title = `⬇ ${activeCount} downloads — termweb`;
-            } else {
-              document.title = 'termweb';
-            }
           } else {
             console.warn(`[App] onDownloadProgress for unknown transfer ${transferId}, map size: ${activeDownloads.size}`);
           }
@@ -535,24 +524,12 @@
           } else {
             console.warn(`[App] onTransferComplete: transfer ${transferId} not found in activeDownloads`);
           }
-
-          // Update title based on remaining active transfers
-          const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
-          if (activeCount === 0) {
-            setTimeout(() => { document.title = 'termweb'; }, 2000);
-          }
         };
 
         // Handle cancelled transfers
         muxClient.getFileTransfer().onTransferCancelled = (transferId) => {
           activeDownloads.delete(transferId);
           activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
-
-          // Update title based on remaining active transfers
-          const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
-          if (activeCount === 0) {
-            document.title = 'termweb';
-          }
         };
 
         // Handle transfer errors
@@ -573,12 +550,6 @@
             existing.status = 'error';
             activeDownloads.set(transferId, existing);
             activeDownloads = new Map(activeDownloads);
-          }
-
-          // Update title
-          const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
-          if (activeCount === 0) {
-            document.title = 'termweb';
           }
         };
 
