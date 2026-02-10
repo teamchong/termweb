@@ -4867,8 +4867,49 @@ const Server = struct {
                         perf_read_ns += read_elapsed;
 
                         if (read_ok) {
-                            // Frame skip: hash the pixel buffer and skip encoding if unchanged
-                            const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
+                            // Frame skip: hash the pixel buffer EXCLUDING the cursor cell
+                            // region to avoid sending frames when only the cursor blinks.
+                            // The frontend renders cursor via CSS overlay, so cursor
+                            // blink in the framebuffer is pure waste.
+                            const frame_hash = blk: {
+                                const surf_size = c.ghostty_surface_size(panel.surface);
+                                const cell_w: usize = @intCast(surf_size.cell_width_px);
+                                const cell_h: usize = @intCast(surf_size.cell_height_px);
+                                const pad_x: usize = @intCast(surf_size.padding_left_px);
+                                const pad_y: usize = @intCast(surf_size.padding_top_px);
+
+                                var hash_cur_col: u16 = 0;
+                                var hash_cur_row: u16 = 0;
+                                var hash_cur_style: u8 = 0;
+                                var hash_cur_vis: u8 = 0;
+                                c.ghostty_surface_cursor_info(panel.surface, &hash_cur_col, &hash_cur_row, &hash_cur_style, &hash_cur_vis);
+
+                                const cur_px_x = pad_x + @as(usize, hash_cur_col) * cell_w;
+                                const cur_px_y = pad_y + @as(usize, hash_cur_row) * cell_h;
+                                const row_stride: usize = @as(usize, pixel_width) * 4;
+                                const cur_x_byte_start = @min(cur_px_x * 4, row_stride);
+                                const cur_x_byte_end = @min((cur_px_x + cell_w) * 4, row_stride);
+                                const cur_y_end = @min(cur_px_y + cell_h, pixel_height);
+
+                                if (cell_w == 0 or cell_h == 0 or cur_x_byte_start >= cur_x_byte_end) {
+                                    // No valid cursor region; hash entire buffer
+                                    break :blk std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
+                                }
+
+                                var hasher = std.hash.XxHash64.init(0);
+                                const buf = panel.bgra_buffer.?;
+                                for (0..pixel_height) |y| {
+                                    const row_off = y * row_stride;
+                                    if (y >= cur_px_y and y < cur_y_end) {
+                                        // Row overlaps cursor: hash before and after cursor
+                                        hasher.update(buf[row_off .. row_off + cur_x_byte_start]);
+                                        hasher.update(buf[row_off + cur_x_byte_end .. row_off + row_stride]);
+                                    } else {
+                                        hasher.update(buf[row_off .. row_off + row_stride]);
+                                    }
+                                }
+                                break :blk hasher.final();
+                            };
 
                             // Debug: log frames after input to diagnose stale pixels
                             if (panel.dbg_input_countdown > 0) {
