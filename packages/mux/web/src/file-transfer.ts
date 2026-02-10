@@ -303,40 +303,48 @@ export class FileTransferHandler {
     const view = new DataView(data);
     const msgType = view.getUint8(0);
 
-    switch (msgType) {
-      case TransferMsgType.TRANSFER_READY:
-        this.handleTransferReady(data);
-        break;
-      case TransferMsgType.FILE_LIST:
-        this.handleFileList(data);
-        break;
-      case TransferMsgType.FILE_REQUEST:
-        this.handleFileRequest(data).catch(err => console.error('File request handling failed:', err));
-        break;
-      case TransferMsgType.FILE_ACK:
-        this.handleFileAck(data);
-        break;
-      case TransferMsgType.TRANSFER_COMPLETE:
-        this.handleTransferComplete(data);
-        break;
-      case TransferMsgType.TRANSFER_ERROR:
-        this.handleTransferError(data);
-        break;
-      case TransferMsgType.DRY_RUN_REPORT:
-        this.handleDryRunReport(data);
-        break;
-      case TransferMsgType.BATCH_DATA:
-        this.handleBatchData(data).catch(err => console.error('Batch data handling failed:', err));
-        break;
-      case TransferMsgType.SYNC_FILE_LIST:
-        this.handleSyncFileList(data).catch(err => console.error('Sync file list handling failed:', err));
-        break;
-      case TransferMsgType.DELTA_DATA:
-        this.handleDeltaData(data).catch(err => console.error('Delta data handling failed:', err));
-        break;
-      case TransferMsgType.SYNC_COMPLETE:
-        this.handleSyncComplete(data);
-        break;
+    try {
+      switch (msgType) {
+        case TransferMsgType.TRANSFER_READY:
+          this.handleTransferReady(data);
+          break;
+        case TransferMsgType.FILE_LIST:
+          this.handleFileList(data);
+          break;
+        case TransferMsgType.FILE_REQUEST:
+          this.handleFileRequest(data).catch(err => console.error('File request handling failed:', err));
+          break;
+        case TransferMsgType.FILE_ACK:
+          this.handleFileAck(data);
+          break;
+        case TransferMsgType.TRANSFER_COMPLETE:
+          this.handleTransferComplete(data);
+          break;
+        case TransferMsgType.TRANSFER_ERROR:
+          this.handleTransferError(data);
+          break;
+        case TransferMsgType.DRY_RUN_REPORT:
+          this.handleDryRunReport(data);
+          break;
+        case TransferMsgType.BATCH_DATA:
+          this.handleBatchData(data).catch(err => console.error('Batch data handling failed:', err));
+          break;
+        case TransferMsgType.SYNC_FILE_LIST:
+          this.handleSyncFileList(data).catch(err => console.error('Sync file list handling failed:', err));
+          break;
+        case TransferMsgType.DELTA_DATA:
+          this.handleDeltaData(data).catch(err => console.error('Delta data handling failed:', err));
+          break;
+        case TransferMsgType.SYNC_COMPLETE:
+          this.handleSyncComplete(data);
+          break;
+      }
+    } catch (err) {
+      console.error(`File transfer message handler failed (type=0x${msgType.toString(16)}):`, err);
+      // Ensure error callback fires so Promises don't hang
+      const view2 = new DataView(data);
+      const transferId = data.byteLength >= 5 ? view2.getUint32(1, true) : 0;
+      this.onTransferError?.(transferId, `Message parsing error: ${err}`);
     }
   }
 
@@ -700,7 +708,8 @@ export class FileTransferHandler {
       entries.push({ action: action < DRY_RUN_ACTION.length ? DRY_RUN_ACTION[action] : 'unknown', path, size });
     }
 
-    this.onDryRunReport?.(transferId, { newCount, updateCount, deleteCount, entries });
+    const report = { newCount, updateCount, deleteCount, entries };
+    this.onDryRunReport?.(transferId, report);
   }
 
   async startFolderUpload(
@@ -826,6 +835,7 @@ export class FileTransferHandler {
     }
 
     const { deleteExtra = false, dryRun = false, excludes = [] } = options;
+    const flagsByte = (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0);
 
     const pathBytes = sharedTextEncoder.encode(serverPath);
     const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
@@ -839,7 +849,7 @@ export class FileTransferHandler {
     let offset = 0;
     view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
     view.setUint8(offset, 1); offset += 1; // direction: download
-    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0)); offset += 1;
+    view.setUint8(offset, flagsByte); offset += 1;
     view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;

@@ -8,6 +8,7 @@ import { tabs, activeTabId as activeTabIdStore, panels, activePanelId, ui, creat
 import PanelComponent from '../components/Panel.svelte';
 import { SplitContainer, type PanelLike } from '../split-container';
 import { FileTransferHandler } from '../file-transfer';
+import type { DryRunReport, TransferOptions } from '../file-transfer';
 import type { AppConfig, LayoutData, LayoutNode, LayoutTab } from '../types';
 import type { PanelStatus } from '../stores/types';
 import { applyColors, generateId, getWsUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
@@ -110,6 +111,11 @@ export class MuxClient {
   private h264PendingFrames = new Map<number, Uint8Array[]>();
   private controlPendingByPanel = new Map<number, ArrayBuffer[]>();
 
+  // Callbacks for transfer dialog UI (set by App.svelte)
+  onUploadRequest?: () => void;
+  onDownloadRequest?: () => void;
+  onFileDropRequest?: (panel: PanelInstance, files: File[]) => void;
+
   constructor() {
     this.fileTransfer = new FileTransferHandler();
     this.fileTransfer.onTransferComplete = (transferId, totalBytes) => {
@@ -126,6 +132,67 @@ export class MuxClient {
     };
   }
 
+  getFileTransfer(): FileTransferHandler {
+    return this.fileTransfer;
+  }
+
+  /** Run a dry-run transfer and return the report.
+   *  Temporarily captures the onDryRunReport callback to resolve a Promise. */
+  async requestDryRun(
+    mode: 'upload' | 'download',
+    serverPath: string,
+    options: TransferOptions,
+    dirHandle?: FileSystemDirectoryHandle,
+    droppedFiles?: File[],
+  ): Promise<DryRunReport | null> {
+    await this.ensureFileWs();
+
+    const dryRunOptions: TransferOptions = { ...options, dryRun: true };
+
+    return new Promise<DryRunReport | null>((resolve) => {
+      const prevDryRunCb = this.fileTransfer.onDryRunReport;
+      const prevErrorCb = this.fileTransfer.onTransferError;
+
+      const cleanup = () => {
+        this.fileTransfer.onDryRunReport = prevDryRunCb;
+        this.fileTransfer.onTransferError = prevErrorCb;
+        clearTimeout(timeout);
+      };
+
+      const timeout = setTimeout(() => {
+        console.warn('[DryRun] Timeout — no response in 30s');
+        cleanup();
+        resolve(null);
+      }, 30000);
+
+      this.fileTransfer.onDryRunReport = (_transferId, report) => {
+        cleanup();
+        this.resetFileWsIdleTimer();
+        resolve(report);
+      };
+
+      this.fileTransfer.onTransferError = (transferId, error) => {
+        cleanup();
+        console.error(`[DryRun] Failed (transfer ${transferId}): ${error}`);
+        this.resetFileWsIdleTimer();
+        resolve(null);
+      };
+
+      if (mode === 'upload') {
+        if (dirHandle) {
+          this.fileTransfer.startFolderUpload(dirHandle, serverPath, dryRunOptions);
+        } else if (droppedFiles) {
+          this.fileTransfer.startFilesUpload(droppedFiles, serverPath, dryRunOptions);
+        } else {
+          cleanup();
+          resolve(null);
+        }
+      } else {
+        this.fileTransfer.startFolderDownload(serverPath, dryRunOptions);
+      }
+    });
+  }
+
   private static checkWebCodecsSupport(): boolean {
     return typeof VideoDecoder !== 'undefined' && typeof VideoDecoder.isConfigSupported === 'function';
   }
@@ -136,7 +203,7 @@ export class MuxClient {
 
   /** Lazy file WS — connects on first transfer, not on page load.
    *  Returns a promise that resolves when the WS is open and ready to send. */
-  private ensureFileWs(): Promise<void> {
+  ensureFileWs(): Promise<void> {
     // Already open — just reset idle timer
     if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
       this.resetFileWsIdleTimer();
@@ -162,9 +229,12 @@ export class MuxClient {
         console.log('File transfer channel connected');
         this.fileTransfer.setSend((data) => {
           if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
-            const copy = new Uint8Array(data.length);
-            copy.set(data);
-            this.fileWs.send(copy);
+            // Prepend zstd framing flag (0x00 = uncompressed)
+            // File data is already zstd-compressed at the application level
+            const frame = new Uint8Array(1 + data.length);
+            frame[0] = 0x00;
+            frame.set(data, 1);
+            this.fileWs.send(frame);
             this.resetFileWsIdleTimer();
           }
         });
@@ -184,7 +254,20 @@ export class MuxClient {
         if (this.destroyed) return;
         this.resetFileWsIdleTimer();
         if (event.data instanceof ArrayBuffer) {
-          this.fileTransfer.handleServerMessage(event.data);
+          // Strip zstd compression flag byte (same framing as control WS)
+          const raw = new Uint8Array(event.data);
+          if (raw.length < 2) return;
+          const flag = raw[0];
+          if (flag === 0x01) {
+            try {
+              const decompressed = decompressZstd(raw.subarray(1));
+              this.fileTransfer.handleServerMessage(decompressed.buffer as ArrayBuffer);
+            } catch (err) {
+              console.error('File WS zstd decompress failed:', err);
+            }
+          } else if (flag === 0x00) {
+            this.fileTransfer.handleServerMessage(raw.buffer.slice(1));
+          }
         }
       };
 
@@ -1851,54 +1934,24 @@ export class MuxClient {
     }
   }
 
-  async showUploadDialog(): Promise<void> {
-    if (!('showDirectoryPicker' in window)) return;
-    try {
-      const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
-      const panel = this.currentActivePanel;
-      const panelInfo = panel ? panels.get(panel.id) : undefined;
-      const defaultPath = panelInfo?.pwd || '~';
-      const serverPath = window.prompt('Upload to server path:', defaultPath);
-      if (!serverPath) return;
-      await this.ensureFileWs();
-      await this.fileTransfer.startFolderUpload(dirHandle, serverPath);
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name !== 'AbortError') {
-        console.error('Upload failed:', err);
-      }
-    }
+  showUploadDialog(): void {
+    this.onUploadRequest?.();
   }
 
-  async showDownloadDialog(): Promise<void> {
+  showDownloadDialog(): void {
+    this.onDownloadRequest?.();
+  }
+
+  handleFileDrop(panel: PanelInstance, files: File[]): void {
+    if (files.length === 0) return;
+    this.onFileDropRequest?.(panel, files);
+  }
+
+  /** Get the pwd of the active panel (for dialog default paths). */
+  getActivePanelPwd(): string {
     const panel = this.currentActivePanel;
     const panelInfo = panel ? panels.get(panel.id) : undefined;
-    const defaultPath = panelInfo?.pwd || '~';
-    const serverPath = window.prompt('Download from server path:', defaultPath);
-    if (!serverPath) return;
-    try {
-      await this.ensureFileWs();
-      await this.fileTransfer.startFolderDownload(serverPath);
-    } catch (err: unknown) {
-      console.error('Download failed:', err);
-    }
-  }
-
-  async handleFileDrop(panel: PanelInstance, files: File[]): Promise<void> {
-    if (files.length === 0) return;
-
-    const panelInfo = panels.get(panel.id);
-    const defaultPath = panelInfo?.pwd || panel.getPwd() || '~';
-    const serverPath = window.prompt('Upload to server path:', defaultPath);
-    if (!serverPath) return;
-
-    try {
-      await this.ensureFileWs();
-      await this.fileTransfer.startFilesUpload(files, serverPath);
-    } catch (err: unknown) {
-      if (err instanceof Error) {
-        console.error('File upload failed:', err);
-      }
-    }
+    return panelInfo?.pwd || panel?.getPwd() || '~';
   }
 
   async showStorageDialog(): Promise<void> {

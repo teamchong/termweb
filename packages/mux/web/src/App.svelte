@@ -7,6 +7,7 @@
   import QuickTerminal from './components/QuickTerminal.svelte';
   import TabOverview from './components/TabOverview.svelte';
   import ShareDialog from './components/ShareDialog.svelte';
+  import TransferDialog, { type TransferConfig } from './components/TransferDialog.svelte';
   import { tabs, activeTabId, activeTab, ui } from './stores/index';
   import { connectionStatus, initialLayoutLoaded, initMuxClient, type MuxClient } from './services/mux';
 
@@ -27,6 +28,13 @@
 
   // Share dialog state
   let shareDialogOpen = $state(false);
+
+  // Transfer dialog state
+  let transferDialogOpen = $state(false);
+  let transferDialogMode: 'upload' | 'download' = $state('download');
+  let transferDialogDefaultPath = $state('');
+  let transferDialogInitialDirHandle: FileSystemDirectoryHandle | undefined = $state();
+  let transferDialogInitialFiles: File[] | undefined = $state();
 
   // Quick terminal ref
   let quickTerminalRef: QuickTerminal | undefined = $state();
@@ -185,6 +193,63 @@
     });
   }
 
+  // Transfer dialog helpers
+  function openUploadDialog() {
+    transferDialogMode = 'upload';
+    transferDialogDefaultPath = muxClient?.getActivePanelPwd() || '';
+    transferDialogInitialDirHandle = undefined;
+    transferDialogInitialFiles = undefined;
+    transferDialogOpen = true;
+  }
+
+  function openDownloadDialog() {
+    transferDialogMode = 'download';
+    transferDialogDefaultPath = muxClient?.getActivePanelPwd() || '';
+    transferDialogInitialDirHandle = undefined;
+    transferDialogInitialFiles = undefined;
+    transferDialogOpen = true;
+  }
+
+  function openFileDropDialog(files: File[]) {
+    transferDialogMode = 'upload';
+    transferDialogDefaultPath = muxClient?.getActivePanelPwd() || '';
+    transferDialogInitialDirHandle = undefined;
+    transferDialogInitialFiles = files;
+    transferDialogOpen = true;
+  }
+
+  async function handleTransferExecute(config: TransferConfig) {
+    if (!muxClient) return;
+    const ft = muxClient.getFileTransfer();
+    const options = { excludes: config.excludes, deleteExtra: config.deleteExtra };
+    try {
+      await muxClient.ensureFileWs();
+      if (transferDialogMode === 'upload') {
+        if (config.dirHandle) {
+          await ft.startFolderUpload(config.dirHandle, config.serverPath, options);
+        } else if (config.files) {
+          await ft.startFilesUpload(config.files, config.serverPath, options);
+        }
+      } else {
+        await ft.startFolderDownload(config.serverPath, options);
+      }
+    } catch (err) {
+      console.error('Transfer failed:', err);
+    }
+  }
+
+  async function handleTransferPreview(config: TransferConfig) {
+    if (!muxClient) return null;
+    const options = { excludes: config.excludes, deleteExtra: config.deleteExtra };
+    return muxClient.requestDryRun(
+      transferDialogMode,
+      config.serverPath,
+      options,
+      config.dirHandle,
+      config.files,
+    );
+  }
+
   // Handle command execution from command palette
   function handleCommand(action: string) {
     switch (action) {
@@ -234,10 +299,10 @@
         muxClient?.toggleInspector();
         break;
       case '_upload':
-        muxClient?.showUploadDialog();
+        openUploadDialog();
         break;
       case '_download':
-        muxClient?.showDownloadDialog();
+        openDownloadDialog();
         break;
       case '_storage':
         muxClient?.showStorageDialog();
@@ -351,6 +416,10 @@
     if (panelsEl) {
       try {
         muxClient = await initMuxClient(panelsEl);
+        // Wire transfer dialog callbacks
+        muxClient.onUploadRequest = () => openUploadDialog();
+        muxClient.onDownloadRequest = () => openDownloadDialog();
+        muxClient.onFileDropRequest = (_panel, files) => openFileDropDialog(files);
       } catch (err) {
         console.error('Failed to initialize MuxClient:', err);
       } finally {
@@ -366,13 +435,7 @@
   // Setup keyboard shortcuts and input forwarding
   function handleKeydown(e: KeyboardEvent) {
     // Skip if dialog is open - let them handle their own keyboard events
-    if (commandPaletteOpen || tabOverviewOpen) {
-      return;
-    }
-    const downloadDialog = document.getElementById('download-dialog');
-    const uploadDialog = document.getElementById('upload-dialog');
-    if (downloadDialog?.classList.contains('visible') ||
-        uploadDialog?.classList.contains('visible')) {
+    if (commandPaletteOpen || tabOverviewOpen || transferDialogOpen) {
       return;
     }
 
@@ -521,13 +584,7 @@
 
   function handleKeyup(e: KeyboardEvent) {
     // Skip if dialog is open
-    if (commandPaletteOpen || tabOverviewOpen) {
-      return;
-    }
-    const downloadDialog = document.getElementById('download-dialog');
-    const uploadDialog = document.getElementById('upload-dialog');
-    if (downloadDialog?.classList.contains('visible') ||
-        uploadDialog?.classList.contains('visible')) {
+    if (commandPaletteOpen || tabOverviewOpen || transferDialogOpen) {
       return;
     }
 
@@ -633,6 +690,18 @@
   <ShareDialog
     open={shareDialogOpen}
     onClose={() => shareDialogOpen = false}
+  />
+
+  <!-- Transfer Dialog -->
+  <TransferDialog
+    open={transferDialogOpen}
+    mode={transferDialogMode}
+    defaultPath={transferDialogDefaultPath}
+    initialDirHandle={transferDialogInitialDirHandle}
+    initialFiles={transferDialogInitialFiles}
+    onTransfer={handleTransferExecute}
+    onPreview={handleTransferPreview}
+    onClose={() => transferDialogOpen = false}
   />
 </div>
 

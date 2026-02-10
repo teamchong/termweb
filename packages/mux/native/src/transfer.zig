@@ -929,6 +929,9 @@ pub const MappedFile = struct {
     data: []align(std.heap.page_size_min) u8,
     fd: posix.fd_t,
 
+    // Sentinel for empty files — avoids alignment issues with []align(page_size) u8
+    var empty_page: [0]u8 align(std.heap.page_size_min) = .{};
+
     pub fn init(path: []const u8) !MappedFile {
         const fd = try posix.open(path, .{ .ACCMODE = .RDONLY }, 0);
         errdefer posix.close(fd);
@@ -937,7 +940,7 @@ pub const MappedFile = struct {
         const size: usize = @intCast(stat.size);
 
         if (size == 0) {
-            return MappedFile{ .data = &[_]u8{}, .fd = fd };
+            return MappedFile{ .data = empty_page[0..0], .fd = fd };
         }
 
         const mapped = try posix.mmap(
@@ -963,7 +966,7 @@ pub const MappedFile = struct {
         const size: usize = @intCast(stat.size);
 
         if (size == 0) {
-            return MappedFile{ .data = &[_]u8{}, .fd = fd };
+            return MappedFile{ .data = empty_page[0..0], .fd = fd };
         }
 
         const mapped = try posix.mmap(
@@ -1163,12 +1166,17 @@ pub const TransferSession = struct {
         return false;
     }
 
-    // Build file list from directory (for downloads)
+    // Build file list from directory or single file (for downloads)
     pub fn buildFileList(self: *TransferSession) !void {
         self.files.clearRetainingCapacity();
         self.total_bytes = 0;
 
         var dir = fs.openDirAbsolute(self.base_path, .{ .iterate = true }) catch |err| {
+            if (err == error.NotDir) {
+                // Path is a file — handle single-file download
+                try self.buildSingleFileEntry();
+                return;
+            }
             std.debug.print("Failed to open directory {s}: {}\n", .{ self.base_path, err });
             return err;
         };
@@ -1252,6 +1260,11 @@ pub const TransferSession = struct {
         self.total_bytes = 0;
 
         var dir = fs.openDirAbsolute(self.base_path, .{ .iterate = true }) catch |err| {
+            if (err == error.NotDir) {
+                // Path is a file — handle single-file download
+                try self.buildSingleFileEntry();
+                return;
+            }
             std.debug.print("Failed to open directory {s}: {}\n", .{ self.base_path, err });
             return err;
         };
@@ -1260,15 +1273,56 @@ pub const TransferSession = struct {
         // Phase 1: walk without hashing
         try self.walkDirectoryNoHash(dir, "");
 
-        // Phase 2: batch hash all non-directory files
-        self.batchHashFiles(dir) catch {
-            // Fallback: hash each file individually (same as sync buildFileList)
-            for (self.files.items) |*entry| {
-                if (!entry.is_dir and entry.hash == 0 and entry.size > 0) {
-                    entry.hash = self.hashFileMmap(dir, entry.path) catch 0;
+        // Phase 2: batch hash all non-directory files (skip for dry runs — only need paths/sizes)
+        if (!self.flags.dry_run) {
+            self.batchHashFiles(dir) catch {
+                // Fallback: hash each file individually (same as sync buildFileList)
+                for (self.files.items) |*entry| {
+                    if (!entry.is_dir and entry.hash == 0 and entry.size > 0) {
+                        entry.hash = self.hashFileMmap(dir, entry.path) catch 0;
+                    }
                 }
-            }
-        };
+            };
+        }
+    }
+
+    /// Handle single-file download: split base_path into parent dir + filename,
+    /// update base_path to the parent, and add one file entry.
+    fn buildSingleFileEntry(self: *TransferSession) !void {
+        // Split path into parent directory and filename
+        const sep_pos = std.mem.lastIndexOfScalar(u8, self.base_path, '/') orelse return error.NotDir;
+        const parent_path = if (sep_pos == 0) "/" else self.base_path[0..sep_pos];
+        const filename = self.base_path[sep_pos + 1 ..];
+        if (filename.len == 0) return error.NotDir;
+
+        // Open parent directory to stat and hash the file
+        var parent_dir = fs.openDirAbsolute(parent_path, .{}) catch return error.NotDir;
+        defer parent_dir.close();
+
+        const stat = parent_dir.statFile(filename) catch return error.NotDir;
+        const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+
+        // Hash the file via mmap
+        const hash = self.hashFileMmap(parent_dir, filename) catch 0;
+
+        // Dupe filename BEFORE freeing base_path (filename is a slice into base_path)
+        const filename_copy = try self.allocator.dupe(u8, filename);
+        errdefer self.allocator.free(filename_copy);
+
+        // Update base_path to parent directory
+        const new_base = try self.allocator.dupe(u8, parent_path);
+        self.allocator.free(self.base_path);
+        self.base_path = new_base;
+
+        // Add single file entry
+        try self.files.append(self.allocator, .{
+            .path = filename_copy,
+            .size = stat.size,
+            .mtime = mtime,
+            .hash = hash,
+            .is_dir = false,
+        });
+        self.total_bytes = stat.size;
     }
 
     /// Walk directory tree without hashing (deferred for batch hashing).
@@ -1827,6 +1881,13 @@ pub fn buildFileChunkPrecompressed(
 pub const BatchEntry = struct {
     file_index: u32,
     data: []const u8,
+};
+
+/// Result of compressing a file, passed through goroutine channels.
+pub const CompressedMsg = struct {
+    file_index: u32,
+    file_size: u64,
+    chunks: [][]u8, // compressed chunks, owned by allocator
 };
 
 /// Build BATCH_DATA message — multiple small files compressed as one block.

@@ -21,6 +21,8 @@ const transfer = @import("transfer.zig");
 const auth = @import("auth.zig");
 const WakeSignal = @import("wake_signal.zig").WakeSignal;
 const Channel = @import("async/channel.zig").Channel;
+const goroutine_runtime = @import("async/runtime.zig");
+const gchannel = @import("async/gchannel.zig");
 pub const tunnel_mod = @import("tunnel.zig");
 
 
@@ -1515,6 +1517,7 @@ const Server = struct {
     inspector_open: bool,  // Whether inspector is open
     shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
     wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
+    goroutine_rt: *goroutine_runtime.Runtime, // M:N goroutine scheduler for file transfer pipeline
 
     var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
 
@@ -1527,17 +1530,17 @@ const Server = struct {
         // Create HTTP server for static files (no ghostty config needed initially)
         const http_srv = try http.HttpServer.init(allocator, "0.0.0.0", http_port, null);
 
-        // Create control WebSocket server (zstd channel: all non-H264 traffic)
+        // Create control WebSocket server (zstd-compressed control traffic)
         const control_ws = try ws.Server.init(allocator, "0.0.0.0", control_port);
         control_ws.setCallbacks(onControlConnect, onControlMessage, onControlDisconnect);
 
-        // Create file transfer WebSocket server (dedicated channel for uploads/downloads)
+        // Create file transfer WebSocket server (zstd-compressed file transfers)
         const file_ws = try ws.Server.init(allocator, "0.0.0.0", 0);
         file_ws.setCallbacks(onFileConnect, onFileMessage, onFileDisconnect);
 
-        // Create H264 WebSocket server (video frames only, server→client, no deflate)
+        // Create H264 WebSocket server (pre-compressed video, no zstd)
         // Short write timeout: video frames are droppable, don't block render loop
-        const h264_ws = try ws.Server.initNoDeflate(allocator, "0.0.0.0", panel_port);
+        const h264_ws = try ws.Server.initNoCompression(allocator, "0.0.0.0", panel_port);
         h264_ws.send_timeout_ms = 10; // 10ms — drop frame rather than stall
         h264_ws.setCallbacks(onH264Connect, onH264Message, onH264Disconnect);
 
@@ -1553,6 +1556,10 @@ const Server = struct {
         errdefer pending_resizes_ch.deinit();
         const pending_splits_ch = try Channel(PanelSplitRequest).initBuffered(allocator, 64);
         errdefer pending_splits_ch.deinit();
+
+        // Initialize goroutine runtime for file transfer pipeline (0 = auto-detect CPU count)
+        const gor_rt = try goroutine_runtime.Runtime.init(allocator, 0);
+        errdefer gor_rt.deinit();
 
         server.* = .{
             .app = null, // Lazy init on first panel
@@ -1596,6 +1603,7 @@ const Server = struct {
                 };
             } else {},
             .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
+            .goroutine_rt = gor_rt,
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -1728,6 +1736,8 @@ const Server = struct {
         if (is_linux) {
             if (self.shared_va_ctx) |*ctx| ctx.deinit();
         }
+        // Shutdown goroutine runtime (waits for all goroutines to complete)
+        self.goroutine_rt.deinit();
         // Only free ghostty if it was initialized
         if (self.app) |app| c.ghostty_app_free(app);
         if (self.config) |cfg| c.ghostty_config_free(cfg);
@@ -3277,12 +3287,21 @@ const Server = struct {
         };
         defer init_data.deinit(self.allocator);
 
-        // Expand ~ in path
-        const expanded_path = self.expandPath(init_data.path) catch init_data.path;
-        defer if (expanded_path.ptr != init_data.path.ptr) self.allocator.free(expanded_path);
+        std.debug.print("TRANSFER_INIT: dir={s} flags=0x{x:0>2} path='{s}' excludes={d}\n", .{
+            @tagName(init_data.direction),
+            @as(u8, @bitCast(init_data.flags)),
+            init_data.path,
+            init_data.excludes.len,
+        });
+
+        // Resolve path: expand ~, join relative paths with initial_cwd
+        const resolved_path = self.resolvePath(init_data.path);
+        defer if (resolved_path.ptr != self.initial_cwd.ptr) self.allocator.free(@constCast(resolved_path));
+
+        std.debug.print("  resolved_path='{s}'\n", .{resolved_path});
 
         // Create session
-        const session = self.transfer_manager.createSession(init_data.direction, init_data.flags, expanded_path) catch |err| {
+        const session = self.transfer_manager.createSession(init_data.direction, init_data.flags, resolved_path) catch |err| {
             std.debug.print("Failed to create transfer session: {}\n", .{err});
             return;
         };
@@ -3300,21 +3319,19 @@ const Server = struct {
         defer self.allocator.free(ready_msg);
         conn.sendBinary(ready_msg) catch {};
 
-        std.debug.print("Transfer session {d} created: {s} -> {s}\n", .{
-            session.id,
-            if (init_data.direction == .upload) "browser" else "server",
-            if (init_data.direction == .upload) "server" else "browser",
-        });
-
         // For downloads, build file list and send
         if (init_data.direction == .download) {
             session.buildFileListAsync() catch |err| {
-                std.debug.print("Failed to build file list: {}\n", .{err});
-                const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read directory") catch return;
+                std.debug.print("Failed to build file list for '{s}': {}\n", .{ resolved_path, err });
+                const error_msg = transfer.buildTransferError(self.allocator, session.id, "Path not found or not accessible") catch return;
                 defer self.allocator.free(error_msg);
-                conn.sendBinary(error_msg) catch {};
+                conn.sendBinary(error_msg) catch |send_err| {
+                    std.debug.print("Failed to send TRANSFER_ERROR for session {d}: {}\n", .{ session.id, send_err });
+                };
                 return;
             };
+
+            std.debug.print("  file list built: {d} files, {d} bytes total\n", .{ session.files.items.len, session.total_bytes });
 
             // If dry run, send report instead of file list
             if (init_data.flags.dry_run) {
@@ -3509,12 +3526,12 @@ const Server = struct {
         };
         defer sync_data.deinit(self.allocator);
 
-        // Expand ~ in path
-        const expanded_path = self.expandPath(sync_data.path) catch sync_data.path;
-        defer if (expanded_path.ptr != sync_data.path.ptr) self.allocator.free(expanded_path);
+        // Resolve path: expand ~, join relative paths with initial_cwd
+        const resolved_path = self.resolvePath(sync_data.path);
+        defer if (resolved_path.ptr != self.initial_cwd.ptr) self.allocator.free(@constCast(resolved_path));
 
         // Create a download session for the sync
-        const session = self.transfer_manager.createSession(.download, .{}, expanded_path) catch |err| {
+        const session = self.transfer_manager.createSession(.download, .{}, resolved_path) catch |err| {
             std.debug.print("Failed to create sync session: {}\n", .{err});
             return;
         };
@@ -3542,7 +3559,7 @@ const Server = struct {
 
         std.debug.print("Sync session {d} created for {s} ({d} files)\n", .{
             session.id,
-            expanded_path,
+            resolved_path,
             session.files.items.len,
         });
     }
@@ -3614,10 +3631,81 @@ const Server = struct {
         conn.sendBinary(delta_msg) catch {};
     }
 
+    /// Context passed to each file-processing goroutine.
+    const FileGoroutineCtx = struct {
+        allocator: std.mem.Allocator,
+        session_id: u32,
+        file_index: u32,
+        file_size: u64,
+        file_path: []const u8, // Owned copy of relative path
+        base_path: []const u8, // Borrowed from session (stable for transfer lifetime)
+        is_active: *bool, // Pointer to session.is_active
+        send_ch: *gchannel.GChannel(transfer.CompressedMsg),
+        done_counter: *std.atomic.Value(usize), // Decremented when goroutine finishes
+
+        fn deinit(self: *FileGoroutineCtx) void {
+            self.allocator.free(self.file_path);
+            self.allocator.destroy(self);
+        }
+    };
+
+    /// Goroutine entry point: reads a file, compresses it, sends result to channel.
+    fn processFileGoroutine(arg: *anyopaque) void {
+        const ctx: *FileGoroutineCtx = @ptrCast(@alignCast(arg));
+        // Save done_counter before ctx.deinit frees the struct.
+        // Defers execute LIFO: deinit runs first, then fetchAdd signals completion.
+        const done_counter = ctx.done_counter;
+        defer _ = done_counter.fetchAdd(1, .release);
+        defer ctx.deinit();
+
+        if (!@atomicLoad(bool, ctx.is_active, .acquire)) return;
+
+        const data = readFileForGoroutine(ctx.allocator, ctx.base_path, ctx.file_path, ctx.file_size) orelse return;
+        defer ctx.allocator.free(data);
+
+        if (!@atomicLoad(bool, ctx.is_active, .acquire)) return;
+
+        const chunks = transfer.ParallelCompressor.compressChunksParallel(
+            ctx.allocator,
+            data,
+            3,
+        ) catch return;
+
+        if (!ctx.send_ch.send(.{
+            .file_index = ctx.file_index,
+            .file_size = ctx.file_size,
+            .chunks = chunks,
+        })) {
+            transfer.ParallelCompressor.freeChunks(ctx.allocator, chunks);
+        }
+    }
+
+    /// Read a file using pread. Safe to call from any goroutine/thread.
+    fn readFileForGoroutine(allocator: std.mem.Allocator, base_path: []const u8, rel_path: []const u8, size: u64) ?[]u8 {
+        var dir = std.fs.openDirAbsolute(base_path, .{}) catch return null;
+        defer dir.close();
+
+        var file = dir.openFile(rel_path, .{}) catch return null;
+        defer file.close();
+
+        const buf = allocator.alloc(u8, @intCast(size)) catch return null;
+        const bytes_read = file.readAll(buf) catch {
+            allocator.free(buf);
+            return null;
+        };
+
+        if (bytes_read < buf.len) {
+            // Short read — return what we got (shrink allocation)
+            const trimmed = allocator.realloc(buf, bytes_read) catch return buf;
+            return trimmed;
+        }
+        return buf;
+    }
+
     /// Push all file chunks for a download transfer.
-    /// Iterates every non-directory file in the session, reads/compresses
-    /// chunks via mmap, and sends FILE_REQUEST messages to the client.
-    /// Sends TRANSFER_COMPLETE when finished.
+    /// Small files use batch I/O (MultiFileReader). Large files are processed
+    /// concurrently via goroutines (read + compress in parallel, send results
+    /// through a channel to the WS handler thread).
     fn pushDownloadFiles(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
         const chunk_size: usize = 256 * 1024;
         var bytes_sent: u64 = 0;
@@ -3639,29 +3727,51 @@ const Server = struct {
         defer small_sizes.deinit(self.allocator);
         var small_bytes: u64 = 0;
 
+        // Create per-transfer channel for large file results (goroutines → WS thread)
+        const GCh = gchannel.GChannel(transfer.CompressedMsg);
+        const send_ch = GCh.initBuffered(self.allocator, self.goroutine_rt, 8) catch {
+            self.pushDownloadFilesSerial(conn, session);
+            return;
+        };
+
+        // Track goroutine completion so we can safely deinit the channel.
+        // Goroutines hold pointers to send_ch — we must wait for all to finish
+        // before freeing it to avoid use-after-free.
+        var goroutine_done = std.atomic.Value(usize).init(0);
+        var large_file_count: usize = 0;
+
+        // Ensure channel outlives all goroutines: wait for completion then deinit
+        defer {
+            // Wait for all goroutines to finish before freeing channel
+            while (goroutine_done.load(.acquire) < large_file_count) {
+                std.Thread.sleep(100 * std.time.ns_per_us);
+            }
+            // Drain any buffered messages (free their chunks to avoid leaks)
+            while (send_ch.recv()) |msg| {
+                transfer.ParallelCompressor.freeChunks(self.allocator, msg.chunks);
+            }
+            send_ch.deinit();
+        }
+
         for (session.files.items, 0..) |entry, i| {
             if (entry.is_dir) continue;
             if (!session.is_active) break;
 
             const file_index: u32 = @intCast(i);
 
-            // Empty files: client creates from FILE_LIST metadata
             if (entry.size == 0) continue;
 
-            // Small files: accumulate indices for batch read
             if (entry.size <= transfer.batch_threshold) {
                 small_indices.append(self.allocator, file_index) catch continue;
                 small_sizes.append(self.allocator, entry.size) catch continue;
                 small_bytes += entry.size;
 
-                // Flush batch if accumulated enough (256KB or 64 files)
                 if (small_bytes >= chunk_size or small_indices.items.len >= 64) {
                     self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
                 }
                 continue;
             }
 
-            // Flush any pending small files before sending a large file
             if (small_indices.items.len > 0) {
                 self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
             }
@@ -3669,10 +3779,125 @@ const Server = struct {
                 self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
             }
 
-            // Large files: read via platform-optimal I/O
-            // Linux: io_uring pipelined reads
-            // macOS: dispatch_io pipelined reads
-            // Other: mmap with madvise prefetch
+            const file_path_copy = self.allocator.dupe(u8, entry.path) catch continue;
+            const ctx = self.allocator.create(FileGoroutineCtx) catch {
+                self.allocator.free(file_path_copy);
+                continue;
+            };
+            ctx.* = .{
+                .allocator = self.allocator,
+                .session_id = session.id,
+                .file_index = file_index,
+                .file_size = entry.size,
+                .file_path = file_path_copy,
+                .base_path = session.base_path,
+                .is_active = &session.is_active,
+                .send_ch = send_ch,
+                .done_counter = &goroutine_done,
+            };
+            _ = self.goroutine_rt.go(processFileGoroutine, @ptrCast(ctx)) catch {
+                ctx.deinit();
+                continue;
+            };
+            large_file_count += 1;
+        }
+
+        // Flush remaining small files
+        if (small_indices.items.len > 0) {
+            self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
+        }
+        if (batch_entries.items.len > 0) {
+            self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
+        }
+
+        // Receive compressed results from goroutines on this (WS handler) thread.
+        // GChannel's recv() uses condition variable fallback for OS threads.
+        var files_done: usize = 0;
+        while (files_done < large_file_count) {
+            if (!session.is_active) {
+                send_ch.close();
+                break;
+            }
+            const msg = send_ch.recv() orelse break;
+            defer transfer.ParallelCompressor.freeChunks(self.allocator, msg.chunks);
+
+            var chunk_offset: u64 = 0;
+            for (msg.chunks) |compressed| {
+                if (!session.is_active) break;
+
+                const remaining = msg.file_size - chunk_offset;
+                const this_chunk: u32 = @intCast(@min(chunk_size, remaining));
+
+                const ws_msg = transfer.buildFileChunkPrecompressed(
+                    self.allocator,
+                    session.id,
+                    msg.file_index,
+                    chunk_offset,
+                    this_chunk,
+                    compressed,
+                ) catch break;
+                defer self.allocator.free(ws_msg);
+
+                conn.sendBinary(ws_msg) catch return;
+
+                chunk_offset += this_chunk;
+                bytes_sent += this_chunk;
+            }
+            files_done += 1;
+        }
+
+        const complete_msg = transfer.buildTransferComplete(self.allocator, session.id, bytes_sent) catch return;
+        defer self.allocator.free(complete_msg);
+        conn.sendBinary(complete_msg) catch {};
+
+        std.debug.print("Download complete: {d} bytes sent across {d} files ({d} large via goroutines)\n", .{ bytes_sent, session.files.items.len, large_file_count });
+    }
+
+    /// Serial fallback for pushDownloadFiles (used when goroutine channel creation fails).
+    fn pushDownloadFilesSerial(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
+        const chunk_size: usize = 256 * 1024;
+        var bytes_sent: u64 = 0;
+
+        var batch_entries: std.ArrayListUnmanaged(transfer.BatchEntry) = .{};
+        defer batch_entries.deinit(self.allocator);
+        var batch_data_bufs: std.ArrayListUnmanaged([]const u8) = .{};
+        defer {
+            for (batch_data_bufs.items) |buf| self.allocator.free(buf);
+            batch_data_bufs.deinit(self.allocator);
+        }
+        var batch_bytes: u64 = 0;
+
+        var small_indices: std.ArrayListUnmanaged(u32) = .{};
+        defer small_indices.deinit(self.allocator);
+        var small_sizes: std.ArrayListUnmanaged(u64) = .{};
+        defer small_sizes.deinit(self.allocator);
+        var small_bytes: u64 = 0;
+
+        for (session.files.items, 0..) |entry, i| {
+            if (entry.is_dir) continue;
+            if (!session.is_active) break;
+
+            const file_index: u32 = @intCast(i);
+            if (entry.size == 0) continue;
+
+            if (entry.size <= transfer.batch_threshold) {
+                small_indices.append(self.allocator, file_index) catch continue;
+                small_sizes.append(self.allocator, entry.size) catch continue;
+                small_bytes += entry.size;
+                if (small_bytes >= chunk_size or small_indices.items.len >= 64) {
+                    self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
+                }
+                continue;
+            }
+
+            if (small_indices.items.len > 0) {
+                self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
+            }
+            if (batch_entries.items.len > 0) {
+                self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
+            }
+
+            // Serial: read via platform I/O, compress, send
             const owned_buf: ?[]u8 = if (comptime is_linux) blk: {
                 break :blk session.readFileViaUring(file_index, self.allocator) catch |err| {
                     std.debug.print("io_uring read failed for {s}: {}\n", .{ entry.path, err });
@@ -3686,7 +3911,6 @@ const Server = struct {
             } else null;
 
             const file_data: []const u8 = if (owned_buf) |ud| ud else blk: {
-                // mmap fallback (other platforms, or if async I/O init fails)
                 if (i + 1 < session.files.items.len) {
                     const next_entry = session.files.items[i + 1];
                     if (!next_entry.is_dir and next_entry.size > 0) {
@@ -3705,28 +3929,23 @@ const Server = struct {
                 if (owned_buf) |ud| self.allocator.free(ud) else session.closeCurrentFile();
             }
 
-            // Use parallel compressor to compress all chunks at once
             const compressed_chunks = transfer.ParallelCompressor.compressChunksParallel(
                 self.allocator,
                 file_data,
-                3, // compression level
+                3,
             ) catch |err| {
                 std.debug.print("Parallel compression failed for {s}: {}, falling back\n", .{ entry.path, err });
-                // Defer handles uring_data/mmap cleanup; pushFileSequential does its own reads
                 self.pushFileSequential(conn, session, file_index, entry.size, chunk_size, &bytes_sent);
                 continue;
             };
             defer transfer.ParallelCompressor.freeChunks(self.allocator, compressed_chunks);
 
-            // Send each pre-compressed chunk
             var chunk_offset: u64 = 0;
             for (compressed_chunks, 0..) |compressed, ci| {
                 if (!session.is_active) break;
-
                 const remaining = entry.size - chunk_offset;
                 const this_chunk: u32 = @intCast(@min(chunk_size, remaining));
-
-                const msg = transfer.buildFileChunkPrecompressed(
+                const ws_msg = transfer.buildFileChunkPrecompressed(
                     self.allocator,
                     session.id,
                     file_index,
@@ -3737,18 +3956,13 @@ const Server = struct {
                     std.debug.print("Failed to build chunk {d} for {s}: {}\n", .{ ci, entry.path, err });
                     break;
                 };
-                defer self.allocator.free(msg);
-
-                conn.sendBinary(msg) catch return;
-
+                defer self.allocator.free(ws_msg);
+                conn.sendBinary(ws_msg) catch return;
                 chunk_offset += this_chunk;
                 bytes_sent += this_chunk;
             }
-
-            // Cleanup handled by defer (frees uring_data or closes mmap)
         }
 
-        // Flush remaining small files and batch
         if (small_indices.items.len > 0) {
             self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
         }
@@ -3759,8 +3973,7 @@ const Server = struct {
         const complete_msg = transfer.buildTransferComplete(self.allocator, session.id, bytes_sent) catch return;
         defer self.allocator.free(complete_msg);
         conn.sendBinary(complete_msg) catch {};
-
-        std.debug.print("Download complete: {d} bytes sent across {d} files\n", .{ bytes_sent, session.files.items.len });
+        std.debug.print("Download complete (serial fallback): {d} bytes sent\n", .{bytes_sent});
     }
 
     fn flushBatch(
@@ -3831,31 +4044,49 @@ const Server = struct {
         }
 
         // Build null-terminated relative paths for MultiFileReader
-        const z_paths = self.allocator.alloc([*:0]const u8, count) catch return;
+        const z_paths = self.allocator.alloc([*:0]const u8, count) catch |err| {
+            std.debug.print("flushSmallBatch: alloc z_paths failed: {}\n", .{err});
+            return;
+        };
         defer self.allocator.free(z_paths);
         var allocated: usize = 0;
         defer for (z_paths[0..allocated]) |p| self.allocator.free(std.mem.span(p));
 
         for (small_indices.items, 0..) |fi, idx| {
-            z_paths[idx] = self.allocator.dupeZ(u8, session.files.items[fi].path) catch return;
+            z_paths[idx] = self.allocator.dupeZ(u8, session.files.items[fi].path) catch |err| {
+                std.debug.print("flushSmallBatch: dupeZ path failed: {}\n", .{err});
+                return;
+            };
             allocated = idx + 1;
         }
 
         // Open base directory for relative path reads
-        var dir = std.fs.openDirAbsolute(session.base_path, .{}) catch return;
+        var dir = std.fs.openDirAbsolute(session.base_path, .{}) catch |err| {
+            std.debug.print("flushSmallBatch: openDir '{s}' failed: {}\n", .{ session.base_path, err });
+            return;
+        };
         defer dir.close();
 
         // MultiFileReader: io_uring on Linux, dispatch_apply on macOS, pread on other
-        var reader = transfer.MultiFileReader.init(dir.fd, self.allocator) catch return;
+        var reader = transfer.MultiFileReader.init(dir.fd, self.allocator) catch |err| {
+            std.debug.print("flushSmallBatch: MultiFileReader init failed: {}\n", .{err});
+            return;
+        };
         defer reader.deinit();
 
-        const results = reader.readFiles(z_paths, small_sizes.items) catch return;
+        const results = reader.readFiles(z_paths, small_sizes.items) catch |err| {
+            std.debug.print("flushSmallBatch: readFiles failed: {}\n", .{err});
+            return;
+        };
         defer self.allocator.free(results);
 
         // Build batch entries from read results
         for (small_indices.items, 0..) |fi, idx| {
             const r = results[idx];
-            if (r.size == 0 and r.data.len == 0) continue; // Per-file read failure, skip
+            if (r.size == 0 and r.data.len == 0) {
+                std.debug.print("flushSmallBatch: file {d} '{s}' read returned empty\n", .{ fi, session.files.items[fi].path });
+                continue;
+            }
 
             const data = if (r.size < r.data.len) blk: {
                 const trimmed = self.allocator.dupe(u8, r.data[0..r.size]) catch continue;
@@ -3935,18 +4166,42 @@ const Server = struct {
             }) catch {};
         }
 
-        const report_msg = transfer.buildDryRunReport(self.allocator, session.id, entries.items) catch return;
+        const report_msg = transfer.buildDryRunReport(self.allocator, session.id, entries.items) catch |err| {
+            std.debug.print("Failed to build dry run report: {}\n", .{err});
+            return;
+        };
         defer self.allocator.free(report_msg);
-        conn.sendBinary(report_msg) catch {};
+        conn.sendBinary(report_msg) catch |err| {
+            std.debug.print("Failed to send dry run report: {}\n", .{err});
+        };
     }
 
-    // Expand ~ in path to home directory
-    fn expandPath(self: *Server, path: []const u8) ![]u8 {
-        if (path.len > 0 and path[0] == '~') {
-            const home = std.posix.getenv("HOME") orelse return error.NoHome;
-            return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home, path[1..] });
+    /// Resolve a client-supplied path to an absolute path.
+    /// Handles: ~ expansion, relative paths (joined with initial_cwd), empty → initial_cwd.
+    fn resolvePath(self: *Server, path: []const u8) []const u8 {
+        if (path.len == 0) return self.initial_cwd;
+
+        // Expand ~ to $HOME
+        if (path[0] == '~') {
+            const home = std.posix.getenv("HOME") orelse return self.initial_cwd;
+            if (path.len == 1) {
+                return home;
+            }
+            // ~/foo or ~foo — only expand ~/
+            if (path[1] == '/') {
+                return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home, path[1..] }) catch return self.initial_cwd;
+            }
+            // ~something — not a valid expansion, treat as relative
+            return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.initial_cwd, path }) catch return self.initial_cwd;
         }
-        return self.allocator.dupe(u8, path);
+
+        // Already absolute
+        if (std.fs.path.isAbsolute(path)) {
+            return self.allocator.dupe(u8, path) catch return self.initial_cwd;
+        }
+
+        // Relative path — join with initial_cwd
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.initial_cwd, path }) catch return self.initial_cwd;
     }
 
     // Process pending panel creation requests (must run on main thread)
@@ -3970,6 +4225,9 @@ const Server = struct {
             if (req.kind == .regular) {
                 self.broadcastLayoutUpdate();
             }
+
+            // Broadcast initial pwd so clients have it before shell emits OSC 7
+            self.broadcastPanelPwd(panel.id, working_dir);
 
             // Linux only: Send initial title since shell integration may not be configured
             // macOS works fine without this as ghostty auto-injects shell integration
@@ -4069,6 +4327,12 @@ const Server = struct {
             // Panel starts streaming immediately (H264 frames sent to all h264_connections)
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
+
+            // Broadcast initial pwd (inherit from parent or use initial_cwd)
+            {
+                const inherit_pwd = if (parent_panel) |parent| (if (parent.pwd.len > 0) parent.pwd else self.initial_cwd) else self.initial_cwd;
+                self.broadcastPanelPwd(panel.id, inherit_pwd);
+            }
 
             // Resume parent panel streaming (will get keyframe on next frame)
             // Note: If parent will be resized, resizeInternal sets force_keyframe

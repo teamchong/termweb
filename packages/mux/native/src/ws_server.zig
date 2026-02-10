@@ -588,7 +588,7 @@ pub const Server = struct {
         return initWithOptions(allocator, address, port, true);
     }
 
-    pub fn initNoDeflate(allocator: Allocator, address: []const u8, port: u16) !*Server {
+    pub fn initNoCompression(allocator: Allocator, address: []const u8, port: u16) !*Server {
         return initWithOptions(allocator, address, port, false);
     }
 

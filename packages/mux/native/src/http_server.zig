@@ -52,9 +52,13 @@ const embedded_zstd_wasm = web_assets.zstd_wasm;
 
 // Common headers for all responses:
 // - COOP/COEP for SharedArrayBuffer support (required for Web Workers with shared memory)
+// - CORP cross-origin: allows this page to be loaded in cross-origin iframes with COEP
+// - CSP frame-ancestors *: allow embedding in iframes from any origin
 // - Cache-Control: no-store to prevent browsers from caching terminal client (security)
 const cross_origin_headers = "Cross-Origin-Opener-Policy: same-origin\r\n" ++
     "Cross-Origin-Embedder-Policy: require-corp\r\n" ++
+    "Cross-Origin-Resource-Policy: cross-origin\r\n" ++
+    "Content-Security-Policy: frame-ancestors *\r\n" ++
     "Cache-Control: no-store\r\n";
 
 // Color struct matching ghostty_config_color_s

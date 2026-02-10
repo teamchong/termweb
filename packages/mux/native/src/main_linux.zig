@@ -115,7 +115,7 @@ pub fn main() !void {
     defer http_server.deinit();
 
     // Start WebSocket server
-    var ws_server = try ws.Server.init(allocator, "0.0.0.0", ws_port);
+    var ws_server = try ws.Server.initNoCompression(allocator, "0.0.0.0", ws_port);
     defer ws_server.deinit();
     ws_server.setCallbacks(onConnect, onMessage, onDisconnect);
 
