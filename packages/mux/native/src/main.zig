@@ -3533,10 +3533,13 @@ const Server = struct {
         defer self.allocator.free(list_msg);
         conn.sendBinary(list_msg) catch {};
 
-        // Start pushing remaining files
-        self.pushDownloadFiles(conn, session);
-
+        // Start pushing remaining files in a separate thread (same as initial download)
         std.debug.print("Resumed download {d}, pushing {d} remaining files\n", .{ session.id, session.files.items.len });
+        const push_thread = std.Thread.spawn(.{}, pushDownloadFilesThread, .{ self, conn, session }) catch |err| {
+            std.debug.print("Failed to spawn pushDownloadFiles thread for resume: {}\n", .{err});
+            return;
+        };
+        push_thread.detach();
     }
 
     // Handle TRANSFER_CANCEL message
@@ -3829,7 +3832,11 @@ const Server = struct {
             // Wait for all goroutines to finish before freeing channel.
             // Exit early if session becomes inactive (server shutdown).
             while (goroutine_done.load(.acquire) < large_file_count) {
-                if (!@atomicLoad(bool, &session.is_active, .acquire)) break;
+                if (!@atomicLoad(bool, &session.is_active, .acquire)) {
+                    // Close channel to unblock the receive loop
+                    send_ch.close();
+                    break;
+                }
                 std.Thread.sleep(100 * std.time.ns_per_us);
             }
             // Drain any buffered messages (free their chunks to avoid leaks)
