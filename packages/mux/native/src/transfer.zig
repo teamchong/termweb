@@ -1411,6 +1411,18 @@ pub const TransferSession = struct {
                 }
 
                 const stat = dir.statFile(entry.name) catch continue;
+
+                // Skip files that exceed size limit to prevent OOM/disk exhaustion
+                if (stat.size > max_file_size) {
+                    std.debug.print("[Transfer] Skipping large file ({d} MB > {d} MB): {s}\n", .{
+                        stat.size / (1024 * 1024),
+                        max_file_size / (1024 * 1024),
+                        rel_path,
+                    });
+                    self.allocator.free(rel_path);
+                    continue;
+                }
+
                 const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
                 const hash = self.hashFileMmap(dir, entry.name) catch 0;
 
@@ -1495,6 +1507,17 @@ pub const TransferSession = struct {
         defer parent_dir.close();
 
         const stat = parent_dir.statFile(filename) catch return error.NotDir;
+
+        // Reject file if it exceeds size limit
+        if (stat.size > max_file_size) {
+            std.debug.print("[Transfer] File too large ({d} MB > {d} MB): {s}\n", .{
+                stat.size / (1024 * 1024),
+                max_file_size / (1024 * 1024),
+                filename,
+            });
+            return error.FileTooLarge;
+        }
+
         const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
 
         // Hash the file via mmap
@@ -1582,6 +1605,18 @@ pub const TransferSession = struct {
                 }
 
                 const stat = dir.statFile(entry.name) catch continue;
+
+                // Skip files that exceed size limit to prevent OOM/disk exhaustion
+                if (stat.size > max_file_size) {
+                    std.debug.print("[Transfer] Skipping large file ({d} MB > {d} MB): {s}\n", .{
+                        stat.size / (1024 * 1024),
+                        max_file_size / (1024 * 1024),
+                        rel_path,
+                    });
+                    self.allocator.free(rel_path);
+                    continue;
+                }
+
                 const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
 
                 try self.files.append(self.allocator, .{
