@@ -58,6 +58,10 @@ const default_chunk_size = 256 * 1024;
 /// 16KB captures most JS/TS source files, package.json, type declarations, etc.
 pub const batch_threshold: u64 = 16 * 1024;
 
+/// Files larger than this are skipped to prevent OOM on huge binaries/videos.
+/// 50MB threshold - prevents server crash when downloading large build artifacts.
+pub const max_file_size: u64 = 50 * 1024 * 1024;
+
 /// High water mark for dispatch I/O (256KB).
 /// Controls buffer size for macOS async I/O.
 const dispatch_high_water = 256 * 1024;

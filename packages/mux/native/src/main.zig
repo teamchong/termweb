@@ -3746,6 +3746,16 @@ const Server = struct {
             return null;
         }
 
+        // Skip files that are too large to prevent OOM
+        if (size > transfer.max_file_size) {
+            std.debug.print("[Goroutine] SKIPPED: file too large ({d} MB > {d} MB limit): {s}\n", .{
+                size / (1024 * 1024),
+                transfer.max_file_size / (1024 * 1024),
+                rel_path,
+            });
+            return null;
+        }
+
         var dir = std.fs.openDirAbsolute(base_path, .{}) catch return null;
         defer dir.close();
 
