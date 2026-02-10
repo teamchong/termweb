@@ -1695,6 +1695,7 @@ const Server = struct {
     }
 
     fn deinit(self: *Server) void {
+        std.debug.print("[deinit] starting...\n", .{});
         self.running.store(false, .release);
 
         // Cancel all active file transfers so goroutines and handler threads exit
@@ -1715,10 +1716,15 @@ const Server = struct {
 
         // Shut down WebSocket servers first and wait for all connection threads to finish
         // This must happen BEFORE destroying panels to avoid use-after-free
+        std.debug.print("[deinit] stopping servers...\n", .{});
         self.http_server.deinit();
+        std.debug.print("[deinit] http done, stopping h264...\n", .{});
         self.h264_ws_server.deinit();
+        std.debug.print("[deinit] h264 done, stopping control...\n", .{});
         self.control_ws_server.deinit();
+        std.debug.print("[deinit] control done, stopping file...\n", .{});
         self.file_ws_server.deinit();
+        std.debug.print("[deinit] all servers stopped\n", .{});
 
         // Now safe to destroy panels since all connection threads have finished
         var panel_it = self.panels.valueIterator();
@@ -1741,10 +1747,16 @@ const Server = struct {
             self.push_threads_mutex.lock();
             const threads = self.push_threads.toOwnedSlice(self.allocator) catch &.{};
             self.push_threads_mutex.unlock();
-            for (threads) |t| t.join();
+            std.debug.print("[deinit] joining {d} push threads...\n", .{threads.len});
+            for (threads, 0..) |t, i| {
+                std.debug.print("[deinit] joining push thread {d}...\n", .{i});
+                t.join();
+                std.debug.print("[deinit] push thread {d} joined\n", .{i});
+            }
             self.allocator.free(threads);
         }
         self.push_threads.deinit(self.allocator);
+        std.debug.print("[deinit] push threads done\n", .{});
 
         self.auth_state.deinit();
         self.transfer_manager.deinit();
@@ -5185,22 +5197,27 @@ const Server = struct {
 
         // Render loop exited (Ctrl+C or error) — cancel all transfers first
         // so goroutines and handler threads can exit quickly
+        std.debug.print("[shutdown] cancelling transfers...\n", .{});
         self.transfer_manager.cancelAll();
 
         // Signal goroutine runtime shutdown so GChannel.recv() on OS threads
         // returns null (unblocks push threads stuck waiting for goroutine results)
+        std.debug.print("[shutdown] signalling goroutine shutdown...\n", .{});
         self.goroutine_rt.signalShutdown();
 
         // Stop all servers to unblock their threads. This is done here instead
         // of the signal handler because .stop() calls allocator/deinit operations
         // that are not signal-safe.
+        std.debug.print("[shutdown] stopping servers...\n", .{});
         self.http_server.stop();
         self.h264_ws_server.stop();
         self.control_ws_server.stop();
         self.file_ws_server.stop();
 
         // Wait for HTTP thread to finish (transfer threads should exit quickly now)
+        std.debug.print("[shutdown] joining HTTP thread...\n", .{});
         http_thread.join();
+        std.debug.print("[shutdown] HTTP thread joined\n", .{});
     }
 };
 
