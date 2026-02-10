@@ -3674,13 +3674,14 @@ const Server = struct {
         file_index: u32,
         file_size: u64,
         file_path: []const u8, // Owned copy of relative path
-        base_path: []const u8, // Borrowed from session (stable for transfer lifetime)
+        base_path: []const u8, // Owned copy of base path (must be absolute)
         is_active: *bool, // Pointer to session.is_active
         send_ch: *gchannel.GChannel(transfer.CompressedMsg),
         done_counter: *std.atomic.Value(usize), // Decremented when goroutine finishes
 
         fn deinit(self: *FileGoroutineCtx) void {
             self.allocator.free(self.file_path);
+            self.allocator.free(self.base_path);
             self.allocator.destroy(self);
         }
     };
@@ -3733,6 +3734,12 @@ const Server = struct {
 
     /// Read a file using pread. Safe to call from any goroutine/thread.
     fn readFileForGoroutine(allocator: std.mem.Allocator, base_path: []const u8, rel_path: []const u8, size: u64) ?[]u8 {
+        // Validate base_path is absolute to prevent panic in openDirAbsolute
+        if (!std.fs.path.isAbsolute(base_path)) {
+            std.debug.print("[Goroutine] ERROR: base_path is not absolute: '{s}'\n", .{base_path});
+            return null;
+        }
+
         var dir = std.fs.openDirAbsolute(base_path, .{}) catch return null;
         defer dir.close();
 
@@ -3836,8 +3843,13 @@ const Server = struct {
             // Only flush at the end to avoid sending many tiny BATCH_DATA messages
 
             const file_path_copy = self.allocator.dupe(u8, entry.path) catch continue;
+            const base_path_copy = self.allocator.dupe(u8, session.base_path) catch {
+                self.allocator.free(file_path_copy);
+                continue;
+            };
             const ctx = self.allocator.create(FileGoroutineCtx) catch {
                 self.allocator.free(file_path_copy);
+                self.allocator.free(base_path_copy);
                 continue;
             };
             ctx.* = .{
@@ -3846,7 +3858,7 @@ const Server = struct {
                 .file_index = file_index,
                 .file_size = entry.size,
                 .file_path = file_path_copy,
-                .base_path = session.base_path,
+                .base_path = base_path_copy,
                 .is_active = &session.is_active,
                 .send_ch = send_ch,
                 .done_counter = &goroutine_done,
