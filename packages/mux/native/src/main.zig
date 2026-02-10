@@ -3326,36 +3326,16 @@ const Server = struct {
         defer self.allocator.free(ready_msg);
         conn.sendBinary(ready_msg) catch {};
 
-        // For downloads, build file list and send
+        // For downloads, build file list and send (threaded to avoid blocking WS receive loop)
         if (init_data.direction == .download) {
-            session.buildFileListAsync() catch |err| {
-                std.debug.print("Failed to build file list for '{s}': {}\n", .{ resolved_path, err });
-                const error_msg = transfer.buildTransferError(self.allocator, session.id, "Path not found or not accessible") catch return;
+            const build_thread = std.Thread.spawn(.{}, buildFileListAndSendThread, .{ self, conn, session, init_data.flags.dry_run }) catch |err| {
+                std.debug.print("Failed to spawn buildFileList thread: {}\n", .{err});
+                const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to start transfer") catch return;
                 defer self.allocator.free(error_msg);
-                conn.sendBinary(error_msg) catch |send_err| {
-                    std.debug.print("Failed to send TRANSFER_ERROR for session {d}: {}\n", .{ session.id, send_err });
-                };
+                conn.sendBinary(error_msg) catch {};
                 return;
             };
-
-            std.debug.print("  file list built: {d} files, {d} bytes total\n", .{ session.files.items.len, session.total_bytes });
-
-            // If dry run, send report instead of file list
-            if (init_data.flags.dry_run) {
-                self.sendDryRunReport(conn, session);
-            } else {
-                const list_msg = transfer.buildFileList(self.allocator, session) catch return;
-                defer self.allocator.free(list_msg);
-                conn.sendBinary(list_msg) catch {};
-
-                // Push all file data to the client in a separate thread
-                // so the WebSocket receive loop can continue reading messages
-                const push_thread = std.Thread.spawn(.{}, pushDownloadFilesThread, .{ self, conn, session }) catch |err| {
-                    std.debug.print("Failed to spawn pushDownloadFiles thread: {}\n", .{err});
-                    return;
-                };
-                push_thread.detach();
-            }
+            build_thread.detach();
         }
     }
 
@@ -3366,9 +3346,21 @@ const Server = struct {
         const transfer_id = std.mem.readInt(u32, data[1..5], .little);
         const session = self.transfer_manager.getSession(transfer_id) orelse return;
 
-        // Build file list (async: walk then batch hash)
+        // Build file list in thread to avoid blocking (upload file list can be large)
+        const build_thread = std.Thread.spawn(.{}, buildFileListForUploadThread, .{ self, conn, session }) catch |err| {
+            std.debug.print("Failed to spawn buildFileList thread for upload: {}\n", .{err});
+            return;
+        };
+        build_thread.detach();
+    }
+
+    /// Thread wrapper for upload file list building
+    fn buildFileListForUploadThread(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
         session.buildFileListAsync() catch |err| {
-            std.debug.print("Failed to build file list: {}\n", .{err});
+            std.debug.print("Failed to build file list for upload: {}\n", .{err});
+            const error_msg = transfer.buildTransferError(self.allocator, session.id, "Failed to read directory") catch return;
+            defer self.allocator.free(error_msg);
+            conn.sendBinary(error_msg) catch {};
             return;
         };
 
@@ -3782,6 +3774,34 @@ const Server = struct {
     /// Thread wrapper for pushDownloadFiles — spawned to avoid blocking the WebSocket receive loop
     fn pushDownloadFilesThread(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
         self.pushDownloadFiles(conn, session);
+    }
+
+    /// Thread wrapper for buildFileListAndSend — spawned to avoid blocking during directory scan/hash
+    fn buildFileListAndSendThread(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession, is_dry_run: bool) void {
+        session.buildFileListAsync() catch |err| {
+            std.debug.print("Failed to build file list: {}\n", .{err});
+            const error_msg = transfer.buildTransferError(self.allocator, session.id, "Path not found or not accessible") catch return;
+            defer self.allocator.free(error_msg);
+            conn.sendBinary(error_msg) catch {};
+            return;
+        };
+
+        std.debug.print("  file list built: {d} files, {d} bytes total\n", .{ session.files.items.len, session.total_bytes });
+
+        if (is_dry_run) {
+            self.sendDryRunReport(conn, session);
+        } else {
+            const list_msg = transfer.buildFileList(self.allocator, session) catch return;
+            defer self.allocator.free(list_msg);
+            conn.sendBinary(list_msg) catch {};
+
+            // Now spawn another thread for pushDownloadFiles
+            const push_thread = std.Thread.spawn(.{}, pushDownloadFilesThread, .{ self, conn, session }) catch |err| {
+                std.debug.print("Failed to spawn pushDownloadFiles thread: {}\n", .{err});
+                return;
+            };
+            push_thread.detach();
+        }
     }
 
     /// Push all file chunks for a download transfer.
