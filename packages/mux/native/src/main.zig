@@ -2033,6 +2033,8 @@ const Server = struct {
         if (conn.user_data) |user_data| {
             const session: *transfer.TransferSession = @ptrCast(@alignCast(user_data));
             const session_id = session.id;
+            // Signal goroutines to stop by setting is_active = false
+            @atomicStore(bool, &session.is_active, false, .release);
             session.deleteState();
             self.transfer_manager.removeSession(session_id);
             conn.user_data = null;
@@ -3466,14 +3468,14 @@ const Server = struct {
         };
         defer resume_data.deinit(self.allocator);
 
-        std.debug.print("Resuming download for path: {s}, {d} completed files\n", .{ resume_data.path, resume_data.completed_files.len });
+        std.debug.print("Resuming download {d} for path: {s}, {d} completed files\n", .{ resume_data.transfer_id, resume_data.path, resume_data.completed_files.len });
 
         // Resolve path
         const resolved_path = self.resolvePath(resume_data.path);
         defer if (resolved_path.ptr != self.initial_cwd.ptr) self.allocator.free(@constCast(resolved_path));
 
-        // Create transfer session (like TRANSFER_INIT does)
-        const session = self.transfer_manager.createSession(.download, .{
+        // Create transfer session with the same ID the client used (not a new ID)
+        const session = self.transfer_manager.createSessionWithId(resume_data.transfer_id, .download, .{
             .delete_extra = false,
             .dry_run = false,
             .use_gitignore = false,
@@ -3541,12 +3543,14 @@ const Server = struct {
         const transfer_id = std.mem.readInt(u32, data[1..5], .little);
 
         if (self.transfer_manager.getSession(transfer_id)) |session| {
+            // Signal goroutines to stop by setting is_active = false
+            @atomicStore(bool, &session.is_active, false, .release);
             session.deleteState();
         }
         self.transfer_manager.removeSession(transfer_id);
         conn.user_data = null;
 
-        std.debug.print("Transfer {d} cancelled\n", .{transfer_id});
+        std.debug.print("Transfer {d} cancelled by client\n", .{transfer_id});
     }
 
     // Handle SYNC_REQUEST message — incremental sync (rsync-style)
@@ -3965,6 +3969,12 @@ const Server = struct {
             }
             files_done += 1;
             std.debug.print("[pushDownloadFiles] Received large file from goroutine: {d}/{d}\n", .{ files_done, large_file_count });
+        }
+
+        // Only send TRANSFER_COMPLETE if session is still active (not canceled/disconnected)
+        if (!session.is_active) {
+            std.debug.print("[pushDownloadFiles] Transfer {d} was cancelled/disconnected, skipping TRANSFER_COMPLETE\n", .{session.id});
+            return;
         }
 
         std.debug.print("[pushDownloadFiles] All large files received, sending TRANSFER_COMPLETE\n", .{});
@@ -5142,15 +5152,19 @@ const Server = struct {
         // Run render loop in main thread
         self.runRenderLoop();
 
-        // Render loop exited (Ctrl+C or error) — stop all servers to unblock
-        // their threads. This is done here instead of the signal handler because
-        // .stop() calls allocator/deinit operations that are not signal-safe.
+        // Render loop exited (Ctrl+C or error) — cancel all transfers first
+        // so goroutines and handler threads can exit quickly
+        self.transfer_manager.cancelAll();
+
+        // Stop all servers to unblock their threads. This is done here instead
+        // of the signal handler because .stop() calls allocator/deinit operations
+        // that are not signal-safe.
         self.http_server.stop();
         self.h264_ws_server.stop();
         self.control_ws_server.stop();
         self.file_ws_server.stop();
 
-        // Wait for HTTP thread to finish
+        // Wait for HTTP thread to finish (transfer threads should exit quickly now)
         http_thread.join();
     }
 };

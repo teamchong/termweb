@@ -1132,8 +1132,21 @@ export class FileTransferHandler {
       this.activeTransfers.delete(transferId);
       this.onTransferCancelled?.(transferId);
 
+      // Send TRANSFER_CANCEL message to server
+      if (this.canSend()) {
+        const msg = new ArrayBuffer(5);
+        const view = new DataView(msg);
+        view.setUint8(0, TransferMsgType.TRANSFER_CANCEL);
+        view.setUint32(1, transferId, true);
+        this.send(msg);
+        console.log(`[FT] Sent TRANSFER_CANCEL for ${transferId}`);
+      }
+
       // Clean up OPFS temp files
       this.worker?.postMessage({ type: 'cleanup-temp', transferId });
+
+      // Delete transfer metadata (prevent resume)
+      this.worker?.postMessage({ type: 'delete-transfer-metadata', transferId });
     }
   }
 
@@ -1143,6 +1156,11 @@ export class FileTransferHandler {
     for (const id of transferIds) {
       this.cancelTransfer(id);
     }
+  }
+
+  /** Check if a transfer is currently active */
+  isTransferActive(transferId: number): boolean {
+    return this.activeTransfers.has(transferId);
   }
 
   private async collectFilesFromHandle(

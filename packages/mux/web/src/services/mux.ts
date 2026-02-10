@@ -275,8 +275,13 @@ export class MuxClient {
         // Auto-resume interrupted downloads from OPFS (persists across page reloads)
         this.fileTransfer.getInterruptedDownloads().then(async (downloads) => {
           if (downloads.length > 0) {
-            console.log(`[MuxClient] Found ${downloads.length} interrupted download(s), resuming...`);
+            console.log(`[MuxClient] Found ${downloads.length} interrupted download(s), checking which need resume...`);
             for (const download of downloads) {
+              // Skip if already active (prevents duplicate transfers on rapid reconnects)
+              if (this.fileTransfer.isTransferActive(download.transferId)) {
+                console.log(`[MuxClient] Skipping resume for ${download.transferId} - already active`);
+                continue;
+              }
               try {
                 await this.fileTransfer.resumeInterruptedDownload(download);
               } catch (err) {

@@ -3017,11 +3017,18 @@ pub const TransferManager = struct {
     }
 
     pub fn createSession(self: *TransferManager, direction: TransferDirection, flags: TransferFlags, base_path: []const u8) !*TransferSession {
+        return self.createSessionWithId(null, direction, flags, base_path);
+    }
+
+    pub fn createSessionWithId(self: *TransferManager, id_opt: ?u32, direction: TransferDirection, flags: TransferFlags, base_path: []const u8) !*TransferSession {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const id = self.next_id;
-        self.next_id += 1;
+        const id = id_opt orelse blk: {
+            const new_id = self.next_id;
+            self.next_id += 1;
+            break :blk new_id;
+        };
 
         const session = try TransferSession.init(self.allocator, id, direction, flags, base_path);
         try self.sessions.put(id, session);
