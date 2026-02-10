@@ -2369,6 +2369,79 @@ pub fn parseTransferInit(allocator: Allocator, data: []const u8) !TransferInitDa
     };
 }
 
+// Parse TRANSFER_RESUME message (resume interrupted download)
+// [0x23][transfer_id:u32][path_len:u16][path][completed_count:u32][[file_path_len:u16][file_path]]...
+pub const TransferResumeData = struct {
+    transfer_id: u32,
+    path: []const u8,
+    completed_files: []const []const u8,
+
+    pub fn deinit(self: *TransferResumeData, allocator: Allocator) void {
+        allocator.free(self.path);
+        for (self.completed_files) |file_path| {
+            allocator.free(file_path);
+        }
+        allocator.free(self.completed_files);
+    }
+};
+
+pub fn parseTransferResume(allocator: Allocator, data: []const u8) !TransferResumeData {
+    if (data.len < 7) return error.MessageTooShort;
+
+    var offset: usize = 1; // Skip msg type
+
+    const transfer_id = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+
+    const path_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+    offset += 2;
+
+    if (data.len < offset + path_len) return error.MessageTooShort;
+
+    const path = try allocator.dupe(u8, data[offset..][0..path_len]);
+    offset += path_len;
+
+    if (data.len < offset + 4) {
+        allocator.free(path);
+        return error.MessageTooShort;
+    }
+
+    const completed_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+
+    // Parse completed file paths
+    var completed_files = try allocator.alloc([]const u8, completed_count);
+    var i: u32 = 0;
+    while (i < completed_count) : (i += 1) {
+        if (offset + 2 > data.len) {
+            // Free already allocated
+            for (completed_files[0..i]) |file_path| allocator.free(file_path);
+            allocator.free(completed_files);
+            allocator.free(path);
+            return error.MessageTooShort;
+        }
+
+        const file_path_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+        offset += 2;
+
+        if (data.len < offset + file_path_len) {
+            for (completed_files[0..i]) |file_path| allocator.free(file_path);
+            allocator.free(completed_files);
+            allocator.free(path);
+            return error.MessageTooShort;
+        }
+
+        completed_files[i] = try allocator.dupe(u8, data[offset..][0..file_path_len]);
+        offset += file_path_len;
+    }
+
+    return .{
+        .transfer_id = transfer_id,
+        .path = path,
+        .completed_files = completed_files,
+    };
+}
+
 // Parse FILE_DATA message (upload from browser)
 // [0x22][transfer_id:u32][file_index:u32][chunk_offset:u64][uncompressed_size:u32][compressed_data...]
 pub const FileDataMsg = struct {

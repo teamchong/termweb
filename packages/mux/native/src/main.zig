@@ -3348,8 +3348,13 @@ const Server = struct {
                 defer self.allocator.free(list_msg);
                 conn.sendBinary(list_msg) catch {};
 
-                // Push all file data to the client
-                self.pushDownloadFiles(conn, session);
+                // Push all file data to the client in a separate thread
+                // so the WebSocket receive loop can continue reading messages
+                const push_thread = std.Thread.spawn(.{}, pushDownloadFilesThread, .{ self, conn, session }) catch |err| {
+                    std.debug.print("Failed to spawn pushDownloadFiles thread: {}\n", .{err});
+                    return;
+                };
+                push_thread.detach();
             }
         }
     }
@@ -3462,52 +3467,76 @@ const Server = struct {
 
     // Handle TRANSFER_RESUME message
     fn handleTransferResume(self: *Server, conn: *ws.Connection, data: []u8) void {
-        if (data.len < 5) return;
+        // Parse TRANSFER_RESUME message with completed files list
+        var resume_data = transfer.parseTransferResume(self.allocator, data) catch |err| {
+            std.debug.print("Failed to parse TRANSFER_RESUME: {}\n", .{err});
+            return;
+        };
+        defer resume_data.deinit(self.allocator);
 
-        const transfer_id = std.mem.readInt(u32, data[1..5], .little);
+        std.debug.print("Resuming download for path: {s}, {d} completed files\n", .{ resume_data.path, resume_data.completed_files.len });
 
-        // Try to load saved state
-        const session = self.transfer_manager.resumeSession(transfer_id) catch |err| {
-            std.debug.print("Failed to resume transfer {d}: {}\n", .{ transfer_id, err });
-            const error_msg = transfer.buildTransferError(self.allocator, transfer_id, "Transfer state not found") catch return;
-            defer self.allocator.free(error_msg);
-            conn.sendBinary(error_msg) catch {};
+        // Resolve path
+        const resolved_path = self.resolvePath(resume_data.path);
+        defer if (resolved_path.ptr != self.initial_cwd.ptr) self.allocator.free(@constCast(resolved_path));
+
+        // Create transfer session (like TRANSFER_INIT does)
+        const session = self.transfer_manager.createSession(.download, .{
+            .delete_extra = false,
+            .dry_run = false,
+            .use_gitignore = false,
+        }, resolved_path) catch |err| {
+            std.debug.print("Failed to create resume session: {}\n", .{err});
             return;
         };
 
         conn.user_data = session;
 
-        // Send TRANSFER_READY with resume position
-        const ready_msg = transfer.buildTransferReadyEx(
-            self.allocator,
-            session.id,
-            session.current_file_index,
-            session.current_file_offset,
-            session.bytes_transferred,
-        ) catch return;
+        // Build file list
+        session.buildFileListAsync() catch |err| {
+            std.debug.print("Failed to build file list for resume: {}\n", .{err});
+            const error_msg = transfer.buildTransferError(self.allocator, session.id, "Path not found or not accessible") catch return;
+            defer self.allocator.free(error_msg);
+            conn.sendBinary(error_msg) catch {};
+            return;
+        };
+
+        // Filter out completed files - collect remaining into new list
+        const total_files = session.files.items.len;
+        var write_idx: usize = 0;
+        for (session.files.items) |file_entry| {
+            var is_completed = false;
+            for (resume_data.completed_files) |completed_path| {
+                if (std.mem.eql(u8, file_entry.path, completed_path)) {
+                    is_completed = true;
+                    break;
+                }
+            }
+            if (!is_completed) {
+                session.files.items[write_idx] = file_entry;
+                write_idx += 1;
+            }
+        }
+
+        // Trim session.files to only remaining files
+        session.files.shrinkRetainingCapacity(write_idx);
+
+        std.debug.print("Resume: {d} total files, {d} remaining\n", .{ total_files, write_idx });
+
+        // Send TRANSFER_READY
+        const ready_msg = transfer.buildTransferReady(self.allocator, session.id) catch return;
         defer self.allocator.free(ready_msg);
         conn.sendBinary(ready_msg) catch {};
 
-        // For uploads, send file list so client can correlate file indices
-        if (session.direction == .upload) {
-            const list_msg = transfer.buildFileList(self.allocator, session) catch return;
-            defer self.allocator.free(list_msg);
-            conn.sendBinary(list_msg) catch {};
-        } else {
-            // For downloads, resume pushing files from saved position
-            const list_msg = transfer.buildFileList(self.allocator, session) catch return;
-            defer self.allocator.free(list_msg);
-            conn.sendBinary(list_msg) catch {};
-            self.pushDownloadFiles(conn, session);
-        }
+        // Send FILE_LIST with remaining files
+        const list_msg = transfer.buildFileList(self.allocator, session) catch return;
+        defer self.allocator.free(list_msg);
+        conn.sendBinary(list_msg) catch {};
 
-        std.debug.print("Resumed transfer {d} at file {d}, offset {d}, {d}/{d} bytes\n", .{
-            session.id,
-            session.current_file_index,
-            session.current_file_offset,
-            session.bytes_transferred,
-            session.total_bytes,
-        });
+        // Start pushing remaining files
+        self.pushDownloadFiles(conn, session);
+
+        std.debug.print("Resumed download {d}, pushing {d} remaining files\n", .{ session.id, session.files.items.len });
     }
 
     // Handle TRANSFER_CANCEL message
@@ -3722,6 +3751,11 @@ const Server = struct {
             return trimmed;
         }
         return buf;
+    }
+
+    /// Thread wrapper for pushDownloadFiles — spawned to avoid blocking the WebSocket receive loop
+    fn pushDownloadFilesThread(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
+        self.pushDownloadFiles(conn, session);
     }
 
     /// Push all file chunks for a download transfer.

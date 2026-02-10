@@ -666,6 +666,94 @@ function applyDelta(cachedData: Uint8Array, deltaPayload: Uint8Array): Uint8Arra
   return result;
 }
 
+// ── Transfer Metadata for Resume Support ──
+
+interface TransferMetadata {
+  transferId: number;
+  serverPath: string;
+  totalFiles: number;
+  totalBytes: number;
+  completedFiles: string[]; // File paths that have been fully written
+  bytesTransferred: number;
+  startTime: number;
+  lastUpdateTime: number;
+}
+
+async function saveTransferMetadata(meta: TransferMetadata): Promise<void> {
+  if (!opfsRoot) return;
+  try {
+    const transfersDir = await opfsRoot.getDirectoryHandle('transfers', { create: true });
+    const transferDir = await transfersDir.getDirectoryHandle(`${meta.transferId}`, { create: true });
+    const metaFile = await transferDir.getFileHandle('metadata.json', { create: true });
+    const writable = await metaFile.createWritable();
+    await writable.write(JSON.stringify(meta));
+    await writable.close();
+    console.log(`[Worker] Saved metadata for transfer ${meta.transferId}`);
+  } catch (err) {
+    console.error('[Worker] Failed to save transfer metadata:', err);
+  }
+}
+
+async function loadTransferMetadata(transferId: number): Promise<TransferMetadata | null> {
+  if (!opfsRoot) return null;
+  try {
+    const transfersDir = await opfsRoot.getDirectoryHandle('transfers', { create: false });
+    const transferDir = await transfersDir.getDirectoryHandle(`${transferId}`, { create: false });
+    const metaFile = await transferDir.getFileHandle('metadata.json', { create: false });
+    const file = await metaFile.getFile();
+    const text = await file.text();
+    return JSON.parse(text) as TransferMetadata;
+  } catch {
+    return null;
+  }
+}
+
+async function updateTransferProgress(transferId: number, filePath: string, bytesWritten: number): Promise<void> {
+  const meta = await loadTransferMetadata(transferId);
+  if (!meta) return;
+
+  if (!meta.completedFiles.includes(filePath)) {
+    meta.completedFiles.push(filePath);
+  }
+  meta.bytesTransferred += bytesWritten;
+  meta.lastUpdateTime = Date.now();
+
+  await saveTransferMetadata(meta);
+}
+
+async function deleteTransferMetadata(transferId: number): Promise<void> {
+  if (!opfsRoot) return;
+  try {
+    const transfersDir = await opfsRoot.getDirectoryHandle('transfers', { create: false });
+    await transfersDir.removeEntry(`${transferId}`, { recursive: true });
+    console.log(`[Worker] Deleted metadata for transfer ${transferId}`);
+  } catch (err) {
+    console.error('[Worker] Failed to delete transfer metadata:', err);
+  }
+}
+
+async function getInterruptedTransfers(): Promise<TransferMetadata[]> {
+  if (!opfsRoot) return [];
+  try {
+    const transfersDir = await opfsRoot.getDirectoryHandle('transfers', { create: false });
+    const interrupted: TransferMetadata[] = [];
+
+    for await (const entry of transfersDir.values()) {
+      if (entry.kind === 'directory') {
+        const transferId = parseInt(entry.name);
+        const meta = await loadTransferMetadata(transferId);
+        if (meta) {
+          interrupted.push(meta);
+        }
+      }
+    }
+
+    return interrupted;
+  } catch {
+    return [];
+  }
+}
+
 // Message handler
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
@@ -726,6 +814,9 @@ self.onmessage = async (e: MessageEvent) => {
                 closeHandle(transferId, filePath);
                 fileQueues.delete(fileKey); // Clean up queue when file is complete
                 console.log(`[Worker] closed handle: idx=${fileIndex}`);
+
+                // Update transfer progress metadata for resume support
+                await updateTransferProgress(transferId, filePath, decompressed.length);
               }
 
               (self as unknown as Worker).postMessage({
@@ -890,6 +981,32 @@ self.onmessage = async (e: MessageEvent) => {
           const message = err instanceof Error ? err.message : 'Delta application failed';
           (self as unknown as Worker).postMessage({ type: 'delta-error', id, message });
         }
+        break;
+      }
+
+      // ── Transfer Metadata for Resume ──
+
+      case 'save-transfer-metadata': {
+        await saveTransferMetadata(msg.metadata);
+        (self as unknown as Worker).postMessage({ type: 'metadata-saved', transferId: msg.metadata.transferId });
+        break;
+      }
+
+      case 'load-transfer-metadata': {
+        const meta = await loadTransferMetadata(msg.transferId);
+        (self as unknown as Worker).postMessage({ type: 'metadata-loaded', transferId: msg.transferId, metadata: meta });
+        break;
+      }
+
+      case 'delete-transfer-metadata': {
+        await deleteTransferMetadata(msg.transferId);
+        (self as unknown as Worker).postMessage({ type: 'metadata-deleted', transferId: msg.transferId });
+        break;
+      }
+
+      case 'get-interrupted-transfers': {
+        const interrupted = await getInterruptedTransfers();
+        (self as unknown as Worker).postMessage({ type: 'interrupted-transfers', transfers: interrupted });
         break;
       }
     }

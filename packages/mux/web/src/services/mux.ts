@@ -135,10 +135,11 @@ export class MuxClient {
       console.log(`[MuxClient] onDownloadProgress wrapper: transferId=${transferId}, filesCompleted=${filesCompleted}, callback=${this.onDownloadProgress ? 'defined' : 'undefined'}`);
       this.onDownloadProgress?.(transferId, filesCompleted, totalFiles, bytesTransferred, totalBytes);
     };
-    this.fileTransfer.onConnectionShouldClose = () => {
-      console.log('[MuxClient] Transfer complete, closing file WebSocket to prevent zombie state');
-      this.closeFileWs();
-    };
+    // Don't immediately close file WS on transfer complete - rely on idle timer instead
+    // this.fileTransfer.onConnectionShouldClose = () => {
+    //   console.log('[MuxClient] Transfer complete, closing file WebSocket to prevent zombie state');
+    //   this.closeFileWs();
+    // };
   }
 
   getFileTransfer(): FileTransferHandler {
@@ -270,6 +271,20 @@ export class MuxClient {
           console.log(`Resuming ${interrupted.size} interrupted upload(s)`);
           this.fileTransfer.resumeInterruptedUploads();
         }
+
+        // Auto-resume interrupted downloads from OPFS (persists across page reloads)
+        this.fileTransfer.getInterruptedDownloads().then(async (downloads) => {
+          if (downloads.length > 0) {
+            console.log(`[MuxClient] Found ${downloads.length} interrupted download(s), resuming...`);
+            for (const download of downloads) {
+              try {
+                await this.fileTransfer.resumeInterruptedDownload(download);
+              } catch (err) {
+                console.error(`[MuxClient] Failed to resume download ${download.transferId}:`, err);
+              }
+            }
+          }
+        });
       };
 
       ws.onmessage = (event) => {

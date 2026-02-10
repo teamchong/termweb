@@ -198,6 +198,19 @@ export class FileTransferHandler {
       case 'cleanup-done':
         break;
 
+      case 'metadata-saved':
+      case 'metadata-deleted':
+        // No action needed — fire-and-forget
+        break;
+
+      case 'metadata-loaded':
+        // Will be handled by promise resolution
+        break;
+
+      case 'interrupted-transfers':
+        // Will be handled by promise resolution
+        break;
+
       case 'zip-created':
         console.log('[FT] Received zip-created message from worker');
         this.onZipCreated(msg);
@@ -296,6 +309,70 @@ export class FileTransferHandler {
       this.sendTransferResume(transferId);
     }
     this.interruptedUploads.clear();
+  }
+
+  /** Get interrupted downloads from OPFS metadata (persists across page reloads) */
+  async getInterruptedDownloads(): Promise<any[]> {
+    if (!this.worker) return [];
+
+    return new Promise((resolve) => {
+      const handler = (e: MessageEvent) => {
+        if (e.data.type === 'interrupted-transfers') {
+          this.worker?.removeEventListener('message', handler);
+          resolve(e.data.transfers);
+        }
+      };
+      this.worker.addEventListener('message', handler);
+      this.worker.postMessage({ type: 'get-interrupted-transfers' });
+    });
+  }
+
+  /** Resume an interrupted download by sending TRANSFER_RESUME */
+  async resumeInterruptedDownload(metadata: any): Promise<void> {
+    if (!this.canSend()) {
+      console.error('[FT] Cannot resume - not connected');
+      return;
+    }
+
+    console.log(`[FT] Resuming download ${metadata.transferId}: ${metadata.serverPath}`);
+
+    // Register as active transfer
+    this.activeTransfers.set(metadata.transferId, {
+      id: metadata.transferId,
+      direction: 'download',
+      path: metadata.serverPath,  // Set path so handleFileList can find it
+      totalBytes: metadata.totalBytes,
+      bytesTransferred: metadata.bytesTransferred,
+      currentFileIndex: metadata.completedFiles.length,
+      state: 'pending',
+      useZipMode: true,
+      filesCompleted: metadata.completedFiles.length,
+      serverPath: metadata.serverPath,
+    });
+
+    // Send TRANSFER_RESUME to server with completed files list
+    const pathBytes = sharedTextEncoder.encode(metadata.serverPath);
+    const completedFilesData = metadata.completedFiles.map((f: string) => sharedTextEncoder.encode(f));
+    const completedFilesLen = completedFilesData.reduce((sum: number, b: Uint8Array) => sum + 2 + b.length, 0);
+
+    const msgLen = 1 + 4 + 2 + pathBytes.length + 4 + completedFilesLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, TransferMsgType.TRANSFER_RESUME); offset += 1;
+    view.setUint32(offset, metadata.transferId, true); offset += 4;
+    view.setUint16(offset, pathBytes.length, true); offset += 2;
+    bytes.set(pathBytes, offset); offset += pathBytes.length;
+    view.setUint32(offset, completedFilesData.length, true); offset += 4;
+    for (const fileBytes of completedFilesData) {
+      view.setUint16(offset, fileBytes.length, true); offset += 2;
+      bytes.set(fileBytes, offset); offset += fileBytes.length;
+    }
+
+    this.send(msg);
+    console.log(`[FT] Sent TRANSFER_RESUME for ${metadata.transferId}`);
   }
 
   disconnect(): void {
@@ -480,6 +557,24 @@ export class FileTransferHandler {
           transfer.useZipMode = true;
           transfer.filesCompleted = 0;
         }
+
+        // Save transfer metadata for resume support
+        if (this.worker && transfer.serverPath) {
+          this.worker.postMessage({
+            type: 'save-transfer-metadata',
+            metadata: {
+              transferId,
+              serverPath: transfer.serverPath,
+              totalFiles: nonDirFiles,
+              totalBytes,
+              completedFiles: [],
+              bytesTransferred: transfer.bytesTransferred,
+              startTime: Date.now(),
+              lastUpdateTime: Date.now(),
+            },
+          });
+        }
+
         this.requestNextFile(transferId);
       } else if (transfer.direction === 'upload' && transfer.files) {
         // Resume upload — start sending from resume position
@@ -798,6 +893,9 @@ export class FileTransferHandler {
 
     // Clean up OPFS temp files for this transfer
     this.worker?.postMessage({ type: 'cleanup', transferId });
+
+    // Delete transfer metadata (resume no longer needed)
+    this.worker?.postMessage({ type: 'delete-transfer-metadata', transferId });
 
     // Clean up OPFS cache after successful download
     if (transfer?.serverPath) {
@@ -1556,6 +1654,9 @@ export class FileTransferHandler {
     this.onTransferComplete?.(msg.transferId, transfer.totalBytes ?? 0);
     console.log(`[FT] Sending cleanup-temp message to worker for transfer ${msg.transferId}`);
     this.worker?.postMessage({ type: 'cleanup-temp', transferId: msg.transferId });
+
+    // Delete transfer metadata (resume no longer needed)
+    this.worker?.postMessage({ type: 'delete-transfer-metadata', transferId: msg.transferId });
 
     // Clean up OPFS cache
     if (transfer.serverPath) {
