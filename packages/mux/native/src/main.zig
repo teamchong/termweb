@@ -4909,6 +4909,71 @@ const Server = struct {
                         read_elapsed = @intCast(std.time.nanoTimestamp() - t_read);
                         perf_read_ns += read_elapsed;
 
+                        // Query cursor state and broadcast if changed (for frontend CSS overlay).
+                        // Must run BEFORE the hash-skip `continue` below, because invisible
+                        // characters (spaces) don't change the framebuffer and would otherwise
+                        // cause the cursor position update to be skipped entirely.
+                        {
+                            var cur_col: u16 = 0;
+                            var cur_row: u16 = 0;
+                            var cur_style: u8 = 0;
+                            var cur_visible: u8 = 0;
+                            c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible);
+
+                            const size = c.ghostty_surface_size(panel.surface);
+                            const surf_total_w: u16 = @intCast(size.width_px);
+                            const surf_total_h: u16 = @intCast(size.height_px);
+
+                            // Broadcast surface dims only when they change (resize)
+                            const surface_changed = surf_total_w != panel.last_surf_w or surf_total_h != panel.last_surf_h;
+                            if (surface_changed) {
+                                panel.last_surf_w = surf_total_w;
+                                panel.last_surf_h = surf_total_h;
+                                const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
+                                var ctrl_buf2: [max_broadcast_conns]*ws.Connection = undefined;
+                                const ctrl_conns2 = self.snapshotControlConns(&ctrl_buf2);
+                                for (ctrl_conns2) |ctrl_conn| {
+                                    ctrl_conn.sendBinary(&dims_buf) catch {};
+                                }
+                            }
+
+                            // Re-send cursor when surface dims change: padding and pixel
+                            // coordinates are recalculated against the new surface layout,
+                            // even if the cursor's grid col/row haven't moved.
+                            if (surface_changed or
+                                cur_col != panel.last_cursor_col or
+                                cur_row != panel.last_cursor_row or
+                                cur_style != panel.last_cursor_style or
+                                cur_visible != panel.last_cursor_visible)
+                            {
+                                panel.last_cursor_col = cur_col;
+                                panel.last_cursor_row = cur_row;
+                                panel.last_cursor_style = cur_style;
+                                panel.last_cursor_visible = cur_visible;
+
+                                // Compute cursor in surface-space pixel coordinates.
+                                // Always send cell-sized rectangle; CSS handles bar/underline visuals.
+                                // Y offset +2 accounts for visual baseline alignment with text.
+                                const cell_w: u16 = @intCast(size.cell_width_px);
+                                const cell_h: u16 = @intCast(size.cell_height_px);
+                                const padding_x: u16 = @intCast(size.padding_left_px);
+                                const padding_y: u16 = @intCast(size.padding_top_px);
+                                const surf_x = padding_x + cur_col * cell_w;
+                                const surf_y = padding_y + cur_row * cell_h + 2;
+                                const surf_w: u16 = cell_w -| 1;
+                                const surf_h: u16 = cell_h -| 2;
+
+                                const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible);
+
+                                // Broadcast to control WS connections
+                                var ctrl_buf: [max_broadcast_conns]*ws.Connection = undefined;
+                                const ctrl_conns = self.snapshotControlConns(&ctrl_buf);
+                                for (ctrl_conns) |ctrl_conn| {
+                                    ctrl_conn.sendBinary(&cursor_buf) catch {};
+                                }
+                            }
+                        }
+
                         if (read_ok) {
                             // Frame skip: hash the pixel buffer and skip encoding if unchanged
                             const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
@@ -5030,67 +5095,7 @@ const Server = struct {
                         }
                     }
 
-                    // Query cursor state and broadcast if changed (for frontend CSS blink)
-                    {
-                        var cur_col: u16 = 0;
-                        var cur_row: u16 = 0;
-                        var cur_style: u8 = 0;
-                        var cur_visible: u8 = 0;
-                        c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible);
-
-                        const size = c.ghostty_surface_size(panel.surface);
-                        const surf_total_w: u16 = @intCast(size.width_px);
-                        const surf_total_h: u16 = @intCast(size.height_px);
-
-                        // Broadcast surface dims only when they change (resize)
-                        const surface_changed = surf_total_w != panel.last_surf_w or surf_total_h != panel.last_surf_h;
-                        if (surface_changed) {
-                            panel.last_surf_w = surf_total_w;
-                            panel.last_surf_h = surf_total_h;
-                            const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
-                            var ctrl_buf2: [max_broadcast_conns]*ws.Connection = undefined;
-                            const ctrl_conns2 = self.snapshotControlConns(&ctrl_buf2);
-                            for (ctrl_conns2) |ctrl_conn| {
-                                ctrl_conn.sendBinary(&dims_buf) catch {};
-                            }
-                        }
-
-                        // Re-send cursor when surface dims change: padding and pixel
-                        // coordinates are recalculated against the new surface layout,
-                        // even if the cursor's grid col/row haven't moved.
-                        if (surface_changed or
-                            cur_col != panel.last_cursor_col or
-                            cur_row != panel.last_cursor_row or
-                            cur_style != panel.last_cursor_style or
-                            cur_visible != panel.last_cursor_visible)
-                        {
-                            panel.last_cursor_col = cur_col;
-                            panel.last_cursor_row = cur_row;
-                            panel.last_cursor_style = cur_style;
-                            panel.last_cursor_visible = cur_visible;
-
-                            // Compute cursor in surface-space pixel coordinates.
-                            // Always send cell-sized rectangle; CSS handles bar/underline visuals.
-                            // Y offset +2 accounts for visual baseline alignment with text.
-                            const cell_w: u16 = @intCast(size.cell_width_px);
-                            const cell_h: u16 = @intCast(size.cell_height_px);
-                            const padding_x: u16 = @intCast(size.padding_left_px);
-                            const padding_y: u16 = @intCast(size.padding_top_px);
-                            const surf_x = padding_x + cur_col * cell_w;
-                            const surf_y = padding_y + cur_row * cell_h + 2;
-                            const surf_w: u16 = cell_w -| 1;
-                            const surf_h: u16 = cell_h -| 2;
-
-                            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible);
-
-                            // Broadcast to control WS connections
-                            var ctrl_buf: [max_broadcast_conns]*ws.Connection = undefined;
-                            const ctrl_conns = self.snapshotControlConns(&ctrl_buf);
-                            for (ctrl_conns) |ctrl_conn| {
-                                ctrl_conn.sendBinary(&cursor_buf) catch {};
-                            }
-                        }
-                    }
+                    // Cursor state polling moved before hash-skip `continue` (above)
 
                     // Spike detection: log immediately if any single frame exceeds 50ms
                     const frame_total_ns: u64 = @intCast(std.time.nanoTimestamp() - t_frame_start);
