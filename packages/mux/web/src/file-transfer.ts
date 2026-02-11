@@ -71,7 +71,6 @@ export interface TransferState {
 }
 
 export interface TransferOptions {
-  deleteExtra?: boolean;
   dryRun?: boolean;
   excludes?: string[];
   useGitignore?: boolean;
@@ -938,7 +937,7 @@ export class FileTransferHandler {
       return;
     }
 
-    const { deleteExtra = false, dryRun = false, excludes = [], useGitignore = false } = options;
+    const { dryRun = false, excludes = [], useGitignore = false } = options;
 
     let files: Awaited<ReturnType<typeof this.collectFilesFromHandle>>;
     try {
@@ -961,7 +960,7 @@ export class FileTransferHandler {
     let offset = 0;
     view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
     view.setUint8(offset, 0); offset += 1; // direction: upload
-    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0) | (useGitignore ? 4 : 0)); offset += 1;
+    view.setUint8(offset, (dryRun ? 1 : 0) | (useGitignore ? 2 : 0)); offset += 1;
     view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;
@@ -997,7 +996,7 @@ export class FileTransferHandler {
       return;
     }
 
-    const { deleteExtra = false, dryRun = false, excludes = [], useGitignore = false } = options;
+    const { dryRun = false, excludes = [], useGitignore = false } = options;
 
     const transferFiles: TransferFile[] = files.map(f => ({
       path: f.name,
@@ -1018,7 +1017,7 @@ export class FileTransferHandler {
     let offset = 0;
     view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
     view.setUint8(offset, 0); offset += 1; // direction: upload
-    view.setUint8(offset, (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0) | (useGitignore ? 4 : 0)); offset += 1;
+    view.setUint8(offset, (dryRun ? 1 : 0) | (useGitignore ? 2 : 0)); offset += 1;
     view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;
@@ -1058,8 +1057,8 @@ export class FileTransferHandler {
       return;
     }
 
-    const { deleteExtra = false, dryRun = false, excludes = [], useGitignore = false } = options;
-    const flagsByte = (deleteExtra ? 1 : 0) | (dryRun ? 2 : 0) | (useGitignore ? 4 : 0);
+    const { dryRun = false, excludes = [], useGitignore = false } = options;
+    const flagsByte = (dryRun ? 1 : 0) | (useGitignore ? 2 : 0);
 
     const pathBytes = sharedTextEncoder.encode(serverPath);
     const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));

@@ -1048,10 +1048,9 @@ pub const TransferDirection = enum(u8) {
 
 // Transfer flags (bit field)
 pub const TransferFlags = packed struct {
-    delete_extra: bool = false,  // Delete files not in source
-    dry_run: bool = false,       // Preview only, don't transfer
+    dry_run: bool = false, // Preview only, don't transfer
     use_gitignore: bool = false, // Apply .gitignore patterns from base directory
-    _reserved: u5 = 0,
+    _reserved: u6 = 0,
 };
 
 // File entry in file list

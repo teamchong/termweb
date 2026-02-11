@@ -5,7 +5,6 @@
   export interface TransferConfig {
     serverPath: string;
     excludes: string[];
-    deleteExtra: boolean;
     useGitignore: boolean;
     dirHandle?: FileSystemDirectoryHandle;
     files?: File[];
@@ -36,7 +35,6 @@
   let stage: 'config' | 'preview' = $state('config');
   let serverPath = $state('');
   let excludesText = $state('');
-  let deleteExtra = $state(false);
   let useGitignore = $state(true);
   let previewReport: DryRunReport | null = $state(null);
   let isLoading = $state(false);
@@ -55,7 +53,6 @@
       stage = 'config';
       serverPath = defaultPath || '';
       excludesText = '';
-      deleteExtra = false;
       useGitignore = true;
       previewReport = null;
       isLoading = false;
@@ -89,7 +86,7 @@
       .split(',')
       .map(s => s.trim())
       .filter(s => s.length > 0);
-    return { serverPath: path, excludes, deleteExtra, useGitignore, dirHandle, files: uploadFiles };
+    return { serverPath: path, excludes, useGitignore, dirHandle, files: uploadFiles };
   }
 
   let canSubmit = $derived(
@@ -271,13 +268,6 @@
           <input type="checkbox" bind:checked={useGitignore} />
           Use .gitignore
         </label>
-
-        {#if mode === 'upload'}
-          <label class="checkbox-label">
-            <input type="checkbox" bind:checked={deleteExtra} />
-            Delete extra files on destination
-          </label>
-        {/if}
 
         {#if errorMsg}
           <div class="error-msg">{errorMsg}</div>

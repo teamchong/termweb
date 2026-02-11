@@ -328,7 +328,6 @@ export class UploadDialog {
 export interface DownloadOptions {
   path: string;
   excludes: string[];
-  deleteExtra: boolean;
   preview: boolean;
 }
 
@@ -338,7 +337,6 @@ export class DownloadDialog {
   // Cached element references
   private inputEl: HTMLInputElement | null = null;
   private excludeEl: HTMLInputElement | null = null;
-  private deleteEl: HTMLInputElement | null = null;
   private previewEl: HTMLInputElement | null = null;
   private downloadBtn: Element | null = null;
   private closeBtn: Element | null = null;
@@ -356,7 +354,6 @@ export class DownloadDialog {
     if (!this.handlersSetup) {
       this.inputEl = this.overlay.querySelector('.download-input') as HTMLInputElement;
       this.excludeEl = this.overlay.querySelector('.download-exclude') as HTMLInputElement;
-      this.deleteEl = this.overlay.querySelector('.download-delete') as HTMLInputElement;
       this.previewEl = this.overlay.querySelector('.download-preview') as HTMLInputElement;
       this.downloadBtn = this.overlay.querySelector('.dialog-btn.primary');
       this.closeBtn = this.overlay.querySelector('.dialog-btn.cancel');
@@ -414,7 +411,6 @@ export class DownloadDialog {
     const options: DownloadOptions = {
       path,
       excludes,
-      deleteExtra: this.deleteEl?.checked || false,
       preview: this.previewEl?.checked || false,
     };
 
