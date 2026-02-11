@@ -186,22 +186,44 @@
   // replicates the canvas's object-fit:contain area using container queries.
   // No JS objFitScale math — CSS handles the contain-fit sizing identically.
   //
-  // IMPORTANT: Use surface dims (cursorSurfW/H) not video frame dims (frameWidth/H).
-  // The encoder may scale the surface down (MAX_PIXELS cap) and add 16px alignment
-  // padding. Cursor coordinates are in ghostty surface space, so percentages must
-  // be computed against surface dimensions to stay correct at any resolution.
+  // The cursor viewport must use VIDEO FRAME dimensions (frameWidth/H) for its
+  // aspect ratio so it matches the canvas's object-fit:contain area exactly.
+  // On Linux, VA-API requires 16-pixel aligned frames, so the frame is slightly
+  // larger than the surface. Using surface dims would create an aspect ratio
+  // mismatch causing cursor drift.
+  //
+  // Cursor PERCENTAGES depend on the encoder path:
+  // - Fast path (surfW == frameW): direct pixel copy with black padding at
+  //   bottom/right. Cursor position in frame == surface position → use frame dims.
+  // - Downscale path (surfW != frameW): source stretched to fill entire frame.
+  //   Cursor maps proportionally: surf_pos/surfDim == frame_pos/frameDim → use
+  //   surface dims (they give the same percentage as frame-space coords).
+  //
+  // Viewport aspect ratio: frame dims (matches canvas content)
+  // Fallback: surface dims when frame dims not yet available (before first frame)
   // Key that changes on every cursor move — used by {#key} to restart CSS blink animation
   let cursorKey = $derived(`${cursorX},${cursorY}`);
 
+  // Viewport uses frame dims (matches canvas object-fit:contain).
+  // Falls back to surface dims before the first video frame arrives.
+  let viewportW = $derived(frameWidth > 0 ? frameWidth : cursorSurfW);
+  let viewportH = $derived(frameHeight > 0 ? frameHeight : cursorSurfH);
+
+  // Percentage denominators: frame dims for fast path (no stretching),
+  // surface dims for downscale path (stretched) or before first frame.
+  // Fast path detection: encoder copies pixels directly when surfW == frameW.
+  let pctW = $derived(frameWidth > 0 && cursorSurfW === frameWidth ? frameWidth : cursorSurfW);
+  let pctH = $derived(frameHeight > 0 && cursorSurfW === frameWidth ? frameHeight : cursorSurfH);
+
   let cursorPct = $derived.by(() => {
     if (!cursorVisible || cursorW === 0 || paused) return null;
-    if (cursorSurfW === 0 || cursorSurfH === 0) return null;
+    if (pctW === 0 || pctH === 0) return null;
 
     return {
-      left: (cursorX / cursorSurfW) * 100,
-      top: (cursorY / cursorSurfH) * 100,
-      width: (cursorW / cursorSurfW) * 100,
-      height: (cursorH / cursorSurfH) * 100,
+      left: (cursorX / pctW) * 100,
+      top: (cursorY / pctH) * 100,
+      width: (cursorW / pctW) * 100,
+      height: (cursorH / pctH) * 100,
     };
   });
 
@@ -1556,8 +1578,8 @@
         </div>
       </div>
     {/if}
-    {#if cursorSurfW > 0 && cursorSurfH > 0}
-      <div class="cursor-container" style="--fw:{cursorSurfW};--fh:{cursorSurfH};--cursor-color:{cursorColor}">
+    {#if viewportW > 0 && viewportH > 0}
+      <div class="cursor-container" style="--fw:{viewportW};--fh:{viewportH};--cursor-color:{cursorColor}">
         <div class="cursor-viewport">
           {#if cursorPct}
             {#key cursorKey}
