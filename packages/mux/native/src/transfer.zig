@@ -1223,7 +1223,7 @@ pub const TransferSession = struct {
     /// Load .gitignore patterns from base_path and add them as exclude patterns.
     /// Supports basic patterns: globs, directory markers (trailing /), comments (#).
     /// Negation patterns (!) are skipped.
-    fn loadGitignore(self: *TransferSession) void {
+    pub fn loadGitignore(self: *TransferSession) void {
         // Load global gitignore using git config
         self.loadGlobalGitignore();
 

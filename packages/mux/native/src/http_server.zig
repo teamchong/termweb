@@ -76,6 +76,9 @@ const Color = extern struct {
 /// Parameters: network stream, HTTP request headers, user context data.
 pub const WsUpgradeCallback = *const fn (stream: net.Stream, request: []const u8, user_data: ?*anyopaque) void;
 
+/// Callback for API requests. Returns JSON response body (caller frees), or null if path not handled.
+pub const ApiCallback = *const fn (path: []const u8, user_data: ?*anyopaque) ?[]const u8;
+
 // Simple HTTP server for embedded static files + config endpoint + WebSocket upgrades
 pub const HttpServer = struct {
     listener: net.Server,
@@ -93,6 +96,9 @@ pub const HttpServer = struct {
     file_ws_callback: ?WsUpgradeCallback = null,
     preview_ws_callback: ?WsUpgradeCallback = null,
     ws_user_data: ?*anyopaque = null,
+    // API callback for custom endpoints (e.g., /api/benchmark/stats)
+    api_callback: ?ApiCallback = null,
+    api_user_data: ?*anyopaque = null,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16, ghostty_config: ?c.ghostty_config_t) !*HttpServer {
         const server = try allocator.create(HttpServer);
@@ -250,6 +256,24 @@ pub const HttpServer = struct {
 
         // Regular HTTP - close stream when done
         defer stream.close();
+
+        // Handle /api/* endpoints via callback
+        if (std.mem.startsWith(u8, path, "/api/")) {
+            if (self.api_callback) |cb| {
+                if (cb(path, self.api_user_data)) |json| {
+                    var api_header_buf: [256]u8 = undefined;
+                    const api_header = std.fmt.bufPrint(&api_header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{json.len}) catch {
+                        self.sendError(stream, 500, "Internal Server Error");
+                        return;
+                    };
+                    _ = stream.write(api_header) catch return;
+                    _ = stream.write(json) catch return;
+                    return;
+                }
+            }
+            self.sendError(stream, 404, "API endpoint not found");
+            return;
+        }
 
         // Handle /config endpoint - returns WebSocket info
         if (std.mem.eql(u8, path, "/config")) {

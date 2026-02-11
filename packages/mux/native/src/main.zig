@@ -15,6 +15,8 @@
 //!
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+const enable_benchmark = build_options.enable_benchmark;
 const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
@@ -1563,12 +1565,13 @@ const Server = struct {
     goroutine_rt: *goroutine_runtime.Runtime, // M:N goroutine scheduler for file transfer pipeline
 
     // Bandwidth benchmark counters (atomic — updated from multiple threads)
-    bw_h264_bytes: std.atomic.Value(u64),           // Total H264 bytes sent to clients
-    bw_h264_frames: std.atomic.Value(u64),           // Total H264 frames sent
-    bw_control_bytes_sent: std.atomic.Value(u64),    // Total control bytes sent (on-wire, after compression)
-    bw_control_bytes_recv: std.atomic.Value(u64),    // Total control bytes received (on-wire, after compression)
-    bw_raw_pixels_bytes: std.atomic.Value(u64),      // Total raw BGRA pixels captured (pre-encode baseline)
-    bw_start_time: std.atomic.Value(i64),            // Timestamp when stats started (truncated nanoTimestamp)
+    // Enabled with: zig build -Dbenchmark
+    bw_h264_bytes: if (enable_benchmark) std.atomic.Value(u64) else void,
+    bw_h264_frames: if (enable_benchmark) std.atomic.Value(u64) else void,
+    bw_control_bytes_sent: if (enable_benchmark) std.atomic.Value(u64) else void,
+    bw_control_bytes_recv: if (enable_benchmark) std.atomic.Value(u64) else void,
+    bw_raw_pixels_bytes: if (enable_benchmark) std.atomic.Value(u64) else void,
+    bw_start_time: if (enable_benchmark) std.atomic.Value(i64) else void,
 
     var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
 
@@ -1674,12 +1677,12 @@ const Server = struct {
             } else {},
             .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
             .goroutine_rt = gor_rt,
-            .bw_h264_bytes = std.atomic.Value(u64).init(0),
-            .bw_h264_frames = std.atomic.Value(u64).init(0),
-            .bw_control_bytes_sent = std.atomic.Value(u64).init(0),
-            .bw_control_bytes_recv = std.atomic.Value(u64).init(0),
-            .bw_raw_pixels_bytes = std.atomic.Value(u64).init(0),
-            .bw_start_time = std.atomic.Value(i64).init(@truncate(std.time.nanoTimestamp())),
+            .bw_h264_bytes = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
+            .bw_h264_frames = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
+            .bw_control_bytes_sent = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
+            .bw_control_bytes_recv = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
+            .bw_raw_pixels_bytes = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
+            .bw_start_time = if (enable_benchmark) std.atomic.Value(i64).init(@truncate(std.time.nanoTimestamp())) else {},
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -2038,8 +2041,9 @@ const Server = struct {
         const self = global_server.load(.acquire) orelse return;
         if (data.len == 0) return;
 
-        // Track incoming control bytes (post-decompression size from client)
-        _ = self.bw_control_bytes_recv.fetchAdd(data.len, .monotonic);
+        if (comptime enable_benchmark) {
+            _ = self.bw_control_bytes_recv.fetchAdd(data.len, .monotonic);
+        }
 
         const msg_type = data[0];
         if (msg_type == 0xFE) {
@@ -2231,10 +2235,11 @@ const Server = struct {
             conn.sendBinaryParts(&id_buf, frame_data) catch continue;
             any_sent = true;
         }
-        if (any_sent) {
-            // Track bandwidth: 4-byte panel_id prefix + H264 payload per client
-            _ = self.bw_h264_bytes.fetchAdd(4 + frame_data.len, .monotonic);
-            _ = self.bw_h264_frames.fetchAdd(1, .monotonic);
+        if (comptime enable_benchmark) {
+            if (any_sent) {
+                _ = self.bw_h264_bytes.fetchAdd(4 + frame_data.len, .monotonic);
+                _ = self.bw_h264_frames.fetchAdd(1, .monotonic);
+            }
         }
         return any_sent;
     }
@@ -2832,16 +2837,22 @@ const Server = struct {
         return buf[0..count];
     }
 
-    /// Broadcast binary data to all control connections and track bytes for bandwidth benchmark.
+    /// Broadcast binary data to all control connections, tracking bytes when benchmark is enabled.
     fn broadcastControlData(self: *Server, data: []const u8) void {
         var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
         const conns = self.snapshotControlConns(&conn_buf);
-        var sent: u64 = 0;
-        for (conns) |ctrl_conn| {
-            ctrl_conn.sendBinary(data) catch continue;
-            sent += data.len;
+        if (comptime enable_benchmark) {
+            var sent: u64 = 0;
+            for (conns) |ctrl_conn| {
+                ctrl_conn.sendBinary(data) catch continue;
+                sent += data.len;
+            }
+            if (sent > 0) _ = self.bw_control_bytes_sent.fetchAdd(sent, .monotonic);
+        } else {
+            for (conns) |ctrl_conn| {
+                ctrl_conn.sendBinary(data) catch {};
+            }
         }
-        if (sent > 0) _ = self.bw_control_bytes_sent.fetchAdd(sent, .monotonic);
     }
 
     fn broadcastInspectorUpdates(self: *Server) void {
@@ -3025,13 +3036,18 @@ const Server = struct {
         std.mem.writeInt(u16, msg_buf[1..3], layout_len, .little);
         @memcpy(msg_buf[3..][0..layout_len], layout_json[0..layout_len]);
 
-        // Track bandwidth for layout updates
-        var sent: u64 = 0;
-        for (conn_buf[0..count]) |conn| {
-            conn.sendBinary(msg_buf) catch continue;
-            sent += msg_buf.len;
+        if (comptime enable_benchmark) {
+            var sent: u64 = 0;
+            for (conn_buf[0..count]) |conn| {
+                conn.sendBinary(msg_buf) catch continue;
+                sent += msg_buf.len;
+            }
+            if (sent > 0) _ = self.bw_control_bytes_sent.fetchAdd(sent, .monotonic);
+        } else {
+            for (conn_buf[0..count]) |conn| {
+                conn.sendBinary(msg_buf) catch {};
+            }
         }
-        if (sent > 0) _ = self.bw_control_bytes_sent.fetchAdd(sent, .monotonic);
     }
 
     fn sendMainClientState(self: *Server, conn: *ws.Connection, client_id: u32) void {
@@ -3486,6 +3502,9 @@ const Server = struct {
             return;
         };
 
+        // Load gitignore patterns from the target directory if requested
+        if (session.flags.use_gitignore) session.loadGitignore();
+
         // Populate session file list from client data
         session.files.clearAndFree(self.allocator);
         for (parsed.files) |entry| {
@@ -3506,6 +3525,24 @@ const Server = struct {
 
         if (file_data.file_index >= session.files.items.len) return;
         const file_entry = session.files.items[file_data.file_index];
+
+        // Skip excluded files (gitignore, manual excludes) — still ACK so client continues
+        const excluded = file_entry.is_dir or session.isExcluded(file_entry.path) or blk: {
+            // Check each directory component (so "node_modules" excludes "pkg/node_modules/file.js")
+            var iter = std.mem.splitScalar(u8, file_entry.path, '/');
+            while (iter.next()) |segment| {
+                if (iter.peek() == null) break; // skip filename (last segment)
+                if (session.isExcluded(segment)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (excluded) {
+            session.bytes_transferred += file_data.uncompressed_size;
+            const ack_msg = transfer.buildFileAck(self.allocator, file_data.transfer_id, file_data.file_index, session.bytes_transferred) catch return;
+            defer self.allocator.free(ack_msg);
+            conn.sendBinary(ack_msg) catch {};
+            return;
+        }
 
         // Decompress the data (detect zstd by magic bytes, otherwise assume raw)
         const is_zstd = file_data.compressed_data.len >= 4 and
@@ -5073,8 +5110,9 @@ const Server = struct {
                         }
 
                         if (read_ok) {
-                            // Track raw BGRA pixels captured for bandwidth comparison
-                            _ = self.bw_raw_pixels_bytes.fetchAdd(panel.bgra_buffer.?.len, .monotonic);
+                            if (comptime enable_benchmark) {
+                                _ = self.bw_raw_pixels_bytes.fetchAdd(panel.bgra_buffer.?.len, .monotonic);
+                            }
 
                             // Frame skip: hash the pixel buffer and skip encoding if unchanged
                             const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
@@ -5250,25 +5288,26 @@ const Server = struct {
                             }) catch "";
                             _ = f.write(line) catch {};
 
-                            // Bandwidth stats line (cumulative totals for benchmark comparison)
-                            const bw_h264 = self.bw_h264_bytes.load(.monotonic);
-                            const bw_h264_frames = self.bw_h264_frames.load(.monotonic);
-                            const bw_ctrl_sent = self.bw_control_bytes_sent.load(.monotonic);
-                            const bw_ctrl_recv = self.bw_control_bytes_recv.load(.monotonic);
-                            const bw_raw_px = self.bw_raw_pixels_bytes.load(.monotonic);
-                            const bw_now: i64 = @truncate(std.time.nanoTimestamp());
-                            const elapsed_s: u64 = @intCast(@divFloor(bw_now - self.bw_start_time.load(.monotonic), std.time.ns_per_s));
-                            var bw_buf: [512]u8 = undefined;
-                            const bw_line = std.fmt.bufPrint(&bw_buf, "BW t={d}s h264={d}KB/{d}frames ctrl_out={d}KB ctrl_in={d}KB raw_px={d}MB total_ws={d}KB\n", .{
-                                elapsed_s,
-                                bw_h264 / 1024,
-                                bw_h264_frames,
-                                bw_ctrl_sent / 1024,
-                                bw_ctrl_recv / 1024,
-                                bw_raw_px / (1024 * 1024),
-                                (bw_h264 + bw_ctrl_sent) / 1024,
-                            }) catch "";
-                            _ = f.write(bw_line) catch {};
+                            if (comptime enable_benchmark) {
+                                const bw_h264 = self.bw_h264_bytes.load(.monotonic);
+                                const bw_h264_frames = self.bw_h264_frames.load(.monotonic);
+                                const bw_ctrl_sent = self.bw_control_bytes_sent.load(.monotonic);
+                                const bw_ctrl_recv = self.bw_control_bytes_recv.load(.monotonic);
+                                const bw_raw_px = self.bw_raw_pixels_bytes.load(.monotonic);
+                                const bw_now2: i64 = @truncate(std.time.nanoTimestamp());
+                                const elapsed_s: u64 = @intCast(@divFloor(bw_now2 - self.bw_start_time.load(.monotonic), std.time.ns_per_s));
+                                var bw_buf: [512]u8 = undefined;
+                                const bw_line = std.fmt.bufPrint(&bw_buf, "BW t={d}s h264={d}KB/{d}frames ctrl_out={d}KB ctrl_in={d}KB raw_px={d}MB total_ws={d}KB\n", .{
+                                    elapsed_s,
+                                    bw_h264 / 1024,
+                                    bw_h264_frames,
+                                    bw_ctrl_sent / 1024,
+                                    bw_ctrl_recv / 1024,
+                                    bw_raw_px / (1024 * 1024),
+                                    (bw_h264 + bw_ctrl_sent) / 1024,
+                                }) catch "";
+                                _ = f.write(bw_line) catch {};
+                            }
                         }
                     }
                     fps_counter = 0;
@@ -6379,8 +6418,9 @@ fn onFileWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*any
 }
 
 /// Handle API requests (e.g., /api/benchmark/stats).
-/// Returns a JSON string (static buffer, no allocation needed) or null if path not handled.
+/// Only reachable when -Dbenchmark is set (callback gated at setup).
 fn handleApiRequest(path: []const u8, user_data: ?*anyopaque) ?[]const u8 {
+    if (comptime !enable_benchmark) return null;
     const server: *Server = @ptrCast(@alignCast(user_data orelse return null));
 
     if (std.mem.eql(u8, path, "/api/benchmark/stats")) {
@@ -6393,7 +6433,6 @@ fn handleApiRequest(path: []const u8, user_data: ?*anyopaque) ?[]const u8 {
         const elapsed_ns: u64 = @intCast(bw_now - server.bw_start_time.load(.monotonic));
         const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
 
-        // Use a thread-local static buffer for the JSON response
         const S = struct {
             threadlocal var json_buf: [1024]u8 = undefined;
         };
@@ -6461,8 +6500,10 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
         null,
         server,
     );
-    server.http_server.api_callback = handleApiRequest;
-    server.http_server.api_user_data = server;
+    if (comptime enable_benchmark) {
+        server.http_server.api_callback = handleApiRequest;
+        server.http_server.api_user_data = server;
+    }
 
     // Resolve connection mode: interactive shows a picker, others are direct
     const chosen_provider: ?tunnel_mod.Provider = switch (mode) {
