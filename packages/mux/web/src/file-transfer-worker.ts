@@ -14,6 +14,8 @@ interface ZstdExports {
 
 let wasm: ZstdExports | null = null;
 let opfsRoot: FileSystemDirectoryHandle | null = null;
+let opfsReady = false;
+const opfsQueue: Array<{ msg: any; transfers?: Transferable[] }> = [];
 const openHandles = new Map<string, FileSystemSyncAccessHandle>();
 // Queue for serializing chunk writes per file (prevents concurrent access handle creation)
 const fileQueues = new Map<string, Promise<void>>();
@@ -21,12 +23,15 @@ const fileQueues = new Map<string, Promise<void>>();
 const completedFiles = new Set<string>();
 // Track cancelled transfers so async operations don't re-create deleted metadata
 const cancelledTransfers = new Set<number>();
+// In-memory temp file storage for zip creation (no OPFS dependency)
+const tempFileStore = new Map<number, Map<string, Uint8Array>>();
 
 const MAX_DECOMPRESSED_SIZE = 128 * 1024 * 1024;
 
 async function initWasm(): Promise<void> {
-  const response = await fetch('/zstd.wasm');
-  const bytes = await response.arrayBuffer();
+  const t0 = performance.now();
+  const bytes = await fetch('/zstd.wasm').then(r => r.arrayBuffer());
+  console.log(`[Worker] fetch zstd.wasm: ${(performance.now() - t0).toFixed(0)}ms (${bytes.byteLength} bytes)`);
 
   let mem: WebAssembly.Memory | null = null;
   const wasi_stubs = {
@@ -56,17 +61,47 @@ async function initWasm(): Promise<void> {
     random_get: () => 0,
   };
 
+  const t1 = performance.now();
   const { instance } = await WebAssembly.instantiate(bytes, {
     wasi_snapshot_preview1: wasi_stubs,
   });
   mem = instance.exports.memory as WebAssembly.Memory;
   wasm = instance.exports as unknown as ZstdExports;
+  console.log(`[Worker] WASM compile: ${(performance.now() - t1).toFixed(0)}ms`);
+  console.log(`[Worker] initWasm total: ${(performance.now() - t0).toFixed(0)}ms`);
+}
 
-  try {
-    opfsRoot = await navigator.storage.getDirectory();
-  } catch {
-    // OPFS not available
+/** Activate OPFS with a root handle received from the main thread */
+async function activateOPFS(root: FileSystemDirectoryHandle): Promise<void> {
+  const t0 = performance.now();
+  opfsRoot = root;
+  console.log(`[Worker] OPFS root received from main thread`);
+
+  await clearAllTransferMetadata();
+  console.log(`[Worker] clearAllTransferMetadata: ${(performance.now() - t0).toFixed(0)}ms`);
+
+  opfsReady = true;
+  console.log(`[Worker] OPFS ready`);
+
+  // Flush queued OPFS-dependent operations
+  const queued = opfsQueue.splice(0);
+  if (queued.length > 0) {
+    console.log(`[Worker] Flushing ${queued.length} queued OPFS operations`);
+    for (const item of queued) {
+      // Re-dispatch through the message handler
+      self.dispatchEvent(new MessageEvent('message', { data: item.msg }));
+    }
   }
+
+  (self as unknown as Worker).postMessage({ type: 'opfs-ready' });
+}
+
+/** Queue an OPFS-dependent operation if OPFS isn't ready yet. Returns true if queued. */
+function queueIfOPFSNotReady(msg: any): boolean {
+  if (opfsReady) return false;
+  console.log(`[Worker] OPFS not ready, queuing: ${msg.type}`);
+  opfsQueue.push({ msg });
+  return true;
 }
 
 function decompressData(data: Uint8Array): Uint8Array {
@@ -726,6 +761,15 @@ async function updateTransferProgress(transferId: number, filePath: string, byte
   await saveTransferMetadata(meta);
 }
 
+async function clearAllTransferMetadata(): Promise<void> {
+  if (!opfsRoot) return;
+  try {
+    await opfsRoot.removeEntry('transfers', { recursive: true });
+  } catch {
+    // 'transfers' directory doesn't exist — nothing to clear
+  }
+}
+
 async function deleteTransferMetadata(transferId: number): Promise<void> {
   if (!opfsRoot) return;
   try {
@@ -767,7 +811,17 @@ self.onmessage = async (e: MessageEvent) => {
     switch (msg.type) {
       case 'init': {
         await initWasm();
-        (self as unknown as Worker).postMessage({ type: 'init-done', opfsAvailable: opfsRoot !== null });
+        (self as unknown as Worker).postMessage({ type: 'init-done' });
+        break;
+      }
+
+      case 'set-opfs-root': {
+        // Main thread obtained the OPFS root handle and sent it here
+        if (msg.opfsRoot) {
+          activateOPFS(msg.opfsRoot).catch(err => {
+            console.error('[Worker] OPFS activation failed:', err);
+          });
+        }
         break;
       }
 
@@ -792,63 +846,47 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'decompress-and-write': {
-        const { transferId, fileIndex, filePath, offset, compressedData, fileSize } = msg;
-        console.log(`[Worker] decompress-and-write: idx=${fileIndex}, path=${filePath}, offset=${offset}, size=${fileSize}`);
+        const { transferId, fileIndex, filePath, compressedData, fileSize } = msg;
 
-        // Queue operations per file to prevent concurrent access handle creation
         const fileKey = `${transferId}/${filePath}`;
         const previousOp = fileQueues.get(fileKey) || Promise.resolve();
 
         const currentOp = previousOp.then(async () => {
           try {
-            // Skip if transfer was cancelled or file already completed
             if (cancelledTransfers.has(transferId)) return;
-            if (completedFiles.has(fileKey)) {
-              console.log(`[Worker] skipping already-completed file: idx=${fileIndex}, path=${filePath}`);
-              return;
-            }
+            if (completedFiles.has(fileKey)) return;
 
             const decompressed = decompressData(new Uint8Array(compressedData));
-            console.log(`[Worker] decompressed: idx=${fileIndex}, decompressed=${decompressed.length} bytes`);
 
-            if (opfsRoot) {
-              const handle = await getOPFSHandle(transferId, filePath);
-              console.log(`[Worker] got handle: idx=${fileIndex}, current size=${handle.getSize()}`);
-
-              handle.write(decompressed, { at: offset });
-              console.log(`[Worker] wrote chunk: idx=${fileIndex}, at offset=${offset}`);
-
-              const written = handle.getSize();
-              const complete = written >= fileSize;
-              console.log(`[Worker] after write: idx=${fileIndex}, size=${written}/${fileSize}, complete=${complete}`);
-
-              if (complete) {
-                completedFiles.add(fileKey);
-                closeHandle(transferId, filePath);
-                fileQueues.delete(fileKey); // Clean up queue when file is complete
-                console.log(`[Worker] closed handle: idx=${fileIndex}`);
-
-                // Update transfer progress metadata for resume support
-                await updateTransferProgress(transferId, filePath, decompressed.length);
-              }
-
-              (self as unknown as Worker).postMessage({
-                type: 'chunk-written',
-                transferId,
-                fileIndex,
-                filePath,
-                bytesWritten: decompressed.length,
-                complete,
-              });
-              console.log(`[Worker] sent chunk-written: idx=${fileIndex}`);
+            // Accumulate in worker memory
+            if (!tempFileStore.has(transferId)) tempFileStore.set(transferId, new Map());
+            const store = tempFileStore.get(transferId)!;
+            const existing = store.get(filePath);
+            if (existing) {
+              const merged = new Uint8Array(existing.length + decompressed.length);
+              merged.set(existing);
+              merged.set(decompressed, existing.length);
+              store.set(filePath, merged);
             } else {
-              // No OPFS — return decompressed data to main thread
-              const buffer = decompressed.buffer as ArrayBuffer;
-              (self as unknown as Worker).postMessage(
-                { type: 'chunk-decompressed', transferId, fileIndex, filePath, offset, data: buffer, bytesWritten: decompressed.length },
-                [buffer]
-              );
+              store.set(filePath, decompressed);
             }
+
+            const totalWritten = store.get(filePath)!.length;
+            const complete = totalWritten >= fileSize;
+
+            if (complete) {
+              completedFiles.add(fileKey);
+              fileQueues.delete(fileKey);
+            }
+
+            (self as unknown as Worker).postMessage({
+              type: 'chunk-written',
+              transferId,
+              fileIndex,
+              filePath,
+              bytesWritten: decompressed.length,
+              complete,
+            });
           } catch (err) {
             console.error(`[Worker] ERROR decompress-and-write: idx=${fileIndex}, path=${filePath}`, err);
             (self as unknown as Worker).postMessage({
@@ -867,16 +905,23 @@ self.onmessage = async (e: MessageEvent) => {
 
       case 'get-file': {
         const { transferId, filePath } = msg;
-        const data = await readFileFromOPFS(transferId, filePath);
-        (self as unknown as Worker).postMessage(
-          { type: 'file-data', transferId, filePath, data },
-          [data]
-        );
+        const store = tempFileStore.get(transferId);
+        const fileData = store?.get(filePath);
+        if (fileData) {
+          const buffer = fileData.buffer.slice(fileData.byteOffset, fileData.byteOffset + fileData.byteLength) as ArrayBuffer;
+          (self as unknown as Worker).postMessage(
+            { type: 'file-data', transferId, filePath, data: buffer },
+            [buffer]
+          );
+        } else {
+          console.error(`[Worker] get-file: not found: ${filePath}`);
+        }
         break;
       }
 
       case 'cleanup': {
-        await cleanupTransfer(msg.transferId);
+        tempFileStore.delete(msg.transferId);
+        if (opfsReady) await cleanupTransfer(msg.transferId);
         (self as unknown as Worker).postMessage({ type: 'cleanup-done', transferId: msg.transferId });
         break;
       }
@@ -884,32 +929,39 @@ self.onmessage = async (e: MessageEvent) => {
       // ── Temp file operations for zip creation ──
 
       case 'write-temp-file': {
-        await writeTempFile(msg.transferId, msg.path, msg.data);
+        if (!tempFileStore.has(msg.transferId)) tempFileStore.set(msg.transferId, new Map());
+        tempFileStore.get(msg.transferId)!.set(msg.path, new Uint8Array(msg.data));
         break;
       }
 
       case 'create-zip-from-temp': {
-        console.log(`[Worker] create-zip-from-temp: transferId=${msg.transferId}, folderName=${msg.folderName}`);
-        const { zipData, filename } = await createZipFromTemp(msg.transferId, msg.folderName);
-        console.log(`[Worker] Zip created: size=${zipData.byteLength} bytes, filename=${filename}`);
+        const store = tempFileStore.get(msg.transferId);
+        if (!store || store.size === 0) {
+          console.error(`[Worker] create-zip-from-temp: No files for transfer ${msg.transferId}`);
+          break;
+        }
+        console.log(`[Worker] Creating zip from ${store.size} in-memory files`);
+        const zipData = createZipInWorker(store);
+        const folderName = msg.folderName || 'download';
+        const filename = `${folderName}.zip`;
+        console.log(`[Worker] Zip created: ${zipData.length} bytes, filename: ${filename}`);
+        const buffer = zipData.buffer as ArrayBuffer;
         (self as unknown as Worker).postMessage(
-          { type: 'zip-created', transferId: msg.transferId, zipData, filename },
-          [zipData]
+          { type: 'zip-created', transferId: msg.transferId, zipData: buffer, filename },
+          [buffer]
         );
-        console.log('[Worker] Sent zip-created message to main thread');
         break;
       }
 
       case 'cleanup-temp': {
-        console.log(`[Worker] cleanup-temp: transferId=${msg.transferId}`);
-        await cleanupTempFiles(msg.transferId);
-        console.log('[Worker] Temp files cleaned up');
+        tempFileStore.delete(msg.transferId);
         break;
       }
 
       // ── Cache operations ──
 
       case 'cache-put': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id, serverPath, filePath, data, metadata } = msg;
         await cachePut(serverPath, filePath, data, metadata);
         (self as unknown as Worker).postMessage({ type: 'cache-put-done', id, serverPath, filePath });
@@ -917,6 +969,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'cache-get': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id, serverPath, filePath } = msg;
         const data = await cacheGet(serverPath, filePath);
         (self as unknown as Worker).postMessage(
@@ -927,6 +980,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'cache-list': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id, serverPath } = msg;
         const files = await readCacheMeta(serverPath);
         (self as unknown as Worker).postMessage({ type: 'cache-list-result', id, serverPath, files });
@@ -934,6 +988,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'cache-remove': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id, serverPath, filePath } = msg;
         await cacheRemove(serverPath, filePath);
         (self as unknown as Worker).postMessage({ type: 'cache-remove-done', id, serverPath, filePath });
@@ -941,6 +996,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'cache-clear-all': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id } = msg;
         await cacheClearAll();
         (self as unknown as Worker).postMessage({ type: 'cache-cleared', id });
@@ -948,6 +1004,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'cache-clear-path': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { serverPath } = msg;
         await cacheClearPath(serverPath);
         (self as unknown as Worker).postMessage({ type: 'cache-path-cleared', serverPath });
@@ -955,6 +1012,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'cache-usage': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id } = msg;
         const usage = await cacheUsage();
         (self as unknown as Worker).postMessage({ type: 'cache-usage-result', id, ...usage });
@@ -964,6 +1022,7 @@ self.onmessage = async (e: MessageEvent) => {
       // ── Rsync delta sync operations ──
 
       case 'compute-checksums': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id, serverPath, filePath, blockSize } = msg;
         try {
           const { rolling, strong } = await computeBlockChecksums(serverPath, filePath, blockSize);
@@ -981,6 +1040,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case 'apply-delta': {
+        if (queueIfOPFSNotReady(msg)) break;
         const { id, serverPath, filePath, deltaPayload } = msg;
         try {
           const cachedData = new Uint8Array(await cacheGet(serverPath, filePath));
@@ -1000,25 +1060,32 @@ self.onmessage = async (e: MessageEvent) => {
       // ── Transfer Metadata for Resume ──
 
       case 'save-transfer-metadata': {
+        if (queueIfOPFSNotReady(msg)) break;
         await saveTransferMetadata(msg.metadata);
         (self as unknown as Worker).postMessage({ type: 'metadata-saved', transferId: msg.metadata.transferId });
         break;
       }
 
       case 'load-transfer-metadata': {
+        if (queueIfOPFSNotReady(msg)) break;
         const meta = await loadTransferMetadata(msg.transferId);
         (self as unknown as Worker).postMessage({ type: 'metadata-loaded', transferId: msg.transferId, metadata: meta });
         break;
       }
 
       case 'delete-transfer-metadata': {
+        if (queueIfOPFSNotReady(msg)) break;
         cancelledTransfers.add(msg.transferId);
         await deleteTransferMetadata(msg.transferId);
+        // Re-delete after a delay to catch any in-flight writes that passed the
+        // cancelledTransfers guard before the cancel arrived
+        setTimeout(() => deleteTransferMetadata(msg.transferId), 2000);
         (self as unknown as Worker).postMessage({ type: 'metadata-deleted', transferId: msg.transferId });
         break;
       }
 
       case 'get-interrupted-transfers': {
+        if (queueIfOPFSNotReady(msg)) break;
         const interrupted = await getInterruptedTransfers();
         (self as unknown as Worker).postMessage({ type: 'interrupted-transfers', transfers: interrupted });
         break;

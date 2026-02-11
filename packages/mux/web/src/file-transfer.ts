@@ -2,7 +2,6 @@
 // Uses zstd WASM via dedicated Web Worker (off main thread)
 // with synchronous OPFS access for file caching
 
-import { getCompressionPool } from './compression-pool';
 import { TransferMsgType } from './protocol';
 import { sharedTextEncoder, sharedTextDecoder } from './utils';
 import { OPFSCache } from './opfs-cache';
@@ -25,6 +24,7 @@ import {
   DRY_RUN_ACTION,
 } from './constants';
 import type { FileSystemDirectoryHandleIterator } from './types';
+
 
 // Re-export TransferMsgType for backwards compatibility
 export { TransferMsgType };
@@ -92,16 +92,12 @@ export class FileTransferHandler {
   /** Interrupted uploads saved on disconnect for same-page-session resume */
   private interruptedUploads = new Map<number, TransferState>();
 
-  // Worker for off-thread zstd WASM + synchronous OPFS access
+  // Worker for off-thread zstd WASM
   private worker: Worker | null = null;
-  private workerReady = false;
   private opfsAvailable = false;
   private workerInitPromise: Promise<void>;
   private pendingCompression = new Map<number, { resolve: (data: Uint8Array) => void; reject: (err: Error) => void }>();
   private nextCompressionId = 0;
-
-  // Fallback: main-thread compression pool (used if Worker unavailable)
-  private compressionPool = getCompressionPool();
 
   // OPFS cache for delta sync (created after worker init)
   cache: OPFSCache | null = null;
@@ -118,31 +114,43 @@ export class FileTransferHandler {
     this.workerInitPromise = this.initWorker();
   }
 
-  private initWorker(): Promise<void> {
+  private async initWorker(): Promise<void> {
     return new Promise<void>((resolve) => {
       try {
-        // Add version param to bust worker cache
         this.worker = new Worker('/file-worker.js?v=2');
         this.worker.onmessage = (e) => this.handleWorkerMessage(e);
-        this.worker.onerror = () => {
+        this.worker.onerror = (event) => {
+          console.error('[FT] Worker failed to load:', event);
           this.worker = null;
           resolve();
         };
 
-        const timeout = setTimeout(() => {
-          if (!this.workerReady) {
-            this.worker = null;
-            resolve();
-          }
-        }, 5000);
-
-        this._workerInitResolve = () => {
-          clearTimeout(timeout);
-          resolve();
-        };
-
+        this._workerInitResolve = () => { resolve(); };
         this.worker.postMessage({ type: 'init' });
-      } catch {
+
+        // Get OPFS root on main thread and send to worker
+        console.log('[FT] navigator.storage exists:', !!navigator.storage);
+        console.log('[FT] navigator.storage.getDirectory exists:', typeof navigator.storage?.getDirectory);
+        if (navigator.storage?.getDirectory) {
+          console.log('[FT] Calling navigator.storage.getDirectory()...');
+          const opfsPromise = navigator.storage.getDirectory();
+          // Detect hang: if getDirectory() doesn't resolve in 3s, log it
+          const timeout = setTimeout(() => {
+            console.error('[FT] navigator.storage.getDirectory() hung for 3s — OPFS unavailable in this environment');
+          }, 3000);
+          opfsPromise.then(root => {
+            clearTimeout(timeout);
+            console.log('[FT] Got OPFS root on main thread, sending to worker');
+            this.worker?.postMessage({ type: 'set-opfs-root', opfsRoot: root });
+          }).catch(err => {
+            clearTimeout(timeout);
+            console.warn('[FT] OPFS getDirectory() rejected:', err);
+          });
+        } else {
+          console.warn('[FT] OPFS API not available (no navigator.storage.getDirectory)');
+        }
+      } catch (err) {
+        console.error('[FT] Worker construction failed:', err);
         resolve();
       }
     });
@@ -158,13 +166,22 @@ export class FileTransferHandler {
 
     switch (msg.type) {
       case 'init-done':
-        this.workerReady = true;
-        this.opfsAvailable = msg.opfsAvailable;
-        if (this.worker && msg.opfsAvailable) {
-          this.cache = new OPFSCache(this.worker, true);
+        console.log('[FT] Worker WASM initialized');
+        if (this.worker) {
+          this.worker.onerror = (event) => {
+            console.error('[FT] Worker runtime error:', event);
+          };
         }
         this._workerInitResolve?.();
         this._workerInitResolve = null;
+        break;
+
+      case 'opfs-ready':
+        console.log('[FT] Worker OPFS ready');
+        this.opfsAvailable = true;
+        if (this.worker) {
+          this.cache = new OPFSCache(this.worker, true);
+        }
         break;
 
       case 'compressed': {
@@ -187,10 +204,6 @@ export class FileTransferHandler {
 
       case 'chunk-written':
         this.onChunkWrittenToOPFS(msg);
-        break;
-
-      case 'chunk-decompressed':
-        this.onChunkDecompressedNoOPFS(msg);
         break;
 
       case 'file-data':
@@ -219,7 +232,13 @@ export class FileTransferHandler {
         break;
 
       case 'error':
-        console.error('Worker error:', msg.message);
+        console.error('[FT] Worker error:', msg.message, msg.originalType ? `(during ${msg.originalType})` : '');
+        // If init failed inside the worker, resolve the init promise
+        // so we don't also hit the timeout
+        if (msg.originalType === 'init') {
+          this._workerInitResolve?.();
+          this._workerInitResolve = null;
+        }
         // Reject any pending compression promise
         if (msg.id !== undefined) {
           const pending = this.pendingCompression.get(msg.id);
@@ -324,8 +343,8 @@ export class FileTransferHandler {
           resolve(e.data.transfers);
         }
       };
-      this.worker.addEventListener('message', handler);
-      this.worker.postMessage({ type: 'get-interrupted-transfers' });
+      this.worker!.addEventListener('message', handler);
+      this.worker!.postMessage({ type: 'get-interrupted-transfers' });
     });
   }
 
@@ -342,7 +361,6 @@ export class FileTransferHandler {
     this.activeTransfers.set(metadata.transferId, {
       id: metadata.transferId,
       direction: 'download',
-      path: metadata.serverPath,  // Set path so handleFileList can find it
       totalBytes: metadata.totalBytes,
       bytesTransferred: metadata.bytesTransferred,
       currentFileIndex: metadata.completedFiles.length,
@@ -403,57 +421,40 @@ export class FileTransferHandler {
     const view = new DataView(data);
     const msgType = view.getUint8(0);
 
-    // Log FILE_REQUEST and TRANSFER_COMPLETE messages specifically
-    if (msgType === TransferMsgType.FILE_REQUEST) {
-      const fileIndex = view.getUint32(PROTO_FILE_REQUEST.FILE_INDEX, true);
-      console.log(`[FT] *** Received FILE_REQUEST message (0x${msgType.toString(16)}) for fileIndex=${fileIndex} ***`);
-    }
-    if (msgType === TransferMsgType.TRANSFER_COMPLETE) {
-      console.log(`[FT] *** Received TRANSFER_COMPLETE message (0x${msgType.toString(16)}) ***`);
-    }
-
-    try {
-      switch (msgType) {
-        case TransferMsgType.TRANSFER_READY:
-          this.handleTransferReady(data);
-          break;
-        case TransferMsgType.FILE_LIST:
-          this.handleFileList(data);
-          break;
-        case TransferMsgType.FILE_REQUEST:
-          this.handleFileRequest(data).catch(err => console.error('File request handling failed:', err));
-          break;
-        case TransferMsgType.FILE_ACK:
-          this.handleFileAck(data);
-          break;
-        case TransferMsgType.TRANSFER_COMPLETE:
-          this.handleTransferComplete(data);
-          break;
-        case TransferMsgType.TRANSFER_ERROR:
-          this.handleTransferError(data);
-          break;
-        case TransferMsgType.DRY_RUN_REPORT:
-          this.handleDryRunReport(data);
-          break;
-        case TransferMsgType.BATCH_DATA:
-          this.handleBatchData(data).catch(err => console.error('Batch data handling failed:', err));
-          break;
-        case TransferMsgType.SYNC_FILE_LIST:
-          this.handleSyncFileList(data).catch(err => console.error('Sync file list handling failed:', err));
-          break;
-        case TransferMsgType.DELTA_DATA:
-          this.handleDeltaData(data).catch(err => console.error('Delta data handling failed:', err));
-          break;
-        case TransferMsgType.SYNC_COMPLETE:
-          this.handleSyncComplete(data);
-          break;
-      }
-    } catch (err) {
-      console.error(`File transfer message handler failed (type=0x${msgType.toString(16)}):`, err);
-      // Ensure error callback fires so Promises don't hang
-      const view2 = new DataView(data);
-      const transferId = data.byteLength >= 5 ? view2.getUint32(1, true) : 0;
-      this.onTransferError?.(transferId, `Message parsing error: ${err}`);
+    switch (msgType) {
+      case TransferMsgType.TRANSFER_READY:
+        this.handleTransferReady(data);
+        break;
+      case TransferMsgType.FILE_LIST:
+        this.handleFileList(data);
+        break;
+      case TransferMsgType.FILE_REQUEST:
+        this.handleFileRequest(data);
+        break;
+      case TransferMsgType.FILE_ACK:
+        this.handleFileAck(data);
+        break;
+      case TransferMsgType.TRANSFER_COMPLETE:
+        this.handleTransferComplete(data);
+        break;
+      case TransferMsgType.TRANSFER_ERROR:
+        this.handleTransferError(data);
+        break;
+      case TransferMsgType.DRY_RUN_REPORT:
+        this.handleDryRunReport(data);
+        break;
+      case TransferMsgType.BATCH_DATA:
+        this.handleBatchData(data);
+        break;
+      case TransferMsgType.SYNC_FILE_LIST:
+        this.handleSyncFileList(data);
+        break;
+      case TransferMsgType.DELTA_DATA:
+        this.handleDeltaData(data);
+        break;
+      case TransferMsgType.SYNC_COMPLETE:
+        this.handleSyncComplete(data);
+        break;
     }
   }
 
@@ -538,8 +539,8 @@ export class FileTransferHandler {
 
       // Notify that transfer has started with full details
       const nonDirFiles = files.filter(f => !f.isDir);
-      console.log(`[FT] Calling onTransferStart: transferId=${transferId}, path=${transfer.path}, files=${nonDirFiles.length}`);
-      this.onTransferStart?.(transferId, transfer.path, transfer.direction, nonDirFiles.length, totalBytes);
+      console.log(`[FT] Calling onTransferStart: transferId=${transferId}, path=${transfer.serverPath}, files=${nonDirFiles.length}`);
+      this.onTransferStart?.(transferId, transfer.serverPath ?? '', transfer.direction as 'upload' | 'download', nonDirFiles.length, totalBytes);
 
       // Apply resume position if set (from handleTransferReady during resume)
       if (transfer.resumePosition) {
@@ -554,7 +555,7 @@ export class FileTransferHandler {
 
       if (transfer.direction === 'download') {
         // Enable zip mode for multi-file downloads (stream to OPFS temp)
-        const nonDirFiles = files.filter(f => !f.isDir).length;
+        const nonDirFiles = files.filter(f => !f.isDir && f.size > 0).length;
         if (nonDirFiles > 1) {
           transfer.useZipMode = true;
           transfer.filesCompleted = 0;
@@ -616,35 +617,20 @@ export class FileTransferHandler {
     const file = transfer.files[fileIndex];
     console.log(`[FT] FILE_REQUEST: Processing file ${file.path} (${fileIndex}/${transfer.files.length})`);
 
-
-    if (this.worker && this.workerReady) {
-      console.log(`[FT] → Sending decompress-and-write to worker: fileIndex=${fileIndex}, path=${file.path}, offset=${chunkOffset}`);
-      // Delegate to Worker: decompress + OPFS write (or decompress-only fallback)
-      const buffer = compressedData.buffer.slice(
-        compressedData.byteOffset,
-        compressedData.byteOffset + compressedData.byteLength,
-      );
-      this.worker.postMessage({
-        type: 'decompress-and-write',
-        transferId,
-        fileIndex,
-        filePath: file.path,
-        offset: chunkOffset,
-        compressedData: buffer,
-        fileSize: file.size,
-      }, [buffer]);
-    } else {
-      console.log(`[FT] Worker not ready, using fallback for fileIndex=${fileIndex}`);
-
-      // Fallback: decompress on main thread, accumulate in memory
-      try {
-        const fileData = await this.decompress(compressedData);
-        this.accumulateAndSave(transferId, fileIndex, chunkOffset, fileData);
-      } catch (err) {
-        console.error('Decompression failed:', err);
-        this.failTransfer(transferId, err instanceof Error ? err.message : 'Decompression failed');
-      }
-    }
+    // Delegate to Worker for decompression + storage
+    const buffer = compressedData.buffer.slice(
+      compressedData.byteOffset,
+      compressedData.byteOffset + compressedData.byteLength,
+    );
+    this.worker!.postMessage({
+      type: 'decompress-and-write',
+      transferId,
+      fileIndex,
+      filePath: file.path,
+      offset: chunkOffset,
+      compressedData: buffer,
+      fileSize: file.size,
+    }, [buffer]);
   }
 
   /** Handle BATCH_DATA: multiple small files compressed as one block */
@@ -712,42 +698,45 @@ export class FileTransferHandler {
     }
   }
 
-  /** Worker callback: chunk decompressed and written to OPFS */
+  /** Worker callback: chunk decompressed and stored in worker memory */
   private onChunkWrittenToOPFS(msg: { transferId: number; fileIndex: number; filePath: string; bytesWritten: number; complete: boolean }): void {
-    console.log(`[FT] ← onChunkWrittenToOPFS: fileIndex=${msg.fileIndex}, path=${msg.filePath}, bytes=${msg.bytesWritten}, complete=${msg.complete}`);
     const transfer = this.activeTransfers.get(msg.transferId);
-    if (!transfer || !transfer.files) {
-      console.warn(`[FT] onChunkWrittenToOPFS: No transfer found`);
-      return;
-    }
+    if (!transfer || !transfer.files) return;
 
     transfer.bytesTransferred += msg.bytesWritten;
 
     if (msg.complete) {
-      // Guard against duplicate completions (e.g., file already at full size in OPFS from resume)
       if (!transfer.completedPaths) transfer.completedPaths = new Set();
-      if (transfer.completedPaths.has(msg.filePath)) {
-        console.log(`[FT] Skipping duplicate completion for: ${msg.filePath}`);
-        return;
-      }
+      if (transfer.completedPaths.has(msg.filePath)) return;
       transfer.completedPaths.add(msg.filePath);
 
-      console.log(`[FT] File complete in OPFS, requesting read-back: ${msg.filePath}`);
-      // File fully written to OPFS — read it back for browser download
-      this.worker!.postMessage({
-        type: 'get-file',
-        transferId: msg.transferId,
-        filePath: msg.filePath,
-      });
+      if (transfer.useZipMode) {
+        // Worker has the file in memory — just track progress (no get-file round-trip)
+        transfer.filesCompleted = (transfer.filesCompleted ?? 0) + 1;
+        const totalFiles = transfer.files.filter(f => !f.isDir && f.size > 0).length;
+        this.onDownloadProgress?.(msg.transferId, transfer.filesCompleted, totalFiles, transfer.bytesTransferred, transfer.totalBytes ?? 0);
+
+        // If TRANSFER_COMPLETE already received and all files done, create zip
+        if (transfer.zipPending && !transfer.zipCreating && transfer.filesCompleted >= totalFiles) {
+          if (transfer.zipFallbackTimer) {
+            clearTimeout(transfer.zipFallbackTimer);
+            transfer.zipFallbackTimer = undefined;
+          }
+          transfer.zipCreating = true;
+          this.createZipFromOPFS(msg.transferId);
+        }
+      } else {
+        // Single file — need data back on main thread for browser download
+        this.worker?.postMessage({
+          type: 'get-file',
+          transferId: msg.transferId,
+          filePath: msg.filePath,
+        });
+      }
       transfer.currentFileIndex++;
     }
   }
 
-  /** Worker callback: no OPFS available, decompressed data returned */
-  private onChunkDecompressedNoOPFS(msg: { transferId: number; fileIndex: number; filePath: string; offset: number; data: ArrayBuffer; bytesWritten: number }): void {
-    console.log(`[FT] ← onChunkDecompressedNoOPFS: fileIndex=${msg.fileIndex}, path=${msg.filePath}, offset=${msg.offset}, bytes=${msg.bytesWritten}`);
-    this.accumulateAndSave(msg.transferId, msg.fileIndex, msg.offset, new Uint8Array(msg.data));
-  }
 
   /** Worker callback: file data read from OPFS for browser download */
   private onFileDataFromOPFS(msg: { transferId: number; filePath: string; data: ArrayBuffer }): void {
@@ -763,45 +752,6 @@ export class FileTransferHandler {
     this.cacheDownloadedFile(transfer, msg.filePath, data);
   }
 
-  /** Accumulate decompressed chunks in memory and save when file is complete */
-  private accumulateAndSave(transferId: number, fileIndex: number, chunkOffset: number, fileData: Uint8Array): void {
-    const transfer = this.activeTransfers.get(transferId);
-    if (!transfer || !transfer.files || transfer.state === 'complete' || transfer.state === 'error') return;
-    if (fileIndex >= transfer.files.length) return;
-
-    const file = transfer.files[fileIndex];
-
-    if (!transfer.receivedFiles) transfer.receivedFiles = new Map();
-    let fileChunks = transfer.receivedFiles.get(fileIndex);
-    if (!fileChunks) {
-      fileChunks = [];
-      transfer.receivedFiles.set(fileIndex, fileChunks);
-    }
-    fileChunks.push({ offset: chunkOffset, data: fileData });
-
-    transfer.bytesTransferred += fileData.length;
-
-    // Check per-file completion using accumulated chunk bytes
-    const fileBytes = fileChunks.reduce((sum, c) => sum + c.data.length, 0);
-    if (fileBytes >= file.size) {
-      const chunks = fileChunks;
-      chunks.sort((a, b) => a.offset - b.offset);
-      const fullData = new Uint8Array(file.size);
-      let writeOffset = 0;
-      for (const chunk of chunks) {
-        fullData.set(chunk.data, writeOffset);
-        writeOffset += chunk.data.length;
-      }
-
-      if (!this.handleCompletedFile(transferId, file.path, fullData)) {
-        this.failTransfer(transferId, `Failed to save file: ${file.path}`);
-        return;
-      }
-      this.cacheDownloadedFile(transfer, file.path, fullData);
-      transfer.receivedFiles.delete(fileIndex);
-      transfer.currentFileIndex++;
-    }
-  }
 
   /** Cache a downloaded file for future delta sync */
   private cacheDownloadedFile(transfer: TransferState, filePath: string, data: Uint8Array): void {
@@ -870,7 +820,7 @@ export class FileTransferHandler {
 
     // Zip mode: check if all files are written to OPFS temp
     if (transfer.useZipMode) {
-      const totalFiles = transfer.files?.filter(f => !f.isDir).length ?? 0;
+      const totalFiles = transfer.files?.filter(f => !f.isDir && f.size > 0).length ?? 0;
       const filesCompleted = transfer.filesCompleted ?? 0;
       console.log(`[FT] Zip mode: ${filesCompleted}/${totalFiles} files written to OPFS (totalEntries=${transfer.files?.length})`);
       console.log(`[FT] Checking if ready to create zip: filesCompleted (${filesCompleted}) >= totalFiles (${totalFiles}) = ${filesCompleted >= totalFiles}`);
@@ -1129,7 +1079,6 @@ export class FileTransferHandler {
       direction: 'download',
       serverPath,
       options,
-      path: serverPath,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
@@ -1284,25 +1233,11 @@ export class FileTransferHandler {
   }
 
   private async compress(data: Uint8Array): Promise<Uint8Array> {
-    // Prefer Worker for off-thread compression
-    if (this.worker && this.workerReady) {
-      return this.compressViaWorker(data, FILE_TRANSFER.COMPRESSION_LEVEL);
-    }
-    if (this.compressionPool) {
-      return await this.compressionPool.compress(data, FILE_TRANSFER.COMPRESSION_LEVEL);
-    }
-    return data;
+    return this.compressViaWorker(data, FILE_TRANSFER.COMPRESSION_LEVEL);
   }
 
   private async decompress(data: Uint8Array): Promise<Uint8Array> {
-    // Prefer Worker for off-thread decompression
-    if (this.worker && this.workerReady) {
-      return this.decompressViaWorker(data);
-    }
-    if (this.compressionPool) {
-      return await this.compressionPool.decompress(data);
-    }
-    throw new Error('Decompression unavailable: zstd WASM not initialized');
+    return this.decompressViaWorker(data);
   }
 
   private compressViaWorker(data: Uint8Array, level: number): Promise<Uint8Array> {
@@ -1596,7 +1531,7 @@ export class FileTransferHandler {
       if (isSmallFile) {
         transfer.bytesTransferred += data.length;
       }
-      const totalFiles = transfer.files?.filter(f => !f.isDir).length ?? 0;
+      const totalFiles = transfer.files?.filter(f => !f.isDir && f.size > 0).length ?? 0;
       console.log(`[FT] File completed: ${path} (${transfer.filesCompleted}/${totalFiles}), calling onDownloadProgress with transferId=${transferId}`);
       this.onDownloadProgress?.(transferId, transfer.filesCompleted, totalFiles, transfer.bytesTransferred, transfer.totalBytes ?? 0);
 
@@ -1620,7 +1555,7 @@ export class FileTransferHandler {
           transfer.zipFallbackTimer = setTimeout(() => {
             const t = this.activeTransfers.get(transferId);
             if (t?.zipPending && !t.zipCreating) {
-              const tf = t.files?.filter(f => !f.isDir).length ?? 0;
+              const tf = t.files?.filter(f => !f.isDir && f.size > 0).length ?? 0;
               console.log(`[FT] Timeout fallback: creating zip with ${t.filesCompleted}/${tf} files`);
               t.zipCreating = true; // Prevent multiple zip creations
               this.createZipFromOPFS(transferId);
@@ -1645,16 +1580,18 @@ export class FileTransferHandler {
     console.log(`[FT] createZipFromOPFS: requesting zip from worker, transferId=${transferId}`);
 
     // Extract folder name from server path for zip filename
-    const pathParts = transfer.path.split('/').filter(p => p);
+    const pathParts = (transfer.serverPath ?? '').split('/').filter((p: string) => p);
     const folderName = pathParts[pathParts.length - 1] || 'download';
     console.log(`[FT] Zip filename will be: ${folderName}.zip`);
 
     if (!this.worker) {
       console.error('[FT] No worker available for zip creation!');
+      this.activeTransfers.delete(transferId);
+      this.onTransferError?.(transferId, 'No worker available for zip creation');
       return;
     }
 
-    // Request worker to list all temp files and send them back
+    // Request worker to create zip from temp files
     this.worker.postMessage({ type: 'create-zip-from-temp', transferId, folderName });
     console.log('[FT] Sent create-zip-from-temp message to worker');
     // Worker will send 'zip-created' message with the zip data
