@@ -254,9 +254,7 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
 
         if (completed) |dl| {
             defer viewer.download_manager.allocator.free(dl.suggested_filename);
-            // Defer source_path cleanup — will be freed after we're done with it
-            var source_freed = false;
-            defer if (!source_freed) viewer.download_manager.allocator.free(dl.source_path);
+            defer viewer.download_manager.allocator.free(dl.source_path);
 
             viewer.log("[DOWNLOAD] completed: temp={s} filename={s}\n", .{ dl.source_path, dl.suggested_filename });
 
@@ -274,15 +272,12 @@ pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
                     download_mod.copyFile(dl.source_path, path) catch |err| {
                         viewer.log("[DOWNLOAD] copyFile failed: {}\n", .{err});
                     };
-                    viewer.notifyDownloadComplete(path);
                 }
                 // Always delete temp file
                 std.fs.deleteFileAbsolute(dl.source_path) catch {};
             } else {
                 // Linux: keep file in temp dir, copy path to clipboard via OSC 52
                 copyToClipboardOsc52(dl.source_path);
-                viewer.notifyDownloadComplete(dl.source_path);
-                source_freed = true; // caller keeps the temp file
             }
 
             // Reset viewport after download to fix Chrome's layout

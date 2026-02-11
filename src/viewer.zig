@@ -1823,7 +1823,6 @@ pub const Viewer = struct {
                 defer self.allocator.free(dl.source_path);
                 defer self.allocator.free(dl.suggested_filename);
                 self.log("[DOWNLOAD] Saved to: {s}\n", .{dl.source_path});
-                self.notifyDownloadComplete(dl.source_path);
 
                 // Reset viewport after download to fix Chrome's layout
                 screenshot_api.setViewport(self.cdp_client, self.allocator, self.viewport_width, self.viewport_height, self.dpr) catch |err| {
@@ -2437,6 +2436,9 @@ pub const Viewer = struct {
             tab.deinit();
         }
         self.tabs.deinit(self.allocator);
+        // Clean up temp download directory
+        const dl_dir = self.cdp_client.getDownloadDir();
+        std.fs.deleteTreeAbsolute(dl_dir) catch {};
         self.download_manager.deinit();
         if (self.debug_log) |file| {
             file.close();
