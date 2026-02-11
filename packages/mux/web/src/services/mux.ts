@@ -114,7 +114,7 @@ export class MuxClient {
   // Callbacks for transfer dialog UI (set by App.svelte)
   onUploadRequest?: () => void;
   onDownloadRequest?: () => void;
-  onFileDropRequest?: (panel: PanelInstance, files: File[]) => void;
+  onFileDropRequest?: (panel: PanelInstance, files: File[], dirHandle?: FileSystemDirectoryHandle) => void;
   onDownloadProgress?: (transferId: number, filesCompleted: number, totalFiles: number, bytesTransferred: number, totalBytes: number) => void;
 
   constructor() {
@@ -1224,7 +1224,7 @@ export class MuxClient {
           this.panelsByServerId.set(newServerId, panel);
         },
         onActivate: () => this.setActivePanel(panel),
-        onFileDrop: (files: File[]) => this.handleFileDrop(panel, files),
+        onFileDrop: (files: File[], dirHandle?: FileSystemDirectoryHandle) => this.handleFileDrop(panel, files, dirHandle),
         onTextPaste: (text: string) => {
           this.sendClipboard(text);
           this.sendViewAction('paste_from_clipboard');
@@ -2024,9 +2024,9 @@ export class MuxClient {
     this.onDownloadRequest?.();
   }
 
-  handleFileDrop(panel: PanelInstance, files: File[]): void {
-    if (files.length === 0) return;
-    this.onFileDropRequest?.(panel, files);
+  handleFileDrop(panel: PanelInstance, files: File[], dirHandle?: FileSystemDirectoryHandle): void {
+    if (files.length === 0 && !dirHandle) return;
+    this.onFileDropRequest?.(panel, files, dirHandle);
   }
 
   /** Get the pwd of the active panel (for dialog default paths). */

@@ -231,11 +231,11 @@
     transferDialogOpen = true;
   }
 
-  function openFileDropDialog(files: File[]) {
+  function openFileDropDialog(files: File[], dirHandle?: FileSystemDirectoryHandle) {
     transferDialogMode = 'upload';
     transferDialogDefaultPath = muxClient?.getActivePanelPwd() || '';
-    transferDialogInitialDirHandle = undefined;
-    transferDialogInitialFiles = files;
+    transferDialogInitialDirHandle = dirHandle;
+    transferDialogInitialFiles = dirHandle ? undefined : files;
     downloadProgressOpen = false; // Close transfer monitor when opening file drop dialog
     transferDialogOpen = true;
   }
@@ -461,7 +461,7 @@
         // Wire transfer dialog callbacks
         muxClient.onUploadRequest = () => openUploadDialog();
         muxClient.onDownloadRequest = () => openDownloadDialog();
-        muxClient.onFileDropRequest = (_panel, files) => openFileDropDialog(files);
+        muxClient.onFileDropRequest = (_panel, files, dirHandle) => openFileDropDialog(files, dirHandle);
 
         // Initialize download entry when transfer starts (creates single entry with correct totals)
         muxClient.getFileTransfer().onTransferStart = (transferId, path, direction, totalFiles, totalBytes) => {

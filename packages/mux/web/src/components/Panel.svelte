@@ -22,7 +22,7 @@
     onPwdChange?: (pwd: string) => void;
     onServerIdAssigned?: (serverId: number) => void;
     onActivate?: () => void;
-    onFileDrop?: (files: File[]) => void;
+    onFileDrop?: (files: File[], dirHandle?: FileSystemDirectoryHandle) => void;
     onTextPaste?: (text: string) => void;
   }
 
@@ -1131,14 +1131,34 @@
     dragCounter = 0;
     isDragging = false;
     if (!e.dataTransfer) return;
-    // Extract files synchronously — DataTransferItemList becomes invalid after handler returns
+
+    // Try File System Access API to properly detect dropped folders
+    const items = Array.from(e.dataTransfer.items).filter(i => i.kind === 'file');
+    if (items.length > 0 && typeof items[0].getAsFileSystemHandle === 'function') {
+      // Capture items before they expire — resolve handles asynchronously
+      const handlePromises = items.map(i => (i as any).getAsFileSystemHandle() as Promise<FileSystemHandle>);
+      Promise.all(handlePromises).then(handles => {
+        const dirHandles = handles.filter((h): h is FileSystemDirectoryHandle => h.kind === 'directory');
+        const fileHandles = handles.filter((h): h is FileSystemFileHandle => h.kind === 'file');
+
+        if (dirHandles.length === 1 && fileHandles.length === 0) {
+          // Single folder dropped — use directory handle
+          onFileDrop?.([], dirHandles[0]);
+        } else {
+          // Files (or mix) — convert file handles to File objects
+          Promise.all(fileHandles.map(h => h.getFile())).then(files => {
+            if (files.length > 0) onFileDrop?.(files);
+          });
+        }
+      });
+      return;
+    }
+
+    // Fallback: extract File objects synchronously
     const files: File[] = [];
-    for (let i = 0; i < e.dataTransfer.items.length; i++) {
-      const item = e.dataTransfer.items[i];
-      if (item.kind === 'file') {
-        const file = item.getAsFile();
-        if (file) files.push(file);
-      }
+    for (const item of items) {
+      const file = item.getAsFile();
+      if (file) files.push(file);
     }
     if (files.length > 0) onFileDrop?.(files);
   }
