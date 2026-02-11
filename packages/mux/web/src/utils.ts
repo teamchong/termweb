@@ -11,6 +11,13 @@ import {
 // WebSocket utilities
 // ============================================================================
 
+/** Get the auth token query string (?token=xxx) from the current page URL */
+function getAuthQuery(): string {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get('token');
+  return token ? `?token=${encodeURIComponent(token)}` : '';
+}
+
 /**
  * Build WebSocket URL from path - auto-detects ws/wss based on page protocol.
  * Forwards ?token= query parameter from page URL to WebSocket URL for auth.
@@ -18,10 +25,15 @@ import {
 export function getWsUrl(path: string): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host;
-  const params = new URLSearchParams(window.location.search);
-  const token = params.get('token');
-  const query = token ? `?token=${encodeURIComponent(token)}` : '';
-  return `${protocol}//${host}${path}${query}`;
+  return `${protocol}//${host}${path}${getAuthQuery()}`;
+}
+
+/**
+ * Build authenticated HTTP URL for sub-resources (WASM, workers, etc.).
+ * Appends ?token= from the page URL so each request authenticates.
+ */
+export function getAuthUrl(path: string): string {
+  return `${path}${getAuthQuery()}`;
 }
 
 // ============================================================================

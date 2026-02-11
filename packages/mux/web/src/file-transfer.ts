@@ -3,7 +3,7 @@
 // with synchronous OPFS access for file caching
 
 import { TransferMsgType } from './protocol';
-import { sharedTextEncoder, sharedTextDecoder } from './utils';
+import { sharedTextEncoder, sharedTextDecoder, getAuthUrl } from './utils';
 import { OPFSCache } from './opfs-cache';
 import type { CachedFileMeta } from './opfs-cache';
 import {
@@ -116,7 +116,7 @@ export class FileTransferHandler {
   private async initWorker(): Promise<void> {
     return new Promise<void>((resolve) => {
       try {
-        this.worker = new Worker('/file-worker.js?v=2');
+        this.worker = new Worker(getAuthUrl('/file-worker.js'));
         this.worker.onmessage = (e) => this.handleWorkerMessage(e);
         this.worker.onerror = (event) => {
           console.error('[FT] Worker failed to load:', event);

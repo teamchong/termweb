@@ -28,9 +28,15 @@ const tempFileStore = new Map<number, Map<string, Uint8Array>>();
 
 const MAX_DECOMPRESSED_SIZE = 128 * 1024 * 1024;
 
+function getWorkerAuthQuery(): string {
+  const params = new URLSearchParams(self.location.search);
+  const token = params.get('token');
+  return token ? `?token=${encodeURIComponent(token)}` : '';
+}
+
 async function initWasm(): Promise<void> {
   const t0 = performance.now();
-  const bytes = await fetch('/zstd.wasm').then(r => r.arrayBuffer());
+  const bytes = await fetch(`/zstd.wasm${getWorkerAuthQuery()}`).then(r => r.arrayBuffer());
   console.log(`[Worker] fetch zstd.wasm: ${(performance.now() - t0).toFixed(0)}ms (${bytes.byteLength} bytes)`);
 
   let mem: WebAssembly.Memory | null = null;

@@ -1,6 +1,8 @@
 // zstd compression/decompression via Zig WASM module
 // Both compress and decompress are available (no JS fallback needed)
 
+import { getAuthUrl } from './utils';
+
 interface ZstdExports {
   memory: WebAssembly.Memory;
   zstd_alloc(size: number): number;
@@ -28,7 +30,7 @@ export async function initZstd(wasmPath = '/zstd.wasm'): Promise<void> {
 
   initPromise = (async () => {
     try {
-      const response = await fetch(wasmPath);
+      const response = await fetch(getAuthUrl(wasmPath));
       const bytes = await response.arrayBuffer();
 
       // WASI stubs — zstd WASM is built with wasi-libc which requires these

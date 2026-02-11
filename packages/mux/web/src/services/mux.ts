@@ -11,7 +11,7 @@ import { FileTransferHandler } from '../file-transfer';
 import type { DryRunReport, TransferOptions } from '../file-transfer';
 import type { AppConfig, LayoutData, LayoutNode, LayoutTab } from '../types';
 import type { PanelStatus } from '../stores/types';
-import { applyColors, generateId, getWsUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
+import { applyColors, generateId, getWsUrl, getAuthUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
 import { TIMING, WS_PATHS, CONFIG_ENDPOINT, SERVER_MSG, UI } from '../constants';
 import { BinaryCtrlMsg, Role } from '../protocol';
 import { initZstd, compressZstd, decompressZstd } from '../zstd-wasm';
@@ -566,7 +566,7 @@ export class MuxClient {
 
   private async fetchConfig(): Promise<AppConfig> {
     try {
-      const response = await fetch(CONFIG_ENDPOINT);
+      const response = await fetch(getAuthUrl(CONFIG_ENDPOINT));
       if (!response.ok) return {};
       return await response.json();
     } catch {
@@ -758,10 +758,12 @@ export class MuxClient {
           const isAdmin = role === Role.ADMIN;
           ui.update(s => ({ ...s, isAdmin }));
           // Auto-switch mode based on role
-          if (isAdmin) {
-            this.enterMainMode();
-          } else if (role === Role.EDITOR || role === Role.VIEWER) {
+          // Admins and editors use main mode (can create/interact with panels)
+          // Only read-only viewers use viewer mode
+          if (role === Role.VIEWER) {
             this.enterViewerMode();
+          } else {
+            this.enterMainMode();
           }
           break;
         }
@@ -777,11 +779,12 @@ export class MuxClient {
           const clientId = view.getUint32(2, true);
           ui.update(s => ({ ...s, isMainClient: isMain, clientId }));
           // Switch viewer/main mode based on role
+          // Editors stay in main mode; only viewers are read-only
           const currentAuth = get(authState);
-          if (currentAuth.role === Role.ADMIN) {
-            this.enterMainMode();
-          } else if (currentAuth.role === Role.EDITOR || currentAuth.role === Role.VIEWER) {
+          if (currentAuth.role === Role.VIEWER) {
             this.enterViewerMode();
+          } else {
+            this.enterMainMode();
           }
           break;
         }

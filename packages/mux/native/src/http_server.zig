@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const auth = @import("auth.zig");
 
 // Set socket read timeout for blocking I/O with periodic wakeup
 fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
@@ -45,10 +46,18 @@ const c = if (is_macos) @cImport({
 
 // Embedded web assets - from web_assets module
 const web_assets = @import("web_assets");
-const embedded_index_html = web_assets.index_html;
 const embedded_client_js = web_assets.client_js;
 const embedded_file_worker_js = web_assets.file_worker_js;
 const embedded_zstd_wasm = web_assets.zstd_wasm;
+
+// Inlined HTML: JS is embedded directly so no sub-resource fetch is needed.
+// This avoids needing cookies or separate auth for static assets.
+const embedded_index_html = blk: {
+    const raw_html = web_assets.index_html;
+    const marker = "<script src=\"client.js\"></script>";
+    const pos = std.mem.indexOf(u8, raw_html, marker) orelse @compileError("client.js script tag not found in index.html");
+    break :blk raw_html[0..pos] ++ "<script>" ++ embedded_client_js ++ "</script>" ++ raw_html[pos + marker.len ..];
+};
 
 // Common headers for all responses:
 // - COOP/COEP for SharedArrayBuffer support (required for Web Workers with shared memory)
@@ -99,6 +108,8 @@ pub const HttpServer = struct {
     // API callback for custom endpoints (e.g., /api/benchmark/stats)
     api_callback: ?ApiCallback = null,
     api_user_data: ?*anyopaque = null,
+    // Auth state for token validation on all requests
+    auth_state: ?*auth.AuthState = null,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16, ghostty_config: ?c.ghostty_config_t) !*HttpServer {
         const server = try allocator.create(HttpServer);
@@ -227,6 +238,19 @@ pub const HttpServer = struct {
             self.sendError(stream, 405, "Method Not Allowed");
             stream.close();
             return;
+        }
+
+        // Auth check — all requests require a valid token in query param
+        if (self.auth_state) |auth_st| {
+            const raw_token = auth.extractTokenFromQuery(full_path);
+            var token_buf: [64]u8 = undefined;
+            const token = if (raw_token) |t| auth.decodeToken(&token_buf, t) else null;
+            const role = if (token) |t| auth_st.validateToken(t) else auth.Role.none;
+            if (role == .none) {
+                self.sendError(stream, 401, "Unauthorized");
+                stream.close();
+                return;
+            }
         }
 
         // Check for WebSocket upgrade

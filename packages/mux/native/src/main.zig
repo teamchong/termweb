@@ -1850,6 +1850,18 @@ const Server = struct {
         self.auth_state.deinit();
         self.transfer_manager.deinit();
         self.connection_roles.deinit();
+        // Free heap-allocated session IDs in connection_sessions
+        {
+            var it = self.connection_sessions.valueIterator();
+            while (it.next()) |v| self.allocator.free(v.*);
+        }
+        self.connection_sessions.deinit();
+        // Free heap-allocated session IDs in panel_assignments
+        {
+            var it = self.panel_assignments.valueIterator();
+            while (it.next()) |v| self.allocator.free(v.*);
+        }
+        self.panel_assignments.deinit();
         self.control_client_ids.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
         if (self.standard_clipboard) |clip| self.allocator.free(clip);
@@ -1984,6 +1996,15 @@ const Server = struct {
     fn onControlConnect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
 
+        // Check auth — deny remote connections without valid token
+        const role = self.getConnectionRole(conn);
+        if (role == .none) {
+            // Send auth state so client knows it's denied, then close
+            self.sendAuthState(conn);
+            conn.sendClose() catch {};
+            return;
+        }
+
         var is_new_main = false;
         var client_id: u32 = 0;
 
@@ -2004,7 +2025,9 @@ const Server = struct {
 
         // Resolve token → session_id and cache for multiplayer
         if (conn.request_uri) |uri| {
-            if (auth.extractTokenFromQuery(uri)) |token| {
+            if (auth.extractTokenFromQuery(uri)) |raw_token| {
+                var token_buf: [64]u8 = undefined;
+                const token = auth.decodeToken(&token_buf, raw_token);
                 if (auth.getSessionIdForToken(self.auth_state, token)) |session_id| {
                     const duped = self.allocator.dupe(u8, session_id) catch null;
                     if (duped) |s| {
@@ -2149,6 +2172,14 @@ const Server = struct {
 
     fn onFileConnect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
+
+        // Auth check — deny unauthenticated remote connections
+        const role = self.getConnectionRole(conn);
+        if (role == .none) {
+            conn.sendClose() catch {};
+            return;
+        }
+
         self.mutex.lock();
         self.file_connections.append(self.allocator, conn) catch {};
         self.mutex.unlock();
@@ -2203,6 +2234,13 @@ const Server = struct {
 
     fn onH264Connect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
+
+        // Auth check — deny unauthenticated remote connections
+        const role = self.getConnectionRole(conn);
+        if (role == .none) {
+            conn.sendClose() catch {};
+            return;
+        }
 
         self.mutex.lock();
         self.h264_connections.append(self.allocator, conn) catch {};
@@ -2678,21 +2716,18 @@ const Server = struct {
             return role;
         }
 
-        // Check token from connection URI
+        // Check token from connection URI query param (percent-decode for URL-encoded tokens)
         if (conn.request_uri) |uri| {
-            if (auth.extractTokenFromQuery(uri)) |token| {
+            if (auth.extractTokenFromQuery(uri)) |raw_token| {
+                var token_buf: [64]u8 = undefined;
+                const token = auth.decodeToken(&token_buf, raw_token);
                 const role = self.auth_state.validateToken(token);
-                // Cache the role
                 self.connection_roles.put(conn, role) catch {};
                 return role;
             }
         }
 
-        // No auth required = admin access
-        if (!self.auth_state.auth_required) {
-            return .admin;
-        }
-
+        // No valid token = no access
         return .none;
     }
 
@@ -6741,6 +6776,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
         null,
         server,
     );
+    server.http_server.auth_state = server.auth_state;
     if (comptime enable_benchmark) {
         server.http_server.api_callback = handleApiRequest;
         server.http_server.api_user_data = server;
@@ -6752,6 +6788,15 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
         .local => null,
         .tunnel => |p| p,
     };
+
+    // Generate auth tokens for URLs
+    // Admin token: for the person running the server (full access)
+    const admin_token = server.auth_state.createShareLink(.admin, null, null, null) catch null;
+    // Editor token: from default session (for sharing with coworkers)
+    const editor_token: ?[]const u8 = if (server.auth_state.getSession("default")) |session|
+        &session.editor_token
+    else
+        null;
 
     // Start tunnel if a provider was selected
     var tunnel: ?*tunnel_mod.Tunnel = null;
@@ -6771,8 +6816,17 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
                 if (t.process) |proc| tunnel_child_pid.store(proc.id, .release);
                 if (t.waitForUrl(15 * std.time.ns_per_s)) {
                     if (t.getUrl()) |url| {
-                        std.debug.print("  Tunnel:  {s}\n", .{url});
-                        tunnel_mod.printQrCode(allocator, url);
+                        if (editor_token) |token| {
+                            var enc_buf: [192]u8 = undefined;
+                            const enc_token = auth.percentEncodeToken(&enc_buf, token);
+                            const share_url = std.fmt.allocPrint(allocator, "{s}?token={s}", .{ url, enc_token }) catch url;
+                            defer if (share_url.ptr != url.ptr) allocator.free(share_url);
+                            std.debug.print("  Tunnel:  {s}\n", .{share_url});
+                            tunnel_mod.printQrCode(allocator, share_url);
+                        } else {
+                            std.debug.print("  Tunnel:  {s}\n", .{url});
+                            tunnel_mod.printQrCode(allocator, url);
+                        }
                     }
                 } else {
                     std.debug.print("  Tunnel:  failed (see errors above)\n", .{});
@@ -6785,14 +6839,31 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
     const lan_url = tunnel_mod.getLanUrl(allocator, http_port);
     defer if (lan_url) |u| allocator.free(u);
     if (lan_url) |url| {
-        std.debug.print("  LAN:     {s}\n", .{url});
-        // Show QR for LAN URL if no tunnel QR was shown
-        if (tunnel == null) {
-            tunnel_mod.printQrCode(allocator, url);
+        if (editor_token) |token| {
+            var enc_buf2: [192]u8 = undefined;
+            const enc_token2 = auth.percentEncodeToken(&enc_buf2, token);
+            const share_url = std.fmt.allocPrint(allocator, "{s}?token={s}", .{ url, enc_token2 }) catch url;
+            defer if (share_url.ptr != url.ptr) allocator.free(share_url);
+            std.debug.print("  LAN:     {s}\n", .{share_url});
+            if (tunnel == null) {
+                tunnel_mod.printQrCode(allocator, share_url);
+            }
+        } else {
+            std.debug.print("  LAN:     {s}\n", .{url});
+            if (tunnel == null) {
+                tunnel_mod.printQrCode(allocator, url);
+            }
         }
     }
 
-    std.debug.print("  Local:   http://localhost:{}\n", .{http_port});
+    // Local URL includes admin token (full access for the person running the server)
+    if (admin_token) |token| {
+        var enc_buf3: [192]u8 = undefined;
+        const enc_token3 = auth.percentEncodeToken(&enc_buf3, token);
+        std.debug.print("  Local:   http://localhost:{}?token={s}\n", .{ http_port, enc_token3 });
+    } else {
+        std.debug.print("  Local:   http://localhost:{}\n", .{http_port});
+    }
     std.debug.print("\nServer initialized, waiting for connections...\n", .{});
 
     try server.run();

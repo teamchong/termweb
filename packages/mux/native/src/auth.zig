@@ -227,15 +227,6 @@ pub const AuthState = struct {
     pub fn validateToken(self: *AuthState, token: []const u8) Role {
         if (token.len < 4) return .none;
 
-        // Check token prefix
-        const prefix = token[0..4];
-
-        // Check admin token (if auth not required, no admin token needed)
-        if (!self.auth_required) {
-            // No auth set up, everyone is admin
-            return .admin;
-        }
-
         // Check session tokens
         var iter = self.sessions.valueIterator();
         while (iter.next()) |session| {
@@ -259,7 +250,6 @@ pub const AuthState = struct {
             }
         }
 
-        _ = prefix;
         return .none;
     }
 
@@ -409,7 +399,7 @@ pub const AuthState = struct {
     
 
     pub fn save(self: *AuthState) !void {
-        var file = try fs.createFileAbsolute(self.config_path, .{});
+        var file = try fs.createFileAbsolute(self.config_path, .{ .mode = 0o600 });
         defer file.close();
 
         // Write JSON directly to file
@@ -595,12 +585,7 @@ pub const PasskeyCredential = struct {
 
 
 pub fn getRoleFromRequest(auth_state: *AuthState, token: ?[]const u8) Role {
-    // If no auth required, everyone is admin
-    if (!auth_state.auth_required) {
-        return .admin;
-    }
-
-    // Check token
+    // Check token — all connections must authenticate
     if (token) |t| {
         return auth_state.validateToken(t);
     }
@@ -623,6 +608,8 @@ pub fn getSessionIdForToken(auth_state: *AuthState, token: []const u8) ?[]const 
     return null;
 }
 
+/// Extract token from query string and percent-decode it into the provided buffer.
+/// Tokens may be URL-encoded (e.g. %2F for /) when passed through JS encodeURIComponent.
 pub fn extractTokenFromQuery(uri: []const u8) ?[]const u8 {
     // Look for ?token= or &token=
     const token_param = "token=";
@@ -636,4 +623,58 @@ pub fn extractTokenFromQuery(uri: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Percent-decode a token into a caller-provided buffer. Returns the decoded slice.
+/// Handles %XX sequences produced by encodeURIComponent (e.g. %2F → /, %2B → +, %3D → =).
+pub fn decodeToken(buf: *[64]u8, encoded: []const u8) []const u8 {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < encoded.len and out < buf.len) {
+        if (encoded[i] == '%' and i + 2 < encoded.len) {
+            const hi = hexVal(encoded[i + 1]);
+            const lo = hexVal(encoded[i + 2]);
+            if (hi != null and lo != null) {
+                buf[out] = (@as(u8, hi.?) << 4) | @as(u8, lo.?);
+                out += 1;
+                i += 3;
+                continue;
+            }
+        }
+        buf[out] = encoded[i];
+        out += 1;
+        i += 1;
+    }
+    return buf[0..out];
+}
+
+/// Percent-encode a token for safe inclusion in URLs.
+/// Encodes +, /, = and other non-unreserved characters.
+pub fn percentEncodeToken(out: *[192]u8, token: []const u8) []const u8 {
+    var o: usize = 0;
+    for (token) |c| {
+        if (o + 3 > out.len) break;
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~' => {
+                out[o] = c;
+                o += 1;
+            },
+            else => {
+                out[o] = '%';
+                out[o + 1] = "0123456789ABCDEF"[c >> 4];
+                out[o + 2] = "0123456789ABCDEF"[c & 0x0f];
+                o += 3;
+            },
+        }
+    }
+    return out[0..o];
+}
+
+fn hexVal(c: u8) ?u4 {
+    return switch (c) {
+        '0'...'9' => @intCast(c - '0'),
+        'a'...'f' => @intCast(c - 'a' + 10),
+        'A'...'F' => @intCast(c - 'A' + 10),
+        else => null,
+    };
 }
