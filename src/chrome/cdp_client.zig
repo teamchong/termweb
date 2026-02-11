@@ -7,6 +7,7 @@
 /// This separates high-bandwidth video from interactive input to prevent
 /// input lag when screencast frames are being transmitted.
 const std = @import("std");
+const builtin = @import("builtin");
 const cdp_pipe = @import("cdp_pipe.zig");
 const websocket_cdp = @import("websocket_cdp.zig");
 const json = @import("json");
@@ -79,15 +80,38 @@ pub const CdpClient = struct {
     browser_ws: ?*websocket_cdp.WebSocketCdpClient, // Browser-level for downloads
     page_ws_mutex: std.Thread.Mutex, // Protects page_ws reconnection
 
+    // Download temp directory (unique per process)
+    download_dir: [64]u8,
+    download_dir_len: u8,
+
     // Background reconnect - never blocks main thread
     reconnect_thread: ?std.Thread,
     reconnect_in_progress: std.atomic.Value(bool),
+
+    /// Get the download directory path as a slice
+    pub fn getDownloadDir(self: *const CdpClient) []const u8 {
+        return self.download_dir[0..self.download_dir_len];
+    }
+
+    /// Generate a unique download dir path: {TMPDIR}/termweb-dl-{pid}
+    fn makeDownloadDir() struct { buf: [64]u8, len: u8 } {
+        const tmp = std.posix.getenv("TMPDIR") orelse "/tmp";
+        const pid = if (comptime builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+        var buf: [64]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{s}/termweb-dl-{d}", .{ tmp, pid }) catch blk: {
+            // Fallback if TMPDIR is too long
+            break :blk std.fmt.bufPrint(&buf, "/tmp/termweb-dl-{d}", .{pid}) catch unreachable;
+        };
+        return .{ .buf = buf, .len = @intCast(slice.len) };
+    }
+
 
     /// Initialize CDP client from pipe file descriptors
     /// read_fd: FD to read from Chrome (Chrome's FD 4)
     /// write_fd: FD to write to Chrome (Chrome's FD 3)
     /// debug_port: Chrome's debugging port for WebSocket connections
     pub fn initFromPipe(allocator: std.mem.Allocator, read_fd: std.posix.fd_t, write_fd: std.posix.fd_t, debug_port: u16) !*CdpClient {
+        const dl_dir = makeDownloadDir();
         const client = try allocator.create(CdpClient);
         client.* = .{
             .allocator = allocator,
@@ -98,6 +122,8 @@ pub const CdpClient = struct {
             .page_ws = null,
             .browser_ws = null,
             .page_ws_mutex = .{},
+            .download_dir = dl_dir.buf,
+            .download_dir_len = dl_dir.len,
             .reconnect_thread = null,
             .reconnect_in_progress = std.atomic.Value(bool).init(false),
         };
@@ -106,7 +132,7 @@ pub const CdpClient = struct {
         try client.attachToPageTarget();
 
         // Create downloads directory
-        std.fs.makeDirAbsolute("/tmp/termweb-downloads") catch |err| {
+        std.fs.makeDirAbsolute(client.getDownloadDir()) catch |err| {
             if (err != error.PathAlreadyExists) {
                 logToFile("[CDP] Failed to create download dir: {}\n", .{err});
             }
@@ -207,7 +233,9 @@ pub const CdpClient = struct {
             if (client.browser_ws) |bws| {
                 try bws.startReaderThread();
                 // Async - no need to wait
-                bws.sendCommandAsync("Browser.setDownloadBehavior", "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}");
+                var dl_params_buf: [256]u8 = undefined;
+                const dl_params = std.fmt.bufPrint(&dl_params_buf, "{{\"behavior\":\"allowAndName\",\"downloadPath\":\"{s}\",\"eventsEnabled\":true}}", .{client.getDownloadDir()}) catch unreachable;
+                bws.sendCommandAsync("Browser.setDownloadBehavior", dl_params);
                 bws.sendCommandAsync("Target.setDiscoverTargets", "{\"discover\":true}");
             }
         } else |_| {}
@@ -217,6 +245,7 @@ pub const CdpClient = struct {
     /// Initialize CDP client using WebSocket-only mode
     /// All CDP communication including screencast goes through WebSocket
     pub fn initFromWebSocket(allocator: std.mem.Allocator, debug_port: u16) !*CdpClient {
+        const dl_dir = makeDownloadDir();
         const client = try allocator.create(CdpClient);
         client.* = .{
             .allocator = allocator,
@@ -227,12 +256,14 @@ pub const CdpClient = struct {
             .page_ws = null,
             .browser_ws = null,
             .page_ws_mutex = .{},
+            .download_dir = dl_dir.buf,
+            .download_dir_len = dl_dir.len,
             .reconnect_thread = null,
             .reconnect_in_progress = std.atomic.Value(bool).init(false),
         };
 
         // Create downloads directory
-        std.fs.makeDirAbsolute("/tmp/termweb-downloads") catch |err| {
+        std.fs.makeDirAbsolute(client.getDownloadDir()) catch |err| {
             if (err != error.PathAlreadyExists) {
                 logToFile("[CDP] Failed to create download dir: {}\n", .{err});
             }
@@ -297,7 +328,9 @@ pub const CdpClient = struct {
             if (client.browser_ws) |bws| {
                 try bws.startReaderThread();
                 // Async - no need to wait for response
-                bws.sendCommandAsync("Browser.setDownloadBehavior", "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}");
+                var dl_params_buf: [256]u8 = undefined;
+                const dl_params = std.fmt.bufPrint(&dl_params_buf, "{{\"behavior\":\"allowAndName\",\"downloadPath\":\"{s}\",\"eventsEnabled\":true}}", .{client.getDownloadDir()}) catch unreachable;
+                bws.sendCommandAsync("Browser.setDownloadBehavior", dl_params);
                 bws.sendCommandAsync("Target.setDiscoverTargets", "{\"discover\":true}");
             }
         } else |_| {}
@@ -742,7 +775,9 @@ pub const CdpClient = struct {
         try self.browser_ws.?.startReaderThread();
 
         // Re-enable async - no need to wait
-        self.browser_ws.?.sendCommandAsync("Browser.setDownloadBehavior", "{\"behavior\":\"allowAndName\",\"downloadPath\":\"/tmp/termweb-downloads\",\"eventsEnabled\":true}");
+        var dl_params_buf: [256]u8 = undefined;
+        const dl_params = std.fmt.bufPrint(&dl_params_buf, "{{\"behavior\":\"allowAndName\",\"downloadPath\":\"{s}\",\"eventsEnabled\":true}}", .{self.getDownloadDir()}) catch unreachable;
+        self.browser_ws.?.sendCommandAsync("Browser.setDownloadBehavior", dl_params);
         self.browser_ws.?.sendCommandAsync("Target.setDiscoverTargets", "{\"discover\":true}");
 
         logToFile("[CDP reconnectBrowserWS] Done\n", .{});

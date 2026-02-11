@@ -411,12 +411,15 @@ fn showLinuxFilePicker(allocator: std.mem.Allocator, mode: FilePickerMode, defau
 
 fn tryZenity(allocator: std.mem.Allocator, mode: FilePickerMode, default_name: ?[]const u8) !?[]const u8 {
     // Build argv based on mode
-    var argv_buf: [6][]const u8 = undefined;
+    var argv_buf: [8][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "zenity";
     argc += 1;
     argv_buf[argc] = "--file-selection";
+    argc += 1;
+    // Modal ensures dialog stays on top and grabs focus
+    argv_buf[argc] = "--modal";
     argc += 1;
 
     switch (mode) {

@@ -225,74 +225,121 @@ pub fn handleTargetInfoChanged(viewer: anytype, payload: []const u8) void {
     viewer.requestTabAdd(target_id, url, "", true); // auto_switch=true
 }
 
-/// Handle Browser.downloadWillBegin event
+/// Handle Browser.downloadWillBegin event — just register, no file picker.
+/// The file picker is shown after the download completes (in handleDownloadProgress).
 pub fn handleDownloadWillBegin(viewer: anytype, payload: []const u8) !void {
     viewer.log("[DOWNLOAD] downloadWillBegin: {s}\n", .{payload[0..@min(payload.len, 500)]});
 
     if (download_mod.parseDownloadWillBegin(payload)) |info| {
         viewer.log("[DOWNLOAD] guid={s} filename={s}\n", .{ info.guid, info.suggested_filename });
-
-        if (comptime builtin.os.tag == .linux) {
-            // On Linux: register the download without blocking on GUI picker.
-            // File will auto-save to ~/Downloads/ when download completes.
-            try viewer.download_manager.handleDownloadWillBeginAsync(
-                info.guid, info.url, info.suggested_filename,
-            );
-        } else {
-            // macOS: use native osascript file picker (works without display server)
-            try viewer.download_manager.handleDownloadWillBegin(
-                info.guid,
-                info.url,
-                info.suggested_filename,
-            );
-        }
+        try viewer.download_manager.handleDownloadWillBegin(
+            info.guid, info.url, info.suggested_filename,
+        );
     }
 }
 
-/// Handle Browser.downloadProgress event
+/// Handle Browser.downloadProgress event — handle completed downloads
 pub fn handleDownloadProgress(viewer: anytype, payload: []const u8) !void {
     if (download_mod.parseDownloadProgress(payload)) |info| {
         viewer.log("[DOWNLOAD] progress: guid={s} state={s} {d}/{d} bytes\n", .{
             info.guid, info.state, info.received_bytes, info.total_bytes,
         });
 
-        // On Linux: capture filename before handleDownloadProgress removes the download,
-        // so we can notify the user where the file was saved
-        var notify_filename_buf: [256]u8 = undefined;
-        var notify_filename_len: usize = 0;
-        if (comptime builtin.os.tag == .linux) {
-            if (std.mem.eql(u8, info.state, "completed")) {
-                if (viewer.download_manager.downloads.get(info.guid)) |dl| {
-                    notify_filename_len = @min(dl.suggested_filename.len, 256);
-                    @memcpy(notify_filename_buf[0..notify_filename_len], dl.suggested_filename[0..notify_filename_len]);
-                }
-            }
-        }
-
-        try viewer.download_manager.handleDownloadProgress(
+        const completed = viewer.download_manager.handleDownloadProgress(
             info.guid,
             info.state,
             info.received_bytes,
             info.total_bytes,
         );
 
-        if (std.mem.eql(u8, info.state, "completed")) {
-            viewer.log("[DOWNLOAD] completed\n", .{});
-            // On Linux: notify viewer with the save path (file was auto-saved to ~/Downloads/)
-            if (comptime builtin.os.tag == .linux) {
-                if (notify_filename_len > 0) {
-                    const home = std.posix.getenv("HOME") orelse "/tmp";
-                    var path_buf: [512]u8 = undefined;
-                    const save_path = std.fmt.bufPrint(&path_buf, "{s}/Downloads/{s}", .{
-                        home, notify_filename_buf[0..notify_filename_len],
-                    }) catch notify_filename_buf[0..notify_filename_len];
-                    viewer.notifyDownloadComplete(save_path);
+        if (completed) |dl| {
+            defer viewer.download_manager.allocator.free(dl.suggested_filename);
+            // Defer source_path cleanup — will be freed after we're done with it
+            var source_freed = false;
+            defer if (!source_freed) viewer.download_manager.allocator.free(dl.source_path);
+
+            viewer.log("[DOWNLOAD] completed: temp={s} filename={s}\n", .{ dl.source_path, dl.suggested_filename });
+
+            if (comptime builtin.os.tag == .macos) {
+                // macOS: show native osascript save dialog (built-in, no dependency)
+                const dialog_mod = @import("../ui/dialog.zig");
+                const save_path = dialog_mod.showNativeFilePickerWithName(
+                    viewer.download_manager.allocator,
+                    .save,
+                    dl.suggested_filename,
+                ) catch null;
+
+                if (save_path) |path| {
+                    defer viewer.download_manager.allocator.free(path);
+                    download_mod.copyFile(dl.source_path, path) catch |err| {
+                        viewer.log("[DOWNLOAD] copyFile failed: {}\n", .{err});
+                    };
+                    viewer.notifyDownloadComplete(path);
                 }
+                // Always delete temp file
+                std.fs.deleteFileAbsolute(dl.source_path) catch {};
+            } else {
+                // Linux: keep file in temp dir, copy path to clipboard via OSC 52
+                copyToClipboardOsc52(dl.source_path);
+                viewer.notifyDownloadComplete(dl.source_path);
+                source_freed = true; // caller keeps the temp file
             }
+
+            // Reset viewport after download to fix Chrome's layout
+            screenshot_api.setViewport(viewer.cdp_client, viewer.download_manager.allocator, viewer.viewport_width, viewer.viewport_height, viewer.dpr) catch |err| {
+                viewer.log("[DOWNLOAD] Viewport reset failed: {}\n", .{err});
+            };
         } else if (std.mem.eql(u8, info.state, "canceled")) {
             viewer.log("[DOWNLOAD] canceled\n", .{});
         }
     }
+}
+
+/// Copy text to system clipboard via OSC 52 escape sequence (zero dependency).
+/// Works in any terminal that supports OSC 52 (Ghostty, Kitty, iTerm2, etc.)
+fn copyToClipboardOsc52(text: []const u8) void {
+    const base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const stdout = std.fs.File.stdout();
+
+    // Write OSC 52 header
+    stdout.writeAll("\x1b]52;c;") catch return;
+
+    // Base64 encode the text inline (no allocation needed)
+    var i: usize = 0;
+    while (i < text.len) {
+        const remaining = text.len - i;
+        var buf: [4]u8 = undefined;
+
+        if (remaining >= 3) {
+            const b0 = text[i];
+            const b1 = text[i + 1];
+            const b2 = text[i + 2];
+            buf[0] = base64_alphabet[b0 >> 2];
+            buf[1] = base64_alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+            buf[2] = base64_alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)];
+            buf[3] = base64_alphabet[b2 & 0x3f];
+            i += 3;
+        } else if (remaining == 2) {
+            const b0 = text[i];
+            const b1 = text[i + 1];
+            buf[0] = base64_alphabet[b0 >> 2];
+            buf[1] = base64_alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+            buf[2] = base64_alphabet[(b1 & 0x0f) << 2];
+            buf[3] = '=';
+            i += 2;
+        } else {
+            const b0 = text[i];
+            buf[0] = base64_alphabet[b0 >> 2];
+            buf[1] = base64_alphabet[(b0 & 0x03) << 4];
+            buf[2] = '=';
+            buf[3] = '=';
+            i += 1;
+        }
+        stdout.writeAll(&buf) catch return;
+    }
+
+    // Write OSC 52 terminator
+    stdout.writeAll("\x1b\\") catch return;
 }
 
 /// Handle console messages - look for termweb markers

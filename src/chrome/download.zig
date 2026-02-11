@@ -4,10 +4,9 @@
 /// - Enable downloads with Browser.setDownloadBehavior
 /// - Handle Page.downloadWillBegin events
 /// - Handle Browser.downloadProgress events
-/// - Prompt user for save location and copy downloaded file
+/// - Track downloads and signal completion to the viewer for save prompt
 const std = @import("std");
 const cdp = @import("cdp_client.zig");
-const dialog = @import("../ui/dialog.zig");
 
 /// Download state tracking
 pub const DownloadState = struct {
@@ -25,18 +24,24 @@ pub const DownloadState = struct {
     };
 };
 
+/// Info about a completed download, returned to the caller for save prompt.
+/// The temp file at source_path is owned by the caller — they must either
+/// copy it somewhere or delete it.
+pub const CompletedDownload = struct {
+    source_path: []const u8, // owned, caller must free
+    suggested_filename: []const u8, // owned, caller must free
+};
+
 /// Active downloads tracking
 pub const DownloadManager = struct {
     allocator: std.mem.Allocator,
     downloads: std.StringHashMap(DownloadState),
-    save_paths: std.StringHashMap([]const u8), // guid -> user's chosen save path
     download_path: []const u8, // Chrome's temp download directory
 
     pub fn init(allocator: std.mem.Allocator, download_path: []const u8) DownloadManager {
         return .{
             .allocator = allocator,
             .downloads = std.StringHashMap(DownloadState).init(allocator),
-            .save_paths = std.StringHashMap([]const u8).init(allocator),
             .download_path = download_path,
         };
     }
@@ -49,47 +54,16 @@ pub const DownloadManager = struct {
             self.allocator.free(entry.value_ptr.suggested_filename);
         }
         self.downloads.deinit();
-        var path_iter = self.save_paths.iterator();
-        while (path_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.save_paths.deinit();
     }
 
-    /// Register download tracking without blocking on file picker.
-    /// Used on Linux where the save path prompt is shown in the viewer toolbar.
-    pub fn handleDownloadWillBeginAsync(
-        self: *DownloadManager,
-        guid: []const u8,
-        url: []const u8,
-        suggested_filename: []const u8,
-    ) !void {
-        const guid_copy = try self.allocator.dupe(u8, guid);
-        const url_copy = try self.allocator.dupe(u8, url);
-        const filename_copy = try self.allocator.dupe(u8, suggested_filename);
-
-        try self.downloads.put(guid_copy, .{
-            .guid = guid_copy,
-            .url = url_copy,
-            .suggested_filename = filename_copy,
-            .state = .in_progress,
-            .received_bytes = 0,
-            .total_bytes = 0,
-        });
-        // save_path will be set later by the viewer's download prompt
-    }
-
-    /// Handle downloadWillBegin - show save dialog, track download
+    /// Register download tracking. No UI is shown here — the viewer handles
+    /// the save prompt after the download completes.
     pub fn handleDownloadWillBegin(
         self: *DownloadManager,
         guid: []const u8,
         url: []const u8,
         suggested_filename: []const u8,
     ) !void {
-        // Ask user where to save FIRST
-        const save_path = dialog.showNativeFilePickerWithName(self.allocator, .save, suggested_filename) catch null;
-
         const guid_copy = try self.allocator.dupe(u8, guid);
         const url_copy = try self.allocator.dupe(u8, url);
         const filename_copy = try self.allocator.dupe(u8, suggested_filename);
@@ -102,101 +76,93 @@ pub const DownloadManager = struct {
             .received_bytes = 0,
             .total_bytes = 0,
         });
-
-        // Store save path if user picked one
-        if (save_path) |path| {
-            const guid_for_path = try self.allocator.dupe(u8, guid);
-            try self.save_paths.put(guid_for_path, path);
-        }
     }
 
-    /// Handle downloadProgress event - track progress and copy file when complete
+    /// Handle downloadProgress event. When completed, returns a CompletedDownload
+    /// with the temp file path and suggested filename. The caller owns both strings
+    /// and the temp file — they must copy/delete it and free the strings.
+    /// Returns null for in-progress or canceled downloads.
     pub fn handleDownloadProgress(
         self: *DownloadManager,
         guid: []const u8,
         state: []const u8,
         received_bytes: u64,
         total_bytes: u64,
-    ) !void {
-        if (self.downloads.getPtr(guid)) |download| {
-            download.received_bytes = received_bytes;
-            download.total_bytes = total_bytes;
+    ) ?CompletedDownload {
+        const download = self.downloads.getPtr(guid) orelse return null;
 
-            if (std.mem.eql(u8, state, "completed")) {
-                download.state = .completed;
+        download.received_bytes = received_bytes;
+        download.total_bytes = total_bytes;
 
-                // Build temp file path (Chrome saves with GUID)
-                const source_path = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/{s}",
-                    .{ self.download_path, guid },
-                ) catch return;
-                defer self.allocator.free(source_path);
+        if (std.mem.eql(u8, state, "completed")) {
+            download.state = .completed;
 
-                // Copy to user's chosen location, or fallback to ~/Downloads/
-                if (self.save_paths.fetchRemove(guid)) |entry| {
-                    const save_path = entry.value;
-                    defer self.allocator.free(save_path);
-                    defer self.allocator.free(entry.key);
-                    copyFile(source_path, save_path) catch {};
-                } else {
-                    // No save path set — fallback to ~/Downloads/{filename}
-                    if (self.downloads.get(guid)) |dl| {
-                        const home = std.posix.getenv("HOME") orelse "/tmp";
-                        const fallback = std.fmt.allocPrint(self.allocator, "{s}/Downloads/{s}", .{ home, dl.suggested_filename }) catch null;
-                        if (fallback) |fb_path| {
-                            defer self.allocator.free(fb_path);
-                            // Ensure ~/Downloads/ exists
-                            if (std.mem.lastIndexOfScalar(u8, fb_path, '/')) |sep| {
-                                std.fs.makeDirAbsolute(fb_path[0..sep]) catch |err| switch (err) {
-                                    error.PathAlreadyExists => {},
-                                    else => {},
-                                };
-                            }
-                            copyFile(source_path, fb_path) catch {};
-                        }
-                    }
-                }
-                // Delete temp file
-                std.fs.deleteFileAbsolute(source_path) catch {};
+            // Build temp file path (Chrome saves with GUID as filename)
+            const source_path = std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ self.download_path, guid },
+            ) catch return null;
 
-                // Remove from tracking
-                if (self.downloads.fetchRemove(guid)) |entry| {
-                    self.allocator.free(entry.key);
-                    self.allocator.free(entry.value.url);
-                    self.allocator.free(entry.value.suggested_filename);
-                }
-            } else if (std.mem.eql(u8, state, "canceled")) {
-                download.state = .canceled;
-                // Delete temp file
-                const source_path = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/{s}",
-                    .{ self.download_path, guid },
-                ) catch return;
-                defer self.allocator.free(source_path);
-                std.fs.deleteFileAbsolute(source_path) catch {};
+            // Copy suggested filename before removing from tracking
+            const filename = self.allocator.dupe(u8, download.suggested_filename) catch {
+                self.allocator.free(source_path);
+                return null;
+            };
 
-                // Clean up save path if exists
-                if (self.save_paths.fetchRemove(guid)) |entry| {
-                    self.allocator.free(entry.key);
-                    self.allocator.free(entry.value);
-                }
-
-                if (self.downloads.fetchRemove(guid)) |entry| {
-                    self.allocator.free(entry.key);
-                    self.allocator.free(entry.value.url);
-                    self.allocator.free(entry.value.suggested_filename);
-                }
+            // Remove from tracking (frees the tracking copies)
+            if (self.downloads.fetchRemove(guid)) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value.url);
+                self.allocator.free(entry.value.suggested_filename);
             }
+
+            return .{
+                .source_path = source_path,
+                .suggested_filename = filename,
+            };
+        } else if (std.mem.eql(u8, state, "canceled")) {
+            download.state = .canceled;
+
+            // Delete temp file
+            const source_path = std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ self.download_path, guid },
+            ) catch {
+                self.removeDownload(guid);
+                return null;
+            };
+            defer self.allocator.free(source_path);
+            std.fs.deleteFileAbsolute(source_path) catch {};
+
+            self.removeDownload(guid);
+        }
+
+        return null;
+    }
+
+    fn removeDownload(self: *DownloadManager, guid: []const u8) void {
+        if (self.downloads.fetchRemove(guid)) |entry| {
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value.url);
+            self.allocator.free(entry.value.suggested_filename);
         }
     }
 };
 
 /// Copy a file from source to destination
-fn copyFile(source: []const u8, dest: []const u8) !void {
+pub fn copyFile(source: []const u8, dest: []const u8) !void {
     const source_file = try std.fs.openFileAbsolute(source, .{});
     defer source_file.close();
+
+    // Ensure parent directory exists
+    if (std.mem.lastIndexOfScalar(u8, dest, '/')) |sep| {
+        std.fs.makeDirAbsolute(dest[0..sep]) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
 
     const dest_file = try std.fs.createFileAbsolute(dest, .{});
     defer dest_file.close();

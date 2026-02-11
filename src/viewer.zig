@@ -426,7 +426,7 @@ pub const Viewer = struct {
             .last_clipboard_sync = 0,
             .last_clipboard_hash = 0,
             .allowed_fs_roots = try std.ArrayList([]const u8).initCapacity(allocator, 0),
-            .download_manager = download_mod.DownloadManager.init(allocator, "/tmp/termweb-downloads"),
+            .download_manager = download_mod.DownloadManager.init(allocator, cdp_client.getDownloadDir()),
         };
     }
 
@@ -1557,9 +1557,13 @@ pub const Viewer = struct {
                 if (maybe_event) |*event| {
                     var evt = event.*;
                     defer evt.deinit();
-                    cdp_events_mod.handleCdpEvent(self, &evt) catch {};
+                    cdp_events_mod.handleCdpEvent(self, &evt) catch |err| {
+                        self.log("[CDP ERROR] handleCdpEvent failed for {s}: {}\n", .{ evt.method, err });
+                    };
                 }
-            } else |_| {}
+            } else |err| {
+                self.log("[CDP ERROR] nextEvent failed: {}\n", .{err});
+            }
             std.Thread.sleep(2 * std.time.ns_per_ms);
         }
     }
@@ -1788,7 +1792,7 @@ pub const Viewer = struct {
         self.log("[HINT] Exited hint mode, cleared {} hint images\n", .{hint_count});
     }
 
-    /// Handle Browser.downloadWillBegin event - prompt user for save location
+    /// Handle Browser.downloadWillBegin event — just register, no file picker
     fn handleDownloadWillBegin(self: *Viewer, payload: []const u8) !void {
         self.log("[DOWNLOAD] downloadWillBegin: {s}\n", .{payload[0..@min(payload.len, 500)]});
 
@@ -1802,26 +1806,31 @@ pub const Viewer = struct {
         }
     }
 
-    /// Handle Browser.downloadProgress event - track progress and move file when complete
+    /// Handle Browser.downloadProgress event — prompt user for save location when complete
     fn handleDownloadProgress(self: *Viewer, payload: []const u8) !void {
         if (download_mod.parseDownloadProgress(payload)) |info| {
             self.log("[DOWNLOAD] progress: guid={s} state={s} {d}/{d} bytes\n", .{
                 info.guid, info.state, info.received_bytes, info.total_bytes,
             });
-            try self.download_manager.handleDownloadProgress(
+            const completed = self.download_manager.handleDownloadProgress(
                 info.guid,
                 info.state,
                 info.received_bytes,
                 info.total_bytes,
             );
 
-            // Reset viewport after download completes to fix Chrome's layout
-            if (std.mem.eql(u8, info.state, "completed")) {
-                self.log("[DOWNLOAD] Complete - resetting viewport to fix layout\n", .{});
+            if (completed) |dl| {
+                defer self.allocator.free(dl.source_path);
+                defer self.allocator.free(dl.suggested_filename);
+                self.log("[DOWNLOAD] Saved to: {s}\n", .{dl.source_path});
+                self.notifyDownloadComplete(dl.source_path);
+
+                // Reset viewport after download to fix Chrome's layout
                 screenshot_api.setViewport(self.cdp_client, self.allocator, self.viewport_width, self.viewport_height, self.dpr) catch |err| {
                     self.log("[DOWNLOAD] Viewport reset failed: {}\n", .{err});
                 };
-                // Frame dimensions from screencast will update automatically
+            } else if (std.mem.eql(u8, info.state, "canceled")) {
+                self.log("[DOWNLOAD] Download canceled\n", .{});
             }
         }
     }
