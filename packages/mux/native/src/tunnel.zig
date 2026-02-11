@@ -21,7 +21,7 @@ pub const Provider = enum {
 
     pub fn label(self: Provider) []const u8 {
         return switch (self) {
-            .tailscale => "Tailscale Funnel",
+            .tailscale => "Tailscale Serve",
             .cloudflare => "Cloudflare Tunnel",
             .ngrok => "ngrok",
         };
@@ -181,15 +181,15 @@ fn promptConnectionModeFallback() ?Provider {
     return null;
 }
 
-/// Get the tailscale funnel URL from `tailscale funnel status`.
+/// Get the tailscale serve URL from `tailscale serve status`.
 /// Returns an allocated string or null.
 fn getTailscaleStatusUrl(allocator: std.mem.Allocator) ?[]const u8 {
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "tailscale", "funnel", "status" },
+        .argv = &.{ "tailscale", "serve", "status" },
     }) catch return null;
     defer allocator.free(result.stderr);
-    // tailscale funnel status outputs to stdout: "https://hostname.ts.net (tailnet only)\n|-- ..."
+    // tailscale serve status outputs to stdout: "https://hostname.ts.net (tailnet only)\n|-- ..."
     defer allocator.free(result.stdout);
     if (result.stdout.len == 0) return null;
 
@@ -206,6 +206,36 @@ fn getTailscaleStatusUrl(allocator: std.mem.Allocator) ?[]const u8 {
     if (end <= marker.len) return null;
 
     return allocator.dupe(u8, rest[0..end]) catch null;
+}
+
+/// Validate that the tailscale serve proxy port matches the expected server port.
+/// Warns the user if there's a stale config pointing to the wrong port.
+fn validateTailscaleFunnelPort(allocator: std.mem.Allocator, expected_port: u16) void {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "tailscale", "serve", "status" },
+    }) catch return;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+
+    // Look for "proxy http://localhost:<port>" in the output
+    const proxy_marker = "proxy http://localhost:";
+    const pos = std.mem.indexOf(u8, result.stdout, proxy_marker) orelse return;
+    const num_start = pos + proxy_marker.len;
+    var num_end = num_start;
+    while (num_end < result.stdout.len and result.stdout[num_end] >= '0' and result.stdout[num_end] <= '9') : (num_end += 1) {}
+    if (num_end == num_start) return;
+    const configured_port = std.fmt.parseInt(u16, result.stdout[num_start..num_end], 10) catch return;
+
+    if (configured_port != expected_port) {
+        std.debug.print(
+            "\n  WARNING: Tailscale serve is proxying to port {}, but server is on port {}.\n" ++
+            "  The tunnel URL will NOT work until this is fixed.\n" ++
+            "  Fix: sudo tailscale serve reset && sudo tailscale up --operator=$USER\n" ++
+            "  Then restart termweb.\n\n",
+            .{ configured_port, expected_port },
+        );
+    }
 }
 
 /// Print a JSON error string, replacing literal \n with real newlines and trimming \r.
@@ -316,8 +346,16 @@ pub const Tunnel = struct {
 
         switch (provider) {
             .tailscale => {
+                // Reset any stale background serve config (e.g. from a previous port).
+                // Without this, `tailscale serve <port>` fails with
+                // "background configuration already exists".
+                _ = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &.{ "tailscale", "serve", "reset" },
+                }) catch {};
+
                 argv[0] = "tailscale";
-                argv[1] = "funnel";
+                argv[1] = "serve";
                 argv[2] = port_str;
                 argc = 3;
             },
@@ -351,7 +389,7 @@ pub const Tunnel = struct {
         // If the unused pipe fills up, the subprocess blocks forever.
         switch (provider) {
             .cloudflare, .tailscale => {
-                // cloudflared outputs URL on stderr; tailscale funnel outputs to stderr too
+                // cloudflared outputs URL on stderr; tailscale serve outputs to stderr too
                 process.stderr_behavior = .Pipe;
                 process.stdout_behavior = .Ignore;
             },
@@ -370,8 +408,8 @@ pub const Tunnel = struct {
             .allocator = allocator,
         };
 
-        // For tailscale, also try getting URL from `tailscale funnel status`
-        // (works even when funnel was already configured as a background service)
+        // For tailscale, also try getting URL from `tailscale serve status`
+        // (works even when serve was already configured as a background service)
         if (provider == .tailscale) {
             if (getTailscaleStatusUrl(allocator)) |url| {
                 const len = @min(url.len, tun.public_url.len);
@@ -379,8 +417,11 @@ pub const Tunnel = struct {
                 tun.url_len = len;
                 tun.url_ready.set();
                 allocator.free(url);
-                // Still spawn the reader thread to drain stderr
             }
+
+            // Validate that the serve proxy port matches the server port.
+            // A stale background config can proxy to the wrong port silently.
+            validateTailscaleFunnelPort(allocator, port);
         }
 
         tun.reader_thread = std.Thread.spawn(.{}, readerThread, .{tun}) catch null;
@@ -409,6 +450,14 @@ pub const Tunnel = struct {
         }
 
         _ = self.process.wait() catch {};
+
+        // Reset tailscale serve config to avoid leaving stale port mappings
+        if (self.provider == .tailscale) {
+            _ = std.process.Child.run(.{
+                .allocator = self.allocator,
+                .argv = &.{ "tailscale", "serve", "reset" },
+            }) catch {};
+        }
 
         self.allocator.destroy(self);
     }

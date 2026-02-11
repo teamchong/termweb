@@ -1575,6 +1575,9 @@ const Server = struct {
     bw_control_bytes_sent: if (enable_benchmark) std.atomic.Value(u64) else void,
     bw_control_bytes_recv: if (enable_benchmark) std.atomic.Value(u64) else void,
     bw_raw_pixels_bytes: if (enable_benchmark) std.atomic.Value(u64) else void,
+    bw_vt_bytes: if (enable_benchmark) std.atomic.Value(u64) else void,     // VT bytes from child processes (via /proc)
+    bw_commands: if (enable_benchmark) [32][17:0]u8 else void,              // Recent unique command names (null-terminated)
+    bw_commands_len: if (enable_benchmark) std.atomic.Value(u32) else void, // Number of unique commands seen
     bw_start_time: if (enable_benchmark) std.atomic.Value(i64) else void,
 
     var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
@@ -1686,6 +1689,9 @@ const Server = struct {
             .bw_control_bytes_sent = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
             .bw_control_bytes_recv = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
             .bw_raw_pixels_bytes = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
+            .bw_vt_bytes = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
+            .bw_commands = if (enable_benchmark) [_][17:0]u8{[_:0]u8{0} ** 17} ** 32 else {},
+            .bw_commands_len = if (enable_benchmark) std.atomic.Value(u32).init(0) else {},
             .bw_start_time = if (enable_benchmark) std.atomic.Value(i64).init(@truncate(std.time.nanoTimestamp())) else {},
         };
 
@@ -5341,21 +5347,24 @@ const Server = struct {
                             _ = f.write(line) catch {};
 
                             if (comptime enable_benchmark) {
+                                scanChildVtBytes(self);
                                 const bw_h264 = self.bw_h264_bytes.load(.monotonic);
                                 const bw_h264_frames = self.bw_h264_frames.load(.monotonic);
                                 const bw_ctrl_sent = self.bw_control_bytes_sent.load(.monotonic);
                                 const bw_ctrl_recv = self.bw_control_bytes_recv.load(.monotonic);
                                 const bw_raw_px = self.bw_raw_pixels_bytes.load(.monotonic);
+                                const bw_vt = self.bw_vt_bytes.load(.monotonic);
                                 const bw_now2: i64 = @truncate(std.time.nanoTimestamp());
                                 const elapsed_s: u64 = @intCast(@divFloor(bw_now2 - self.bw_start_time.load(.monotonic), std.time.ns_per_s));
                                 var bw_buf: [512]u8 = undefined;
-                                const bw_line = std.fmt.bufPrint(&bw_buf, "BW t={d}s h264={d}KB/{d}frames ctrl_out={d}KB ctrl_in={d}KB raw_px={d}MB total_ws={d}KB\n", .{
+                                const bw_line = std.fmt.bufPrint(&bw_buf, "BW t={d}s h264={d}KB/{d}frames ctrl_out={d}KB ctrl_in={d}KB raw_px={d}MB vt={d}KB total_ws={d}KB\n", .{
                                     elapsed_s,
                                     bw_h264 / 1024,
                                     bw_h264_frames,
                                     bw_ctrl_sent / 1024,
                                     bw_ctrl_recv / 1024,
                                     bw_raw_px / (1024 * 1024),
+                                    bw_vt / 1024,
                                     (bw_h264 + bw_ctrl_sent) / 1024,
                                 }) catch "";
                                 _ = f.write(bw_line) catch {};
@@ -6469,6 +6478,139 @@ fn onFileWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*any
     server.file_ws_server.handleUpgrade(stream, request);
 }
 
+/// Scan /proc for descendant processes and sum their wchar (VT bytes written to PTY).
+/// Also collects command names from /proc/[pid]/comm.
+/// Only compiled when benchmark is enabled.
+fn scanChildVtBytes(self: *Server) void {
+    if (comptime !enable_benchmark) return;
+
+    const our_pid = std.os.linux.getpid();
+
+    // Read all (pid, ppid) pairs from /proc
+    const Entry = struct { pid: i32, ppid: i32 };
+    var entries: [2048]Entry = undefined;
+    var entry_count: usize = 0;
+
+    var proc_dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return;
+    defer proc_dir.close();
+
+    var iter = proc_dir.iterate();
+    while (iter.next() catch null) |dent| {
+        if (dent.kind != .directory) continue;
+        const pid = std.fmt.parseInt(i32, dent.name, 10) catch continue;
+
+        // Read /proc/[pid]/stat to get ppid
+        var stat_path_buf: [64]u8 = undefined;
+        const stat_path = std.fmt.bufPrint(&stat_path_buf, "/proc/{d}/stat", .{pid}) catch continue;
+        const stat_file = std.fs.openFileAbsolute(stat_path, .{}) catch continue;
+        defer stat_file.close();
+        var stat_buf: [512]u8 = undefined;
+        const stat_len = stat_file.read(&stat_buf) catch continue;
+        if (stat_len == 0) continue;
+        const stat_str = stat_buf[0..stat_len];
+
+        // Parse ppid: format is "pid (comm) state ppid ..."
+        // Find last ')' to handle comm with spaces/parens
+        const last_paren = std.mem.lastIndexOfScalar(u8, stat_str, ')') orelse continue;
+        if (last_paren + 4 >= stat_len) continue;
+        var rest = stat_str[last_paren + 2 ..]; // skip ") "
+        // Skip state field
+        const sp1 = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+        rest = rest[sp1 + 1 ..]; // now at ppid
+        const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        const ppid = std.fmt.parseInt(i32, rest[0..sp2], 10) catch continue;
+
+        if (entry_count < entries.len) {
+            entries[entry_count] = .{ .pid = pid, .ppid = ppid };
+            entry_count += 1;
+        }
+    }
+
+    // Build descendant set: start from our_pid, expand via ppid links
+    var desc_pids: [256]i32 = undefined;
+    var desc_count: usize = 0;
+    desc_pids[0] = our_pid;
+    desc_count = 1;
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (entries[0..entry_count]) |e| {
+            // Is e.ppid in our descendant set?
+            var ppid_match = false;
+            for (desc_pids[0..desc_count]) |d| {
+                if (d == e.ppid) { ppid_match = true; break; }
+            }
+            if (!ppid_match) continue;
+            // Is e.pid already in set?
+            var already = false;
+            for (desc_pids[0..desc_count]) |d| {
+                if (d == e.pid) { already = true; break; }
+            }
+            if (already) continue;
+            if (desc_count < desc_pids.len) {
+                desc_pids[desc_count] = e.pid;
+                desc_count += 1;
+                changed = true;
+            }
+        }
+    }
+
+    // Sum wchar for all descendants (excluding ourselves)
+    var total_wchar: u64 = 0;
+    for (desc_pids[0..desc_count]) |pid| {
+        if (pid == our_pid) continue;
+
+        // Read /proc/[pid]/io for wchar
+        var io_path_buf: [64]u8 = undefined;
+        const io_path = std.fmt.bufPrint(&io_path_buf, "/proc/{d}/io", .{pid}) catch continue;
+        const io_file = std.fs.openFileAbsolute(io_path, .{}) catch continue;
+        defer io_file.close();
+        var io_buf: [256]u8 = undefined;
+        const io_len = io_file.read(&io_buf) catch continue;
+        const io_str = io_buf[0..io_len];
+
+        // Find "wchar: <number>"
+        if (std.mem.indexOf(u8, io_str, "wchar: ")) |pos| {
+            const num_start = pos + 7;
+            var num_end = num_start;
+            while (num_end < io_str.len and io_str[num_end] >= '0' and io_str[num_end] <= '9') : (num_end += 1) {}
+            total_wchar += std.fmt.parseInt(u64, io_str[num_start..num_end], 10) catch 0;
+        }
+
+        // Read /proc/[pid]/comm for command name
+        var comm_path_buf: [64]u8 = undefined;
+        const comm_path = std.fmt.bufPrint(&comm_path_buf, "/proc/{d}/comm", .{pid}) catch continue;
+        const comm_file = std.fs.openFileAbsolute(comm_path, .{}) catch continue;
+        defer comm_file.close();
+        var comm_buf: [17]u8 = undefined;
+        const comm_len = comm_file.read(&comm_buf) catch continue;
+        if (comm_len == 0) continue;
+        // Strip trailing newline
+        const name_len = if (comm_len > 0 and comm_buf[comm_len - 1] == '\n') comm_len - 1 else comm_len;
+        if (name_len == 0) continue;
+        const name = comm_buf[0..name_len];
+
+        // Add to unique commands list if not already present
+        const cmd_count = self.bw_commands_len.load(.monotonic);
+        var found = false;
+        for (self.bw_commands[0..cmd_count]) |*existing| {
+            const existing_len = std.mem.indexOfScalar(u8, existing, 0) orelse existing.len;
+            if (existing_len == name_len and std.mem.eql(u8, existing[0..existing_len], name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found and cmd_count < 32) {
+            @memcpy(self.bw_commands[cmd_count][0..name_len], name);
+            self.bw_commands[cmd_count][name_len] = 0;
+            _ = self.bw_commands_len.fetchAdd(1, .monotonic);
+        }
+    }
+
+    self.bw_vt_bytes.store(total_wchar, .monotonic);
+}
+
 /// Handle API requests (e.g., /api/benchmark/stats).
 /// Only reachable when -Dbenchmark is set (callback gated at setup).
 fn handleApiRequest(path: []const u8, user_data: ?*anyopaque) ?[]const u8 {
@@ -6481,15 +6623,41 @@ fn handleApiRequest(path: []const u8, user_data: ?*anyopaque) ?[]const u8 {
         const ctrl_sent = server.bw_control_bytes_sent.load(.monotonic);
         const ctrl_recv = server.bw_control_bytes_recv.load(.monotonic);
         const raw_px = server.bw_raw_pixels_bytes.load(.monotonic);
+        const vt_bytes = server.bw_vt_bytes.load(.monotonic);
         const bw_now: i64 = @truncate(std.time.nanoTimestamp());
         const elapsed_ns: u64 = @intCast(bw_now - server.bw_start_time.load(.monotonic));
         const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
 
+        // Build commands JSON array
+        const cmd_count = server.bw_commands_len.load(.monotonic);
+        var cmd_json_buf: [1024]u8 = undefined;
+        var cmd_json_len: usize = 0;
+        cmd_json_buf[0] = '[';
+        cmd_json_len = 1;
+        for (0..cmd_count) |i| {
+            const cmd = &server.bw_commands[i];
+            const cmd_len = std.mem.indexOfScalar(u8, cmd, 0) orelse cmd.len;
+            if (cmd_len == 0) continue;
+            if (cmd_json_len > 1) {
+                cmd_json_buf[cmd_json_len] = ',';
+                cmd_json_len += 1;
+            }
+            cmd_json_buf[cmd_json_len] = '"';
+            cmd_json_len += 1;
+            @memcpy(cmd_json_buf[cmd_json_len..][0..cmd_len], cmd[0..cmd_len]);
+            cmd_json_len += cmd_len;
+            cmd_json_buf[cmd_json_len] = '"';
+            cmd_json_len += 1;
+        }
+        cmd_json_buf[cmd_json_len] = ']';
+        cmd_json_len += 1;
+        const cmd_json = cmd_json_buf[0..cmd_json_len];
+
         const S = struct {
-            threadlocal var json_buf: [1024]u8 = undefined;
+            threadlocal var json_buf: [2048]u8 = undefined;
         };
         const json = std.fmt.bufPrint(&S.json_buf,
-            \\{{"elapsed_ms":{d},"h264_bytes":{d},"h264_frames":{d},"control_bytes_sent":{d},"control_bytes_recv":{d},"raw_pixels_bytes":{d},"total_ws_bytes":{d}}}
+            \\{{"elapsed_ms":{d},"h264_bytes":{d},"h264_frames":{d},"control_bytes_sent":{d},"control_bytes_recv":{d},"raw_pixels_bytes":{d},"vt_bytes":{d},"total_ws_bytes":{d},"commands":{s}}}
         , .{
             elapsed_ms,
             h264_bytes,
@@ -6497,7 +6665,9 @@ fn handleApiRequest(path: []const u8, user_data: ?*anyopaque) ?[]const u8 {
             ctrl_sent,
             ctrl_recv,
             raw_px,
+            vt_bytes,
             h264_bytes + ctrl_sent,
+            cmd_json,
         }) catch return null;
         return json;
     }
@@ -6508,6 +6678,9 @@ fn handleApiRequest(path: []const u8, user_data: ?*anyopaque) ?[]const u8 {
         server.bw_control_bytes_sent.store(0, .monotonic);
         server.bw_control_bytes_recv.store(0, .monotonic);
         server.bw_raw_pixels_bytes.store(0, .monotonic);
+        server.bw_vt_bytes.store(0, .monotonic);
+        server.bw_commands_len.store(0, .monotonic);
+        for (&server.bw_commands) |*cmd| cmd.* = std.mem.zeroes([17:0]u8);
         server.bw_start_time.store(@truncate(std.time.nanoTimestamp()), .monotonic);
         const S = struct {
             threadlocal var buf: [64]u8 = undefined;

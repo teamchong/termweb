@@ -1,6 +1,6 @@
 # Termweb Makefile
 
-.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean wasm vendor-reset vendor-patch vendor-sync vendor-build-ghostty vendor-generate-patch
+.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean wasm vendor-reset vendor-patch vendor-sync vendor-build-ghostty vendor-generate-patch benchmark benchmark-report
 
 # Default: build everything (JS must be bundled before Zig embeds it)
 all: build-all
@@ -153,6 +153,23 @@ vendor-generate-patch:
 	@echo "Now run 'zig build' to build with the updated library."
 
 # =============================================================================
+# Bandwidth Benchmark (VT passthrough vs H264+zstd)
+# =============================================================================
+
+# Build with benchmark instrumentation enabled
+benchmark: vendor-sync wasm mux-web
+	zig build -Dbenchmark
+	@echo ""
+	@echo "Built with benchmark enabled."
+	@echo "  1. Run termweb:          ./zig-out/bin/termweb"
+	@echo "  2. Run workloads in the terminal"
+	@echo "  3. Generate report:      make benchmark-report"
+
+# Capture VT baselines, fetch termweb stats, generate comparison report
+benchmark-report:
+	bun run packages/mux/benchmark/run.ts --port $(or $(PORT),7681)
+
+# =============================================================================
 # UI Asset Generation
 # =============================================================================
 
@@ -210,6 +227,10 @@ help:
 	@echo "  make vendor-sync  - Reset submodules and apply patches"
 	@echo "  make vendor-generate-patch - Generate patch, rebuild lib, and copy to vendor/libs/"
 	@echo "  make vendor-build-ghostty - Build libghostty from source only"
+	@echo ""
+	@echo "Benchmark (VT vs H264+zstd bandwidth):"
+	@echo "  make benchmark         - Build with benchmark instrumentation"
+	@echo "  make benchmark-report  - Capture VT baselines + generate comparison report"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make gen-ui       - Generate UI assets from templates"
