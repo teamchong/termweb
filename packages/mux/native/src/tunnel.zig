@@ -21,9 +21,9 @@ pub const Provider = enum {
 
     pub fn label(self: Provider) []const u8 {
         return switch (self) {
-            .tailscale => "Tailscale Serve",
-            .cloudflare => "Cloudflare Tunnel",
-            .ngrok => "ngrok",
+            .tailscale => "Tailscale Serve (VPN)",
+            .cloudflare => "Cloudflare Tunnel (Public)",
+            .ngrok => "ngrok (Public)",
         };
     }
 

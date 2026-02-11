@@ -417,9 +417,9 @@ fn printHelp() void {
         .{mux.default_http_port},
     ) ++
         \\  --local               Local only, skip connection picker
-        \\  --tailscale           Expose via Tailscale Funnel
-        \\  --cloudflare          Expose via Cloudflare Tunnel
-        \\  --ngrok               Expose via ngrok
+        \\  --tailscale           Expose via Tailscale Serve (VPN)
+        \\  --cloudflare          Expose via Cloudflare Tunnel (Public)
+        \\  --ngrok               Expose via ngrok (Public)
         \\
         \\Examples:
         \\  termweb open https://example.com
