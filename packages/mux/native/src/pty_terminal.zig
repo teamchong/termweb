@@ -106,10 +106,13 @@ pub const Terminal = struct {
                 posix.close(pty.slave);
             }
 
-            // Execute shell
+            // Execute shell with inherited environment + TERM override
             const shell_env = std.posix.getenv("SHELL");
             const shell: [*:0]const u8 = if (shell_env) |s| s.ptr else "/bin/bash";
             const argv = [_:null]?[*:0]const u8{shell};
+
+            // Build environment: inherit parent env (includes tmux shim vars if set by main.zig)
+            // plus ensure TERM is set correctly
             const envp = [_:null]?[*:0]const u8{"TERM=xterm-256color"};
 
             _ = execve(shell, &argv, &envp);

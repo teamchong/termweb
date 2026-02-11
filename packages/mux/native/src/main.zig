@@ -614,10 +614,44 @@ const Panel = struct {
         defer if (cwd_z) |z| allocator.free(z);
         surface_config.working_directory = if (cwd_z) |z| z.ptr else null;
 
-        // Set environment variables for shell integration features
-        // GHOSTTY_SHELL_FEATURES enables title updates if user has sourced ghostty shell integration
+        // Set environment variables for shell integration and tmux shim
+        // Build PATH with tmux shim directory prepended so mock tmux is found first
+        const server = Server.global_server.load(.acquire) orelse return error.NoServer;
+        const orig_path = std.posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+
+        var path_buf: [4096]u8 = undefined;
+        const path_val = std.fmt.bufPrint(&path_buf, "{s}:{s}", .{ server.tmux_shim_dir, orig_path }) catch orig_path;
+        // Null-terminate for C interop
+        var path_z_buf: [4097]u8 = undefined;
+        @memcpy(path_z_buf[0..path_val.len], path_val);
+        path_z_buf[path_val.len] = 0;
+
+        // Unix socket path for tmux shim (null-terminated)
+        var sock_z_buf: [256]u8 = undefined;
+        const sock_val = server.tmux_sock_path;
+        const sock_len = @min(sock_val.len, sock_z_buf.len - 1);
+        @memcpy(sock_z_buf[0..sock_len], sock_val[0..sock_len]);
+        sock_z_buf[sock_len] = 0;
+
+        var pane_id_buf: [12]u8 = undefined;
+        const pane_id_val = std.fmt.bufPrint(&pane_id_buf, "{d}", .{id}) catch "1";
+        var pane_id_z_buf: [13]u8 = undefined;
+        @memcpy(pane_id_z_buf[0..pane_id_val.len], pane_id_val);
+        pane_id_z_buf[pane_id_val.len] = 0;
+
+        var tmux_pane_buf: [14]u8 = undefined;
+        const tmux_pane_val = std.fmt.bufPrint(&tmux_pane_buf, "%{d}", .{id}) catch "%1";
+        var tmux_pane_z_buf: [15]u8 = undefined;
+        @memcpy(tmux_pane_z_buf[0..tmux_pane_val.len], tmux_pane_val);
+        tmux_pane_z_buf[tmux_pane_val.len] = 0;
+
         var env_vars = [_]c.ghostty_env_var_s{
             .{ .key = "GHOSTTY_SHELL_FEATURES", .value = "cursor,title,sudo" },
+            .{ .key = "PATH", .value = @ptrCast(&path_z_buf) },
+            .{ .key = "TERMWEB_SOCK", .value = @ptrCast(&sock_z_buf) },
+            .{ .key = "TERMWEB_PANE_ID", .value = @ptrCast(&pane_id_z_buf) },
+            .{ .key = "TMUX", .value = "/tmp/termweb-shim,0,0" },
+            .{ .key = "TMUX_PANE", .value = @ptrCast(&tmux_pane_z_buf) },
         };
         surface_config.env_vars = &env_vars;
         surface_config.env_var_count = env_vars.len;
@@ -1454,6 +1488,7 @@ const PanelRequest = struct {
     scale: f64,
     inherit_cwd_from: u32, // Panel ID to inherit CWD from, 0 = use initial_cwd
     kind: PanelKind,
+    from_api: bool = false, // If true, send new panel ID to tmux_api_response_ch
 };
 
 // Panel destruction request (to be processed on main thread)
@@ -1476,6 +1511,7 @@ const PanelSplitRequest = struct {
     width: u32,
     height: u32,
     scale: f64,
+    from_api: bool = false, // If true, send new panel ID to tmux_api_response_ch
 };
 
 const Server = struct {
@@ -1514,6 +1550,11 @@ const Server = struct {
     standard_clipboard: ?[]u8,  // Standard clipboard buffer (from browser paste)
     initial_cwd: []const u8,  // CWD where termweb was started
     initial_cwd_allocated: bool,  // Whether initial_cwd was allocated (vs static "/")
+    tmux_shim_dir: []const u8,  // Temp directory containing mock tmux script (prepended to PATH)
+    tmux_sock_path: []const u8,  // Unix domain socket path for tmux shim API
+    tmux_sock_fd: ?std.posix.socket_t,  // Listening Unix socket fd (null if not started)
+    tmux_sock_thread: ?std.Thread,  // Listener thread for Unix socket
+    tmux_api_response_ch: *Channel(u32),  // One-shot channel for sync API responses (panel ID)
     overview_open: bool,  // Whether tab overview is currently open
     quick_terminal_open: bool,  // Whether quick terminal is open
     inspector_open: bool,  // Whether inspector is open
@@ -1559,6 +1600,18 @@ const Server = struct {
         const pending_splits_ch = try Channel(PanelSplitRequest).initBuffered(allocator, 64);
         errdefer pending_splits_ch.deinit();
 
+        // Channel for synchronous tmux API responses (panel creation returns new ID)
+        const tmux_api_response_ch = try Channel(u32).initBuffered(allocator, 1);
+        errdefer tmux_api_response_ch.deinit();
+
+        // Create tmux shim directory with mock tmux script and Unix socket
+        const shim_result = try createTmuxShimDir(allocator);
+        errdefer {
+            std.fs.cwd().deleteTree(shim_result.bin_dir) catch {};
+            allocator.free(shim_result.bin_dir);
+            allocator.free(shim_result.sock_path);
+        }
+
         // Initialize goroutine runtime for file transfer pipeline (0 = auto-detect CPU count)
         const gor_rt = try goroutine_runtime.Runtime.init(allocator, 0);
         errdefer gor_rt.deinit();
@@ -1597,6 +1650,11 @@ const Server = struct {
             .standard_clipboard = null,
             .initial_cwd = undefined,
             .initial_cwd_allocated = false,
+            .tmux_shim_dir = shim_result.bin_dir,
+            .tmux_sock_path = shim_result.sock_path,
+            .tmux_sock_fd = null,
+            .tmux_sock_thread = null,
+            .tmux_api_response_ch = tmux_api_response_ch,
             .overview_open = false,
             .quick_terminal_open = false,
             .inspector_open = false,
@@ -1710,6 +1768,7 @@ const Server = struct {
         self.pending_destroys_ch.close();
         self.pending_resizes_ch.close();
         self.pending_splits_ch.close();
+        self.tmux_api_response_ch.close();
 
         // Clear global_server first to prevent callbacks from accessing it during shutdown
         global_server.store(null, .release);
@@ -1765,6 +1824,21 @@ const Server = struct {
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
         if (self.standard_clipboard) |clip| self.allocator.free(clip);
         if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
+        // Shut down tmux Unix socket listener
+        if (self.tmux_sock_fd) |fd| {
+            std.posix.shutdown(fd, .both) catch {};
+            std.posix.close(fd);
+        }
+        if (self.tmux_sock_thread) |t| t.join();
+        // Clean up tmux shim temp directory (includes socket file)
+        {
+            // Remove the parent dir (e.g. /tmp/termweb-{pid}/) not just the bin/ subdir
+            const parent_dir = std.fs.path.dirname(self.tmux_shim_dir) orelse self.tmux_shim_dir;
+            std.fs.cwd().deleteTree(parent_dir) catch {};
+            self.allocator.free(self.tmux_shim_dir);
+            self.allocator.free(self.tmux_sock_path);
+        }
+        self.tmux_api_response_ch.deinit();
         // Free shared VA-API context (after all panels/encoders are destroyed)
         self.wake_signal.deinit();
         if (is_linux) {
@@ -3503,7 +3577,6 @@ const Server = struct {
 
         // Create transfer session with the same ID the client used (not a new ID)
         const session = self.transfer_manager.createSessionWithId(resume_data.transfer_id, .download, .{
-            .delete_extra = false,
             .dry_run = false,
             .use_gitignore = false,
         }, resolved_path) catch |err| {
@@ -3704,7 +3777,7 @@ const Server = struct {
         is_active: *bool, // Pointer to session.is_active
         send_ch: *gchannel.GChannel(transfer.CompressedMsg),
         done_counter: *std.atomic.Value(usize), // Decremented when goroutine finishes
-        semaphore: *std.Thread.Semaphore, // Limits concurrent large file processing
+        token_ch: *gchannel.GChannel(u8), // Goroutine-safe semaphore (recv=acquire, send=release)
 
         fn deinit(self: *FileGoroutineCtx) void {
             self.allocator.free(self.file_path);
@@ -3718,33 +3791,29 @@ const Server = struct {
     /// arg via rdi (x86_64) / x0 (aarch64) using the C ABI.
     fn processFileGoroutine(arg: *anyopaque) callconv(.c) void {
         const ctx: *FileGoroutineCtx = @ptrCast(@alignCast(arg));
-        std.debug.print("[Goroutine] START: file_index={d}, path={s}\n", .{ ctx.file_index, ctx.file_path });
         const done_counter = ctx.done_counter;
-        const semaphore = ctx.semaphore;
+        const token_ch = ctx.token_ch;
         defer _ = done_counter.fetchAdd(1, .release);
 
-        // Early exit before acquiring semaphore — cancelled goroutines skip the
-        // semaphore entirely so new transfers aren't starved by queued goroutines.
+        // Early exit before acquiring token — cancelled goroutines skip entirely
+        // so new transfers aren't starved by queued goroutines.
         if (!@atomicLoad(bool, ctx.is_active, .acquire)) {
-            std.debug.print("[Goroutine] INACTIVE (pre-sem): file_index={d}\n", .{ctx.file_index});
             ctx.deinit();
             return;
         }
 
-        // Acquire semaphore to limit concurrent large file processing (prevents OOM)
-        semaphore.wait();
-        defer semaphore.post();
-        defer ctx.deinit();
-
-        if (!@atomicLoad(bool, ctx.is_active, .acquire)) {
-            std.debug.print("[Goroutine] INACTIVE: file_index={d}\n", .{ctx.file_index});
-            return;
-        }
-
-        const data = readFileForGoroutine(ctx.allocator, ctx.base_path, ctx.file_path, ctx.file_size) orelse {
-            std.debug.print("[Goroutine] READ FAILED: file_index={d}\n", .{ctx.file_index});
+        // Acquire token to limit concurrent large file processing (prevents OOM).
+        // Uses GChannel which parks the goroutine instead of blocking the OS thread.
+        _ = token_ch.recv() orelse {
+            ctx.deinit();
             return;
         };
+        defer _ = token_ch.send(0);
+        defer ctx.deinit();
+
+        if (!@atomicLoad(bool, ctx.is_active, .acquire)) return;
+
+        const data = readFileForGoroutine(ctx.allocator, ctx.base_path, ctx.file_path, ctx.file_size) orelse return;
         defer ctx.allocator.free(data);
 
         if (!@atomicLoad(bool, ctx.is_active, .acquire)) return;
@@ -3753,20 +3822,14 @@ const Server = struct {
             ctx.allocator,
             data,
             3,
-        ) catch {
-            std.debug.print("[Goroutine] COMPRESS FAILED: file_index={d}\n", .{ctx.file_index});
-            return;
-        };
+        ) catch return;
 
         if (!ctx.send_ch.send(.{
             .file_index = ctx.file_index,
             .file_size = ctx.file_size,
             .chunks = chunks,
         })) {
-            std.debug.print("[Goroutine] SEND FAILED (channel closed): file_index={d}\n", .{ctx.file_index});
             transfer.ParallelCompressor.freeChunks(ctx.allocator, chunks);
-        } else {
-            std.debug.print("[Goroutine] SUCCESS: file_index={d}\n", .{ctx.file_index});
         }
     }
 
@@ -3890,26 +3953,40 @@ const Server = struct {
         var goroutine_done = std.atomic.Value(usize).init(0);
         var large_file_count: usize = 0;
 
-        // Semaphore to limit concurrent large file processing (prevent OOM)
-        // Max 32 concurrent goroutines reading/compressing large files
-        var goroutine_sem = std.Thread.Semaphore{ .permits = 32 };
+        // Goroutine-safe token channel to limit concurrent large file processing (prevent OOM).
+        // Uses GChannel instead of std.Thread.Semaphore because semaphore.wait() blocks the
+        // OS thread (via futex), while GChannel.recv() parks the goroutine — allowing other
+        // goroutines to continue running on the same OS thread.
+        const TokenCh = gchannel.GChannel(u8);
+        const token_ch = TokenCh.initBuffered(self.allocator, self.goroutine_rt, 32) catch {
+            self.pushDownloadFilesSerial(conn, session);
+            return;
+        };
 
-        // Ensure channel outlives all goroutines: wait for completion then deinit
+        // Pre-fill token channel with 32 tokens
+        for (0..32) |_| {
+            _ = token_ch.send(0);
+        }
+
+        // Ensure channels outlive all goroutines: wait for completion then deinit
         defer {
-            // Wait for all goroutines to finish before freeing channel.
-            // Exit early if session becomes inactive (server shutdown).
+            // Close channels to unblock any goroutines waiting for tokens or send slots.
+            // This is idempotent and safe to call even if channels are already closed.
+            token_ch.close();
+            send_ch.close();
+
+            // Wait for ALL goroutines to finish before freeing channels.
+            // After closing, goroutines unblock quickly (recv/send return null/false).
+            // We MUST wait — deiniting while goroutines hold channel pointers is use-after-free.
             while (goroutine_done.load(.acquire) < large_file_count) {
-                if (!@atomicLoad(bool, &session.is_active, .acquire)) {
-                    // Close channel to unblock the receive loop
-                    send_ch.close();
-                    break;
-                }
                 std.Thread.sleep(100 * std.time.ns_per_us);
             }
-            // Drain any buffered messages (free their chunks to avoid leaks)
+
+            // All goroutines done — safe to free
             while (send_ch.recv()) |msg| {
                 transfer.ParallelCompressor.freeChunks(self.allocator, msg.chunks);
             }
+            token_ch.deinit();
             send_ch.deinit();
         }
 
@@ -3958,7 +4035,7 @@ const Server = struct {
                 .is_active = &session.is_active,
                 .send_ch = send_ch,
                 .done_counter = &goroutine_done,
-                .semaphore = &goroutine_sem,
+                .token_ch = token_ch,
             };
             _ = self.goroutine_rt.go(processFileGoroutine, @ptrCast(ctx)) catch {
                 ctx.deinit();
@@ -4415,8 +4492,12 @@ const Server = struct {
             } else self.initial_cwd;
 
             const panel = self.createPanelWithOptions(req.width, req.height, req.scale, working_dir, req.kind) catch {
+                if (req.from_api) _ = self.tmux_api_response_ch.send(0);
                 continue;
             };
+
+            // Notify tmux API caller if this was an API-originated request
+            if (req.from_api) _ = self.tmux_api_response_ch.send(panel.id);
 
             // Panel starts streaming immediately (H264 frames sent to all h264_connections)
             self.broadcastPanelCreated(panel.id);
@@ -4516,12 +4597,16 @@ const Server = struct {
 
             const panel = self.createPanelAsSplit(req.width, req.height, req.scale, req.parent_panel_id, req.direction) catch |err| {
                 std.debug.print("Failed to create split panel: {}\n", .{err});
+                if (req.from_api) _ = self.tmux_api_response_ch.send(0);
                 // Resume parent on failure
                 if (parent_panel) |parent| {
                     parent.resumeStream();
                 }
                 continue;
             };
+
+            // Notify tmux API caller if this was an API-originated request
+            if (req.from_api) _ = self.tmux_api_response_ch.send(panel.id);
 
             // Panel starts streaming immediately (H264 frames sent to all h264_connections)
             self.broadcastPanelCreated(panel.id);
@@ -5191,6 +5276,11 @@ const Server = struct {
         self.control_ws_server.running.store(true, .release);
         self.file_ws_server.running.store(true, .release);
 
+        // Start tmux shim Unix socket listener (private channel, no auth needed)
+        startTmuxSocketListener(self) catch |err| {
+            std.debug.print("Warning: tmux shim socket failed to start: {}\n", .{err});
+        };
+
         // Start HTTP server in background (handles all WebSocket via path-based routing)
         const http_thread = try std.Thread.spawn(.{}, runHttpServer, .{self});
 
@@ -5584,6 +5674,551 @@ fn closeSurfaceCallback(userdata: ?*anyopaque, needs_confirm: bool) callconv(.c)
     // Queue the panel for destruction on main thread
     _ = self.pending_destroys_ch.send(.{ .id = panel.id });
     self.wake_signal.notify();
+}
+
+
+// Tmux shim support — generates a mock tmux script in a temp directory
+// so that tools like Claude Code agent teams can create panes via termweb.
+
+const TmuxShimResult = struct {
+    bin_dir: []const u8,
+    sock_path: []const u8,
+};
+
+/// Create temp directory with mock tmux shell script. Returns bin/ dir path and socket path.
+fn createTmuxShimDir(allocator: std.mem.Allocator) !TmuxShimResult {
+    const pid = std.Thread.getCurrentId();
+    const base_dir = try std.fmt.allocPrint(allocator, "/tmp/termweb-{d}", .{pid});
+    defer allocator.free(base_dir);
+
+    const bin_dir = try std.fmt.allocPrint(allocator, "{s}/bin", .{base_dir});
+    errdefer allocator.free(bin_dir);
+
+    const sock_path = try std.fmt.allocPrint(allocator, "{s}/tmux.sock", .{base_dir});
+    errdefer allocator.free(sock_path);
+
+    // Create directory tree
+    std.fs.cwd().makePath(bin_dir) catch |err| {
+        std.debug.print("Failed to create tmux shim dir {s}: {}\n", .{ bin_dir, err });
+        return err;
+    };
+
+    // Write mock tmux script
+    const script_path = try std.fmt.allocPrint(allocator, "{s}/tmux", .{bin_dir});
+    defer allocator.free(script_path);
+
+    const file = try std.fs.cwd().createFile(script_path, .{ .mode = 0o755 });
+    defer file.close();
+    try file.writeAll(tmux_shim_script);
+
+    std.debug.print("Tmux shim created at {s} (socket: {s})\n", .{ bin_dir, sock_path });
+    return .{ .bin_dir = bin_dir, .sock_path = sock_path };
+}
+
+const tmux_shim_script =
+    \\#!/bin/sh
+    \\# Termweb tmux shim — intercepts tmux commands and forwards to termweb API
+    \\# via Unix domain socket. No auth needed — socket file permissions control access.
+    \\SOCK="${TERMWEB_SOCK:-/tmp/termweb-0/tmux.sock}"
+    \\PANE="${TERMWEB_PANE_ID:-1}"
+    \\API="http://localhost"
+    \\
+    \\cmd="$1"; shift 2>/dev/null
+    \\
+    \\case "$cmd" in
+    \\  split-window)
+    \\    dir="v"; cwd=""; run=""
+    \\    while [ $# -gt 0 ]; do
+    \\      case "$1" in
+    \\        -h) dir="h"; shift ;;
+    \\        -v) dir="v"; shift ;;
+    \\        -c) cwd="$2"; shift 2 ;;
+    \\        -t) shift 2 ;;
+    \\        -b|-d|-f|-Z|-P|-I) shift ;;
+    \\        -l|-e|-F|-n) shift 2 ;;
+    \\        -*) shift ;;
+    \\        *) run="$*"; break ;;
+    \\      esac
+    \\    done
+    \\    curl -sf --max-time 10 --unix-socket "$SOCK" -X POST "$API/api/tmux" \
+    \\      -H "Content-Type: application/json" \
+    \\      -d "{\"cmd\":\"split-window\",\"pane\":$PANE,\"dir\":\"$dir\",\"cwd\":\"$cwd\",\"command\":\"$run\"}"
+    \\    ;;
+    \\
+    \\  new-window)
+    \\    name=""; cwd=""
+    \\    while [ $# -gt 0 ]; do
+    \\      case "$1" in
+    \\        -n) name="$2"; shift 2 ;;
+    \\        -c) cwd="$2"; shift 2 ;;
+    \\        -t) shift 2 ;;
+    \\        -*) shift ;;
+    \\        *) break ;;
+    \\      esac
+    \\    done
+    \\    curl -sf --max-time 10 --unix-socket "$SOCK" -X POST "$API/api/tmux" \
+    \\      -H "Content-Type: application/json" \
+    \\      -d "{\"cmd\":\"new-window\",\"cwd\":\"$cwd\",\"name\":\"$name\"}"
+    \\    ;;
+    \\
+    \\  send-keys)
+    \\    target="$PANE"; literal=0
+    \\    while [ $# -gt 1 ]; do
+    \\      case "$1" in
+    \\        -t) target=$(echo "$2" | sed 's/^%//'); shift 2 ;;
+    \\        -l) literal=1; shift ;;
+    \\        -*) shift ;;
+    \\        *) break ;;
+    \\      esac
+    \\    done
+    \\    keys="$*"
+    \\    curl -sf --max-time 5 --unix-socket "$SOCK" -X POST "$API/api/tmux" \
+    \\      -H "Content-Type: application/json" \
+    \\      -d "{\"cmd\":\"send-keys\",\"target\":$target,\"keys\":\"$keys\"}"
+    \\    ;;
+    \\
+    \\  list-panes)
+    \\    fmt=""; flags=""
+    \\    while [ $# -gt 0 ]; do
+    \\      case "$1" in
+    \\        -a) flags="a"; shift ;;
+    \\        -s) flags="s"; shift ;;
+    \\        -F) fmt="$2"; shift 2 ;;
+    \\        -*) shift ;;
+    \\        *) break ;;
+    \\      esac
+    \\    done
+    \\    curl -sf --max-time 5 --unix-socket "$SOCK" "$API/api/tmux?cmd=list-panes&format=$(printf '%s' "$fmt" | sed 's/ /%20/g')"
+    \\    ;;
+    \\
+    \\  display-message)
+    \\    fmt=""; print=0
+    \\    while [ $# -gt 0 ]; do
+    \\      case "$1" in
+    \\        -p) print=1; shift ;;
+    \\        -t) shift 2 ;;
+    \\        *) fmt="$1"; shift ;;
+    \\      esac
+    \\    done
+    \\    if [ "$print" = "1" ]; then
+    \\      curl -sf --max-time 5 --unix-socket "$SOCK" "$API/api/tmux?cmd=display-message&pane=$PANE&format=$(printf '%s' "$fmt" | sed 's/ /%20/g')"
+    \\    fi
+    \\    ;;
+    \\
+    \\  select-pane) exit 0 ;;
+    \\  has-session|-has-session) exit 0 ;;
+    \\  -V|--version) echo "tmux termweb-shim" ;;
+    \\  *) echo "tmux shim: unsupported: $cmd" >&2; exit 0 ;;
+    \\esac
+;
+
+/// Start a Unix domain socket listener for tmux shim API.
+/// Spawns a thread that accepts connections and handles HTTP-over-UDS requests.
+fn startTmuxSocketListener(server: *Server) !void {
+    const sock_path = server.tmux_sock_path;
+
+    // Create null-terminated path for bind
+    var sun_path: [108]u8 = undefined;
+    if (sock_path.len >= sun_path.len) return error.PathTooLong;
+    @memcpy(sun_path[0..sock_path.len], sock_path);
+    sun_path[sock_path.len] = 0;
+
+    // Remove stale socket file if it exists
+    std.fs.cwd().deleteFile(sock_path) catch {};
+
+    // Create Unix domain socket
+    const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    errdefer std.posix.close(fd);
+
+    // Bind to socket path
+    var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = @bitCast(sun_path) };
+    try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+
+    // Set socket permissions (owner only — private channel)
+    std.posix.fchmodat(std.posix.AT.FDCWD, sock_path, 0o700, 0) catch {};
+
+    // Listen
+    try std.posix.listen(fd, 8);
+
+    server.tmux_sock_fd = fd;
+
+    // Spawn listener thread
+    server.tmux_sock_thread = try std.Thread.spawn(.{}, tmuxSocketListenerThread, .{server});
+}
+
+/// Thread function: accepts connections on Unix socket, handles HTTP requests.
+fn tmuxSocketListenerThread(server: *Server) void {
+    const fd = server.tmux_sock_fd orelse return;
+
+    while (server.running.load(.acquire)) {
+        // Accept connection (blocking)
+        const conn_fd = std.posix.accept(fd, null, null, 0) catch |err| {
+            if (!server.running.load(.acquire)) break; // Shutting down
+            if (err == error.ConnectionAborted or err == error.SocketNotBound) break;
+            continue;
+        };
+
+        // Handle in a detached thread to avoid blocking the listener
+        const thread = std.Thread.spawn(.{}, handleTmuxSocketConnection, .{ server, conn_fd }) catch {
+            std.posix.close(conn_fd);
+            continue;
+        };
+        thread.detach();
+    }
+}
+
+/// Handle a single connection on the tmux Unix socket.
+/// Reads HTTP request, dispatches to API handler, sends HTTP response.
+fn handleTmuxSocketConnection(server: *Server, conn_fd: std.posix.socket_t) void {
+    defer std.posix.close(conn_fd);
+
+    // Read HTTP request
+    var buf: [8192]u8 = undefined;
+    const n = std.posix.read(conn_fd, &buf) catch return;
+    if (n == 0) return;
+    const request = buf[0..n];
+
+    // Parse request line (e.g. "GET /api/tmux?cmd=list-panes HTTP/1.1\r\n...")
+    const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return;
+    const request_line = request[0..line_end];
+
+    var parts = std.mem.splitScalar(u8, request_line, ' ');
+    const method = parts.next() orelse return;
+    const full_path = parts.next() orelse return;
+
+    // Extract POST body
+    var body: []const u8 = "";
+    if (std.mem.eql(u8, method, "POST")) {
+        if (std.mem.indexOf(u8, request, "\r\n\r\n")) |hdr_end| {
+            body = request[hdr_end + 4 ..];
+        }
+    }
+
+    // Dispatch to API handler
+    if (handleTmuxApiRequest(server, method, full_path, body)) |response| {
+        defer server.allocator.free(response);
+        // Send HTTP response
+        var hdr_buf: [256]u8 = undefined;
+        const header = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{response.len}) catch return;
+        _ = std.posix.write(conn_fd, header) catch {};
+        _ = std.posix.write(conn_fd, response) catch {};
+    } else {
+        const err_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+        _ = std.posix.write(conn_fd, err_resp) catch {};
+    }
+}
+
+/// Handle tmux API HTTP request. Called from Unix socket handler thread.
+/// Returns allocated response body string (caller must free), or null on error.
+fn handleTmuxApiRequest(server: *Server, method: []const u8, full_path: []const u8, body: []const u8) ?[]const u8 {
+    const allocator = server.allocator;
+
+    if (std.mem.eql(u8, method, "GET")) {
+        // Parse query string
+        const query = if (std.mem.indexOf(u8, full_path, "?")) |idx| full_path[idx + 1 ..] else "";
+        return handleTmuxQuery(server, query);
+    }
+
+    if (std.mem.eql(u8, method, "POST")) {
+        return handleTmuxPost(server, body, allocator);
+    }
+
+    return null;
+}
+
+fn handleTmuxQuery(server: *Server, query: []const u8) ?[]const u8 {
+    const allocator = server.allocator;
+
+    // Parse cmd= from query
+    var cmd: []const u8 = "";
+    var format: []const u8 = "";
+    var pane_str: []const u8 = "";
+
+    var params = std.mem.splitScalar(u8, query, '&');
+    while (params.next()) |param| {
+        if (std.mem.startsWith(u8, param, "cmd=")) {
+            cmd = param[4..];
+        } else if (std.mem.startsWith(u8, param, "format=")) {
+            format = param[7..];
+        } else if (std.mem.startsWith(u8, param, "pane=")) {
+            pane_str = param[5..];
+        }
+    }
+
+    if (std.mem.eql(u8, cmd, "list-panes")) {
+        return handleTmuxListPanes(server, format, allocator);
+    }
+
+    if (std.mem.eql(u8, cmd, "display-message")) {
+        const pane_id = std.fmt.parseInt(u32, pane_str, 10) catch 1;
+        return handleTmuxDisplayMessage(server, pane_id, format, allocator);
+    }
+
+    return null;
+}
+
+fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+
+    server.mutex.lock();
+    defer server.mutex.unlock();
+
+    var it = server.panels.iterator();
+    while (it.next()) |entry| {
+        const panel = entry.value_ptr.*;
+        const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == panel.id) @as(u8, 1) else @as(u8, 0)) else 0;
+
+        if (format.len > 0) {
+            // Simple format string interpolation
+            var line: std.ArrayListUnmanaged(u8) = .{};
+            var i: usize = 0;
+            const f = format;
+            while (i < f.len) {
+                if (i + 1 < f.len and f[i] == '#' and f[i + 1] == '{') {
+                    const close = std.mem.indexOfPos(u8, f, i + 2, "}") orelse {
+                        line.append(allocator, f[i]) catch break;
+                        i += 1;
+                        continue;
+                    };
+                    const var_name = f[i + 2 .. close];
+                    if (std.mem.eql(u8, var_name, "pane_id")) {
+                        std.fmt.format(line.writer(allocator), "%{d}", .{panel.id}) catch {};
+                    } else if (std.mem.eql(u8, var_name, "pane_index")) {
+                        std.fmt.format(line.writer(allocator), "{d}", .{panel.id}) catch {};
+                    } else if (std.mem.eql(u8, var_name, "pane_active")) {
+                        std.fmt.format(line.writer(allocator), "{d}", .{active}) catch {};
+                    } else if (std.mem.eql(u8, var_name, "pane_width")) {
+                        std.fmt.format(line.writer(allocator), "{d}", .{panel.width}) catch {};
+                    } else if (std.mem.eql(u8, var_name, "pane_height")) {
+                        std.fmt.format(line.writer(allocator), "{d}", .{panel.height}) catch {};
+                    } else if (std.mem.eql(u8, var_name, "pane_current_path")) {
+                        line.appendSlice(allocator, if (panel.pwd.len > 0) panel.pwd else server.initial_cwd) catch {};
+                    } else if (std.mem.eql(u8, var_name, "pane_title") or std.mem.eql(u8, var_name, "pane_current_command")) {
+                        line.appendSlice(allocator, if (panel.title.len > 0) panel.title else "shell") catch {};
+                    }
+                    i = close + 1;
+                } else {
+                    line.append(allocator, f[i]) catch break;
+                    i += 1;
+                }
+            }
+            line.append(allocator, '\n') catch {};
+            buf.appendSlice(allocator, line.items) catch {};
+            line.deinit(allocator);
+        } else {
+            // Default format: %N: [WxH] [active]
+            std.fmt.format(buf.writer(allocator), "%{d}: [{d}x{d}] [{s}]\n", .{
+                panel.id, panel.width, panel.height,
+                if (active == 1) "active" else "",
+            }) catch {};
+        }
+    }
+
+    // Return empty string for empty pane list (not null, which would cause 400)
+    return if (buf.items.len > 0) (buf.toOwnedSlice(allocator) catch null) else (allocator.dupe(u8, "") catch null);
+}
+
+fn handleTmuxDisplayMessage(server: *Server, pane_id: u32, format: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    server.mutex.lock();
+    const panel = server.panels.get(pane_id);
+    server.mutex.unlock();
+
+    if (panel == null) {
+        return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
+    }
+    const p = panel.?;
+
+    if (format.len == 0) {
+        return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
+    }
+
+    // Simple format string interpolation
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var i: usize = 0;
+    while (i < format.len) {
+        if (i + 1 < format.len and format[i] == '#' and format[i + 1] == '{') {
+            const close = std.mem.indexOfPos(u8, format, i + 2, "}") orelse {
+                buf.append(allocator, format[i]) catch break;
+                i += 1;
+                continue;
+            };
+            const var_name = format[i + 2 .. close];
+            if (std.mem.eql(u8, var_name, "pane_id")) {
+                std.fmt.format(buf.writer(allocator), "%{d}", .{p.id}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_width")) {
+                std.fmt.format(buf.writer(allocator), "{d}", .{p.width}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_height")) {
+                std.fmt.format(buf.writer(allocator), "{d}", .{p.height}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_current_path")) {
+                buf.appendSlice(allocator, if (p.pwd.len > 0) p.pwd else server.initial_cwd) catch {};
+            }
+            i = close + 1;
+        } else {
+            buf.append(allocator, format[i]) catch break;
+            i += 1;
+        }
+    }
+    buf.append(allocator, '\n') catch {};
+
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
+fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    // Simple JSON parsing — extract "cmd" field
+    const cmd = jsonGetString(body, "cmd") orelse return null;
+
+    if (std.mem.eql(u8, cmd, "split-window")) {
+        const pane_id = jsonGetInt(body, "pane") orelse 1;
+        const dir_str = jsonGetString(body, "dir") orelse "v";
+        const direction: SplitDirection = if (std.mem.eql(u8, dir_str, "h")) .horizontal else .vertical;
+
+        // Record next_panel_id before sending request
+        const expected_id = @atomicLoad(u32, &server.next_panel_id, .acquire);
+
+        _ = server.pending_splits_ch.send(.{
+            .parent_panel_id = pane_id,
+            .direction = direction,
+            .width = 800,
+            .height = 600,
+            .scale = 2.0,
+            .from_api = true,
+        });
+        server.wake_signal.notify();
+
+        // Block waiting for the panel to be created (with timeout)
+        const new_id = server.tmux_api_response_ch.recv() orelse expected_id;
+
+        return std.fmt.allocPrint(allocator, "{{\"pane_id\":\"%{d}\"}}\n", .{new_id}) catch null;
+    }
+
+    if (std.mem.eql(u8, cmd, "new-window")) {
+        const expected_id = @atomicLoad(u32, &server.next_panel_id, .acquire);
+
+        _ = server.pending_panels_ch.send(.{
+            .width = 800,
+            .height = 600,
+            .scale = 2.0,
+            .inherit_cwd_from = 0,
+            .kind = .regular,
+            .from_api = true,
+        });
+        server.wake_signal.notify();
+
+        const new_id = server.tmux_api_response_ch.recv() orelse expected_id;
+
+        return std.fmt.allocPrint(allocator, "{{\"pane_id\":\"%{d}\"}}\n", .{new_id}) catch null;
+    }
+
+    if (std.mem.eql(u8, cmd, "send-keys")) {
+        const target_id = jsonGetInt(body, "target") orelse 1;
+        const keys = jsonGetString(body, "keys") orelse return null;
+
+        server.mutex.lock();
+        const panel = server.panels.get(target_id);
+        server.mutex.unlock();
+
+        if (panel) |p| {
+            // Convert tmux key names to actual bytes
+            var converted: std.ArrayListUnmanaged(u8) = .{};
+            defer converted.deinit(allocator);
+
+            var i: usize = 0;
+            while (i < keys.len) {
+                // Check for known key names (space-separated in tmux)
+                const remaining = keys[i..];
+                if (std.mem.startsWith(u8, remaining, "Enter")) {
+                    converted.append(allocator, '\r') catch {};
+                    i += 5;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else if (std.mem.startsWith(u8, remaining, "Space")) {
+                    converted.append(allocator, ' ') catch {};
+                    i += 5;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else if (std.mem.startsWith(u8, remaining, "Tab")) {
+                    converted.append(allocator, '\t') catch {};
+                    i += 3;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else if (std.mem.startsWith(u8, remaining, "Escape")) {
+                    converted.append(allocator, 0x1b) catch {};
+                    i += 6;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else if (std.mem.startsWith(u8, remaining, "C-c")) {
+                    converted.append(allocator, 0x03) catch {};
+                    i += 3;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else if (std.mem.startsWith(u8, remaining, "C-d")) {
+                    converted.append(allocator, 0x04) catch {};
+                    i += 3;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else if (std.mem.startsWith(u8, remaining, "C-l")) {
+                    converted.append(allocator, 0x0c) catch {};
+                    i += 3;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else if (std.mem.startsWith(u8, remaining, "C-z")) {
+                    converted.append(allocator, 0x1a) catch {};
+                    i += 3;
+                    if (i < keys.len and keys[i] == ' ') i += 1;
+                } else {
+                    converted.append(allocator, keys[i]) catch {};
+                    i += 1;
+                }
+            }
+
+            if (converted.items.len > 0) {
+                p.handleTextInput(converted.items);
+                p.has_pending_input.store(true, .release);
+                server.wake_signal.notify();
+            }
+        }
+
+        return allocator.dupe(u8, "{\"ok\":true}\n") catch null;
+    }
+
+    return null;
+}
+
+/// Simple JSON string field extractor — finds "key":"value" and returns value slice.
+fn jsonGetString(json: []const u8, key: []const u8) ?[]const u8 {
+    // Search for "key":"
+    var i: usize = 0;
+    while (i + key.len + 4 < json.len) : (i += 1) {
+        if (json[i] == '"' and i + 1 + key.len < json.len and
+            std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
+            json[i + 1 + key.len] == '"')
+        {
+            // Found key, skip to value
+            var j = i + 1 + key.len + 1; // past closing quote of key
+            while (j < json.len and (json[j] == ':' or json[j] == ' ')) : (j += 1) {}
+            if (j < json.len and json[j] == '"') {
+                j += 1; // past opening quote of value
+                const start = j;
+                while (j < json.len and json[j] != '"') : (j += 1) {}
+                return json[start..j];
+            }
+        }
+    }
+    return null;
+}
+
+/// Simple JSON integer field extractor — finds "key":123 and returns the integer.
+fn jsonGetInt(json: []const u8, key: []const u8) ?u32 {
+    var i: usize = 0;
+    while (i + key.len + 4 < json.len) : (i += 1) {
+        if (json[i] == '"' and i + 1 + key.len < json.len and
+            std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
+            json[i + 1 + key.len] == '"')
+        {
+            var j = i + 1 + key.len + 1;
+            while (j < json.len and (json[j] == ':' or json[j] == ' ')) : (j += 1) {}
+            // Parse integer
+            const start = j;
+            while (j < json.len and json[j] >= '0' and json[j] <= '9') : (j += 1) {}
+            if (j > start) {
+                return std.fmt.parseInt(u32, json[start..j], 10) catch null;
+            }
+        }
+    }
+    return null;
 }
 
 
