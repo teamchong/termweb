@@ -27,6 +27,10 @@ const goroutine_runtime = @import("async/runtime.zig");
 const gchannel = @import("async/gchannel.zig");
 pub const tunnel_mod = @import("tunnel.zig");
 
+/// Default HTTP port for the mux server.
+/// Port 7681 is the conventional port for terminal-over-web tools (e.g. ttyd).
+pub const default_http_port: u16 = 7681;
+
 
 // Debug logging to stderr
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
@@ -6349,7 +6353,7 @@ fn jsonGetInt(json: []const u8, key: []const u8) ?u32 {
 
 
 const Args = struct {
-    http_port: u16 = 8080,
+    http_port: u16 = default_http_port,
     mode: tunnel_mod.Mode = .interactive,
 };
 
@@ -6364,7 +6368,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     while (arg_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--http-port") or std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             if (arg_it.next()) |val| {
-                args.http_port = std.fmt.parseInt(u16, val, 10) catch 8080;
+                args.http_port = std.fmt.parseInt(u16, val, 10) catch default_http_port;
             }
         } else if (std.mem.eql(u8, arg, "--local")) {
             args.mode = .local;

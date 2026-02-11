@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const PtyTerminal = @import("pty_terminal.zig").Terminal;
+const default_http_port = @import("main.zig").default_http_port;
 
 // Global state for callbacks
 var global_terminal: ?*PtyTerminal = null;
@@ -87,8 +88,8 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var http_port: u16 = 8080;
-    var ws_port: u16 = 8081;
+    var http_port: u16 = default_http_port;
+    var ws_port: u16 = default_http_port + 1;
 
     // Parse args
     var i: usize = 1;
@@ -96,7 +97,7 @@ pub fn main() !void {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             if (i + 1 < args.len) {
-                http_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 8080;
+                http_port = std.fmt.parseInt(u16, args[i + 1], 10) catch default_http_port;
                 ws_port = http_port + 1;
                 i += 1;
             }

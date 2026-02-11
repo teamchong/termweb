@@ -411,7 +411,11 @@ fn printHelp() void {
         \\  termweb help          Show this help
         \\
         \\Mux options:
-        \\  --port, -p PORT       Set HTTP port (default: 8080)
+        \\
+    ++ std.fmt.comptimePrint(
+        "  --port, -p PORT       Set HTTP port (default: {d})\n",
+        .{mux.default_http_port},
+    ) ++
         \\  --local               Local only, skip connection picker
         \\  --tailscale           Expose via Tailscale Funnel
         \\  --cloudflare          Expose via Cloudflare Tunnel
@@ -420,7 +424,11 @@ fn printHelp() void {
         \\Examples:
         \\  termweb open https://example.com
         \\  termweb open https://github.com --profile Default
-        \\  termweb mux --port 8080
+        \\
+    ++ std.fmt.comptimePrint(
+        "  termweb mux --port {d}\n",
+        .{mux.default_http_port},
+    ) ++
         \\  termweb mux --local
         \\  termweb mux --tailscale
         \\
@@ -432,7 +440,7 @@ fn printHelp() void {
 }
 
 fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    var http_port: u16 = 8080;
+    var http_port: u16 = mux.default_http_port;
     var mode: mux.tunnel_mod.Mode = .interactive;
 
     // Skip "termweb" and "mux" args
@@ -442,7 +450,7 @@ fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const arg = mux_args[i];
         if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             if (i + 1 < mux_args.len) {
-                http_port = std.fmt.parseInt(u16, mux_args[i + 1], 10) catch 8080;
+                http_port = std.fmt.parseInt(u16, mux_args[i + 1], 10) catch mux.default_http_port;
                 i += 1;
             }
         } else if (std.mem.eql(u8, arg, "--local")) {
