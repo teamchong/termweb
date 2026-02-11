@@ -592,6 +592,8 @@ const Panel = struct {
     last_cursor_color_b: u8 = 0xc8,
     last_surf_w: u16 = 0,
     last_surf_h: u16 = 0,
+    last_cell_w: u16 = 0,
+    last_cell_h: u16 = 0,
     dbg_input_countdown: u32 = 0, // Debug: log N frames after input
 
     const TARGET_FPS: i64 = 30; // 30 FPS for video
@@ -5203,8 +5205,15 @@ const Server = struct {
                                 self.broadcastControlData(&dims_buf);
                             }
 
-                            // Re-send cursor when surface dims change, position/style/color changes
-                            if (surface_changed or
+                            // Cell dimensions change on zoom in/out/reset even when
+                            // the surface pixel size stays the same. Track them so the
+                            // cursor pixel position is recalculated and re-sent.
+                            const cell_w: u16 = @intCast(size.cell_width_px);
+                            const cell_h: u16 = @intCast(size.cell_height_px);
+                            const cell_dims_changed = cell_w != panel.last_cell_w or cell_h != panel.last_cell_h;
+
+                            // Re-send cursor when surface/cell dims change, position/style/color changes
+                            if (surface_changed or cell_dims_changed or
                                 cur_col != panel.last_cursor_col or
                                 cur_row != panel.last_cursor_row or
                                 cur_style != panel.last_cursor_style or
@@ -5220,12 +5229,12 @@ const Server = struct {
                                 panel.last_cursor_color_r = cur_color_r;
                                 panel.last_cursor_color_g = cur_color_g;
                                 panel.last_cursor_color_b = cur_color_b;
+                                panel.last_cell_w = cell_w;
+                                panel.last_cell_h = cell_h;
 
                                 // Compute cursor in surface-space pixel coordinates.
                                 // Always send cell-sized rectangle; CSS handles bar/underline visuals.
                                 // Y offset +2 accounts for visual baseline alignment with text.
-                                const cell_w: u16 = @intCast(size.cell_width_px);
-                                const cell_h: u16 = @intCast(size.cell_height_px);
                                 const padding_x: u16 = @intCast(size.padding_left_px);
                                 const padding_y: u16 = @intCast(size.padding_top_px);
                                 const surf_x = padding_x + cur_col * cell_w;
