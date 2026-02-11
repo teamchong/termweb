@@ -934,7 +934,38 @@ export class MuxClient {
   }
 
   private handleLayoutUpdate(layout: LayoutData): void {
-    // Reconcile client tree with server's authoritative layout
+    // Check if server layout has panels we don't know about (e.g. created via tmux API)
+    // or tabs we don't have — if so, do a full rebuild
+    const serverPanelIds = new Set<number>();
+    for (const tab of layout.tabs) {
+      this.collectLayoutPanelIds(tab.root, serverPanelIds);
+    }
+
+    let needsRebuild = false;
+    for (const id of serverPanelIds) {
+      if (!this.panelsByServerId.has(id)) {
+        console.log(`[MUX] Layout has unknown panel ${id} — rebuilding`);
+        needsRebuild = true;
+        break;
+      }
+    }
+    if (!needsRebuild) {
+      // Check for new tabs
+      for (const tabLayout of layout.tabs) {
+        if (!this.tabInstances.has(String(tabLayout.id))) {
+          console.log(`[MUX] Layout has unknown tab ${tabLayout.id} — rebuilding`);
+          needsRebuild = true;
+          break;
+        }
+      }
+    }
+
+    if (needsRebuild) {
+      this.restoreLayoutFromServer(layout);
+      return;
+    }
+
+    // All panels and tabs exist — reconcile direction/ratio only
     for (const tabLayout of layout.tabs) {
       const tabId = String(tabLayout.id);
       const tab = this.tabInstances.get(tabId);
@@ -944,6 +975,15 @@ export class MuxClient {
           console.log(`[MUX] Reconciled ${mismatches} direction/ratio mismatches from server layout`);
         }
       }
+    }
+  }
+
+  private collectLayoutPanelIds(node: LayoutNode, ids: Set<number>): void {
+    if (node.type === 'leaf' && node.panelId !== undefined) {
+      ids.add(node.panelId);
+    } else if (node.type === 'split') {
+      if (node.first) this.collectLayoutPanelIds(node.first, ids);
+      if (node.second) this.collectLayoutPanelIds(node.second, ids);
     }
   }
 
