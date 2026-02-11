@@ -650,6 +650,10 @@ export class FileTransferHandler {
       return;
     }
 
+    // Save references before async gap — transfer may be deleted by
+    // handleTransferComplete during decompression (race condition)
+    const files = transfer.files;
+
     console.log(`[FT] BATCH_DATA: Starting decompression of ${compressedData.length} bytes...`);
     let payload: Uint8Array;
     try {
@@ -667,6 +671,9 @@ export class FileTransferHandler {
       console.warn(`Batch size mismatch: expected ${uncompressedSize}, got ${payload.length}`);
     }
 
+    // Re-fetch transfer after async gap (may have been deleted)
+    const currentTransfer = this.activeTransfers.get(transferId);
+
     // Parse batch payload: [file_count:u16] then per file: [file_index:u32][size:u32][data...]
     const batchView = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
     let offset = 0;
@@ -681,7 +688,7 @@ export class FileTransferHandler {
       const fileSize = batchView.getUint32(offset, true); offset += 4;
 
       if (offset + fileSize > payload.length) break;
-      if (fileIndex >= transfer.files.length) {
+      if (fileIndex >= files.length) {
         offset += fileSize;
         continue;
       }
@@ -689,12 +696,20 @@ export class FileTransferHandler {
       const fileData = payload.slice(offset, offset + fileSize);
       offset += fileSize;
 
-      const file = transfer.files[fileIndex];
+      const file = files[fileIndex];
       // Note: bytesTransferred is incremented in handleCompletedFile, don't double-count
 
-      // Small batched files are always complete — save or collect for zip
-      this.handleCompletedFile(transferId, file.path, fileData);
-      this.cacheDownloadedFile(transfer, file.path, fileData);
+      if (currentTransfer) {
+        // Transfer still active — normal path
+        this.handleCompletedFile(transferId, file.path, fileData);
+        this.cacheDownloadedFile(currentTransfer, file.path, fileData);
+      } else {
+        // Transfer was deleted during decompression (race with TRANSFER_COMPLETE).
+        // For non-zip single-file downloads, save the file directly.
+        console.log(`[FT] BATCH_DATA: Transfer ${transferId} gone after decompression, saving ${file.path} directly`);
+        this.saveFile(file.path, fileData);
+        this.cacheDownloadedFile(transfer, file.path, fileData);
+      }
     }
   }
 
