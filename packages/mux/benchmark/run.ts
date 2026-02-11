@@ -3,6 +3,9 @@
  * Bandwidth benchmark report: fetches live stats from a running termweb
  * instance (built with -Dbenchmark) and prints a VT vs H264+zstd comparison.
  *
+ * Compares server→client output bandwidth only. Input (keyboard/mouse) is
+ * equivalent for both approaches and excluded from the comparison.
+ *
  * Usage:
  *   1. Build with benchmark:  make benchmark
  *   2. Run termweb and use it normally (ls, btm, claude, etc.)
@@ -83,9 +86,9 @@ function printReport(stats: Stats): void {
   console.log(`  Commands seen:     ${commands.join(", ")}`);
   console.log("");
 
-  // Main comparison
+  // Main comparison (server→client output only)
   console.log("  ┌─────────────────────────────────────────────────────────┐");
-  console.log("  │  Approach              │  Total Bytes  │  Rate         │");
+  console.log("  │  Approach              │  Bytes (↑)    │  Rate         │");
   console.log("  ├─────────────────────────────────────────────────────────┤");
   console.log(`  │  VT Passthrough        │  ${formatBytes(vtBytes).padEnd(13)}│  ${formatRate(vtBytes, elapsed_s).padEnd(13)}│`);
   console.log(`  │  H264 + zstd (termweb) │  ${formatBytes(totalWs).padEnd(13)}│  ${formatRate(totalWs, elapsed_s).padEnd(13)}│`);
@@ -114,16 +117,16 @@ function printReport(stats: Stats): void {
   console.log(`    H264 video bytes:                ${formatBytes(h264Bytes)} (${stats.h264_frames} frames)`);
   console.log(`    Control channel sent (zstd):     ${formatBytes(ctrlSent)}`);
   console.log(`    Control channel received:        ${formatBytes(ctrlRecv)}`);
-  console.log(`    Total WebSocket out:             ${formatBytes(totalWs)}`);
   console.log(`    Raw BGRA pixels captured:        ${formatBytes(rawPx)}`);
   if (rawPx > 0 && h264Bytes > 0) {
     console.log(`    H264 compression ratio (vs raw): ${(rawPx / h264Bytes).toFixed(0)}:1`);
   }
   console.log("");
 
-  // Key takeaways
-  console.log("  Key Insights:");
-  console.log("  ─────────────");
+  // Notes
+  console.log("  Notes:");
+  console.log("  ──────");
+  console.log("  • Comparison is server→client output only (input is equivalent for both)");
   console.log("  • VT passthrough sends raw escape sequences — bandwidth scales with output volume");
   console.log("  • H264+zstd has bounded bandwidth (capped by bitrate), regardless of terminal output");
   console.log("  • Heavy workloads (claude code, cat large files) cause VT clients to lag;");

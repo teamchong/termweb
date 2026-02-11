@@ -1575,7 +1575,7 @@ const Server = struct {
     bw_control_bytes_sent: if (enable_benchmark) std.atomic.Value(u64) else void,
     bw_control_bytes_recv: if (enable_benchmark) std.atomic.Value(u64) else void,
     bw_raw_pixels_bytes: if (enable_benchmark) std.atomic.Value(u64) else void,
-    bw_vt_bytes: if (enable_benchmark) std.atomic.Value(u64) else void,     // VT bytes from child processes (via /proc)
+    bw_vt_bytes: if (enable_benchmark) std.atomic.Value(u64) else void,     // VT output bytes from child processes (via /proc wchar)
     bw_commands: if (enable_benchmark) [32][17:0]u8 else void,              // Recent unique command names (null-terminated)
     bw_commands_len: if (enable_benchmark) std.atomic.Value(u32) else void, // Number of unique commands seen
     bw_start_time: if (enable_benchmark) std.atomic.Value(i64) else void,
@@ -6556,7 +6556,7 @@ fn scanChildVtBytes(self: *Server) void {
         }
     }
 
-    // Sum wchar for all descendants (excluding ourselves)
+    // Sum wchar (output) for all descendants (excluding ourselves)
     var total_wchar: u64 = 0;
     for (desc_pids[0..desc_count]) |pid| {
         if (pid == our_pid) continue;
@@ -6570,7 +6570,7 @@ fn scanChildVtBytes(self: *Server) void {
         const io_len = io_file.read(&io_buf) catch continue;
         const io_str = io_buf[0..io_len];
 
-        // Find "wchar: <number>"
+        // Find "wchar: <number>" (output bytes written by child)
         if (std.mem.indexOf(u8, io_str, "wchar: ")) |pos| {
             const num_start = pos + 7;
             var num_end = num_start;

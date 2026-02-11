@@ -261,7 +261,7 @@ pub const HttpServer = struct {
         if (std.mem.startsWith(u8, path, "/api/")) {
             if (self.api_callback) |cb| {
                 if (cb(path, self.api_user_data)) |json| {
-                    var api_header_buf: [256]u8 = undefined;
+                    var api_header_buf: [512]u8 = undefined;
                     const api_header = std.fmt.bufPrint(&api_header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{json.len}) catch {
                         self.sendError(stream, 500, "Internal Server Error");
                         return;
