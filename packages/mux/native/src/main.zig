@@ -6752,7 +6752,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
             };
             if (tunnel) |t| {
                 // Store PID so SIGINT handler can kill it immediately
-                tunnel_child_pid.store(t.process.id, .release);
+                if (t.process) |proc| tunnel_child_pid.store(proc.id, .release);
                 if (t.waitForUrl(15 * std.time.ns_per_s)) {
                     if (t.getUrl()) |url| {
                         std.debug.print("  Tunnel:  {s}\n", .{url});

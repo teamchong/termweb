@@ -324,7 +324,7 @@ fn printQrOutput(output: []const u8) void {
 }
 
 pub const Tunnel = struct {
-    process: std.process.Child,
+    process: ?std.process.Child,
     provider: Provider,
     allocator: std.mem.Allocator,
     public_url: [512]u8 = undefined,
@@ -344,21 +344,48 @@ pub const Tunnel = struct {
         var argv: [8][]const u8 = undefined;
         var argc: usize = 0;
 
-        switch (provider) {
-            .tailscale => {
-                // Reset any stale background serve config (e.g. from a previous port).
-                // Without this, `tailscale serve <port>` fails with
-                // "background configuration already exists".
-                _ = std.process.Child.run(.{
-                    .allocator = allocator,
-                    .argv = &.{ "tailscale", "serve", "reset" },
-                }) catch {};
+        // Tailscale uses --bg (daemon-managed, no subprocess needed).
+        // Cloudflare and ngrok run as long-lived subprocesses.
+        if (provider == .tailscale) {
+            // Reset stale config, then configure via --bg (runs in tailscale daemon)
+            _ = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ "tailscale", "serve", "reset" },
+            }) catch {};
+            const bg_result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ "tailscale", "serve", "--bg", port_str },
+            }) catch |err| {
+                std.debug.print("  tailscale serve --bg failed: {}\n", .{err});
+                return error.TunnelFailed;
+            };
+            defer allocator.free(bg_result.stdout);
+            defer allocator.free(bg_result.stderr);
+            if (bg_result.stderr.len > 0) {
+                printCleanError("tailscale", bg_result.stderr);
+            }
 
-                argv[0] = "tailscale";
-                argv[1] = "serve";
-                argv[2] = port_str;
-                argc = 3;
-            },
+            const tun = try allocator.create(Tunnel);
+            tun.* = .{
+                .process = null,
+                .provider = provider,
+                .allocator = allocator,
+            };
+
+            // Get URL from `tailscale serve status` (config is now applied)
+            if (getTailscaleStatusUrl(allocator)) |url| {
+                const len = @min(url.len, tun.public_url.len);
+                @memcpy(tun.public_url[0..len], url[0..len]);
+                tun.url_len = len;
+                tun.url_ready.set();
+                allocator.free(url);
+            }
+
+            return tun;
+        }
+
+        switch (provider) {
+            .tailscale => unreachable,
             .cloudflare => {
                 argv[0] = "cloudflared";
                 argv[1] = "tunnel";
@@ -388,16 +415,15 @@ pub const Tunnel = struct {
         // Only pipe the stream we parse; ignore the other to prevent deadlock.
         // If the unused pipe fills up, the subprocess blocks forever.
         switch (provider) {
-            .cloudflare, .tailscale => {
-                // cloudflared outputs URL on stderr; tailscale serve outputs to stderr too
+            .cloudflare => {
                 process.stderr_behavior = .Pipe;
                 process.stdout_behavior = .Ignore;
             },
             .ngrok => {
-                // ngrok with --log stdout --log-format json outputs JSON to stdout
                 process.stdout_behavior = .Pipe;
                 process.stderr_behavior = .Ignore;
             },
+            .tailscale => unreachable,
         }
         try process.spawn();
 
@@ -407,22 +433,6 @@ pub const Tunnel = struct {
             .provider = provider,
             .allocator = allocator,
         };
-
-        // For tailscale, also try getting URL from `tailscale serve status`
-        // (works even when serve was already configured as a background service)
-        if (provider == .tailscale) {
-            if (getTailscaleStatusUrl(allocator)) |url| {
-                const len = @min(url.len, tun.public_url.len);
-                @memcpy(tun.public_url[0..len], url[0..len]);
-                tun.url_len = len;
-                tun.url_ready.set();
-                allocator.free(url);
-            }
-
-            // Validate that the serve proxy port matches the server port.
-            // A stale background config can proxy to the wrong port silently.
-            validateTailscaleFunnelPort(allocator, port);
-        }
 
         tun.reader_thread = std.Thread.spawn(.{}, readerThread, .{tun}) catch null;
 
@@ -443,15 +453,19 @@ pub const Tunnel = struct {
 
     /// Stop the tunnel subprocess and clean up.
     pub fn stop(self: *Tunnel) void {
-        _ = self.process.kill() catch {};
+        if (self.process) |*proc| {
+            _ = proc.kill() catch {};
+        }
 
         if (self.reader_thread) |thread| {
             thread.join();
         }
 
-        _ = self.process.wait() catch {};
+        if (self.process) |*proc| {
+            _ = proc.wait() catch {};
+        }
 
-        // Reset tailscale serve config to avoid leaving stale port mappings
+        // Reset tailscale serve config (daemon-managed, no subprocess to kill)
         if (self.provider == .tailscale) {
             _ = std.process.Child.run(.{
                 .allocator = self.allocator,
@@ -466,9 +480,11 @@ pub const Tunnel = struct {
     /// Also prints error/status lines from the tunnel subprocess so the user
     /// can see authentication errors, config issues, etc.
     fn readerThread(self: *Tunnel) void {
+        const proc = self.process orelse return;
         const pipe = switch (self.provider) {
-            .ngrok => self.process.stdout,
-            .cloudflare, .tailscale => self.process.stderr,
+            .ngrok => proc.stdout,
+            .cloudflare => proc.stderr,
+            .tailscale => return, // tailscale uses --bg, no subprocess to read
         } orelse return;
 
         const fd = pipe.handle;
