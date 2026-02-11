@@ -495,8 +495,16 @@ export class FileTransferHandler {
         };
         // Don't start uploading yet — server sends FILE_LIST next for resumes
       } else if (transfer.direction === 'upload' && transfer.files) {
-        // Fresh upload — start sending immediately
+        // Send file list to server so it can map file indices to paths
+        this.sendUploadFileList(transferId, transfer.files);
         transfer.state = 'transferring';
+
+        // Notify UI that upload has started
+        const nonDirFiles = transfer.files.filter(f => !f.isDir);
+        const totalBytes = nonDirFiles.reduce((sum, f) => sum + f.size, 0);
+        transfer.totalBytes = totalBytes;
+        this.onTransferStart?.(transferId, transfer.serverPath ?? '', 'upload', nonDirFiles.length, totalBytes);
+
         this.sendNextChunk(transferId).catch(err => console.error('Send chunk failed:', err));
       }
     }
@@ -811,6 +819,13 @@ export class FileTransferHandler {
     const transfer = this.activeTransfers.get(transferId);
     if (transfer && transfer.state !== 'error' && transfer.state !== 'complete') {
       transfer.bytesTransferred = bytesReceived;
+
+      // Report upload progress
+      if (transfer.direction === 'upload' && transfer.files) {
+        const totalFiles = transfer.files.filter(f => !f.isDir).length;
+        this.onDownloadProgress?.(transferId, transfer.currentFileIndex, totalFiles, bytesReceived, transfer.totalBytes ?? 0);
+      }
+
       this.sendNextChunk(transferId).catch(err => console.error('Send chunk failed:', err));
     }
   }
@@ -1172,6 +1187,34 @@ export class FileTransferHandler {
     }
 
     return files;
+  }
+
+  /** Send the upload file list to the server so it can map file indices to paths. */
+  private sendUploadFileList(transferId: number, files: TransferFile[]): void {
+    const totalBytes = files.reduce((sum, f) => sum + (f.isDir ? 0 : f.size), 0);
+    const encodedPaths = files.map(f => sharedTextEncoder.encode(f.path));
+    // [msg_type:1][transfer_id:4][file_count:4][total_bytes:8][per file: path_len:2 + path + size:8 + is_dir:1]
+    const payloadLen = encodedPaths.reduce((sum, p) => sum + 2 + p.length + 8 + 1, 0);
+    const msgLen = 1 + 4 + 4 + 8 + payloadLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, TransferMsgType.UPLOAD_FILE_LIST); offset += 1;
+    view.setUint32(offset, transferId, true); offset += 4;
+    view.setUint32(offset, files.length, true); offset += 4;
+    view.setBigUint64(offset, BigInt(totalBytes), true); offset += 8;
+
+    for (let i = 0; i < files.length; i++) {
+      const pathBytes = encodedPaths[i];
+      view.setUint16(offset, pathBytes.length, true); offset += 2;
+      bytes.set(pathBytes, offset); offset += pathBytes.length;
+      view.setBigUint64(offset, BigInt(files[i].size), true); offset += 8;
+      view.setUint8(offset, files[i].isDir ? 1 : 0); offset += 1;
+    }
+
+    this.send(msg);
   }
 
   private async sendNextChunk(transferId: number): Promise<void> {

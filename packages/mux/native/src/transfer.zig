@@ -1018,10 +1018,11 @@ pub const ClientMsgType = enum(u8) {
     file_data = 0x22,         // File chunk data (upload)
     transfer_resume = 0x23,   // Resume interrupted transfer
     transfer_cancel = 0x24,   // Cancel transfer
+    upload_file_list = 0x25,  // Client sends file list for upload
     // Rsync/sync messages
-    sync_request = 0x25,      // Start incremental sync
-    block_checksums = 0x26,   // Client sends block checksums of cached copy
-    sync_ack = 0x27,          // Client confirms delta applied
+    sync_request = 0x26,      // Start incremental sync
+    block_checksums = 0x27,   // Client sends block checksums of cached copy
+    sync_ack = 0x28,          // Client confirms delta applied
 };
 
 // Message types from server (0x30-0x3F)
@@ -2478,6 +2479,60 @@ pub fn parseTransferResume(allocator: Allocator, data: []const u8) !TransferResu
         .path = path,
         .completed_files = completed_files,
     };
+}
+
+/// Parse UPLOAD_FILE_LIST message (client sends file list before uploading)
+/// [0x25][transfer_id:u32][file_count:u32][total_bytes:u64][for each: path_len:u16, path, size:u64, is_dir:u8]
+pub fn parseUploadFileList(allocator: Allocator, data: []const u8) !struct { transfer_id: u32, files: []FileEntry, total_bytes: u64 } {
+    if (data.len < 13) return error.MessageTooShort;
+
+    var offset: usize = 1; // Skip msg type
+
+    const transfer_id = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+
+    const file_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+    offset += 4;
+
+    const total_bytes = std.mem.readInt(u64, data[offset..][0..8], .little);
+    offset += 8;
+
+    var files = try allocator.alloc(FileEntry, file_count);
+    errdefer allocator.free(files);
+
+    for (0..file_count) |i| {
+        if (offset + 2 > data.len) {
+            for (files[0..i]) |*f| f.deinit(allocator);
+            allocator.free(files);
+            return error.MessageTooShort;
+        }
+        const path_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+        offset += 2;
+
+        if (offset + path_len + 9 > data.len) {
+            for (files[0..i]) |*f| f.deinit(allocator);
+            allocator.free(files);
+            return error.MessageTooShort;
+        }
+        const path = try allocator.dupe(u8, data[offset..][0..path_len]);
+        offset += path_len;
+
+        const size = std.mem.readInt(u64, data[offset..][0..8], .little);
+        offset += 8;
+
+        const is_dir = data[offset] != 0;
+        offset += 1;
+
+        files[i] = .{
+            .path = path,
+            .size = size,
+            .mtime = 0,
+            .hash = 0,
+            .is_dir = is_dir,
+        };
+    }
+
+    return .{ .transfer_id = transfer_id, .files = files, .total_bytes = total_bytes };
 }
 
 // Parse FILE_DATA message (upload from browser)

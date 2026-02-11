@@ -466,28 +466,26 @@
         // Initialize download entry when transfer starts (creates single entry with correct totals)
         muxClient.getFileTransfer().onTransferStart = (transferId, path, direction, totalFiles, totalBytes) => {
           console.log(`[App] onTransferStart: id=${transferId}, direction=${direction}, files=${totalFiles}, bytes=${totalBytes}, path=${path}`);
-          if (direction === 'download') {
-            // Open the progress dialog automatically
-            downloadProgressOpen = true;
+          // Open the progress dialog automatically
+          downloadProgressOpen = true;
 
-            // Create the download entry - create new Map to trigger Svelte 5 reactivity
-            activeDownloads.set(transferId, {
-              files: 0,
-              total: totalFiles,
-              bytes: 0,
-              totalBytes: totalBytes,
-              path: path,
-              status: 'active',
-              startTime: Date.now(),
-            });
-            activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
-            console.log(`[App] Created download entry for transfer ${transferId}, map size: ${activeDownloads.size}`);
+          // Create the transfer entry - create new Map to trigger Svelte 5 reactivity
+          activeDownloads.set(transferId, {
+            files: 0,
+            total: totalFiles,
+            bytes: 0,
+            totalBytes: totalBytes,
+            path: path,
+            status: 'active',
+            startTime: Date.now(),
+          });
+          activeDownloads = new Map(activeDownloads); // Create new Map instance for reactivity
+          console.log(`[App] Created transfer entry for ${direction} ${transferId}, map size: ${activeDownloads.size}`);
 
-            // Clear pending path since we now have the actual transfer
-            if (pendingTransferPath) {
-              console.log('[App] Clearing pendingTransferPath');
-              pendingTransferPath = null;
-            }
+          // Clear pending path since we now have the actual transfer
+          if (pendingTransferPath) {
+            console.log('[App] Clearing pendingTransferPath');
+            pendingTransferPath = null;
           }
         };
 

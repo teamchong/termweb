@@ -1562,6 +1562,14 @@ const Server = struct {
     wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
     goroutine_rt: *goroutine_runtime.Runtime, // M:N goroutine scheduler for file transfer pipeline
 
+    // Bandwidth benchmark counters (atomic — updated from multiple threads)
+    bw_h264_bytes: std.atomic.Value(u64),           // Total H264 bytes sent to clients
+    bw_h264_frames: std.atomic.Value(u64),           // Total H264 frames sent
+    bw_control_bytes_sent: std.atomic.Value(u64),    // Total control bytes sent (on-wire, after compression)
+    bw_control_bytes_recv: std.atomic.Value(u64),    // Total control bytes received (on-wire, after compression)
+    bw_raw_pixels_bytes: std.atomic.Value(u64),      // Total raw BGRA pixels captured (pre-encode baseline)
+    bw_start_time: std.atomic.Value(i64),            // Timestamp when stats started (truncated nanoTimestamp)
+
     var global_server: std.atomic.Value(?*Server) = std.atomic.Value(?*Server).init(null);
 
     fn init(allocator: std.mem.Allocator, http_port: u16, control_port: u16, panel_port: u16) !*Server {
@@ -1666,6 +1674,12 @@ const Server = struct {
             } else {},
             .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
             .goroutine_rt = gor_rt,
+            .bw_h264_bytes = std.atomic.Value(u64).init(0),
+            .bw_h264_frames = std.atomic.Value(u64).init(0),
+            .bw_control_bytes_sent = std.atomic.Value(u64).init(0),
+            .bw_control_bytes_recv = std.atomic.Value(u64).init(0),
+            .bw_raw_pixels_bytes = std.atomic.Value(u64).init(0),
+            .bw_start_time = std.atomic.Value(i64).init(@truncate(std.time.nanoTimestamp())),
         };
 
         // Get current working directory (fallback to "/" if unavailable)
@@ -2024,6 +2038,9 @@ const Server = struct {
         const self = global_server.load(.acquire) orelse return;
         if (data.len == 0) return;
 
+        // Track incoming control bytes (post-decompression size from client)
+        _ = self.bw_control_bytes_recv.fetchAdd(data.len, .monotonic);
+
         const msg_type = data[0];
         if (msg_type == 0xFE) {
             // Batch envelope: [0xFE][count:u16_le][len1:u16_le][msg1...][len2:u16_le][msg2...]...
@@ -2213,6 +2230,11 @@ const Server = struct {
         for (conns_buf[0..conns_count]) |conn| {
             conn.sendBinaryParts(&id_buf, frame_data) catch continue;
             any_sent = true;
+        }
+        if (any_sent) {
+            // Track bandwidth: 4-byte panel_id prefix + H264 payload per client
+            _ = self.bw_h264_bytes.fetchAdd(4 + frame_data.len, .monotonic);
+            _ = self.bw_h264_frames.fetchAdd(1, .monotonic);
         }
         return any_sent;
     }
@@ -2810,6 +2832,18 @@ const Server = struct {
         return buf[0..count];
     }
 
+    /// Broadcast binary data to all control connections and track bytes for bandwidth benchmark.
+    fn broadcastControlData(self: *Server, data: []const u8) void {
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        var sent: u64 = 0;
+        for (conns) |ctrl_conn| {
+            ctrl_conn.sendBinary(data) catch continue;
+            sent += data.len;
+        }
+        if (sent > 0) _ = self.bw_control_bytes_sent.fetchAdd(sent, .monotonic);
+    }
+
     fn broadcastInspectorUpdates(self: *Server) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2893,12 +2927,7 @@ const Server = struct {
         var buf: [5]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_created);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
-
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |conn| {
-            conn.sendBinary(&buf) catch {};
-        }
+        self.broadcastControlData(&buf);
     }
 
     fn broadcastPanelClosed(self: *Server, panel_id: u32) void {
@@ -2906,12 +2935,7 @@ const Server = struct {
         var buf: [5]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_closed);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
-
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |conn| {
-            conn.sendBinary(&buf) catch {};
-        }
+        self.broadcastControlData(&buf);
     }
 
     fn broadcastPanelTitle(self: *Server, panel_id: u32, title: []const u8) void {
@@ -2923,20 +2947,15 @@ const Server = struct {
         buf[5] = title_len;
         @memcpy(buf[6..][0..title_len], title[0..title_len]);
 
-        // Lock once: update panel data + copy connection list, then unlock before sending
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        // Update panel data under mutex
         self.mutex.lock();
         if (self.panels.get(panel_id)) |panel| {
             if (panel.title.len > 0) self.allocator.free(panel.title);
             panel.title = self.allocator.dupe(u8, title) catch &.{};
         }
-        const count = @min(self.control_connections.items.len, max_broadcast_conns);
-        @memcpy(conn_buf[0..count], self.control_connections.items[0..count]);
         self.mutex.unlock();
 
-        for (conn_buf[0..count]) |conn| {
-            conn.sendBinary(buf[0 .. 6 + title_len]) catch {};
-        }
+        self.broadcastControlData(buf[0 .. 6 + title_len]);
     }
 
     fn broadcastPanelBell(self: *Server, panel_id: u32) void {
@@ -2944,12 +2963,7 @@ const Server = struct {
         var buf: [5]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_bell);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
-
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |conn| {
-            conn.sendBinary(&buf) catch {};
-        }
+        self.broadcastControlData(&buf);
     }
 
     fn broadcastPanelPwd(self: *Server, panel_id: u32, pwd: []const u8) void {
@@ -2961,20 +2975,15 @@ const Server = struct {
         std.mem.writeInt(u16, buf[5..7], pwd_len, .little);
         @memcpy(buf[7..][0..pwd_len], pwd[0..pwd_len]);
 
-        // Lock once: update panel data + copy connection list, then unlock before sending
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        // Update panel data under mutex
         self.mutex.lock();
         if (self.panels.get(panel_id)) |panel| {
             if (panel.pwd.len > 0) self.allocator.free(panel.pwd);
             panel.pwd = self.allocator.dupe(u8, pwd) catch &.{};
         }
-        const count = @min(self.control_connections.items.len, max_broadcast_conns);
-        @memcpy(conn_buf[0..count], self.control_connections.items[0..count]);
         self.mutex.unlock();
 
-        for (conn_buf[0..count]) |conn| {
-            conn.sendBinary(buf[0 .. 7 + pwd_len]) catch {};
-        }
+        self.broadcastControlData(buf[0 .. 7 + pwd_len]);
     }
 
     fn broadcastPanelNotification(self: *Server, panel_id: u32, title: []const u8, body: []const u8) void {
@@ -2990,11 +2999,7 @@ const Server = struct {
         std.mem.writeInt(u16, buf[6 + title_len ..][0..2], body_len, .little);
         @memcpy(buf[8 + title_len ..][0..body_len], body[0..body_len]);
 
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |conn| {
-            conn.sendBinary(buf[0..total_len]) catch {};
-        }
+        self.broadcastControlData(buf[0..total_len]);
     }
 
     fn broadcastLayoutUpdate(self: *Server) void {
@@ -3020,9 +3025,13 @@ const Server = struct {
         std.mem.writeInt(u16, msg_buf[1..3], layout_len, .little);
         @memcpy(msg_buf[3..][0..layout_len], layout_json[0..layout_len]);
 
+        // Track bandwidth for layout updates
+        var sent: u64 = 0;
         for (conn_buf[0..count]) |conn| {
-            conn.sendBinary(msg_buf) catch {};
+            conn.sendBinary(msg_buf) catch continue;
+            sent += msg_buf.len;
         }
+        if (sent > 0) _ = self.bw_control_bytes_sent.fetchAdd(sent, .monotonic);
     }
 
     fn sendMainClientState(self: *Server, conn: *ws.Connection, client_id: u32) void {
@@ -3061,12 +3070,7 @@ const Server = struct {
         var buf: [2]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.overview_state);
         buf[1] = if (self.overview_open) 1 else 0;
-
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |conn| {
-            conn.sendBinary(&buf) catch {};
-        }
+        self.broadcastControlData(&buf);
     }
 
     fn sendOverviewState(self: *Server, conn: *ws.Connection) void {
@@ -3084,12 +3088,7 @@ const Server = struct {
         var buf: [2]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.quick_terminal_state);
         buf[1] = if (self.quick_terminal_open) 1 else 0;
-
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |conn| {
-            conn.sendBinary(&buf) catch {};
-        }
+        self.broadcastControlData(&buf);
     }
 
     fn sendQuickTerminalState(self: *Server, conn: *ws.Connection) void {
@@ -3256,11 +3255,7 @@ const Server = struct {
             @memcpy(buf[6..][0..sid_len], session_id[0..sid_len]);
         }
 
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |c_conn| {
-            c_conn.sendBinary(buf[0 .. 6 + sid_len]) catch {};
-        }
+        self.broadcastControlData(buf[0 .. 6 + sid_len]);
     }
 
     /// Send all current panel assignments to a specific client.
@@ -3379,6 +3374,7 @@ const Server = struct {
         switch (msg_type) {
             @intFromEnum(transfer.ClientMsgType.transfer_init) => self.handleTransferInit(conn, data),
             @intFromEnum(transfer.ClientMsgType.file_list_request) => self.handleFileListRequest(conn, data),
+            @intFromEnum(transfer.ClientMsgType.upload_file_list) => self.handleUploadFileList(conn, data),
             @intFromEnum(transfer.ClientMsgType.file_data) => self.handleFileData(conn, data),
             @intFromEnum(transfer.ClientMsgType.transfer_resume) => self.handleTransferResume(conn, data),
             @intFromEnum(transfer.ClientMsgType.transfer_cancel) => self.handleTransferCancel(conn, data),
@@ -3470,6 +3466,33 @@ const Server = struct {
         const list_msg = transfer.buildFileList(self.allocator, session) catch return;
         defer self.allocator.free(list_msg);
         conn.sendBinary(list_msg) catch {};
+    }
+
+    /// Handle UPLOAD_FILE_LIST — client sends its file list before uploading data.
+    /// Populates session.files so handleFileData can map file_index to paths.
+    fn handleUploadFileList(self: *Server, _: *ws.Connection, data: []u8) void {
+        const parsed = transfer.parseUploadFileList(self.allocator, data) catch |err| {
+            std.debug.print("Failed to parse UPLOAD_FILE_LIST: {}\n", .{err});
+            return;
+        };
+
+        const session = self.transfer_manager.getSession(parsed.transfer_id) orelse {
+            // No session — free the parsed files
+            for (parsed.files) |*f| {
+                var entry = f.*;
+                entry.deinit(self.allocator);
+            }
+            self.allocator.free(parsed.files);
+            return;
+        };
+
+        // Populate session file list from client data
+        session.files.clearAndFree(self.allocator);
+        for (parsed.files) |entry| {
+            session.files.append(self.allocator, entry) catch {};
+        }
+        self.allocator.free(parsed.files);
+        session.total_bytes = parsed.total_bytes;
     }
 
     // Handle FILE_DATA message (upload from browser)
@@ -5015,11 +5038,7 @@ const Server = struct {
                                 panel.last_surf_w = surf_total_w;
                                 panel.last_surf_h = surf_total_h;
                                 const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
-                                var ctrl_buf2: [max_broadcast_conns]*ws.Connection = undefined;
-                                const ctrl_conns2 = self.snapshotControlConns(&ctrl_buf2);
-                                for (ctrl_conns2) |ctrl_conn| {
-                                    ctrl_conn.sendBinary(&dims_buf) catch {};
-                                }
+                                self.broadcastControlData(&dims_buf);
                             }
 
                             // Re-send cursor when surface dims change: padding and pixel
@@ -5049,17 +5068,14 @@ const Server = struct {
                                 const surf_h: u16 = cell_h -| 2;
 
                                 const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible);
-
-                                // Broadcast to control WS connections
-                                var ctrl_buf: [max_broadcast_conns]*ws.Connection = undefined;
-                                const ctrl_conns = self.snapshotControlConns(&ctrl_buf);
-                                for (ctrl_conns) |ctrl_conn| {
-                                    ctrl_conn.sendBinary(&cursor_buf) catch {};
-                                }
+                                self.broadcastControlData(&cursor_buf);
                             }
                         }
 
                         if (read_ok) {
+                            // Track raw BGRA pixels captured for bandwidth comparison
+                            _ = self.bw_raw_pixels_bytes.fetchAdd(panel.bgra_buffer.?.len, .monotonic);
+
                             // Frame skip: hash the pixel buffer and skip encoding if unchanged
                             const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
 
@@ -5233,6 +5249,26 @@ const Server = struct {
                                 dropped_str,
                             }) catch "";
                             _ = f.write(line) catch {};
+
+                            // Bandwidth stats line (cumulative totals for benchmark comparison)
+                            const bw_h264 = self.bw_h264_bytes.load(.monotonic);
+                            const bw_h264_frames = self.bw_h264_frames.load(.monotonic);
+                            const bw_ctrl_sent = self.bw_control_bytes_sent.load(.monotonic);
+                            const bw_ctrl_recv = self.bw_control_bytes_recv.load(.monotonic);
+                            const bw_raw_px = self.bw_raw_pixels_bytes.load(.monotonic);
+                            const bw_now: i64 = @truncate(std.time.nanoTimestamp());
+                            const elapsed_s: u64 = @intCast(@divFloor(bw_now - self.bw_start_time.load(.monotonic), std.time.ns_per_s));
+                            var bw_buf: [512]u8 = undefined;
+                            const bw_line = std.fmt.bufPrint(&bw_buf, "BW t={d}s h264={d}KB/{d}frames ctrl_out={d}KB ctrl_in={d}KB raw_px={d}MB total_ws={d}KB\n", .{
+                                elapsed_s,
+                                bw_h264 / 1024,
+                                bw_h264_frames,
+                                bw_ctrl_sent / 1024,
+                                bw_ctrl_recv / 1024,
+                                bw_raw_px / (1024 * 1024),
+                                (bw_h264 + bw_ctrl_sent) / 1024,
+                            }) catch "";
+                            _ = f.write(bw_line) catch {};
                         }
                     }
                     fps_counter = 0;
@@ -6342,6 +6378,56 @@ fn onFileWsUpgrade(stream: std.net.Stream, request: []const u8, user_data: ?*any
     server.file_ws_server.handleUpgrade(stream, request);
 }
 
+/// Handle API requests (e.g., /api/benchmark/stats).
+/// Returns a JSON string (static buffer, no allocation needed) or null if path not handled.
+fn handleApiRequest(path: []const u8, user_data: ?*anyopaque) ?[]const u8 {
+    const server: *Server = @ptrCast(@alignCast(user_data orelse return null));
+
+    if (std.mem.eql(u8, path, "/api/benchmark/stats")) {
+        const h264_bytes = server.bw_h264_bytes.load(.monotonic);
+        const h264_frames = server.bw_h264_frames.load(.monotonic);
+        const ctrl_sent = server.bw_control_bytes_sent.load(.monotonic);
+        const ctrl_recv = server.bw_control_bytes_recv.load(.monotonic);
+        const raw_px = server.bw_raw_pixels_bytes.load(.monotonic);
+        const bw_now: i64 = @truncate(std.time.nanoTimestamp());
+        const elapsed_ns: u64 = @intCast(bw_now - server.bw_start_time.load(.monotonic));
+        const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
+
+        // Use a thread-local static buffer for the JSON response
+        const S = struct {
+            threadlocal var json_buf: [1024]u8 = undefined;
+        };
+        const json = std.fmt.bufPrint(&S.json_buf,
+            \\{{"elapsed_ms":{d},"h264_bytes":{d},"h264_frames":{d},"control_bytes_sent":{d},"control_bytes_recv":{d},"raw_pixels_bytes":{d},"total_ws_bytes":{d}}}
+        , .{
+            elapsed_ms,
+            h264_bytes,
+            h264_frames,
+            ctrl_sent,
+            ctrl_recv,
+            raw_px,
+            h264_bytes + ctrl_sent,
+        }) catch return null;
+        return json;
+    }
+
+    if (std.mem.eql(u8, path, "/api/benchmark/reset")) {
+        server.bw_h264_bytes.store(0, .monotonic);
+        server.bw_h264_frames.store(0, .monotonic);
+        server.bw_control_bytes_sent.store(0, .monotonic);
+        server.bw_control_bytes_recv.store(0, .monotonic);
+        server.bw_raw_pixels_bytes.store(0, .monotonic);
+        server.bw_start_time.store(@truncate(std.time.nanoTimestamp()), .monotonic);
+        const S = struct {
+            threadlocal var buf: [64]u8 = undefined;
+        };
+        const json = std.fmt.bufPrint(&S.buf, "{{}}", .{}) catch return null;
+        return json;
+    }
+
+    return null;
+}
+
 /// Run mux server - can be called from CLI or standalone
 pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) !void {
     // Setup SIGINT handler for graceful shutdown
@@ -6375,6 +6461,8 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
         null,
         server,
     );
+    server.http_server.api_callback = handleApiRequest;
+    server.http_server.api_user_data = server;
 
     // Resolve connection mode: interactive shows a picker, others are direct
     const chosen_provider: ?tunnel_mod.Provider = switch (mode) {
