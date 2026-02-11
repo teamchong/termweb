@@ -1,19 +1,20 @@
+```
 bun run packages/mux/benchmark/run.ts --port 7681
 
 ╔══════════════════════════════════════════════════════════════╗
-║          Termweb Bandwidth Benchmark Report                 ║
-║          VT Passthrough vs H264 + zstd                      ║
+║          Termweb Bandwidth Benchmark Report                  ║
+║          VT Passthrough vs H264 + zstd                       ║
 ╚══════════════════════════════════════════════════════════════╝
 
   Session duration:  67.7s
   Commands seen:     sh, bash
 
-  ┌─────────────────────────────────────────────────────────┐
-  │  Approach              │  Bytes (↑)    │  Rate         │
-  ├─────────────────────────────────────────────────────────┤
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  Approach              │  Bytes (↑)    │  Rate                  │
+  ├─────────────────────────────────────────────────────────────────┤
   │  VT Passthrough        │  29.2 KB      │  441.03306639874705 B/s│
-  │  H264 + zstd (termweb) │  30.7 KB      │  465.0571791613723 B/s│
-  └─────────────────────────────────────────────────────────┘
+  │  H264 + zstd (termweb) │  30.7 KB      │  465.0571791613723 B/s │
+  └─────────────────────────────────────────────────────────────────┘
 
   Result: H264+zstd uses 5.4% more bandwidth (1.05x ratio)
 
@@ -33,3 +34,4 @@ bun run packages/mux/benchmark/run.ts --port 7681
   • H264+zstd has bounded bandwidth (capped by bitrate), regardless of terminal output
   • Heavy workloads (claude code, cat large files) cause VT clients to lag;
     H264 decoding is constant-time via hardware acceleration
+```
