@@ -1,6 +1,6 @@
 # Termweb Makefile
 
-.PHONY: all build run test clean gen-ui mux mux-web mux-native mux-deps mux-clean wasm vendor-reset vendor-patch vendor-sync vendor-build-ghostty vendor-generate-patch benchmark benchmark-report
+.PHONY: all build run test test-tmux clean gen-ui mux mux-web mux-native mux-deps mux-clean wasm vendor-reset vendor-patch vendor-sync vendor-build-ghostty vendor-generate-patch benchmark benchmark-report
 
 # Default: build everything (JS must be bundled before Zig embeds it)
 all: build-all
@@ -16,6 +16,10 @@ run:
 # Run tests
 test:
 	zig build test
+
+# Run tmux shim integration test (starts termweb mux, exercises all tmux commands)
+test-tmux:
+	@./tests/test-tmux-shim.sh
 
 # Clean build artifacts
 clean:
