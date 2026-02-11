@@ -1166,17 +1166,43 @@
   function handlePaste(e: ClipboardEvent): void {
     if (!e.clipboardData) return;
     // Check items for file-kind entries (images, copied files)
-    const files: File[] = [];
-    for (let i = 0; i < e.clipboardData.items.length; i++) {
-      const item = e.clipboardData.items[i];
-      if (item.kind === 'file') {
-        const file = item.getAsFile();
-        if (file) files.push(file);
-      }
-    }
-    if (files.length > 0) {
+    const items = Array.from(e.clipboardData.items).filter(i => i.kind === 'file');
+
+    if (items.length > 0) {
       e.preventDefault();
-      onFileDrop?.(files);
+
+      // Try File System Access API to detect folders (like handleDrop)
+      if (typeof items[0].getAsFileSystemHandle === 'function') {
+        const handlePromises = items.map(i => (i as any).getAsFileSystemHandle() as Promise<FileSystemHandle>);
+        Promise.all(handlePromises).then(handles => {
+          const dirHandles = handles.filter((h): h is FileSystemDirectoryHandle => h?.kind === 'directory');
+          const fileHandles = handles.filter((h): h is FileSystemFileHandle => h?.kind === 'file');
+
+          if (dirHandles.length === 1 && fileHandles.length === 0) {
+            onFileDrop?.([], dirHandles[0]);
+          } else {
+            Promise.all(fileHandles.map(h => h.getFile())).then(files => {
+              if (files.length > 0) onFileDrop?.(files);
+            });
+          }
+        }).catch(() => {
+          // Fallback: use getAsFile()
+          const files: File[] = [];
+          for (const item of items) {
+            const file = item.getAsFile();
+            if (file) files.push(file);
+          }
+          if (files.length > 0) onFileDrop?.(files);
+        });
+      } else {
+        // No File System Access API — use getAsFile() directly
+        const files: File[] = [];
+        for (const item of items) {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+        if (files.length > 0) onFileDrop?.(files);
+      }
       return;
     }
     // No files — handle as text paste into terminal

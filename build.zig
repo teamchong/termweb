@@ -7,6 +7,9 @@ pub fn build(b: *std.Build) void {
     // Option to skip NAPI build (for CI where we only need CLI binary)
     const skip_napi = b.option(bool, "skip-napi", "Skip building NAPI module") orelse false;
 
+    // Option to enable bandwidth benchmark counters in mux server
+    const enable_benchmark = b.option(bool, "benchmark", "Enable bandwidth benchmark counters") orelse false;
+
     // Read version from package.json at build time
     const version = getVersionFromPackageJson(b) orelse "0.0.0";
 
@@ -269,6 +272,11 @@ pub fn build(b: *std.Build) void {
         mux_mod.addImport("websocket", websocket_mod);
         mux_mod.addImport("simd_mask", simd_mask_mod);
         mux_mod.addImport("shared_memory", shared_memory_mod);
+
+        // Build options for mux module
+        const mux_options = b.addOptions();
+        mux_options.addOption(bool, "enable_benchmark", enable_benchmark);
+        mux_mod.addOptions("build_options", mux_options);
 
         // Add mux module to main exe
         exe.root_module.addImport("mux", mux_mod);

@@ -73,12 +73,11 @@ async function initWasm(): Promise<void> {
 
 /** Activate OPFS with a root handle received from the main thread */
 async function activateOPFS(root: FileSystemDirectoryHandle): Promise<void> {
-  const t0 = performance.now();
   opfsRoot = root;
   console.log(`[Worker] OPFS root received from main thread`);
 
-  await clearAllTransferMetadata();
-  console.log(`[Worker] clearAllTransferMetadata: ${(performance.now() - t0).toFixed(0)}ms`);
+  // Do NOT clear transfer metadata here — it's needed for download resume
+  // across page reloads. Metadata is cleaned up per-transfer on completion.
 
   opfsReady = true;
   console.log(`[Worker] OPFS ready`);
@@ -709,6 +708,7 @@ function applyDelta(cachedData: Uint8Array, deltaPayload: Uint8Array): Uint8Arra
 
 interface TransferMetadata {
   transferId: number;
+  direction: 'upload' | 'download';
   serverPath: string;
   totalFiles: number;
   totalBytes: number;
@@ -716,6 +716,9 @@ interface TransferMetadata {
   bytesTransferred: number;
   startTime: number;
   lastUpdateTime: number;
+  // Transfer options preserved for resume
+  useGitignore?: boolean;
+  excludes?: string[];
 }
 
 async function saveTransferMetadata(meta: TransferMetadata): Promise<void> {
@@ -877,6 +880,8 @@ self.onmessage = async (e: MessageEvent) => {
             if (complete) {
               completedFiles.add(fileKey);
               fileQueues.delete(fileKey);
+              // Persist to OPFS metadata for resume support
+              await updateTransferProgress(transferId, filePath, totalWritten);
             }
 
             (self as unknown as Worker).postMessage({
@@ -930,7 +935,10 @@ self.onmessage = async (e: MessageEvent) => {
 
       case 'write-temp-file': {
         if (!tempFileStore.has(msg.transferId)) tempFileStore.set(msg.transferId, new Map());
-        tempFileStore.get(msg.transferId)!.set(msg.path, new Uint8Array(msg.data));
+        const fileData = new Uint8Array(msg.data);
+        tempFileStore.get(msg.transferId)!.set(msg.path, fileData);
+        // Persist to OPFS metadata for resume support
+        await updateTransferProgress(msg.transferId, msg.path, fileData.length);
         break;
       }
 
@@ -955,6 +963,7 @@ self.onmessage = async (e: MessageEvent) => {
 
       case 'cleanup-temp': {
         tempFileStore.delete(msg.transferId);
+        if (opfsReady) await cleanupTempFiles(msg.transferId);
         break;
       }
 

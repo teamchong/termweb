@@ -1354,6 +1354,9 @@ pub const TransferSession = struct {
     }
 
     fn walkDirectory(self: *TransferSession, dir: fs.Dir, prefix: []const u8) !void {
+        // Abort early if transfer was cancelled or server is shutting down
+        if (!@atomicLoad(bool, &self.is_active, .acquire)) return;
+
         const has_include = self.include_pattern != null;
         const should_recurse = if (self.include_pattern) |p|
             containsDoublestar(p) or std.mem.indexOfScalar(u8, p, '/') != null
@@ -1548,6 +1551,9 @@ pub const TransferSession = struct {
     /// directory entries are omitted, and recursion is skipped unless the pattern
     /// contains `**` or `/`.
     fn walkDirectoryNoHash(self: *TransferSession, dir: fs.Dir, prefix: []const u8) !void {
+        // Abort early if transfer was cancelled or server is shutting down
+        if (!@atomicLoad(bool, &self.is_active, .acquire)) return;
+
         const has_include = self.include_pattern != null;
         const should_recurse = if (self.include_pattern) |p|
             containsDoublestar(p) or std.mem.indexOfScalar(u8, p, '/') != null
@@ -2409,14 +2415,21 @@ pub fn parseTransferInit(allocator: Allocator, data: []const u8) !TransferInitDa
 }
 
 // Parse TRANSFER_RESUME message (resume interrupted download)
-// [0x23][transfer_id:u32][path_len:u16][path][completed_count:u32][[file_path_len:u16][file_path]]...
+// [0x23][transfer_id:u32][flags:u8][exclude_count:u8][path_len:u16][path]
+// [[exclude_len:u8][exclude]]...[completed_count:u32][[file_path_len:u16][file_path]]...
 pub const TransferResumeData = struct {
     transfer_id: u32,
+    flags: u8,
     path: []const u8,
+    excludes: []const []const u8,
     completed_files: []const []const u8,
 
     pub fn deinit(self: *TransferResumeData, allocator: Allocator) void {
         allocator.free(self.path);
+        for (self.excludes) |exclude| {
+            allocator.free(exclude);
+        }
+        allocator.free(self.excludes);
         for (self.completed_files) |file_path| {
             allocator.free(file_path);
         }
@@ -2425,12 +2438,18 @@ pub const TransferResumeData = struct {
 };
 
 pub fn parseTransferResume(allocator: Allocator, data: []const u8) !TransferResumeData {
-    if (data.len < 7) return error.MessageTooShort;
+    if (data.len < 9) return error.MessageTooShort; // 1+4+1+1+2
 
     var offset: usize = 1; // Skip msg type
 
     const transfer_id = std.mem.readInt(u32, data[offset..][0..4], .little);
     offset += 4;
+
+    const flags = data[offset];
+    offset += 1;
+
+    const exclude_count = data[offset];
+    offset += 1;
 
     const path_len = std.mem.readInt(u16, data[offset..][0..2], .little);
     offset += 2;
@@ -2440,7 +2459,31 @@ pub fn parseTransferResume(allocator: Allocator, data: []const u8) !TransferResu
     const path = try allocator.dupe(u8, data[offset..][0..path_len]);
     offset += path_len;
 
+    // Parse excludes
+    var excludes = try allocator.alloc([]const u8, exclude_count);
+    var ei: u8 = 0;
+    while (ei < exclude_count) : (ei += 1) {
+        if (offset >= data.len) {
+            for (excludes[0..ei]) |e| allocator.free(e);
+            allocator.free(excludes);
+            allocator.free(path);
+            return error.MessageTooShort;
+        }
+        const exclude_len = data[offset];
+        offset += 1;
+        if (data.len < offset + exclude_len) {
+            for (excludes[0..ei]) |e| allocator.free(e);
+            allocator.free(excludes);
+            allocator.free(path);
+            return error.MessageTooShort;
+        }
+        excludes[ei] = try allocator.dupe(u8, data[offset..][0..exclude_len]);
+        offset += exclude_len;
+    }
+
     if (data.len < offset + 4) {
+        for (excludes) |e| allocator.free(e);
+        allocator.free(excludes);
         allocator.free(path);
         return error.MessageTooShort;
     }
@@ -2453,9 +2496,10 @@ pub fn parseTransferResume(allocator: Allocator, data: []const u8) !TransferResu
     var i: u32 = 0;
     while (i < completed_count) : (i += 1) {
         if (offset + 2 > data.len) {
-            // Free already allocated
             for (completed_files[0..i]) |file_path| allocator.free(file_path);
             allocator.free(completed_files);
+            for (excludes) |e| allocator.free(e);
+            allocator.free(excludes);
             allocator.free(path);
             return error.MessageTooShort;
         }
@@ -2466,6 +2510,8 @@ pub fn parseTransferResume(allocator: Allocator, data: []const u8) !TransferResu
         if (data.len < offset + file_path_len) {
             for (completed_files[0..i]) |file_path| allocator.free(file_path);
             allocator.free(completed_files);
+            for (excludes) |e| allocator.free(e);
+            allocator.free(excludes);
             allocator.free(path);
             return error.MessageTooShort;
         }
@@ -2476,7 +2522,9 @@ pub fn parseTransferResume(allocator: Allocator, data: []const u8) !TransferResu
 
     return .{
         .transfer_id = transfer_id,
+        .flags = flags,
         .path = path,
+        .excludes = excludes,
         .completed_files = completed_files,
     };
 }

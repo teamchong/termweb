@@ -2151,16 +2151,29 @@ const Server = struct {
     fn onFileDisconnect(conn: *ws.Connection) void {
         const self = global_server.load(.acquire) orelse return;
 
-        // Clean up any transfer session associated with this connection
+        // Signal the transfer session to stop, but do NOT free it here.
+        // The push thread (pushDownloadFiles/Serial) holds a direct pointer and
+        // will clean up via defer when it notices is_active=false or send fails.
+        // For uploads (no push thread), removeSession is safe since nothing else
+        // references the session after disconnect.
+        self.mutex.lock();
         if (conn.user_data) |user_data| {
             const session: *transfer.TransferSession = @ptrCast(@alignCast(user_data));
             const session_id = session.id;
-            // Signal goroutines to stop by setting is_active = false
             @atomicStore(bool, &session.is_active, false, .release);
-            session.deleteState();
-            self.transfer_manager.removeSession(session_id);
             conn.user_data = null;
-            std.debug.print("File WS disconnected — cleaned up transfer session {d}\n", .{session_id});
+
+            if (session.direction == .upload) {
+                // Upload: no push thread, safe to remove immediately
+                self.mutex.unlock();
+                self.transfer_manager.removeSession(session_id);
+            } else {
+                // Download: push thread will clean up — don't free here
+                self.mutex.unlock();
+            }
+            std.debug.print("File WS disconnected — session {d} signaled to stop\n", .{session_id});
+        } else {
+            self.mutex.unlock();
         }
 
         self.mutex.lock();
@@ -3450,7 +3463,7 @@ const Server = struct {
                 conn.sendBinary(error_msg) catch {};
                 return;
             };
-            build_thread.detach();
+            self.trackPushThread(build_thread);
         }
     }
 
@@ -3629,22 +3642,37 @@ const Server = struct {
         };
         defer resume_data.deinit(self.allocator);
 
-        std.debug.print("Resuming download {d} for path: {s}, {d} completed files\n", .{ resume_data.transfer_id, resume_data.path, resume_data.completed_files.len });
+        const use_gitignore = (resume_data.flags & 0x02) != 0;
+        std.debug.print("Resuming download {d} for path: {s}, {d} completed files, use_gitignore={}\n", .{ resume_data.transfer_id, resume_data.path, resume_data.completed_files.len, use_gitignore });
 
         // Resolve path
         const resolved_path = self.resolvePath(resume_data.path);
         defer if (resolved_path.ptr != self.initial_cwd.ptr) self.allocator.free(@constCast(resolved_path));
 
-        // Create transfer session with the same ID the client used (not a new ID)
+        // Create transfer session with restored options from client
         const session = self.transfer_manager.createSessionWithId(resume_data.transfer_id, .download, .{
             .dry_run = false,
-            .use_gitignore = false,
+            .use_gitignore = use_gitignore,
         }, resolved_path) catch |err| {
             std.debug.print("Failed to create resume session: {}\n", .{err});
             return;
         };
 
+        // Add exclude patterns from resume data
+        for (resume_data.excludes) |pattern| {
+            session.addExcludePattern(pattern) catch {};
+        }
+
         conn.user_data = session;
+
+        // Track whether push thread takes over cleanup
+        var push_spawned = false;
+        defer if (!push_spawned) {
+            self.mutex.lock();
+            conn.user_data = null;
+            self.mutex.unlock();
+            self.transfer_manager.removeSession(session.id);
+        };
 
         // Build file list
         session.buildFileListAsync() catch |err| {
@@ -3658,7 +3686,7 @@ const Server = struct {
         // Filter out completed files - collect remaining into new list
         const total_files = session.files.items.len;
         var write_idx: usize = 0;
-        for (session.files.items) |file_entry| {
+        for (session.files.items) |*file_entry| {
             var is_completed = false;
             for (resume_data.completed_files) |completed_path| {
                 if (std.mem.eql(u8, file_entry.path, completed_path)) {
@@ -3667,8 +3695,11 @@ const Server = struct {
                 }
             }
             if (!is_completed) {
-                session.files.items[write_idx] = file_entry;
+                session.files.items[write_idx] = file_entry.*;
                 write_idx += 1;
+            } else {
+                // Free the path of completed entries being removed
+                file_entry.deinit(self.allocator);
             }
         }
 
@@ -3687,12 +3718,13 @@ const Server = struct {
         defer self.allocator.free(list_msg);
         conn.sendBinary(list_msg) catch {};
 
-        // Start pushing remaining files in a separate thread (same as initial download)
+        // Start pushing remaining files in a separate thread (it takes over session cleanup)
         std.debug.print("Resumed download {d}, pushing {d} remaining files\n", .{ session.id, session.files.items.len });
         const push_thread = std.Thread.spawn(.{}, pushDownloadFilesThread, .{ self, conn, session }) catch |err| {
             std.debug.print("Failed to spawn pushDownloadFiles thread for resume: {}\n", .{err});
             return;
         };
+        push_spawned = true;
         self.trackPushThread(push_thread);
     }
 
@@ -3703,11 +3735,15 @@ const Server = struct {
         const transfer_id = std.mem.readInt(u32, data[1..5], .little);
 
         if (self.transfer_manager.getSession(transfer_id)) |session| {
-            // Signal goroutines to stop by setting is_active = false
+            // Signal goroutines/push thread to stop
             @atomicStore(bool, &session.is_active, false, .release);
-            session.deleteState();
+
+            if (session.direction == .upload) {
+                // Upload: no push thread, safe to remove immediately
+                self.transfer_manager.removeSession(transfer_id);
+            }
+            // Download: push thread's defer handles removeSession
         }
-        self.transfer_manager.removeSession(transfer_id);
         conn.user_data = null;
 
         std.debug.print("Transfer {d} cancelled by client\n", .{transfer_id});
@@ -3948,6 +3984,15 @@ const Server = struct {
 
     /// Thread wrapper for buildFileListAndSend — spawned to avoid blocking during directory scan/hash
     fn buildFileListAndSendThread(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession, is_dry_run: bool) void {
+        // Track whether push thread was spawned (it takes over session cleanup)
+        var push_spawned = false;
+        defer if (!push_spawned) {
+            self.mutex.lock();
+            conn.user_data = null;
+            self.mutex.unlock();
+            self.transfer_manager.removeSession(session.id);
+        };
+
         session.buildFileListAsync() catch |err| {
             std.debug.print("Failed to build file list: {}\n", .{err});
             const error_msg = transfer.buildTransferError(self.allocator, session.id, "Path not found or not accessible") catch return;
@@ -3965,11 +4010,12 @@ const Server = struct {
             defer self.allocator.free(list_msg);
             conn.sendBinary(list_msg) catch {};
 
-            // Now spawn another thread for pushDownloadFiles
+            // Now spawn another thread for pushDownloadFiles (it takes over session cleanup)
             const push_thread = std.Thread.spawn(.{}, pushDownloadFilesThread, .{ self, conn, session }) catch |err| {
                 std.debug.print("Failed to spawn pushDownloadFiles thread: {}\n", .{err});
                 return;
             };
+            push_spawned = true;
             self.trackPushThread(push_thread);
         }
     }
@@ -3979,6 +4025,15 @@ const Server = struct {
     /// concurrently via goroutines (read + compress in parallel, send results
     /// through a channel to the WS handler thread).
     fn pushDownloadFiles(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
+        // Always clean up session when this function returns (normal, error, or cancel).
+        // This pairs with onFileDisconnect which only signals is_active=false for downloads.
+        defer {
+            self.mutex.lock();
+            conn.user_data = null;
+            self.mutex.unlock();
+            self.transfer_manager.removeSession(session.id);
+        }
+
         std.debug.print("[pushDownloadFiles] START: transferId={d}, total files={d}\n", .{ session.id, session.files.items.len });
         const chunk_size: usize = 256 * 1024;
         var bytes_sent: u64 = 0;
@@ -4168,10 +4223,7 @@ const Server = struct {
         std.debug.print("[pushDownloadFiles] TRANSFER_COMPLETE sent successfully (msg_size={d})\n", .{complete_msg.len});
 
         std.debug.print("Download complete: {d} bytes sent across {d} files ({d} large via goroutines)\n", .{ bytes_sent, session.files.items.len, large_file_count });
-
-        // Clean up session after successful download
-        self.transfer_manager.removeSession(session.id);
-        conn.user_data = null;
+        // Session cleanup handled by defer at function start
     }
 
     /// Serial fallback for pushDownloadFiles (used when goroutine channel creation fails).
@@ -4295,10 +4347,7 @@ const Server = struct {
         defer self.allocator.free(complete_msg);
         conn.sendBinary(complete_msg) catch {};
         std.debug.print("Download complete (serial fallback): {d} bytes sent\n", .{bytes_sent});
-
-        // Clean up session after successful download
-        self.transfer_manager.removeSession(session.id);
-        conn.user_data = null;
+        // Session cleanup handled by caller's defer (pushDownloadFiles)
     }
 
     fn flushBatch(
@@ -4507,9 +4556,8 @@ const Server = struct {
             std.debug.print("Failed to send dry run report: {}\n", .{err});
         };
 
-        // Clean up session after sending dry run report
-        self.transfer_manager.removeSession(session.id);
-        conn.user_data = null;
+        // Session cleanup is handled by buildFileListAndSendThread's defer
+        // (push_spawned stays false for dry runs, so defer runs removeSession).
     }
 
     /// Resolve a client-supplied path to an absolute path.

@@ -319,14 +319,53 @@ export class FileTransferHandler {
     return this.interruptedUploads;
   }
 
-  /** Resume all interrupted uploads by sending TRANSFER_RESUME for each.
+  /** Resume all interrupted uploads by re-initiating each as a fresh upload.
+   *  Slices the file list to only remaining files and sends TRANSFER_INIT.
    *  Called by mux.ts when the file WS reconnects. */
   resumeInterruptedUploads(): void {
     if (!this.canSend()) return;
-    for (const [transferId, interrupted] of this.interruptedUploads) {
-      // Re-register as active transfer awaiting server's resume response
-      this.activeTransfers.set(transferId, { ...interrupted, state: 'pending' });
-      this.sendTransferResume(transferId);
+    for (const [, interrupted] of this.interruptedUploads) {
+      if (!interrupted.files || !interrupted.serverPath) continue;
+
+      // Slice file list to only remaining files (skip already-completed ones)
+      const startIdx = interrupted.currentFileIndex;
+      const remainingFiles = interrupted.files.slice(startIdx);
+      if (remainingFiles.length === 0) continue;
+
+      // Build and send a fresh TRANSFER_INIT
+      const { dryRun = false, excludes = [], useGitignore = false } = interrupted.options ?? {};
+      const pathBytes = sharedTextEncoder.encode(interrupted.serverPath);
+      const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
+      const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
+      const msgLen = 1 + 1 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
+      const msg = new ArrayBuffer(msgLen);
+      const view = new DataView(msg);
+      const bytes = new Uint8Array(msg);
+      let offset = 0;
+      view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
+      view.setUint8(offset, 0); offset += 1; // direction: upload
+      view.setUint8(offset, (dryRun ? 1 : 0) | (useGitignore ? 2 : 0)); offset += 1;
+      view.setUint8(offset, excludes.length); offset += 1;
+      view.setUint16(offset, pathBytes.length, true); offset += 2;
+      bytes.set(pathBytes, offset); offset += pathBytes.length;
+      for (const exclude of excludeBytes) {
+        view.setUint8(offset, exclude.length); offset += 1;
+        bytes.set(exclude, offset); offset += exclude.length;
+      }
+      this.send(msg);
+
+      // Set as pending transfer — will get new ID from TRANSFER_READY
+      this.pendingTransfer = {
+        id: 0,
+        direction: 'upload',
+        files: remainingFiles,
+        options: interrupted.options,
+        state: 'pending',
+        bytesTransferred: 0,
+        currentFileIndex: 0,
+        currentChunkOffset: 0,
+        serverPath: interrupted.serverPath,
+      };
     }
     this.interruptedUploads.clear();
   }
@@ -356,7 +395,12 @@ export class FileTransferHandler {
 
     console.log(`[FT] Resuming download ${metadata.transferId}: ${metadata.serverPath}`);
 
-    // Register as active transfer
+    // Restore options from persisted metadata
+    const useGitignore = metadata.useGitignore ?? false;
+    const excludes: string[] = metadata.excludes ?? [];
+    const flagsByte = useGitignore ? 2 : 0; // bit1 = use_gitignore (dry_run is always false for resume)
+
+    // Register as active transfer with restored options
     this.activeTransfers.set(metadata.transferId, {
       id: metadata.transferId,
       direction: 'download',
@@ -367,14 +411,19 @@ export class FileTransferHandler {
       useZipMode: true,
       filesCompleted: metadata.completedFiles.length,
       serverPath: metadata.serverPath,
+      options: { useGitignore, excludes },
     });
 
-    // Send TRANSFER_RESUME to server with completed files list
+    // Build TRANSFER_RESUME with flags + excludes + completed files
+    // [0x23][transfer_id:u32][flags:u8][exclude_count:u8][path_len:u16][path]
+    // [[exclude_len:u8][exclude]]...[completed_count:u32][[file_path_len:u16][file_path]]...
     const pathBytes = sharedTextEncoder.encode(metadata.serverPath);
+    const excludeBytes = excludes.map((p: string) => sharedTextEncoder.encode(p));
+    const excludeTotalLen = excludeBytes.reduce((acc: number, b: Uint8Array) => acc + 1 + b.length, 0);
     const completedFilesData = metadata.completedFiles.map((f: string) => sharedTextEncoder.encode(f));
     const completedFilesLen = completedFilesData.reduce((sum: number, b: Uint8Array) => sum + 2 + b.length, 0);
 
-    const msgLen = 1 + 4 + 2 + pathBytes.length + 4 + completedFilesLen;
+    const msgLen = 1 + 4 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen + 4 + completedFilesLen;
     const msg = new ArrayBuffer(msgLen);
     const view = new DataView(msg);
     const bytes = new Uint8Array(msg);
@@ -382,8 +431,14 @@ export class FileTransferHandler {
     let offset = 0;
     view.setUint8(offset, TransferMsgType.TRANSFER_RESUME); offset += 1;
     view.setUint32(offset, metadata.transferId, true); offset += 4;
+    view.setUint8(offset, flagsByte); offset += 1;
+    view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;
+    for (const exclude of excludeBytes) {
+      view.setUint8(offset, exclude.length); offset += 1;
+      bytes.set(exclude, offset); offset += exclude.length;
+    }
     view.setUint32(offset, completedFilesData.length, true); offset += 4;
     for (const fileBytes of completedFilesData) {
       view.setUint16(offset, fileBytes.length, true); offset += 2;
@@ -391,7 +446,7 @@ export class FileTransferHandler {
     }
 
     this.send(msg);
-    console.log(`[FT] Sent TRANSFER_RESUME for ${metadata.transferId}`);
+    console.log(`[FT] Sent TRANSFER_RESUME for ${metadata.transferId} (useGitignore=${useGitignore}, excludes=${excludes.length})`);
   }
 
   disconnect(): void {
@@ -568,12 +623,13 @@ export class FileTransferHandler {
           transfer.filesCompleted = 0;
         }
 
-        // Save transfer metadata for resume support
+        // Save transfer metadata for resume support (including options)
         if (this.worker && transfer.serverPath) {
           this.worker.postMessage({
             type: 'save-transfer-metadata',
             metadata: {
               transferId,
+              direction: 'download',
               serverPath: transfer.serverPath,
               totalFiles: nonDirFiles,
               totalBytes,
@@ -581,6 +637,8 @@ export class FileTransferHandler {
               bytesTransferred: transfer.bytesTransferred,
               startTime: Date.now(),
               lastUpdateTime: Date.now(),
+              useGitignore: transfer.options?.useGitignore ?? false,
+              excludes: transfer.options?.excludes ?? [],
             },
           });
         }
@@ -956,7 +1014,10 @@ export class FileTransferHandler {
 
     let files: Awaited<ReturnType<typeof this.collectFilesFromHandle>>;
     try {
+      console.log(`[FT] collectFilesFromHandle: starting, dirHandle.name=${dirHandle.name}`);
       files = await this.collectFilesFromHandle(dirHandle, '');
+      const nonDirFiles = files.filter(f => !f.isDir);
+      console.log(`[FT] collectFilesFromHandle: done, ${files.length} total entries, ${nonDirFiles.length} files`);
     } catch (err) {
       console.error('Failed to collect files:', err);
       this.onTransferError?.(0, err instanceof Error ? err.message : 'Failed to collect files');
@@ -994,6 +1055,7 @@ export class FileTransferHandler {
       files,
       dirHandle,
       options,
+      serverPath,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
@@ -1050,6 +1112,7 @@ export class FileTransferHandler {
       direction: 'upload',
       files: transferFiles,
       options,
+      serverPath,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
@@ -1133,13 +1196,12 @@ export class FileTransferHandler {
         this.send(msg);
         console.log(`[FT] Sent TRANSFER_CANCEL for ${transferId}`);
       }
-
-      // Clean up OPFS temp files
-      this.worker?.postMessage({ type: 'cleanup-temp', transferId });
-
-      // Delete transfer metadata (prevent resume)
-      this.worker?.postMessage({ type: 'delete-transfer-metadata', transferId });
     }
+
+    // Always clean up OPFS (even if transfer wasn't in activeTransfers,
+    // e.g. after onDisconnect cleared it but UI still shows the transfer)
+    this.worker?.postMessage({ type: 'cleanup-temp', transferId });
+    this.worker?.postMessage({ type: 'delete-transfer-metadata', transferId });
   }
 
   /** Cancel all active transfers */
