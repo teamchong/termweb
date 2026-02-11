@@ -272,6 +272,7 @@ pub fn build(b: *std.Build) void {
         mux_mod.addImport("websocket", websocket_mod);
         mux_mod.addImport("simd_mask", simd_mask_mod);
         mux_mod.addImport("shared_memory", shared_memory_mod);
+        mux_mod.addImport("hashmap_helper", hashmap_shim);
 
         // Build options for mux module
         const mux_options = b.addOptions();
@@ -420,6 +421,21 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // Mux module tests (auth rate limiting, etc.)
+    const mux_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/mux/native/src/auth.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hashmap_helper", .module = hashmap_shim },
+            },
+        }),
+    });
+    const mux_test_step = b.step("test-mux", "Run mux module tests");
+    mux_test_step.dependOn(&b.addRunArtifact(mux_tests).step);
+    test_step.dependOn(&b.addRunArtifact(mux_tests).step);
 
     // WASM zstd module for browser-side compression
     {

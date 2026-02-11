@@ -156,6 +156,7 @@ pub const Connection = struct {
     is_open: bool,
     user_data: ?*anyopaque,
     request_uri: ?[]const u8 = null,  // Request URI for auth token extraction
+    peer_addr: ?net.Address = null,   // Peer IP for rate limiting
     // App-level zstd compression (replaces permessage-deflate)
     zstd_enabled: bool = false,
     compressor: ?zstd.Compressor = null,
@@ -198,6 +199,17 @@ pub const Connection = struct {
             self.request_uri = null;
         }
         self.stream.close();
+    }
+
+    /// Format peer IP address into a buffer. Returns the formatted slice or null.
+    pub fn getPeerIpStr(self: *Connection, buf: *[45]u8) ?[]const u8 {
+        const addr = self.peer_addr orelse return null;
+        const written = std.fmt.bufPrint(buf, "{f}", .{addr}) catch return null;
+        // Strip port suffix (":12345") — keep only the IP
+        if (std.mem.lastIndexOfScalar(u8, written, ':')) |colon| {
+            return written[0..colon];
+        }
+        return written;
     }
 
     /// Perform WebSocket handshake (server side).
@@ -677,15 +689,16 @@ pub const Server = struct {
 
     // Accept one connection and handle it (blocking)
     pub fn acceptOne(self: *Server) !*Connection {
-        const stream = try self.listener.accept();
+        const accepted = try self.listener.accept();
 
         const conn = try self.allocator.create(Connection);
-        conn.* = Connection.init(stream.stream, self.allocator);
+        conn.* = Connection.init(accepted.stream, self.allocator);
+        conn.peer_addr = accepted.address;
 
         // Configure socket for low-latency interactive use
-        setSocketOptions(stream.stream.handle);
-        setReadTimeout(stream.stream.handle, 100); // 100ms wakeup for shutdown check
-        setWriteTimeout(stream.stream.handle, self.send_timeout_ms);
+        setSocketOptions(accepted.stream.handle);
+        setReadTimeout(accepted.stream.handle, 100); // 100ms wakeup for shutdown check
+        setWriteTimeout(accepted.stream.handle, self.send_timeout_ms);
 
         // Perform handshake (with or without zstd based on server config)
         try conn.acceptHandshakeWithOptions(self.enable_zstd);

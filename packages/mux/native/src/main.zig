@@ -1549,6 +1549,7 @@ const Server = struct {
     file_ws_server: *ws.Server,
     http_server: *http.HttpServer,
     auth_state: *auth.AuthState,  // Session and access control
+    rate_limiter: auth.RateLimiter,  // Per-IP rate limiting for failed auth attempts
     transfer_manager: transfer.TransferManager,
     push_threads: std.ArrayList(std.Thread),  // Tracked push threads for clean shutdown
     push_threads_mutex: std.Thread.Mutex,
@@ -1661,6 +1662,7 @@ const Server = struct {
             .control_ws_server = control_ws,
             .file_ws_server = file_ws,
             .auth_state = auth_state,
+            .rate_limiter = auth.RateLimiter.init(allocator),
             .transfer_manager = transfer.TransferManager.init(allocator),
             .push_threads = .{},
             .push_threads_mutex = .{},
@@ -1848,6 +1850,7 @@ const Server = struct {
         std.debug.print("[deinit] push threads done\n", .{});
 
         self.auth_state.deinit();
+        self.rate_limiter.deinit();
         self.transfer_manager.deinit();
         self.connection_roles.deinit();
         // Free heap-allocated session IDs in connection_sessions
@@ -2716,18 +2719,35 @@ const Server = struct {
             return role;
         }
 
+        // Get peer IP for rate limiting
+        var ip_buf: [45]u8 = undefined;
+        const ip = conn.getPeerIpStr(&ip_buf);
+
+        // Check rate limit before attempting auth
+        if (ip) |ip_str| {
+            if (self.rate_limiter.isBlocked(ip_str)) {
+                return .none;
+            }
+        }
+
         // Check token from connection URI query param (percent-decode for URL-encoded tokens)
         if (conn.request_uri) |uri| {
             if (auth.extractTokenFromQuery(uri)) |raw_token| {
                 var token_buf: [64]u8 = undefined;
                 const token = auth.decodeToken(&token_buf, raw_token);
                 const role = self.auth_state.validateToken(token);
+                if (role == .none) {
+                    if (ip) |ip_str| self.rate_limiter.recordFailure(ip_str);
+                } else {
+                    if (ip) |ip_str| self.rate_limiter.recordSuccess(ip_str);
+                }
                 self.connection_roles.put(conn, role) catch {};
                 return role;
             }
         }
 
-        // No valid token = no access
+        // No valid token = no access — record as failure
+        if (ip) |ip_str| self.rate_limiter.recordFailure(ip_str);
         return .none;
     }
 
@@ -4827,6 +4847,9 @@ const Server = struct {
             self.processPendingResizes();
             self.processPendingSplits();
 
+            // Periodic cleanup of expired rate limit entries (self-throttles to once per minute)
+            self.rate_limiter.cleanup();
+
             // Process input for all panels (more responsive than frame rate)
             // Collect panels first, then release mutex before calling ghostty
             // (ghostty callbacks may need the mutex)
@@ -6777,6 +6800,7 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
         server,
     );
     server.http_server.auth_state = server.auth_state;
+    server.http_server.rate_limiter = &server.rate_limiter;
     if (comptime enable_benchmark) {
         server.http_server.api_callback = handleApiRequest;
         server.http_server.api_user_data = server;

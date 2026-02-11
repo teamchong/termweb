@@ -10,12 +10,14 @@
 //! - Share links with optional expiration and usage limits
 //! - Session management with persistent tokens
 //! - Password/passkey authentication for admin access
+//! - Per-IP rate limiting for failed auth attempts
 //!
 const std = @import("std");
 const fs = std.fs;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const crypto = std.crypto;
+const hashmap_helper = @import("hashmap_helper");
 
 pub const Role = enum(u8) {
     admin = 0,    // Full access, can manage sessions and tokens
@@ -677,4 +679,273 @@ fn hexVal(c: u8) ?u4 {
         'A'...'F' => @intCast(c - 'A' + 10),
         else => null,
     };
+}
+
+/// Per-IP rate limiter for failed authentication attempts.
+/// Blocks IPs that exceed max_failures within window_secs.
+pub const RateLimiter = struct {
+    entries: hashmap_helper.StringHashMap(Entry),
+    allocator: Allocator,
+    mutex: std.Thread.Mutex = .{},
+    last_cleanup: i64 = 0,
+
+    const max_failures: u32 = 10;
+    const window_secs: i64 = 300;
+    const lockout_secs: i64 = 300;
+    const cleanup_interval: i64 = 60;
+
+    const Entry = struct {
+        fail_count: u32,
+        window_start: i64,
+    };
+
+    pub fn init(allocator: Allocator) RateLimiter {
+        return .{
+            .entries = hashmap_helper.StringHashMap(Entry).init(allocator),
+            .allocator = allocator,
+            .last_cleanup = std.time.timestamp(),
+        };
+    }
+
+    pub fn deinit(self: *RateLimiter) void {
+        for (self.entries.keys()) |key| {
+            self.allocator.free(key);
+        }
+        self.entries.deinit();
+    }
+
+    /// Returns true if the IP is currently blocked.
+    pub fn isBlocked(self: *RateLimiter, ip: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = std.time.timestamp();
+        const entry = self.entries.getPtr(ip) orelse return false;
+
+        // Lockout expired — clear entry
+        if (now - entry.window_start > lockout_secs) {
+            self.removeEntryByKey(ip);
+            return false;
+        }
+
+        return entry.fail_count >= max_failures;
+    }
+
+    /// Record a failed auth attempt.
+    pub fn recordFailure(self: *RateLimiter, ip: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = std.time.timestamp();
+
+        if (self.entries.getPtr(ip)) |entry| {
+            // Window expired — reset
+            if (now - entry.window_start > window_secs) {
+                entry.* = .{ .fail_count = 1, .window_start = now };
+            } else {
+                entry.fail_count += 1;
+            }
+        } else {
+            // New entry — dupe the key string
+            const key = self.allocator.dupe(u8, ip) catch return;
+            self.entries.put(key, .{
+                .fail_count = 1,
+                .window_start = now,
+            }) catch {
+                self.allocator.free(key);
+            };
+        }
+    }
+
+    /// Reset failures on successful auth.
+    pub fn recordSuccess(self: *RateLimiter, ip: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.removeEntryByKey(ip);
+    }
+
+    /// Remove expired entries. Safe to call frequently (self-throttles to once per minute).
+    pub fn cleanup(self: *RateLimiter) void {
+        const now = std.time.timestamp();
+        if (now - self.last_cleanup < cleanup_interval) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.last_cleanup = now;
+
+        // Walk backwards to safely remove during iteration
+        const keys = self.entries.keys();
+        const values = self.entries.values();
+        var i: usize = keys.len;
+        while (i > 0) {
+            i -= 1;
+            if (now - values[i].window_start > lockout_secs) {
+                self.allocator.free(keys[i]);
+                self.entries.swapRemoveAt(i);
+            }
+        }
+    }
+
+    fn removeEntryByKey(self: *RateLimiter, ip: []const u8) void {
+        // fetchSwapRemove returns the removed entry so we can free the key
+        if (self.entries.fetchSwapRemove(ip)) |removed| {
+            self.allocator.free(removed.key);
+        }
+    }
+
+    // --- Test helpers (not called in production) ---
+
+    /// Directly set an entry's window_start for testing time-dependent behavior.
+    fn testSetWindowStart(self: *RateLimiter, ip: []const u8, window_start: i64) void {
+        if (self.entries.getPtr(ip)) |entry| {
+            entry.window_start = window_start;
+        }
+    }
+};
+
+test "RateLimiter: not blocked before max_failures" {
+    var rl = RateLimiter.init(std.testing.allocator);
+    defer rl.deinit();
+
+    const ip = "192.168.1.1";
+
+    // Record 9 failures (below threshold of 10)
+    for (0..9) |_| {
+        rl.recordFailure(ip);
+    }
+    try std.testing.expect(!rl.isBlocked(ip));
+}
+
+test "RateLimiter: blocked after max_failures" {
+    var rl = RateLimiter.init(std.testing.allocator);
+    defer rl.deinit();
+
+    const ip = "192.168.1.1";
+
+    // Record 10 failures (at threshold)
+    for (0..10) |_| {
+        rl.recordFailure(ip);
+    }
+    try std.testing.expect(rl.isBlocked(ip));
+}
+
+test "RateLimiter: success resets counter" {
+    var rl = RateLimiter.init(std.testing.allocator);
+    defer rl.deinit();
+
+    const ip = "10.0.0.1";
+
+    // Trigger lockout
+    for (0..10) |_| {
+        rl.recordFailure(ip);
+    }
+    try std.testing.expect(rl.isBlocked(ip));
+
+    // Successful auth resets counter
+    rl.recordSuccess(ip);
+    try std.testing.expect(!rl.isBlocked(ip));
+}
+
+test "RateLimiter: lockout expires after 5 minutes" {
+    var rl = RateLimiter.init(std.testing.allocator);
+    defer rl.deinit();
+
+    const ip = "172.16.0.1";
+
+    // Trigger lockout
+    for (0..10) |_| {
+        rl.recordFailure(ip);
+    }
+    try std.testing.expect(rl.isBlocked(ip));
+
+    // Simulate time passing: set window_start to 301 seconds ago (> lockout_secs=300)
+    const now = std.time.timestamp();
+    rl.testSetWindowStart(ip, now - 301);
+
+    // Lockout should have expired
+    try std.testing.expect(!rl.isBlocked(ip));
+
+    // Entry should have been cleaned up
+    try std.testing.expectEqual(@as(usize, 0), rl.entries.count());
+}
+
+test "RateLimiter: window expiry resets failure count" {
+    var rl = RateLimiter.init(std.testing.allocator);
+    defer rl.deinit();
+
+    const ip = "10.0.0.2";
+
+    // Record 9 failures
+    for (0..9) |_| {
+        rl.recordFailure(ip);
+    }
+    try std.testing.expect(!rl.isBlocked(ip));
+
+    // Simulate window expiry (> window_secs=300)
+    const now = std.time.timestamp();
+    rl.testSetWindowStart(ip, now - 301);
+
+    // Next failure should start a fresh window (count resets to 1)
+    rl.recordFailure(ip);
+    try std.testing.expect(!rl.isBlocked(ip));
+
+    // Verify count was reset to 1 (not 10)
+    if (rl.entries.getPtr(ip)) |entry| {
+        try std.testing.expectEqual(@as(u32, 1), entry.fail_count);
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "RateLimiter: cleanup removes expired entries" {
+    var rl = RateLimiter.init(std.testing.allocator);
+    defer rl.deinit();
+
+    const ip1 = "10.0.0.1";
+    const ip2 = "10.0.0.2";
+
+    // Create entries for two IPs
+    for (0..5) |_| {
+        rl.recordFailure(ip1);
+        rl.recordFailure(ip2);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rl.entries.count());
+
+    // Expire ip1's entry, keep ip2 fresh
+    const now = std.time.timestamp();
+    rl.testSetWindowStart(ip1, now - 301);
+
+    // Force cleanup to run (set last_cleanup far in past)
+    rl.last_cleanup = now - 61;
+    rl.cleanup();
+
+    // ip1 should be cleaned up, ip2 should remain
+    try std.testing.expectEqual(@as(usize, 1), rl.entries.count());
+    try std.testing.expect(rl.entries.getPtr(ip1) == null);
+    try std.testing.expect(rl.entries.getPtr(ip2) != null);
+}
+
+test "RateLimiter: independent per-IP tracking" {
+    var rl = RateLimiter.init(std.testing.allocator);
+    defer rl.deinit();
+
+    const ip1 = "192.168.1.1";
+    const ip2 = "192.168.1.2";
+
+    // Lock out ip1
+    for (0..10) |_| {
+        rl.recordFailure(ip1);
+    }
+    try std.testing.expect(rl.isBlocked(ip1));
+
+    // ip2 should not be affected
+    try std.testing.expect(!rl.isBlocked(ip2));
+
+    // A few failures on ip2 shouldn't lock it out
+    for (0..3) |_| {
+        rl.recordFailure(ip2);
+    }
+    try std.testing.expect(!rl.isBlocked(ip2));
 }

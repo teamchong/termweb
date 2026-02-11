@@ -110,6 +110,8 @@ pub const HttpServer = struct {
     api_user_data: ?*anyopaque = null,
     // Auth state for token validation on all requests
     auth_state: ?*auth.AuthState = null,
+    // Rate limiter for failed auth attempts
+    rate_limiter: ?*auth.RateLimiter = null,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16, ghostty_config: ?c.ghostty_config_t) !*HttpServer {
         const server = try allocator.create(HttpServer);
@@ -186,7 +188,7 @@ pub const HttpServer = struct {
             // Blocking accept — stop() closes listener to unblock
             const conn = self.listener.accept() catch break;
 
-            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn.stream }) catch {
+            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn.stream, conn.address }) catch {
                 conn.stream.close();
                 continue;
             };
@@ -194,9 +196,27 @@ pub const HttpServer = struct {
         }
     }
 
-    fn handleConnection(self: *HttpServer, stream: net.Stream) void {
+    fn handleConnection(self: *HttpServer, stream: net.Stream, peer_addr: net.Address) void {
         _ = self.active_connections.fetchAdd(1, .acq_rel);
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
+
+        // Format peer IP for rate limiting
+        var ip_buf: [45]u8 = undefined;
+        const ip_full = std.fmt.bufPrint(&ip_buf, "{f}", .{peer_addr}) catch "";
+        // Strip port suffix (e.g. "127.0.0.1:8080" → "127.0.0.1")
+        const ip_str = if (std.mem.lastIndexOfScalar(u8, ip_full, ':')) |colon|
+            ip_full[0..colon]
+        else
+            ip_full;
+
+        // Rate limit check — reject before reading request body
+        if (self.rate_limiter) |rl| {
+            if (rl.isBlocked(ip_str)) {
+                self.sendError(stream, 429, "Too Many Requests");
+                stream.close();
+                return;
+            }
+        }
 
         // Set read timeout so we don't block forever during shutdown
         setReadTimeout(stream.handle, 1000); // 1 second timeout
@@ -247,10 +267,12 @@ pub const HttpServer = struct {
             const token = if (raw_token) |t| auth.decodeToken(&token_buf, t) else null;
             const role = if (token) |t| auth_st.validateToken(t) else auth.Role.none;
             if (role == .none) {
+                if (self.rate_limiter) |rl| rl.recordFailure(ip_str);
                 self.sendError(stream, 401, "Unauthorized");
                 stream.close();
                 return;
             }
+            if (self.rate_limiter) |rl| rl.recordSuccess(ip_str);
         }
 
         // Check for WebSocket upgrade
