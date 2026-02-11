@@ -306,7 +306,7 @@ export const SERVER_MSG = {
   CLIENT_LIST: 0x12,
   /** Multiplayer: your session identity */
   SESSION_IDENTITY: 0x13,
-  /** Cursor position/style update for frontend CSS blink (15 bytes, no surface dims) */
+  /** Cursor position/style/color update for frontend CSS blink (18 bytes) */
   CURSOR_STATE: 0x14,
   /** Surface pixel dimensions per panel (sent on resize, not per-frame) */
   SURFACE_DIMS: 0x15,

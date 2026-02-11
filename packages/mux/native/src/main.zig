@@ -171,7 +171,7 @@ pub const BinaryCtrlMsg = enum(u8) {
     panel_assignment = 0x11,  // Multiplayer: panel assigned/unassigned [type:u8][panel_id:u32][session_id_len:u8][session_id:...]
     client_list = 0x12,  // Multiplayer: connected clients list [type:u8][count:u8][{client_id:u32, role:u8, session_id_len:u8, session_id:...}*]
     session_identity = 0x13,  // Multiplayer: your session identity [type:u8][session_id_len:u8][session_id:...]
-    cursor_state = 0x14,  // Cursor position/style for frontend CSS blink [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
+    cursor_state = 0x14,  // Cursor position/style/color for frontend CSS blink [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8] = 18 bytes
     surface_dims = 0x15,  // Surface pixel dimensions (sent on resize, not per-frame) [type:u8][panel_id:u32][width:u16][height:u16] = 9 bytes
     inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
 
@@ -587,6 +587,9 @@ const Panel = struct {
     last_cursor_row: u16 = 0,
     last_cursor_style: u8 = 0,
     last_cursor_visible: u8 = 1,
+    last_cursor_color_r: u8 = 0xc8,
+    last_cursor_color_g: u8 = 0xc8,
+    last_cursor_color_b: u8 = 0xc8,
     last_surf_w: u16 = 0,
     last_surf_h: u16 = 0,
     dbg_input_countdown: u32 = 0, // Debug: log N frames after input
@@ -2793,10 +2796,10 @@ const Server = struct {
     /// Max connections for stack-based snapshot (avoids heap allocation during broadcast).
     const max_broadcast_conns = 16;
 
-    /// Build 15-byte cursor state message in surface-space coordinates.
-    /// [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8]
-    fn buildCursorBuf(panel_id: u32, x: u16, y: u16, w: u16, h: u16, style: u8, visible: u8) [15]u8 {
-        var buf: [15]u8 = undefined;
+    /// Build 18-byte cursor state message in surface-space coordinates.
+    /// [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8]
+    fn buildCursorBuf(panel_id: u32, x: u16, y: u16, w: u16, h: u16, style: u8, visible: u8, r: u8, g: u8, b: u8) [18]u8 {
+        var buf: [18]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.cursor_state);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
         std.mem.writeInt(u16, buf[5..7], x, .little);
@@ -2805,6 +2808,9 @@ const Server = struct {
         std.mem.writeInt(u16, buf[11..13], h, .little);
         buf[13] = style;
         buf[14] = visible;
+        buf[15] = r;
+        buf[16] = g;
+        buf[17] = b;
         return buf;
     }
 
@@ -2845,7 +2851,7 @@ const Server = struct {
             const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
             conn.sendBinary(&dims_buf) catch {};
 
-            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, panel.last_cursor_style, panel.last_cursor_visible);
+            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, panel.last_cursor_style, panel.last_cursor_visible, panel.last_cursor_color_r, panel.last_cursor_color_g, panel.last_cursor_color_b);
             conn.sendBinary(&cursor_buf) catch {};
         }
     }
@@ -5121,7 +5127,10 @@ const Server = struct {
                             var cur_row: u16 = 0;
                             var cur_style: u8 = 0;
                             var cur_visible: u8 = 0;
-                            c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible);
+                            var cur_color_r: u8 = 0xc8;
+                            var cur_color_g: u8 = 0xc8;
+                            var cur_color_b: u8 = 0xc8;
+                            c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible, &cur_color_r, &cur_color_g, &cur_color_b);
 
                             const size = c.ghostty_surface_size(panel.surface);
                             const surf_total_w: u16 = @intCast(size.width_px);
@@ -5136,19 +5145,23 @@ const Server = struct {
                                 self.broadcastControlData(&dims_buf);
                             }
 
-                            // Re-send cursor when surface dims change: padding and pixel
-                            // coordinates are recalculated against the new surface layout,
-                            // even if the cursor's grid col/row haven't moved.
+                            // Re-send cursor when surface dims change, position/style/color changes
                             if (surface_changed or
                                 cur_col != panel.last_cursor_col or
                                 cur_row != panel.last_cursor_row or
                                 cur_style != panel.last_cursor_style or
-                                cur_visible != panel.last_cursor_visible)
+                                cur_visible != panel.last_cursor_visible or
+                                cur_color_r != panel.last_cursor_color_r or
+                                cur_color_g != panel.last_cursor_color_g or
+                                cur_color_b != panel.last_cursor_color_b)
                             {
                                 panel.last_cursor_col = cur_col;
                                 panel.last_cursor_row = cur_row;
                                 panel.last_cursor_style = cur_style;
                                 panel.last_cursor_visible = cur_visible;
+                                panel.last_cursor_color_r = cur_color_r;
+                                panel.last_cursor_color_g = cur_color_g;
+                                panel.last_cursor_color_b = cur_color_b;
 
                                 // Compute cursor in surface-space pixel coordinates.
                                 // Always send cell-sized rectangle; CSS handles bar/underline visuals.
@@ -5162,7 +5175,7 @@ const Server = struct {
                                 const surf_w: u16 = cell_w -| 1;
                                 const surf_h: u16 = cell_h -| 2;
 
-                                const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible);
+                                const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible, cur_color_r, cur_color_g, cur_color_b);
                                 self.broadcastControlData(&cursor_buf);
                             }
                         }
@@ -5184,7 +5197,10 @@ const Server = struct {
                                     var cur_row: u16 = 0;
                                     var cur_style: u8 = 0;
                                     var cur_visible: u8 = 0;
-                                    c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible);
+                                    var dbg_cr: u8 = 0;
+                                    var dbg_cg: u8 = 0;
+                                    var dbg_cb: u8 = 0;
+                                    c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible, &dbg_cr, &dbg_cg, &dbg_cb);
 
                                     // Sample a few pixels to see if content changes
                                     // Check pixel at row 0, col 5 (likely near prompt text)

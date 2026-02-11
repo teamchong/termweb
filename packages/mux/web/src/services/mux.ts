@@ -854,8 +854,8 @@ export class MuxClient {
           break;
         }
         case SERVER_MSG.CURSOR_STATE: {
-          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8] = 15 bytes
-          if (data.byteLength < 15) break;
+          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8] = 18 bytes
+          if (data.byteLength < 18) break;
           const panelId = view.getUint32(1, true);
           const x = view.getUint16(5, true);
           const y = view.getUint16(7, true);
@@ -863,13 +863,16 @@ export class MuxClient {
           const h = view.getUint16(11, true);
           const style = view.getUint8(13);   // 0=bar, 1=block, 2=underline, 3=block_hollow
           const visible = view.getUint8(14) === 1;
+          const colorR = view.getUint8(15);
+          const colorG = view.getUint8(16);
+          const colorB = view.getUint8(17);
           // Use cached surface dims from SURFACE_DIMS message
           const dims = this.surfaceDims.get(panelId);
           const totalW = dims?.w ?? 0;
           const totalH = dims?.h ?? 0;
           const panel = this.panelsByServerId.get(panelId);
           if (panel) {
-            panel.updateCursorState(x, y, w, h, style, visible, totalW, totalH);
+            panel.updateCursorState(x, y, w, h, style, visible, totalW, totalH, colorR, colorG, colorB);
           }
           break;
         }

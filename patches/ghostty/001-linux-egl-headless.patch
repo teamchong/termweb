@@ -1,5 +1,5 @@
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 3d3973084..880806f2b 100644
+index 3d3973084..1e073a122 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
 @@ -38,6 +38,7 @@ typedef enum {
@@ -53,8 +53,8 @@ index 3d3973084..880806f2b 100644
 +#ifdef __linux__
 +// Read pixels from the OpenGL framebuffer (for video encoding)
 +bool ghostty_surface_read_pixels(ghostty_surface_t, uint8_t*, size_t);
-+// Get cursor position, style, and visibility for frontend rendering
-+void ghostty_surface_cursor_info(ghostty_surface_t, uint16_t*, uint16_t*, uint8_t*, uint8_t*);
++// Get cursor position, style, visibility, and color for frontend rendering
++void ghostty_surface_cursor_info(ghostty_surface_t, uint16_t*, uint16_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*);
 +#endif
 +
  // APIs I'd like to get rid of eventually but are still needed for now.
@@ -740,7 +740,7 @@ index 000000000..c68a974d3
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..7c643b1e3 100644
+index dcf8a6357..654db8963 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -948,15 +948,16 @@ index dcf8a6357..7c643b1e3 100644
      /// Update the occlusion state of a surface.
      export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
          surface.occlusionCallback(visible);
-@@ -2204,4 +2318,64 @@ pub const CAPI = struct {
+@@ -2204,4 +2318,83 @@ pub const CAPI = struct {
              }
          }
      };
 +
 +    // Linux-only C APIs
 +    const Linux = struct {
-+        /// Get cursor position, style, and visibility for headless rendering.
++        /// Get cursor position, style, visibility, and color for headless rendering.
 +        /// Returns cursor info in terminal cell coordinates.
++        /// Color is resolved from: OSC 12 override -> config default -> foreground color.
 +        /// Caller must hold renderer_state.mutex (or call from same thread after draw).
 +        export fn ghostty_surface_cursor_info(
 +            ptr: *Surface,
@@ -964,6 +965,9 @@ index dcf8a6357..7c643b1e3 100644
 +            out_row: *u16,
 +            out_style: *u8,
 +            out_visible: *u8,
++            out_color_r: *u8,
++            out_color_g: *u8,
++            out_color_b: *u8,
 +        ) void {
 +            ptr.core_surface.renderer_state.mutex.lock();
 +            defer ptr.core_surface.renderer_state.mutex.unlock();
@@ -973,6 +977,21 @@ index dcf8a6357..7c643b1e3 100644
 +            out_row.* = @intCast(screen.cursor.y);
 +            out_style.* = @intFromEnum(screen.cursor.cursor_style);
 +            out_visible.* = if (t.modes.get(.cursor_visible)) 1 else 0;
++
++            // Resolve cursor color: OSC 12 override -> config default -> foreground -> fallback
++            if (t.colors.cursor.get()) |rgb| {
++                out_color_r.* = rgb.r;
++                out_color_g.* = rgb.g;
++                out_color_b.* = rgb.b;
++            } else if (t.colors.foreground.get()) |rgb| {
++                out_color_r.* = rgb.r;
++                out_color_g.* = rgb.g;
++                out_color_b.* = rgb.b;
++            } else {
++                out_color_r.* = 0xc8;
++                out_color_g.* = 0xc8;
++                out_color_b.* = 0xc8;
++            }
 +        }
 +
 +        /// Read pixels from the OpenGL framebuffer for video encoding
@@ -1213,3 +1232,33 @@ index bfa92f31d..88bc81ed5 100644
  
      // If the cursor is blinking and our blink state is not visible,
      // then we don't show the cursor.
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index c8acebd0f..4f0ca6018 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -2434,14 +2434,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     break :cursor_color state.colors.foreground;
+                 };
+ 
+-                self.addCursor(
+-                    &state.cursor,
+-                    style,
+-                    cursor_color,
+-                );
++                // Skip cursor glyph and text recoloring when cursor is fully transparent.
++                // With opacity=0 the glyph is invisible and text recoloring would make
++                // the character under the cursor disappear (background-on-background).
++                if (self.config.cursor_opacity > 0 or !self.focused) {
++                    self.addCursor(
++                        &state.cursor,
++                        style,
++                        cursor_color,
++                    );
++                }
+ 
+                 // If the cursor is visible then we set our uniforms.
+-                if (style == .block) {
++                if (style == .block and (self.config.cursor_opacity > 0 or !self.focused)) {
+                     const wide = state.cursor.cell.wide;
+ 
+                     self.uniforms.cursor_pos = .{

@@ -172,6 +172,11 @@
   // Server surface dimensions — the coordinate space cursor values live in
   let cursorSurfW = $state(0);
   let cursorSurfH = $state(0);
+  // Cursor color from Ghostty (resolved: OSC 12 -> config cursor-color -> foreground)
+  let cursorColorR = $state(0xc8);
+  let cursorColorG = $state(0xc8);
+  let cursorColorB = $state(0xc8);
+  let cursorColor = $derived(`rgb(${cursorColorR},${cursorColorG},${cursorColorB})`);
 
   // Reactive canvas buffer dimensions (encoder-aligned) — updated from video frames.
   let frameWidth = $state(0);
@@ -1334,7 +1339,7 @@
     onPwdChange?.(newPwd);
   }
 
-  export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number): void {
+  export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number): void {
     cursorX = x;
     cursorY = y;
     cursorW = w;
@@ -1343,6 +1348,9 @@
     cursorVisible = visible;
     cursorSurfW = totalW;
     cursorSurfH = totalH;
+    if (r !== undefined) cursorColorR = r;
+    if (g !== undefined) cursorColorG = g;
+    if (b !== undefined) cursorColorB = b;
   }
 
   // ============================================================================
@@ -1549,7 +1557,7 @@
       </div>
     {/if}
     {#if cursorSurfW > 0 && cursorSurfH > 0}
-      <div class="cursor-container" style="--fw:{cursorSurfW};--fh:{cursorSurfH}">
+      <div class="cursor-container" style="--fw:{cursorSurfW};--fh:{cursorSurfH};--cursor-color:{cursorColor}">
         <div class="cursor-viewport">
           {#if cursorPct}
             {#key cursorKey}
@@ -1860,23 +1868,23 @@
     animation: cursor-blink 1.2s step-end infinite;
   }
   .cursor-bar {
-    background: var(--text, #c8c8c8);
+    background: var(--cursor-color, var(--text, #c8c8c8));
     max-width: 2px;
   }
-  .cursor-block { background: var(--text, #c8c8c8); opacity: 0.7; }
+  .cursor-block { background: var(--cursor-color, var(--text, #c8c8c8)); opacity: 0.75; }
   .cursor-underline {
     background: transparent;
-    border-bottom: 2px solid var(--text, #c8c8c8);
+    border-bottom: 2px solid var(--cursor-color, var(--text, #c8c8c8));
   }
   .cursor-hollow {
     background: transparent;
-    border: 1px solid var(--text, #c8c8c8);
+    border: 1px solid var(--cursor-color, var(--text, #c8c8c8));
   }
 
   /* Inactive panel: show hollow cursor without blink */
   :global(.panel:not(.focused)) .cursor-overlay {
     background: transparent;
-    border: 1px solid var(--text, #c8c8c8);
+    border: 1px solid var(--cursor-color, var(--text, #c8c8c8));
     max-width: none;
     opacity: 1;
     animation: none;
