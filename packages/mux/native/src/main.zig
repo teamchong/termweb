@@ -583,6 +583,7 @@ const Panel = struct {
     last_tick_time: i128, // For rate limiting panel.tick()
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
     consecutive_unchanged: u32, // Consecutive frames with no pixel change (for adaptive frame rate)
+    idle_keyframe_sent: bool, // One-shot: sent a quality keyframe during this idle period
 
     // Cursor state tracking (for frontend CSS blink overlay)
     last_cursor_col: u16 = 0,
@@ -604,6 +605,9 @@ const Panel = struct {
     const IDLE_THRESHOLD: u32 = 30;
     /// When idle, only tick every Nth cycle (effectively ~3 FPS for cursor/spinner checks)
     const IDLE_DIVISOR: u32 = 10;
+    /// After this many consecutive unchanged frames, send a quality keyframe.
+    /// At 30 FPS, 15 frames ≈ 0.5 seconds of idle after activity stops.
+    const IDLE_KEYFRAME_THRESHOLD: u32 = 15;
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
 
     fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, kind: PanelKind) !*Panel {
@@ -746,6 +750,7 @@ const Panel = struct {
             .last_tick_time = 0,
             .ticks_since_connect = 0,
             .consecutive_unchanged = 0,
+            .idle_keyframe_sent = false,
         };
 
         return panel;
@@ -5368,6 +5373,16 @@ const Server = struct {
                         }
                     }
 
+                    // Idle quality keyframe: after ~0.5s of unchanged content,
+                    // send one high-quality keyframe so the user sees a crisp screen
+                    // after heavy activity (where AIMD may have degraded quality).
+                    if (panel.consecutive_unchanged == Panel.IDLE_KEYFRAME_THRESHOLD and
+                        !panel.idle_keyframe_sent)
+                    {
+                        panel.force_keyframe = true;
+                        panel.idle_keyframe_sent = true;
+                    }
+
                     // Adaptive idle mode: when terminal content is unchanged for ~1s,
                     // reduce tick rate to save CPU/GPU (cursor/spinner checks only).
                     // Input or force_keyframe (reconnection) resets immediately.
@@ -5410,6 +5425,7 @@ const Server = struct {
                                 continue;
                             }
                             panel.consecutive_unchanged = 0;
+                            panel.idle_keyframe_sent = false;
 
                             if (panel.prepareFrame() catch null) |result| {
                                 frame_data = result.data;
@@ -5607,6 +5623,7 @@ const Server = struct {
                                 continue;
                             }
                             panel.consecutive_unchanged = 0;
+                            panel.idle_keyframe_sent = false;
                             panel.last_frame_hash = frame_hash;
 
                             // Pass explicit dimensions to ensure encoder matches frame size
