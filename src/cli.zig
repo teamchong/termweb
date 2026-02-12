@@ -24,6 +24,7 @@ const VERSION = build_options.version;
 const Command = enum {
     open,
     mux,
+    token,
     help,
     version,
     unknown,
@@ -43,6 +44,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     switch (command) {
         .open => try cmdOpen(allocator, args[2..]),
         .mux => try cmdMux(allocator, args),
+        .token => try cmdToken(allocator, args),
         .version => try cmdVersion(),
         .help => printHelp(),
         .unknown => {
@@ -56,6 +58,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "open")) return .open;
     if (std.mem.eql(u8, arg, "mux")) return .mux;
+    if (std.mem.eql(u8, arg, "token")) return .token;
     if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return .help;
     if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) return .version;
     return .unknown;
@@ -408,6 +411,7 @@ fn printHelp() void {
         \\Other commands:
         \\  termweb version       Show version
         \\  termweb mux           Start terminal multiplexer server
+        \\  termweb token         Manage auth tokens and share links
         \\  termweb help          Show this help
         \\
         \\Mux options:
@@ -420,6 +424,14 @@ fn printHelp() void {
         \\  --tailscale           Expose via Tailscale Serve (VPN)
         \\  --cloudflare          Expose via Cloudflare Tunnel (Public)
         \\  --ngrok               Expose via ngrok (Public)
+        \\
+        \\Token commands:
+        \\  termweb token                              List sessions and tokens
+        \\  termweb token regenerate [session-id]      Regenerate tokens (default session)
+        \\  termweb token share --role editor           Create share link
+        \\    [--expires 1h] [--max-uses 10] [--label "Demo"]
+        \\  termweb token revoke <token>               Revoke a share link
+        \\  termweb token revoke --all                 Revoke all share links
         \\
         \\Examples:
         \\  termweb open https://example.com
@@ -437,6 +449,240 @@ fn printHelp() void {
         \\  - Kitty-compatible terminal: Ghostty, Kitty, or WezTerm
         \\
     , .{});
+}
+
+const auth = mux.auth;
+
+fn cmdToken(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // Load auth state from ~/.termweb/auth.json
+    var state = auth.AuthState.init(allocator) catch |err| {
+        std.debug.print("Error loading auth state: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer state.deinit();
+
+    const sub_args = if (args.len > 2) args[2..] else &[_][]const u8{};
+
+    if (sub_args.len == 0) {
+        // Default: list sessions and tokens
+        tokenList(state);
+        return;
+    }
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        tokenList(state);
+    } else if (std.mem.eql(u8, subcmd, "regenerate")) {
+        const session_id = if (sub_args.len > 1) sub_args[1] else "default";
+        tokenRegenerate(state, session_id);
+    } else if (std.mem.eql(u8, subcmd, "share")) {
+        tokenShare(state, sub_args[1..]);
+    } else if (std.mem.eql(u8, subcmd, "revoke")) {
+        tokenRevoke(state, sub_args[1..]);
+    } else {
+        std.debug.print("Unknown token subcommand: {s}\n\n", .{subcmd});
+        std.debug.print("Usage: termweb token [list|regenerate|share|revoke]\n", .{});
+        std.process.exit(1);
+    }
+}
+
+fn tokenList(state: *auth.AuthState) void {
+    std.debug.print("Sessions:\n", .{});
+    var iter = state.sessions.iterator();
+    var has_sessions = false;
+    while (iter.next()) |entry| {
+        has_sessions = true;
+        const session = entry.value_ptr;
+        std.debug.print("  {s} ({s})\n", .{ session.id, session.name });
+
+        var enc_buf: [192]u8 = undefined;
+        const editor_enc = auth.percentEncodeToken(&enc_buf, &session.editor_token);
+        std.debug.print("    Editor: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, editor_enc });
+
+        const viewer_enc = auth.percentEncodeToken(&enc_buf, &session.viewer_token);
+        std.debug.print("    Viewer: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, viewer_enc });
+    }
+    if (!has_sessions) {
+        std.debug.print("  (no sessions)\n", .{});
+    }
+
+    // Share links
+    if (state.share_links.items.len > 0) {
+        std.debug.print("\nShare links: {d} active\n", .{state.share_links.items.len});
+        for (state.share_links.items) |link| {
+            var enc_buf2: [192]u8 = undefined;
+            const tok_enc = auth.percentEncodeToken(&enc_buf2, &link.token);
+
+            const role_str: []const u8 = switch (link.token_type) {
+                .admin => "admin",
+                .editor => "editor",
+                .viewer => "viewer",
+            };
+
+            std.debug.print("  {s}  {s}", .{ tok_enc[0..@min(tok_enc.len, 12)], role_str });
+
+            // Expiry info
+            if (link.expires_at) |exp| {
+                const now = std.time.timestamp();
+                const remaining = exp - now;
+                if (remaining <= 0) {
+                    std.debug.print("  expires: expired", .{});
+                } else if (remaining < 3600) {
+                    std.debug.print("  expires: {d}m left", .{@divTrunc(remaining, 60)});
+                } else {
+                    std.debug.print("  expires: {d}h left", .{@divTrunc(remaining, 3600)});
+                }
+            } else {
+                std.debug.print("  expires: never", .{});
+            }
+
+            // Usage info
+            if (link.max_uses) |max| {
+                std.debug.print("  uses: {d}/{d}", .{ link.use_count, max });
+            } else {
+                std.debug.print("  uses: {d}/\xe2\x88\x9e", .{link.use_count}); // ∞ in UTF-8
+            }
+
+            // Label
+            if (link.label) |l| {
+                std.debug.print("  \"{s}\"", .{l});
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+}
+
+fn tokenRegenerate(state: *auth.AuthState, session_id: []const u8) void {
+    if (state.getSession(session_id) == null) {
+        std.debug.print("Session not found: {s}\n", .{session_id});
+        std.process.exit(1);
+    }
+
+    state.regenerateSessionToken(session_id, .editor) catch {
+        std.debug.print("Error regenerating editor token\n", .{});
+        std.process.exit(1);
+    };
+    state.regenerateSessionToken(session_id, .viewer) catch {
+        std.debug.print("Error regenerating viewer token\n", .{});
+        std.process.exit(1);
+    };
+
+    std.debug.print("Tokens regenerated for session: {s}\n\n", .{session_id});
+
+    // Print new tokens
+    if (state.getSession(session_id)) |session| {
+        var enc_buf: [192]u8 = undefined;
+        const editor_enc = auth.percentEncodeToken(&enc_buf, &session.editor_token);
+        std.debug.print("  Editor: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, editor_enc });
+
+        const viewer_enc = auth.percentEncodeToken(&enc_buf, &session.viewer_token);
+        std.debug.print("  Viewer: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, viewer_enc });
+    }
+}
+
+fn tokenShare(state: *auth.AuthState, args: []const []const u8) void {
+    var role: auth.TokenType = .viewer;
+    var expires_secs: ?i64 = null;
+    var max_uses: ?u32 = null;
+    var label: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--role")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                if (std.mem.eql(u8, args[i], "admin")) {
+                    role = .admin;
+                } else if (std.mem.eql(u8, args[i], "editor")) {
+                    role = .editor;
+                } else if (std.mem.eql(u8, args[i], "viewer")) {
+                    role = .viewer;
+                } else {
+                    std.debug.print("Invalid role: {s} (use admin, editor, or viewer)\n", .{args[i]});
+                    std.process.exit(1);
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--expires")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                expires_secs = parseDuration(args[i]);
+                if (expires_secs == null) {
+                    std.debug.print("Invalid duration: {s} (use e.g. 1h, 30m, 7d)\n", .{args[i]});
+                    std.process.exit(1);
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--max-uses")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                max_uses = std.fmt.parseInt(u32, args[i], 10) catch {
+                    std.debug.print("Invalid max-uses: {s}\n", .{args[i]});
+                    std.process.exit(1);
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--label")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                label = args[i];
+            }
+        }
+    }
+
+    const token = state.createShareLink(role, expires_secs, max_uses, label) catch {
+        std.debug.print("Error creating share link\n", .{});
+        std.process.exit(1);
+    };
+
+    var enc_buf: [192]u8 = undefined;
+    const tok_enc = auth.percentEncodeToken(&enc_buf, token);
+
+    const role_str: []const u8 = switch (role) {
+        .admin => "admin",
+        .editor => "editor",
+        .viewer => "viewer",
+    };
+
+    std.debug.print("Share link created ({s}):\n", .{role_str});
+    std.debug.print("  http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, tok_enc });
+}
+
+fn tokenRevoke(state: *auth.AuthState, args: []const []const u8) void {
+    if (args.len == 0) {
+        std.debug.print("Usage: termweb token revoke <token>\n", .{});
+        std.debug.print("       termweb token revoke --all\n", .{});
+        std.process.exit(1);
+    }
+
+    if (std.mem.eql(u8, args[0], "--all")) {
+        state.revokeAllShareLinks() catch {
+            std.debug.print("Error revoking share links\n", .{});
+            std.process.exit(1);
+        };
+        std.debug.print("All share links revoked.\n", .{});
+        return;
+    }
+
+    state.revokeShareLink(args[0]) catch {
+        std.debug.print("Error revoking share link\n", .{});
+        std.process.exit(1);
+    };
+    std.debug.print("Share link revoked.\n", .{});
+}
+
+/// Parse a duration string like "1h", "30m", "7d" into seconds.
+fn parseDuration(s: []const u8) ?i64 {
+    if (s.len < 2) return null;
+    const unit = s[s.len - 1];
+    const num_str = s[0 .. s.len - 1];
+    const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
+    if (num <= 0) return null;
+    return switch (unit) {
+        'm' => num * 60,
+        'h' => num * 3600,
+        'd' => num * 86400,
+        else => null,
+    };
 }
 
 fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {

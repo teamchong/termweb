@@ -3,6 +3,7 @@
  */
 import { writable, derived, get } from 'svelte/store';
 import type { PanelInfo, TabInfo, UIState, PanelStatus } from './types';
+import type { Session } from '../types';
 
 // Re-export types
 export * from './types';
@@ -128,6 +129,12 @@ export function toggleInspector() {
 export function toggleCommandPalette() {
   ui.update(s => ({ ...s, commandPaletteOpen: !s.commandPaletteOpen }));
 }
+
+// ============================================================================
+// Sessions Store (admin only — populated from server SESSION_LIST)
+// ============================================================================
+
+export const sessions = writable<Session[]>([]);
 
 // ============================================================================
 // Helpers

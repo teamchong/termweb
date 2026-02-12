@@ -118,5 +118,5 @@ export interface LayoutTab {
 
 export interface LayoutData {
   tabs: LayoutTab[];
-  activePanelId?: number;
+  // activePanelId removed — active panel is per-session, managed client-side
 }

@@ -263,16 +263,34 @@ pub const HttpServer = struct {
         // Auth check — all requests require a valid token in query param
         if (self.auth_state) |auth_st| {
             const raw_token = auth.extractTokenFromQuery(full_path);
-            var token_buf: [64]u8 = undefined;
+            var token_buf: [256]u8 = undefined;
             const token = if (raw_token) |t| auth.decodeToken(&token_buf, t) else null;
-            const role = if (token) |t| auth_st.validateToken(t) else auth.Role.none;
-            if (role == .none) {
-                if (self.rate_limiter) |rl| rl.recordFailure(ip_str);
+
+            if (token) |t| {
+                const role = auth_st.validateToken(t);
+                if (role == .none) {
+                    if (self.rate_limiter) |rl| rl.recordFailure(ip_str);
+                    self.sendError(stream, 401, "Unauthorized");
+                    stream.close();
+                    return;
+                }
+                if (self.rate_limiter) |rl| rl.recordSuccess(ip_str);
+
+                // Static token on non-WebSocket request → exchange for JWT and redirect
+                if (auth.isStaticToken(t) and !self.isWebSocketUpgrade(request)) {
+                    const session_id = auth.getSessionIdForToken(auth_st, t) orelse "default";
+                    var jwt_buf: [256]u8 = undefined;
+                    const jwt = auth_st.createJwt(role, session_id, &jwt_buf);
+                    self.sendRedirectPage(stream, jwt);
+                    stream.close();
+                    return;
+                }
+            } else {
+                // No token at all
                 self.sendError(stream, 401, "Unauthorized");
                 stream.close();
                 return;
             }
-            if (self.rate_limiter) |rl| rl.recordSuccess(ip_str);
         }
 
         // Check for WebSocket upgrade
@@ -388,6 +406,24 @@ pub const HttpServer = struct {
             }
         }
         return false;
+    }
+
+    /// Send a minimal HTML page with a spinner that redirects to the JWT URL.
+    /// Used to exchange static tokens for JWTs without the static token entering browser history.
+    fn sendRedirectPage(_: *HttpServer, stream: net.Stream, jwt: []const u8) void {
+        const header = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+        const prefix =
+            \\<!DOCTYPE html><html><head><style>
+            \\body{display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e}
+            \\.s{width:40px;height:40px;border:3px solid #333;border-top-color:#7c3aed;border-radius:50%;animation:r .6s linear infinite}
+            \\@keyframes r{to{transform:rotate(360deg)}}
+            \\</style></head><body><div class="s"></div><script>location.replace(location.pathname+'?token=
+        ;
+        const suffix = "')</script></body></html>";
+        _ = stream.write(header) catch return;
+        _ = stream.write(prefix) catch return;
+        _ = stream.write(jwt) catch return;
+        _ = stream.write(suffix) catch return;
     }
 
     fn sendError(self: *HttpServer, stream: net.Stream, code: u16, message: []const u8) void {

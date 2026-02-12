@@ -294,6 +294,12 @@ export const SERVER_MSG = {
   INSPECTOR_STATE: 0x09,
   /** Authentication state */
   AUTH_STATE: 0x0A,
+  /** Session list (admin only) */
+  SESSION_LIST: 0x0B,
+  /** Share links list (admin only) */
+  SHARE_LINKS: 0x0C,
+  /** JWT renewal: [type:u8][jwt_len:u16_le][jwt...] */
+  JWT_RENEWAL: 0x0D,
   /** Overview open/closed state */
   OVERVIEW_STATE: 0x0E,
   /** Quick terminal open/closed state */

@@ -37,18 +37,20 @@ export const BinaryCtrlMsg = {
   PANEL_INPUT: 0x86,      // Coworker input to assigned panel: [panel_id:u32][input_msg...]
   PANEL_MSG: 0x87,        // Panel message envelope: [type:u8][panel_id:u32][inner_msg...] — routes panel input through zstd WS
   SET_INSPECTOR: 0x8B,    // Set inspector open/closed state: [type:u8][open:u8]
-  // Auth messages
+  // Auth messages (must match server AuthMsg enum 0x90-0x9F)
   GET_AUTH_STATE: 0x90,
   SET_PASSWORD: 0x91,
   VERIFY_PASSWORD: 0x92,
-  CLEAR_PASSWORD: 0x93,
-  CREATE_SESSION: 0x94,
-  DELETE_SESSION: 0x95,
-  REGEN_TOKEN: 0x96,
-  CREATE_SHARE_LINK: 0x97,
-  REVOKE_SHARE_LINK: 0x98,
-  GET_SESSION_LIST: 0x99,
-  GET_SHARE_LINKS: 0x9A,
+  CREATE_SESSION: 0x93,
+  DELETE_SESSION: 0x94,
+  REGEN_TOKEN: 0x95,
+  CREATE_SHARE_LINK: 0x96,
+  REVOKE_SHARE_LINK: 0x97,
+  REVOKE_ALL_SHARES: 0x98,
+  ADD_PASSKEY: 0x99,
+  REMOVE_PASSKEY: 0x9A,
+  GET_SESSION_LIST: 0x9B,
+  GET_SHARE_LINKS: 0x9C,
 } as const;
 
 // Server -> client auth response types
@@ -60,6 +62,7 @@ export const AuthResponseType = {
 
 // Server -> client control message types
 export const ServerCtrlMsg = {
+  JWT_RENEWAL: 0x0D,  // JWT renewal: [type:u8][jwt_len:u16_le][jwt...]
   OVERVIEW_STATE: 0x0E,  // Overview open/closed state
   QUICK_TERMINAL_STATE: 0x0F,  // Quick terminal open/closed state
   MAIN_CLIENT_STATE: 0x10,  // Main client election: [type:u8][is_main:u8][client_id:u32]

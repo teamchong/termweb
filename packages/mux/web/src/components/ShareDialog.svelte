@@ -4,9 +4,11 @@
   interface Props {
     open?: boolean;
     onClose?: () => void;
+    shareUrl?: string;
+    title?: string;
   }
 
-  let { open = false, onClose }: Props = $props();
+  let { open = false, onClose, shareUrl: propUrl, title = 'Share Terminal' }: Props = $props();
 
   let qrDataUrl = $state('');
   let copied = $state(false);
@@ -14,7 +16,7 @@
 
   $effect(() => {
     if (open) {
-      shareUrl = window.location.href.replace(/[?#].*$/, '');
+      shareUrl = propUrl || window.location.href.replace(/[?#].*$/, '');
       QRCode.toDataURL(shareUrl, {
         width: 200,
         margin: 2,
@@ -48,7 +50,7 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="share-overlay" onclick={handleOverlayClick} onkeydown={handleKeydown}>
     <div class="share-dialog">
-      <div class="share-header">Share Terminal</div>
+      <div class="share-header">{title}</div>
 
       {#if qrDataUrl}
         <div class="qr-container">

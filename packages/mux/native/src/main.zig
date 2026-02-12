@@ -20,7 +20,7 @@ const enable_benchmark = build_options.enable_benchmark;
 const ws = @import("ws_server.zig");
 const http = @import("http_server.zig");
 const transfer = @import("transfer.zig");
-const auth = @import("auth.zig");
+pub const auth = @import("auth.zig");
 const WakeSignal = @import("wake_signal.zig").WakeSignal;
 const Channel = @import("async/channel.zig").Channel;
 const goroutine_runtime = @import("async/runtime.zig");
@@ -208,6 +208,8 @@ pub const BinaryCtrlMsg = enum(u8) {
     revoke_all_shares = 0x98,    // Revoke all share links
     add_passkey = 0x99,          // Add passkey credential
     remove_passkey = 0x9A,       // Remove passkey credential
+    get_session_list = 0x9B,     // Request session list (admin only)
+    get_share_links = 0x9C,      // Request share links (admin only)
 };
 
 // Layout Management (persisted to disk)
@@ -339,7 +341,10 @@ pub const Layout = struct {
         self.next_tab_id += 1;
 
         try self.tabs.append(self.allocator, tab);
-        self.active_panel_id = panel_id;
+        // Set render focus hint if none exists (first panel must render)
+        if (self.active_panel_id == null) {
+            self.active_panel_id = panel_id;
+        }
         return tab;
     }
 
@@ -370,7 +375,7 @@ pub const Layout = struct {
     pub fn splitPanel(self: *Layout, panel_id: u32, direction: SplitDirection, new_panel_id: u32) !void {
         const tab = self.findTabByPanel(panel_id) orelse return error.PanelNotFound;
         try splitNode(self.allocator, tab.root, panel_id, direction, new_panel_id);
-        self.active_panel_id = new_panel_id;
+        // active_panel_id set by client via 0x83 focus_panel (per-session)
     }
 
     fn splitNode(allocator: std.mem.Allocator, node: *SplitNode, panel_id: u32, direction: SplitDirection, new_panel_id: u32) !void {
@@ -481,11 +486,8 @@ pub const Layout = struct {
             try writeNodeJson(writer, tab.root);
             try writer.writeAll("}");
         }
-        if (self.active_panel_id) |apid| {
-            try writer.print("],\"activePanelId\":{}}}", .{apid});
-        } else {
-            try writer.writeAll("]}");
-        }
+        // activePanelId is per-session (managed client-side), not part of shared layout
+        try writer.writeAll("]}");
 
         return buf.toOwnedSlice(allocator);
     }
@@ -1525,6 +1527,21 @@ const PanelSplitRequest = struct {
     from_api: bool = false, // If true, send new panel ID to tmux_api_response_ch
 };
 
+/// JWT renewal tracking per connection
+const JwtExpiry = struct {
+    role: auth.Role,
+    session_id: []const u8, // Heap-allocated, owned by this struct
+    expiry: i64,
+};
+
+/// Per-session viewport dimensions, tracked so the server knows each client's
+/// screen size for split creation and PTY sizing decisions.
+const SessionViewport = struct {
+    width: u32,
+    height: u32,
+    scale: f64,
+};
+
 const Server = struct {
     // Ghostty app/config - lazy initialized on first panel, freed when last panel closes
     app: ?c.ghostty_app_t,
@@ -1535,9 +1552,13 @@ const Server = struct {
     file_connections: std.ArrayList(*ws.Connection),
     connection_roles: std.AutoHashMap(*ws.Connection, auth.Role),  // Track connection roles
     control_client_ids: std.AutoHashMap(*ws.Connection, u32),  // Track client IDs per control connection
+    connection_jwt_info: std.AutoHashMap(*ws.Connection, JwtExpiry),  // JWT renewal tracking
+    last_jwt_check: i64,  // Timestamp of last JWT renewal check (throttle)
     // Multiplayer: pane assignment state
     panel_assignments: std.AutoHashMap(u32, []const u8),  // panel_id → session_id
     connection_sessions: std.AutoHashMap(*ws.Connection, []const u8),  // conn → session_id (cached)
+    session_active_panels: std.StringHashMap(u32),  // session_id → focused panel_id (per-session focus)
+    session_viewports: std.StringHashMap(SessionViewport),  // session_id → last known viewport
     main_client_id: u32,       // ID of current main client (0 = none)
     next_client_id: u32,       // Counter for assigning client IDs
     layout: Layout,
@@ -1649,8 +1670,12 @@ const Server = struct {
             .file_connections = .{},
             .connection_roles = std.AutoHashMap(*ws.Connection, auth.Role).init(allocator),
             .control_client_ids = std.AutoHashMap(*ws.Connection, u32).init(allocator),
+            .connection_jwt_info = std.AutoHashMap(*ws.Connection, JwtExpiry).init(allocator),
+            .last_jwt_check = 0,
             .panel_assignments = std.AutoHashMap(u32, []const u8).init(allocator),
             .connection_sessions = std.AutoHashMap(*ws.Connection, []const u8).init(allocator),
+            .session_active_panels = std.StringHashMap(u32).init(allocator),
+            .session_viewports = std.StringHashMap(SessionViewport).init(allocator),
             .main_client_id = 0,
             .next_client_id = 1,
             .layout = Layout.init(allocator),
@@ -1855,6 +1880,12 @@ const Server = struct {
         self.rate_limiter.deinit();
         self.transfer_manager.deinit();
         self.connection_roles.deinit();
+        // Free heap-allocated session IDs in connection_jwt_info
+        {
+            var it = self.connection_jwt_info.valueIterator();
+            while (it.next()) |v| self.allocator.free(v.session_id);
+        }
+        self.connection_jwt_info.deinit();
         // Free heap-allocated session IDs in connection_sessions
         {
             var it = self.connection_sessions.valueIterator();
@@ -2031,7 +2062,7 @@ const Server = struct {
         // Resolve token → session_id and cache for multiplayer
         if (conn.request_uri) |uri| {
             if (auth.extractTokenFromQuery(uri)) |raw_token| {
-                var token_buf: [64]u8 = undefined;
+                var token_buf: [256]u8 = undefined;
                 const token = auth.decodeToken(&token_buf, raw_token);
                 if (auth.getSessionIdForToken(self.auth_state, token)) |session_id| {
                     const duped = self.allocator.dupe(u8, session_id) catch null;
@@ -2062,6 +2093,24 @@ const Server = struct {
         // Send session identity (so client knows its own session_id)
         self.sendSessionIdentity(conn);
 
+        // Initialize per-session active panel if this session is new
+        {
+            self.mutex.lock();
+            if (self.connection_sessions.get(conn)) |session_id| {
+                if (self.session_active_panels.get(session_id) == null) {
+                    // Default to first panel in first tab
+                    if (self.layout.tabs.items.len > 0) {
+                        var pid_buf: [1]u32 = undefined;
+                        const count = self.layout.tabs.items[0].collectPanelIdsInto(&pid_buf);
+                        if (count > 0) {
+                            self.putSessionActivePanel(session_id, pid_buf[0]);
+                        }
+                    }
+                }
+            }
+            self.mutex.unlock();
+        }
+
         // Send current panel assignments to newly connected client
         self.sendAllPanelAssignments(conn);
 
@@ -2070,6 +2119,11 @@ const Server = struct {
 
         // Send client list to admin(s)
         self.sendClientListToAdmins();
+
+        // Send session list to admin on connect so admin UI has data immediately
+        if (role == .admin) {
+            self.sendSessionList(conn);
+        }
 
         // If new main elected, broadcast so existing clients update
         if (is_new_main) {
@@ -2160,9 +2214,34 @@ const Server = struct {
         // Remove connection role
         _ = self.connection_roles.remove(conn);
 
-        // Remove cached session for this connection
+        // Remove JWT renewal tracking (mutex already held)
+        self.untrackJwtInfo(conn);
+
+        // Remove cached session for this connection and clean up per-session state
         if (self.connection_sessions.fetchRemove(conn)) |entry| {
-            self.allocator.free(entry.value);
+            const disconnected_session_id = entry.value;
+
+            // Check if any other connection shares this session_id
+            var still_connected = false;
+            var sit = self.connection_sessions.valueIterator();
+            while (sit.next()) |other_sid| {
+                if (std.mem.eql(u8, other_sid.*, disconnected_session_id)) {
+                    still_connected = true;
+                    break;
+                }
+            }
+
+            // Clean up per-session state if this was the last connection for the session
+            if (!still_connected) {
+                if (self.session_active_panels.fetchRemove(disconnected_session_id)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+                if (self.session_viewports.fetchRemove(disconnected_session_id)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+            }
+
+            self.allocator.free(disconnected_session_id);
         }
         self.mutex.unlock();
 
@@ -2428,6 +2507,27 @@ const Server = struct {
             return;
         }
 
+        // Gate resize messages by panel ownership
+        if (inner_type == @intFromEnum(ClientMsg.resize)) {
+            self.mutex.lock();
+            // Always record per-session viewport from resize dimensions
+            if (self.connection_sessions.get(conn)) |session_id| {
+                if (inner.len >= 5) {
+                    const w: u32 = std.mem.readInt(u16, inner[1..3], .little);
+                    const h: u32 = std.mem.readInt(u16, inner[3..5], .little);
+                    const current_scale = if (self.panels.get(panel_id)) |pp| pp.scale else 2.0;
+                    self.putSessionViewport(session_id, .{
+                        .width = w,
+                        .height = h,
+                        .scale = current_scale,
+                    });
+                }
+            }
+            const should_apply = self.isResizeAuthorized(conn, panel_id);
+            self.mutex.unlock();
+            if (!should_apply) return;
+        }
+
         // General panel input (key, mouse, text, resize, etc.)
         p.handleMessage(@constCast(inner));
         p.has_pending_input.store(true, .release);
@@ -2501,20 +2601,47 @@ const Server = struct {
         } else if (msg_type == 0x82) { // resize_panel
             if (data.len < 9) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
-            const width = std.mem.readInt(u16, data[5..7], .little);
-            const height = std.mem.readInt(u16, data[7..9], .little);
+            const width: u32 = std.mem.readInt(u16, data[5..7], .little);
+            const height: u32 = std.mem.readInt(u16, data[7..9], .little);
             // Extended: [type:u8][panel_id:u32][w:u16][h:u16][scale:f32] = 13 bytes
             var scale: f64 = 0;
             if (data.len >= 13) {
                 const scale_f32: f32 = @bitCast(std.mem.readInt(u32, data[9..13], .little));
                 if (scale_f32 > 0) scale = @floatCast(scale_f32);
             }
-            _ = self.pending_resizes_ch.send(.{ .id = panel_id, .width = width, .height = height, .scale = scale });
-            self.wake_signal.notify();
+
+            self.mutex.lock();
+            // Always record per-session viewport
+            if (self.connection_sessions.get(conn)) |session_id| {
+                const effective_scale = if (scale > 0) scale else blk: {
+                    if (self.panels.get(panel_id)) |p| break :blk p.scale;
+                    break :blk 2.0;
+                };
+                self.putSessionViewport(session_id, .{
+                    .width = width,
+                    .height = height,
+                    .scale = effective_scale,
+                });
+            }
+            // Only apply PTY resize if authorized (owner or unassigned)
+            const should_apply = self.isResizeAuthorized(conn, panel_id);
+            self.mutex.unlock();
+
+            if (should_apply) {
+                _ = self.pending_resizes_ch.send(.{ .id = panel_id, .width = @intCast(width), .height = @intCast(height), .scale = scale });
+                self.wake_signal.notify();
+            }
         } else if (msg_type == 0x83) { // focus_panel
             if (data.len < 5) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
             self.mutex.lock();
+
+            // Track per-session active panel (for input routing)
+            if (self.connection_sessions.get(conn)) |session_id| {
+                self.putSessionActivePanel(session_id, panel_id);
+            }
+
+            // Update global render focus hint (last-writer-wins for tab encoding priority)
             const old_tab_id = self.layout.getActiveTabId();
             self.layout.active_panel_id = panel_id;
             const new_tab_id = self.layout.getActiveTabId();
@@ -2709,16 +2836,83 @@ const Server = struct {
                 self.auth_state.revokeAllShareLinks() catch {};
                 self.sendShareLinks(conn);
             },
+            0x9B => { // get_session_list
+                if (role != .admin) return;
+                self.sendSessionList(conn);
+            },
+            0x9C => { // get_share_links
+                if (role != .admin) return;
+                self.sendShareLinks(conn);
+            },
             else => {
                 std.log.warn("Unknown auth message type: 0x{x:0>2}", .{msg_type});
             },
         }
     }
 
+    /// Check if a connection is authorized to resize a panel's PTY.
+    /// Must be called with self.mutex held.
+    fn isResizeAuthorized(self: *Server, conn: *ws.Connection, panel_id: u32) bool {
+        const role = self.connection_roles.get(conn) orelse .none;
+        if (role == .admin) return true;
+        const assigned_session = self.panel_assignments.get(panel_id) orelse return true;
+        const sender_session = self.connection_sessions.get(conn) orelse return false;
+        return std.mem.eql(u8, sender_session, assigned_session);
+    }
+
+    /// Record a session's viewport dimensions. Creates owned key if new entry.
+    /// Must be called with self.mutex held.
+    fn putSessionViewport(self: *Server, session_id: []const u8, viewport: SessionViewport) void {
+        if (self.session_viewports.getPtr(session_id)) |vp_ptr| {
+            vp_ptr.* = viewport;
+        } else {
+            const key = self.allocator.dupe(u8, session_id) catch return;
+            self.session_viewports.put(key, viewport) catch {
+                self.allocator.free(key);
+            };
+        }
+    }
+
+    /// Update per-session active panel. Creates owned key if new entry.
+    /// Must be called with self.mutex held.
+    fn putSessionActivePanel(self: *Server, session_id: []const u8, panel_id: u32) void {
+        if (self.session_active_panels.getPtr(session_id)) |val_ptr| {
+            val_ptr.* = panel_id;
+        } else {
+            const key = self.allocator.dupe(u8, session_id) catch return;
+            self.session_active_panels.put(key, panel_id) catch {
+                self.allocator.free(key);
+            };
+        }
+    }
+
+    /// Remove references to a destroyed panel from per-session tracking.
+    /// Must be called with self.mutex held.
+    fn cleanupDestroyedPanelSessions(self: *Server, panel_id: u32) void {
+        var to_remove: [16][]const u8 = undefined;
+        var remove_count: usize = 0;
+        var it = self.session_active_panels.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == panel_id) {
+                if (remove_count < to_remove.len) {
+                    to_remove[remove_count] = entry.key_ptr.*;
+                    remove_count += 1;
+                }
+            }
+        }
+        for (to_remove[0..remove_count]) |key| {
+            if (self.session_active_panels.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
+            }
+        }
+    }
+
     fn getConnectionRole(self: *Server, conn: *ws.Connection) auth.Role {
         // Check if we have a cached role for this connection
-        if (self.connection_roles.get(conn)) |role| {
-            return role;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.connection_roles.get(conn)) |role| return role;
         }
 
         // Get peer IP for rate limiting
@@ -2735,15 +2929,20 @@ const Server = struct {
         // Check token from connection URI query param (percent-decode for URL-encoded tokens)
         if (conn.request_uri) |uri| {
             if (auth.extractTokenFromQuery(uri)) |raw_token| {
-                var token_buf: [64]u8 = undefined;
+                var token_buf: [256]u8 = undefined;
                 const token = auth.decodeToken(&token_buf, raw_token);
                 const role = self.auth_state.validateToken(token);
                 if (role == .none) {
                     if (ip) |ip_str| self.rate_limiter.recordFailure(ip_str);
                 } else {
                     if (ip) |ip_str| self.rate_limiter.recordSuccess(ip_str);
+
+                    // Track JWT expiry for auto-renewal (thread-safe helper)
+                    self.trackJwtInfo(conn, token);
                 }
+                self.mutex.lock();
                 self.connection_roles.put(conn, role) catch {};
+                self.mutex.unlock();
                 return role;
             }
         }
@@ -2751,6 +2950,91 @@ const Server = struct {
         // No valid token = no access — record as failure
         if (ip) |ip_str| self.rate_limiter.recordFailure(ip_str);
         return .none;
+    }
+
+    /// Store JWT tracking info for a connection (thread-safe).
+    /// Extracts JWT claims and stores role/session/expiry for auto-renewal.
+    /// Handles overwrite by freeing the previous session_id.
+    fn trackJwtInfo(self: *Server, conn: *ws.Connection, token: []const u8) void {
+        if (token.len <= 10 or !std.mem.startsWith(u8, token, "eyJ")) return;
+        var sid_buf: [64]u8 = undefined;
+        const claims = auth.getJwtClaims(token, &sid_buf) orelse return;
+        const duped_sid = self.allocator.dupe(u8, claims.session_id) catch return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.connection_jwt_info.fetchPut(conn, .{
+            .role = claims.role,
+            .session_id = duped_sid,
+            .expiry = claims.exp,
+        }) catch null) |old| {
+            self.allocator.free(old.value.session_id);
+        }
+    }
+
+    /// Remove JWT tracking info for a connection (caller must hold self.mutex).
+    fn untrackJwtInfo(self: *Server, conn: *ws.Connection) void {
+        if (self.connection_jwt_info.fetchRemove(conn)) |entry| {
+            self.allocator.free(entry.value.session_id);
+        }
+    }
+
+    /// Check all tracked JWT connections and send renewal if expiry is within 5 minutes.
+    /// Self-throttles to run at most once every 10 seconds.
+    fn renewExpiredJwts(self: *Server) void {
+        const now = std.time.timestamp();
+
+        // Throttle: only check every 10 seconds
+        if (now - self.last_jwt_check < 10) return;
+        self.last_jwt_check = now;
+
+        // Collect connections that need renewal under mutex
+        var renew_buf: [64]*ws.Connection = undefined;
+        var renew_count: usize = 0;
+
+        self.mutex.lock();
+        var it = self.connection_jwt_info.iterator();
+        while (it.next()) |entry| {
+            // Renew 5 minutes before expiry (jwt_expiry_secs = 900, renew at 600)
+            if (now > entry.value_ptr.expiry - 300 and renew_count < renew_buf.len) {
+                renew_buf[renew_count] = entry.key_ptr.*;
+                renew_count += 1;
+            }
+        }
+        self.mutex.unlock();
+
+        // Send fresh JWTs (outside mutex — sendBinary does its own I/O)
+        for (renew_buf[0..renew_count]) |conn| {
+            var jwt_buf: [256]u8 = undefined;
+            var role: auth.Role = .none;
+            var session_id: []const u8 = "";
+
+            // Read info under mutex
+            self.mutex.lock();
+            if (self.connection_jwt_info.getPtr(conn)) |info| {
+                role = info.role;
+                session_id = info.session_id;
+            }
+            self.mutex.unlock();
+
+            if (role == .none) continue;
+
+            const jwt = self.auth_state.createJwt(role, session_id, &jwt_buf);
+            if (jwt.len > 0) {
+                // Send JWT_RENEWAL message: [0x0D][jwt_len:u16_le][jwt...]
+                var msg: [3 + 256]u8 = undefined;
+                msg[0] = 0x0D; // JWT_RENEWAL
+                std.mem.writeInt(u16, msg[1..3], @intCast(jwt.len), .little);
+                @memcpy(msg[3..][0..jwt.len], jwt);
+                conn.sendBinary(msg[0 .. 3 + jwt.len]) catch {};
+
+                // Update expiry under mutex
+                self.mutex.lock();
+                if (self.connection_jwt_info.getPtr(conn)) |info| {
+                    info.expiry = now + 900; // jwt_expiry_secs
+                }
+                self.mutex.unlock();
+            }
+        }
     }
 
     fn sendAuthState(self: *Server, conn: *ws.Connection) void {
@@ -3430,7 +3714,8 @@ const Server = struct {
 
         for (self.control_connections.items) |ctrl_conn| {
             const cid = self.control_client_ids.get(ctrl_conn) orelse 0;
-            const crole = self.getConnectionRole(ctrl_conn);
+            // Use cached role directly — mutex is already held, calling getConnectionRole would deadlock
+            const crole = self.connection_roles.get(ctrl_conn) orelse .none;
             const csession = self.connection_sessions.get(ctrl_conn) orelse "";
 
             msg_buf.writer(self.allocator).writeInt(u32, cid, .little) catch break;
@@ -3445,7 +3730,8 @@ const Server = struct {
         // Snapshot admin connections
         for (self.control_connections.items) |ctrl_conn| {
             if (count >= max_broadcast_conns) break;
-            const crole = self.getConnectionRole(ctrl_conn);
+            // Use cached role directly — mutex is already held
+            const crole = self.connection_roles.get(ctrl_conn) orelse .none;
             conn_buf[count] = ctrl_conn;
             role_buf[count] = crole;
             count += 1;
@@ -4680,7 +4966,9 @@ const Server = struct {
             // Notify tmux API caller if this was an API-originated request
             if (req.from_api) _ = self.tmux_api_response_ch.send(panel.id);
 
-            // Panel starts streaming immediately (H264 frames sent to all h264_connections)
+            // Panel starts streaming immediately. Initial dimensions are approximate;
+            // each client's ResizeObserver sends the correct viewport-based resize
+            // within one animation frame (~16ms).
             self.broadcastPanelCreated(panel.id);
             // Only broadcast layout update for regular panels (quick terminal is outside layout)
             if (req.kind == .regular) {
@@ -4715,6 +5003,9 @@ const Server = struct {
 
                 // Remove from layout
                 self.layout.removePanel(req.id);
+
+                // Clean up per-session references to this panel
+                self.cleanupDestroyedPanelSessions(req.id);
 
                 // Remove panel assignment if any
                 const had_assignment = if (self.panel_assignments.fetchRemove(req.id)) |old| blk: {
@@ -4790,6 +5081,9 @@ const Server = struct {
             if (req.from_api) _ = self.tmux_api_response_ch.send(panel.id);
 
             // Panel starts streaming immediately (H264 frames sent to all h264_connections)
+            // Initial dimensions are approximate (parent halved). Each client's
+            // ResizeObserver will send the correct viewport-based resize within
+            // one animation frame (~16ms), which triggers a keyframe at the right size.
             self.broadcastPanelCreated(panel.id);
             self.broadcastLayoutUpdate();
 
@@ -4851,6 +5145,9 @@ const Server = struct {
 
             // Periodic cleanup of expired rate limit entries (self-throttles to once per minute)
             self.rate_limiter.cleanup();
+
+            // Periodic JWT renewal — check every ~10 seconds (300 frames at 30fps)
+            self.renewExpiredJwts();
 
             // Process input for all panels (more responsive than frame rate)
             // Collect panels first, then release mutex before calling ghostty
@@ -6291,15 +6588,53 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         const dir_str = jsonGetString(body, "dir") orelse "v";
         const direction: SplitDirection = if (std.mem.eql(u8, dir_str, "h")) .horizontal else .vertical;
 
+        // Derive new panel dimensions: prefer panel owner's viewport, fall back to parent panel
+        var width: u32 = 800;
+        var height: u32 = 600;
+        var scale: f64 = 2.0;
+        {
+            server.mutex.lock();
+            const parent = server.panels.get(pane_id);
+
+            // Prefer panel owner's viewport for accurate split sizing
+            const owner_viewport: ?SessionViewport = blk: {
+                if (server.panel_assignments.get(pane_id)) |owner_sid| {
+                    if (server.session_viewports.get(owner_sid)) |vp| break :blk vp;
+                }
+                break :blk null;
+            };
+            server.mutex.unlock();
+
+            if (owner_viewport) |vp| {
+                scale = vp.scale;
+                if (direction == .horizontal) {
+                    width = vp.width / 2;
+                    height = vp.height;
+                } else {
+                    width = vp.width;
+                    height = vp.height / 2;
+                }
+            } else if (parent) |p| {
+                scale = p.scale;
+                if (direction == .horizontal) {
+                    width = p.width / 2;
+                    height = p.height;
+                } else {
+                    width = p.width;
+                    height = p.height / 2;
+                }
+            }
+        }
+
         // Record next_panel_id before sending request
         const expected_id = @atomicLoad(u32, &server.next_panel_id, .acquire);
 
         _ = server.pending_splits_ch.send(.{
             .parent_panel_id = pane_id,
             .direction = direction,
-            .width = 800,
-            .height = 600,
-            .scale = 2.0,
+            .width = width,
+            .height = height,
+            .scale = scale,
             .from_api = true,
         });
         server.wake_signal.notify();
@@ -6311,12 +6646,38 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
     }
 
     if (std.mem.eql(u8, cmd, "new-window")) {
+        // Derive dimensions: prefer first available session viewport, fall back to first panel
+        var width: u32 = 800;
+        var height: u32 = 600;
+        var scale: f64 = 2.0;
+        {
+            server.mutex.lock();
+            var found = false;
+            var vp_it = server.session_viewports.valueIterator();
+            if (vp_it.next()) |vp| {
+                width = vp.width;
+                height = vp.height;
+                scale = vp.scale;
+                found = true;
+            }
+            if (!found) {
+                var it = server.panels.iterator();
+                if (it.next()) |entry| {
+                    const p = entry.value_ptr.*;
+                    width = p.width;
+                    height = p.height;
+                    scale = p.scale;
+                }
+            }
+            server.mutex.unlock();
+        }
+
         const expected_id = @atomicLoad(u32, &server.next_panel_id, .acquire);
 
         _ = server.pending_panels_ch.send(.{
-            .width = 800,
-            .height = 600,
-            .scale = 2.0,
+            .width = width,
+            .height = height,
+            .scale = scale,
             .inherit_cwd_from = 0,
             .kind = .regular,
             .from_api = true,

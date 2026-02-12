@@ -4,7 +4,7 @@
  */
 import { writable, get } from 'svelte/store';
 import { mount, unmount } from 'svelte';
-import { tabs, activeTabId as activeTabIdStore, panels, activePanelId, ui, createPanelInfo, createTabInfo } from '../stores/index';
+import { tabs, activeTabId as activeTabIdStore, panels, activePanelId, ui, sessions, createPanelInfo, createTabInfo } from '../stores/index';
 import PanelComponent from '../components/Panel.svelte';
 import { SplitContainer, type PanelLike } from '../split-container';
 import { FileTransferHandler } from '../file-transfer';
@@ -111,6 +111,9 @@ export class MuxClient {
   private h264PendingFrames = new Map<number, Uint8Array[]>();
   private controlPendingByPanel = new Map<number, ArrayBuffer[]>();
 
+  /** Original permanent token from URL (edt_/vwr_ prefix), preserved across JWT renewals */
+  permanentToken: string | null = null;
+
   // Callbacks for transfer dialog UI (set by App.svelte)
   onUploadRequest?: () => void;
   onDownloadRequest?: () => void;
@@ -118,6 +121,12 @@ export class MuxClient {
   onDownloadProgress?: (transferId: number, filesCompleted: number, totalFiles: number, bytesTransferred: number, totalBytes: number) => void;
 
   constructor() {
+    // Capture permanent token from URL before JWT renewal replaces it
+    const urlToken = new URL(window.location.href).searchParams.get('token');
+    if (urlToken && (urlToken.startsWith('edt_') || urlToken.startsWith('vwr_'))) {
+      this.permanentToken = urlToken;
+    }
+
     this.fileTransfer = new FileTransferHandler();
     this.fileTransfer.onTransferComplete = (transferId, totalBytes) => {
       console.log(`Transfer ${transferId} completed: ${totalBytes} bytes`);
@@ -767,6 +776,20 @@ export class MuxClient {
           }
           break;
         }
+        case SERVER_MSG.JWT_RENEWAL: {
+          // [0x0D][jwt_len:u16_le][jwt...]
+          if (data.byteLength > 3) {
+            const jwtLen = view.getUint16(1, true);
+            if (jwtLen > 0 && data.byteLength >= 3 + jwtLen) {
+              const jwt = new TextDecoder().decode(bytes.slice(3, 3 + jwtLen));
+              // Update URL without reload so future requests/reconnects use the new JWT
+              const url = new URL(window.location.href);
+              url.searchParams.set('token', jwt);
+              window.history.replaceState({}, '', url.toString());
+            }
+          }
+          break;
+        }
         case SERVER_MSG.OVERVIEW_STATE:
           ui.update(s => ({ ...s, overviewOpen: view.getUint8(1) === 1 }));
           break;
@@ -847,6 +870,34 @@ export class MuxClient {
           break;
         }
 
+        case SERVER_MSG.SESSION_LIST: {
+          // [0x0B][count:u16][{id_len:u16, id, name_len:u16, name, editor_token:44, viewer_token:44}*]
+          if (data.byteLength < 3) break;
+          const count = view.getUint16(1, true);
+          const parsed: Array<{id: string; name: string; createdAt: number; editorToken: string; viewerToken: string}> = [];
+          let offset = 3;
+          for (let i = 0; i < count; i++) {
+            if (offset + 2 > data.byteLength) break;
+            const idLen = view.getUint16(offset, true); offset += 2;
+            if (offset + idLen > data.byteLength) break;
+            const id = sharedTextDecoder.decode(bytes.slice(offset, offset + idLen)); offset += idLen;
+            if (offset + 2 > data.byteLength) break;
+            const nameLen = view.getUint16(offset, true); offset += 2;
+            if (offset + nameLen > data.byteLength) break;
+            const name = sharedTextDecoder.decode(bytes.slice(offset, offset + nameLen)); offset += nameLen;
+            if (offset + 88 > data.byteLength) break;
+            const editorToken = sharedTextDecoder.decode(bytes.slice(offset, offset + 44)); offset += 44;
+            const viewerToken = sharedTextDecoder.decode(bytes.slice(offset, offset + 44)); offset += 44;
+            parsed.push({ id, name, createdAt: 0, editorToken, viewerToken });
+          }
+          sessions.set(parsed);
+          break;
+        }
+        case SERVER_MSG.SHARE_LINKS: {
+          // [0x0C][count:u16][{token:44, type:u8, use_count:u32, valid:u8}*]
+          // Currently just log — full share link UI can be added later
+          break;
+        }
         case SERVER_MSG.SURFACE_DIMS: {
           // [0x15][panel_id:u32][width:u16][height:u16] = 9 bytes
           if (data.byteLength < 9) break;
@@ -940,45 +991,25 @@ export class MuxClient {
   }
 
   private handleLayoutUpdate(layout: LayoutData): void {
-    // Check if server layout has panels we don't know about (e.g. created via tmux API)
-    // or tabs we don't have — if so, do a full rebuild
-    const serverPanelIds = new Set<number>();
-    for (const tab of layout.tabs) {
-      this.collectLayoutPanelIds(tab.root, serverPanelIds);
-    }
-
-    let needsRebuild = false;
-    for (const id of serverPanelIds) {
-      if (!this.panelsByServerId.has(id)) {
-        console.log(`[MUX] Layout has unknown panel ${id} — rebuilding`);
-        needsRebuild = true;
-        break;
-      }
-    }
-    if (!needsRebuild) {
-      // Check for new tabs
-      for (const tabLayout of layout.tabs) {
-        if (!this.tabInstances.has(String(tabLayout.id))) {
-          console.log(`[MUX] Layout has unknown tab ${tabLayout.id} — rebuilding`);
-          needsRebuild = true;
-          break;
-        }
+    // Handle new tabs incrementally — create only what's missing
+    for (const tabLayout of layout.tabs) {
+      if (!this.tabInstances.has(String(tabLayout.id))) {
+        console.log(`[MUX] Layout has new tab ${tabLayout.id} — creating`);
+        this.restoreTab(tabLayout);
       }
     }
 
-    if (needsRebuild) {
-      this.restoreLayoutFromServer(layout);
-      return;
-    }
-
-    // All panels and tabs exist — reconcile direction/ratio only
+    // Reconcile existing tabs: direction, ratio, and new splits (leaf→split conversion)
     for (const tabLayout of layout.tabs) {
       const tabId = String(tabLayout.id);
       const tab = this.tabInstances.get(tabId);
       if (tab) {
-        const mismatches = this.reconcileTree(tab.root, tabLayout.root);
-        if (mismatches > 0) {
-          console.log(`[MUX] Reconciled ${mismatches} direction/ratio mismatches from server layout`);
+        const fixes = this.reconcileTree(tab.root, tabLayout.root, tab.element);
+        if (fixes > 0) {
+          console.log(`[MUX] Reconciled ${fixes} mismatches from server layout`);
+          // Update tab's panel list after structural changes
+          const allPanels = tab.root.getAllPanels();
+          tabs.updateTab(tabId, { panelIds: allPanels.map(p => p.id) });
         }
       }
     }
@@ -994,14 +1025,22 @@ export class MuxClient {
   }
 
   /**
-   * Walk client and server trees in parallel, fixing direction/ratio mismatches.
+   * Walk client and server trees in parallel, fixing structural mismatches.
+   * Handles direction/ratio fixes AND leaf→split conversions (for server-initiated splits).
    * Returns the number of fixes applied.
    */
-  private reconcileTree(container: SplitContainer, node: LayoutNode): number {
+  private reconcileTree(container: SplitContainer, node: LayoutNode, tabElement: HTMLElement): number {
     let fixes = 0;
 
-    if (node.type === 'split' && container.direction !== null && node.first && node.second) {
-      // Both are splits - check direction
+    if (node.type === 'leaf') {
+      // Server says leaf — nothing structural to change
+      return fixes;
+    }
+
+    if (node.type !== 'split' || !node.first || !node.second) return fixes;
+
+    if (container.direction !== null && container.first && container.second) {
+      // Both are splits — check direction
       const expectedDirection: 'horizontal' | 'vertical' = node.direction === 'horizontal' ? 'horizontal' : 'vertical';
       if (container.direction !== expectedDirection) {
         console.log(`[MUX] Direction mismatch: client=${container.direction}, server=${expectedDirection}`);
@@ -1016,10 +1055,109 @@ export class MuxClient {
         fixes++;
       }
       // Recurse into children
-      if (container.first) fixes += this.reconcileTree(container.first, node.first);
-      if (container.second) fixes += this.reconcileTree(container.second, node.second);
+      fixes += this.reconcileTree(container.first, node.first, tabElement);
+      fixes += this.reconcileTree(container.second, node.second, tabElement);
+    } else if (container.panel) {
+      // Client has leaf, server has split — convert leaf to split incrementally.
+      // This happens when the server (e.g. tmux API) splits an existing panel.
+      const existingServerId = container.panel.serverId;
+
+      // Figure out which side of the server split contains the existing panel
+      const firstIds = new Set<number>();
+      this.collectLayoutPanelIds(node.first, firstIds);
+      const secondIds = new Set<number>();
+      this.collectLayoutPanelIds(node.second, secondIds);
+
+      const existingInFirst = existingServerId !== null && firstIds.has(existingServerId);
+      const existingInSecond = existingServerId !== null && secondIds.has(existingServerId);
+
+      if (!existingInFirst && !existingInSecond) {
+        // Existing panel not found in server layout — fall back to full rebuild
+        console.warn(`[MUX] Panel ${existingServerId} not found in server split — full rebuild`);
+        return fixes;
+      }
+
+      const isHorizontal = node.direction === 'horizontal';
+      // SplitContainer.split() directions: 'right'|'down'|'left'|'up'
+      // If existing is first child → new panel goes right/down
+      // If existing is second child → new panel goes left/up
+      const splitCmd: 'right' | 'down' | 'left' | 'up' = existingInFirst
+        ? (isHorizontal ? 'right' : 'down')
+        : (isHorizontal ? 'left' : 'up');
+
+      // Get the first leaf ID from the "other" side to create as the new panel
+      const otherNode = existingInFirst ? node.second : node.first;
+      const newPanelServerId = this.getFirstLeafId(otherNode);
+
+      if (newPanelServerId === null) {
+        console.warn('[MUX] No leaf found in other side of server split');
+        return fixes;
+      }
+
+      console.log(`[MUX] Converting leaf (panel ${existingServerId}) to split: creating panel ${newPanelServerId}, direction=${splitCmd}`);
+      const newPanel = this.createPanel(tabElement, newPanelServerId);
+      container.split(splitCmd, newPanel);
+      // Flush pending messages AFTER the split so the panel element has its
+      // correct post-split dimensions. Don't send resize here — the Panel.svelte
+      // ResizeObserver will fire on the next animation frame with accurate
+      // dimensions from each client's own viewport.
+      this.flushPendingMessages(newPanelServerId, newPanel);
+
+      // Apply ratio from server
+      if (node.ratio !== undefined) {
+        container.ratio = node.ratio;
+        container.applyRatio();
+      }
+      fixes++;
+
+      // Recurse into both children for further structural changes
+      if (container.first && container.second) {
+        const [firstNode, secondNode] = existingInFirst
+          ? [node.first, node.second]
+          : [node.second, node.first];
+        fixes += this.reconcileTree(container.first, firstNode, tabElement);
+        fixes += this.reconcileTree(container.second, secondNode, tabElement);
+      }
     }
     return fixes;
+  }
+
+  /** Get the first leaf panel ID from a layout subtree. */
+  private getFirstLeafId(node: LayoutNode): number | null {
+    if (node.type === 'leaf' && node.panelId !== undefined) return node.panelId;
+    if (node.type === 'split') {
+      if (node.first) {
+        const id = this.getFirstLeafId(node.first);
+        if (id !== null) return id;
+      }
+      if (node.second) {
+        const id = this.getFirstLeafId(node.second);
+        if (id !== null) return id;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Flush buffered control messages and H264 frames for a newly registered panel.
+   * Does NOT send a resize — the Panel.svelte ResizeObserver handles that after
+   * the DOM has reflowed, giving each client accurate viewport-based dimensions.
+   */
+  private flushPendingMessages(serverId: number, panel: PanelInstance): void {
+    const pendingCtrl = this.controlPendingByPanel.get(serverId);
+    if (pendingCtrl) {
+      this.controlPendingByPanel.delete(serverId);
+      for (const msg of pendingCtrl) {
+        this.handleBinaryMessage(msg);
+      }
+    }
+    const pendingFrames = this.h264PendingFrames.get(serverId);
+    if (pendingFrames) {
+      this.h264PendingFrames.delete(serverId);
+      for (const frame of pendingFrames) {
+        panel.decodePreviewFrame(frame);
+      }
+    }
   }
 
   private handlePanelList(panelList: Array<{ panel_id: number; title: string }>, layout: unknown): void {
@@ -1540,13 +1678,8 @@ export class MuxClient {
     for (const tabLayout of layout.tabs) {
       this.restoreTab(tabLayout);
     }
-    // Restore active panel (active tab is derived from it)
-    const activePanel = layout.activePanelId !== undefined
-      ? this.panelsByServerId.get(layout.activePanelId) as PanelInstance | undefined
-      : undefined;
-    if (activePanel) {
-      this.setActivePanel(activePanel);
-    } else if (this.tabInstances.size > 0) {
+    // Active panel is per-session (client-side) — default to first panel in first tab
+    if (this.tabInstances.size > 0) {
       const firstTab = this.tabInstances.values().next().value;
       if (firstTab) {
         const panels = firstTab.root.getAllPanels();
@@ -1813,6 +1946,45 @@ export class MuxClient {
     this.sendControlMessage(BinaryCtrlMsg.UNASSIGN_PANEL, data);
   }
 
+  /** Request session list from server (admin only) */
+  requestSessionList(): void {
+    this.sendControlMessage(BinaryCtrlMsg.GET_SESSION_LIST, new Uint8Array(0));
+  }
+
+  /** Create a new session (admin only) */
+  createSession(id: string, name: string): void {
+    const idBytes = sharedTextEncoder.encode(id);
+    const nameBytes = sharedTextEncoder.encode(name);
+    const data = new Uint8Array(2 + 2 + idBytes.length + nameBytes.length);
+    const view = new DataView(data.buffer);
+    view.setUint16(0, idBytes.length, true);
+    view.setUint16(2, nameBytes.length, true);
+    data.set(idBytes, 4);
+    data.set(nameBytes, 4 + idBytes.length);
+    this.sendControlMessage(BinaryCtrlMsg.CREATE_SESSION, data);
+  }
+
+  /** Delete a session (admin only) */
+  deleteSession(id: string): void {
+    const idBytes = sharedTextEncoder.encode(id);
+    const data = new Uint8Array(2 + idBytes.length);
+    const view = new DataView(data.buffer);
+    view.setUint16(0, idBytes.length, true);
+    data.set(idBytes, 2);
+    this.sendControlMessage(BinaryCtrlMsg.DELETE_SESSION, data);
+  }
+
+  /** Regenerate a session token (admin only) */
+  regenerateToken(sessionId: string, tokenType: number): void {
+    const idBytes = sharedTextEncoder.encode(sessionId);
+    const data = new Uint8Array(2 + 1 + idBytes.length);
+    const view = new DataView(data.buffer);
+    view.setUint16(0, idBytes.length, true);
+    data[2] = tokenType;
+    data.set(idBytes, 3);
+    this.sendControlMessage(BinaryCtrlMsg.REGEN_TOKEN, data);
+  }
+
   /** Send input to assigned panel via control WS (coworker mode) */
   private sendPanelInputViaControl(serverId: number, inputMsg: ArrayBuffer | ArrayBufferView): void {
     const inputBytes = inputMsg instanceof ArrayBuffer
@@ -1857,6 +2029,17 @@ export class MuxClient {
 
   getActivePanel(): PanelInstance | null {
     return this.currentActivePanel;
+  }
+
+  /** Get all panel server IDs in the active tab */
+  getActiveTabPanelServerIds(): number[] {
+    const activeId = get(activeTabIdStore);
+    if (!activeId) return [];
+    const tab = this.tabInstances.get(activeId);
+    if (!tab) return [];
+    return tab.root.getAllPanels()
+      .map(p => (p as PanelInstance).serverId)
+      .filter((id): id is number => id != null);
   }
 
   getTabElements(): Map<string, HTMLElement> {

@@ -7,10 +7,12 @@
   import QuickTerminal from './components/QuickTerminal.svelte';
   import TabOverview from './components/TabOverview.svelte';
   import ShareDialog from './components/ShareDialog.svelte';
+  import AdminSharesDialog from './components/AdminSharesDialog.svelte';
   import TransferDialog, { type TransferConfig } from './components/TransferDialog.svelte';
   import DownloadProgressDialog from './components/DownloadProgressDialog.svelte';
-  import { tabs, activeTabId, activeTab, ui } from './stores/index';
+  import { tabs, activeTabId, activeTab, panels, ui, sessions } from './stores/index';
   import { connectionStatus, initialLayoutLoaded, initMuxClient, type MuxClient } from './services/mux';
+  import type { Session } from './types';
 
   // MuxClient instance
   let muxClient: MuxClient | null = $state(null);
@@ -29,6 +31,11 @@
 
   // Share dialog state
   let shareDialogOpen = $state(false);
+  let shareDialogUrl = $state('');
+  let shareDialogTitle = $state('Share Terminal');
+
+  // Admin shares dialog state
+  let adminSharesOpen = $state(false);
 
   // Transfer dialog state
   let transferDialogOpen = $state(false);
@@ -171,9 +178,14 @@
     ...windowTabListItems,
   ]);
 
-  // Share menu
-  let shareMenuItems = $derived<MenuItem[]>([
-    { label: 'Share URL', action: '_share_url', icon: '🔗' },
+  // Share menu (admin vs non-admin)
+  let shareMenuItems = $derived<MenuItem[]>($ui.isAdmin ? [
+    { label: 'Share Current Panel', action: '_share_panel' },
+    { label: 'Share Current Tab', action: '_share_tab' },
+    { separator: true },
+    { label: 'Manage Shares...', action: '_manage_shares' },
+  ] : [
+    { label: 'Share URL', action: '_share_url' },
   ]);
 
   // Tab event handlers
@@ -290,6 +302,58 @@
       config.dirHandle,
       config.files,
     );
+  }
+
+  // Share current panel (admin only): create session, assign panel, show QR
+  function shareCurrentPanel() {
+    if (!muxClient) return;
+    const panel = muxClient.getActivePanel();
+    if (!panel?.serverId) return;
+    const sessionId = `share-${Date.now().toString(36)}`;
+    const panelInfo = panels.get(panel.id);
+    const sessionName = panelInfo?.title || `Panel ${panel.serverId}`;
+    muxClient.createSession(sessionId, sessionName);
+    // Wait for session list update with the new session
+    const unsub = sessions.subscribe(list => {
+      const found = list.find(s => s.id === sessionId);
+      if (found) {
+        setTimeout(() => unsub()); // unsubscribe after this tick
+        muxClient!.assignPanel(panel.serverId!, sessionId);
+        shareDialogUrl = `${window.location.origin}?token=${found.editorToken}`;
+        shareDialogTitle = `Share: ${sessionName}`;
+        shareDialogOpen = true;
+      }
+    });
+  }
+
+  // Share current tab (admin only): create session, assign all panels, show QR
+  function shareCurrentTab() {
+    if (!muxClient) return;
+    const panelIds = muxClient.getActiveTabPanelServerIds();
+    if (panelIds.length === 0) return;
+    const sessionId = `share-${Date.now().toString(36)}`;
+    const tabTitle = $activeTab?.title || 'Tab';
+    const sessionName = `${tabTitle} (${panelIds.length} panel${panelIds.length > 1 ? 's' : ''})`;
+    muxClient.createSession(sessionId, sessionName);
+    const unsub = sessions.subscribe(list => {
+      const found = list.find(s => s.id === sessionId);
+      if (found) {
+        setTimeout(() => unsub());
+        for (const pid of panelIds) {
+          muxClient!.assignPanel(pid, sessionId);
+        }
+        shareDialogUrl = `${window.location.origin}?token=${found.editorToken}`;
+        shareDialogTitle = `Share: ${sessionName}`;
+        shareDialogOpen = true;
+      }
+    });
+  }
+
+  // Handle "show QR" action from admin shares dialog
+  function handleShareSession(session: Session) {
+    shareDialogUrl = `${window.location.origin}?token=${session.editorToken}`;
+    shareDialogTitle = `Share: ${session.name || session.id}`;
+    shareDialogOpen = true;
   }
 
   // Handle command execution from command palette
@@ -438,8 +502,26 @@
           }
         }).catch(() => {});
         break;
-      case '_share_url':
+      case '_share_url': {
+        // Non-admin: show permanent token URL or base URL
+        const token = muxClient?.permanentToken;
+        if (token) {
+          shareDialogUrl = `${window.location.origin}?token=${token}`;
+        } else {
+          shareDialogUrl = window.location.href.replace(/[?#].*$/, '');
+        }
+        shareDialogTitle = 'Share Terminal';
         shareDialogOpen = true;
+        break;
+      }
+      case '_share_panel':
+        shareCurrentPanel();
+        break;
+      case '_share_tab':
+        shareCurrentTab();
+        break;
+      case '_manage_shares':
+        adminSharesOpen = true;
         break;
       default:
         // Handle dynamic tab selection from Window Tab List
@@ -837,6 +919,16 @@
   <ShareDialog
     open={shareDialogOpen}
     onClose={() => shareDialogOpen = false}
+    shareUrl={shareDialogUrl}
+    title={shareDialogTitle}
+  />
+
+  <!-- Admin Shares Dialog -->
+  <AdminSharesDialog
+    open={adminSharesOpen}
+    onClose={() => adminSharesOpen = false}
+    {muxClient}
+    onShareSession={handleShareSession}
   />
 
   <!-- Transfer Dialog -->
