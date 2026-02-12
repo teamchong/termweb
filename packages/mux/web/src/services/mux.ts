@@ -27,7 +27,7 @@ interface PanelInstance extends PanelLike {
   show: () => void;
   sendKeyInput: (e: KeyboardEvent, action: number) => void;
   sendTextInput: (text: string) => void;
-  setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
+  setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null, immediateFn?: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
   decodePreviewFrame: (frameData: Uint8Array) => void;
   handleInspectorState: (state: unknown) => void;
   getStatus: () => PanelStatus;
@@ -394,6 +394,21 @@ export class MuxClient {
       this.controlFlushScheduled = true;
       requestAnimationFrame(() => this.flushControlBatch());
     }
+  }
+
+  /** Send binary data immediately on the control WS, bypassing rAF batching.
+   *  Used for latency-sensitive input (keystrokes, mouse clicks). */
+  private sendControlImmediate(data: Uint8Array): void {
+    if (!this.isControlWsOpen()) return;
+    // Small messages (keystrokes ~5-15 bytes): skip zstd, send with 0x00 flag
+    if (data.length < 32) {
+      const frame = new Uint8Array(1 + data.length);
+      frame[0] = 0x00;
+      frame.set(data, 1);
+      this.controlWs!.send(frame);
+      return;
+    }
+    this.sendRawCompressed(data);
   }
 
   /** Flush all queued messages as one zstd-compressed batch */
@@ -1386,7 +1401,7 @@ export class MuxClient {
       show: () => void;
       sendKeyInput: (e: KeyboardEvent, action: number) => void;
       sendTextInput: (text: string) => void;
-      setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
+      setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null, immediateFn?: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
       decodePreviewFrame: (frameData: Uint8Array) => void;
       handleInspectorState: (state: unknown) => void;
       getStatus: () => PanelStatus;
@@ -1415,7 +1430,7 @@ export class MuxClient {
       show: () => comp.show(),
       sendKeyInput: (e, a) => comp.sendKeyInput(e, a),
       sendTextInput: (t) => comp.sendTextInput(t),
-      setControlWsSend: (fn) => comp.setControlWsSend(fn),
+      setControlWsSend: (fn, immFn) => comp.setControlWsSend(fn, immFn),
       decodePreviewFrame: (f) => comp.decodePreviewFrame(f),
       handleInspectorState: (s) => comp.handleInspectorState(s),
       getStatus: () => comp.getStatus(),
@@ -1432,10 +1447,17 @@ export class MuxClient {
     panels.add(createPanelInfo(panelId, serverId, isQuickTerminal));
 
     // Wire panel to send via PANEL_MSG envelope on control WS
-    panel.setControlWsSend((msg) => {
-      const sid = panel.serverId ?? 0;
-      this.sendPanelMsg(sid, msg);
-    });
+    // Batched path (rAF) for bulk messages, immediate path for key/click input
+    panel.setControlWsSend(
+      (msg) => {
+        const sid = panel.serverId ?? 0;
+        this.sendPanelMsg(sid, msg);
+      },
+      (msg) => {
+        const sid = panel.serverId ?? 0;
+        this.sendPanelMsgImmediate(sid, msg);
+      },
+    );
 
     // Viewers only receive frames (via H264 WS demux) — no create/split/input
     if (!this.isViewer) {
@@ -1894,6 +1916,19 @@ export class MuxClient {
     this.sendControlBinary(envelope);
   }
 
+  /** Wrap a panel message in PANEL_MSG envelope and send immediately (no rAF).
+   *  Used for latency-sensitive input (keystrokes, mouse clicks). */
+  private sendPanelMsgImmediate(serverId: number, msg: ArrayBuffer | ArrayBufferView): void {
+    const inputBytes = msg instanceof ArrayBuffer
+      ? new Uint8Array(msg)
+      : new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
+    const envelope = new Uint8Array(1 + 4 + inputBytes.length);
+    envelope[0] = BinaryCtrlMsg.PANEL_MSG;
+    new DataView(envelope.buffer).setUint32(1, serverId, true);
+    envelope.set(inputBytes, 5);
+    this.sendControlImmediate(envelope);
+  }
+
   private sendClosePanel(serverId: number): void {
     const data = new Uint8Array(4);
     const view = new DataView(data.buffer);
@@ -1998,16 +2033,30 @@ export class MuxClient {
     this.sendControlBinary(msg);
   }
 
+  /** Send input immediately to assigned panel via control WS (coworker mode) */
+  private sendPanelInputViaControlImmediate(serverId: number, inputMsg: ArrayBuffer | ArrayBufferView): void {
+    const inputBytes = inputMsg instanceof ArrayBuffer
+      ? new Uint8Array(inputMsg)
+      : new Uint8Array(inputMsg.buffer, inputMsg.byteOffset, inputMsg.byteLength);
+    const msg = new Uint8Array(1 + 4 + inputBytes.length);
+    msg[0] = BinaryCtrlMsg.PANEL_INPUT;
+    const view = new DataView(msg.buffer);
+    view.setUint32(1, serverId, true);
+    msg.set(inputBytes, 5);
+    this.sendControlImmediate(msg);
+  }
+
   /** Wire up coworker input for a panel */
   private setupCoworkerInput(panel: PanelInstance, serverId: number): void {
-    panel.setControlWsSend((msg) => {
-      this.sendPanelInputViaControl(serverId, msg);
-    });
+    panel.setControlWsSend(
+      (msg) => this.sendPanelInputViaControl(serverId, msg),
+      (msg) => this.sendPanelInputViaControlImmediate(serverId, msg),
+    );
   }
 
   /** Remove coworker input from a panel */
   private clearCoworkerInput(panel: PanelInstance): void {
-    panel.setControlWsSend(null);
+    panel.setControlWsSend(null, null);
   }
 
   /** Called when PANEL_ASSIGNMENT is received — wire/unwire coworker input */

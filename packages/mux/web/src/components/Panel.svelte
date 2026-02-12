@@ -89,6 +89,7 @@
   // ============================================================================
 
   let controlWsSend: ((msg: ArrayBuffer | ArrayBufferView) => void) | null = null;
+  let controlWsSendImmediate: ((msg: ArrayBuffer | ArrayBufferView) => void) | null = null;
   let decoder: VideoDecoder | null = null;
   let snapshotCanvas: HTMLCanvasElement | undefined;
   let snapshotCtx: CanvasRenderingContext2D | null = null;
@@ -236,13 +237,19 @@
     return controlWsSend !== null;
   }
 
-  /** Send input via control WS (PANEL_MSG envelope) */
+  /** Send input via control WS (PANEL_MSG envelope, rAF batched) */
   function sendInput(buf: ArrayBuffer | ArrayBufferView): void {
     controlWsSend?.(buf);
   }
 
-  export function setControlWsSend(fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null): void {
+  /** Send input immediately, bypassing rAF batching (for key/click) */
+  function sendInputImmediate(buf: ArrayBuffer | ArrayBufferView): void {
+    (controlWsSendImmediate ?? controlWsSend)?.(buf);
+  }
+
+  export function setControlWsSend(fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null, immediateFn?: ((msg: ArrayBuffer | ArrayBufferView) => void) | null): void {
     controlWsSend = fn;
+    controlWsSendImmediate = immediateFn ?? null;
   }
 
   function setStatus(newStatus: PanelStatus): void {
@@ -735,7 +742,7 @@
     view.set(codeBytes, 4);
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
-    sendInput(buf);
+    sendInputImmediate(buf);
   }
 
   function handleMouseDown(e: MouseEvent): void {
@@ -787,7 +794,7 @@
     mouseButtonView.setUint8(17, e.button);
     mouseButtonView.setUint8(18, pressed ? 1 : 0);
     mouseButtonView.setUint8(19, getModifiers(e));
-    sendInput(mouseButtonBuffer);
+    sendInputImmediate(mouseButtonBuffer);
   }
 
   function handleWheel(e: WheelEvent): void {
@@ -932,7 +939,7 @@
     view.set(codeBytes, 4);
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
-    sendInput(buf);
+    sendInputImmediate(buf);
   }
 
   function handleMobileInput(e: Event): void {
@@ -1044,10 +1051,10 @@
         mouseButtonView.setUint8(17, 0); // left button
         mouseButtonView.setUint8(18, 1); // pressed
         mouseButtonView.setUint8(19, 0);
-        sendInput(mouseButtonBuffer);
+        sendInputImmediate(mouseButtonBuffer);
 
         mouseButtonView.setUint8(18, 0); // released
-        sendInput(mouseButtonBuffer);
+        sendInputImmediate(mouseButtonBuffer);
 
         // Focus the hidden textarea to show virtual keyboard
         onActivate?.();
@@ -1345,7 +1352,7 @@
     const view = new Uint8Array(buf);
     view[0] = ClientMsg.TEXT_INPUT;
     view.set(textBytes, 1);
-    sendInput(buf);
+    sendInputImmediate(buf);
   }
 
   export function getStatus(): PanelStatus {
