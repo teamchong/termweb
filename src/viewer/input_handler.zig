@@ -269,10 +269,10 @@ pub fn handleNormalModeKey(viewer: anytype, event: NormalizedKeyEvent) !void {
 
     switch (event.base_key) {
         .char => |c| {
-            // Translate Ctrl+Shift+P to Cmd+Shift+P for VSCode command palette
-            if (event.ctrl and event.shift and (c == 'p' or c == 'P')) {
+            // Translate Ctrl+Shift+K to Cmd+Shift+K for command palette
+            if (event.ctrl and event.shift and (c == 'k' or c == 'K')) {
                 const new_mods = (mods & ~@as(u8, 2)) | 4; // remove ctrl, add meta
-                interact_mod.sendCharWithModifiers(viewer.cdp_client, viewer.allocator, 'p', new_mods);
+                interact_mod.sendCharWithModifiers(viewer.cdp_client, viewer.allocator, 'k', new_mods);
             } else {
                 // Pass to browser with original modifiers
                 interact_mod.sendCharWithModifiers(viewer.cdp_client, viewer.allocator, c, mods);

@@ -120,7 +120,7 @@
     { label: 'Decrease Font', action: 'decrease_font_size:1', shortcut: '⌘-', icon: 'A−', disabled: !hasTabs },
     { label: 'Reset Font', action: 'reset_font_size', shortcut: '⌘0', icon: 'A', disabled: !hasTabs },
     { separator: true },
-    { label: 'Command Palette', action: '_command_palette', shortcut: '⌘⇧P', icon: '⌘' },
+    { label: 'Command Palette', action: '_command_palette', shortcut: '⌘⇧K', icon: '⌘' },
     { label: 'Change Title...', action: '_change_title', icon: '✎', disabled: !hasTabs },
     { separator: true },
     { label: 'Quick Terminal', action: '_quick_terminal', shortcut: '⌥⌘\\', icon: '▼' },
@@ -684,7 +684,7 @@
     const key = e.key.toLowerCase();
 
     // Application shortcuts (Cmd+key combinations)
-    if (e.metaKey && e.shiftKey && key === 'p') {
+    if (e.metaKey && e.shiftKey && key === 'k') {
       e.preventDefault();
       commandPaletteOpen = true;
       return;
@@ -895,7 +895,7 @@
             <span>New Tab</span><kbd>⌘/</kbd>
           </button>
           <button type="button" class="shortcut" onclick={() => commandPaletteOpen = true}>
-            <span>Command Palette</span><kbd>⌘⇧P</kbd>
+            <span>Command Palette</span><kbd>⌘⇧K</kbd>
           </button>
         </div>
       </div>
