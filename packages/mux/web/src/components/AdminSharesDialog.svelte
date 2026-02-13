@@ -31,11 +31,11 @@
   }
 
   function handleRegenToken(session: Session) {
-    muxClient?.regenerateToken(session.id, 0); // 0 = editor token
+    muxClient?.regenerateToken(session.id);
   }
 
   function handleCopyUrl(session: Session) {
-    const url = `${window.location.origin}?token=${session.editorToken}`;
+    const url = `${window.location.origin}?token=${session.token}`;
     navigator.clipboard.writeText(url).catch(() => {});
   }
 

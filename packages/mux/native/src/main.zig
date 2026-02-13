@@ -1534,7 +1534,6 @@ const PanelSplitRequest = struct {
 
 /// JWT renewal tracking per connection
 const JwtExpiry = struct {
-    role: auth.Role,
     session_id: []const u8, // Heap-allocated, owned by this struct
     expiry: i64,
 };
@@ -2766,18 +2765,19 @@ const Server = struct {
                     self.sendAuthError(conn, "Invalid password");
                 }
             },
-            0x93 => { // create_session
+            0x93 => { // create_session: [0x93][id_len:u16][name_len:u16][role:u8][id][name]
                 if (role != .admin) {
                     self.sendAuthError(conn, "Permission denied");
                     return;
                 }
-                if (data.len < 5) return;
+                if (data.len < 6) return;
                 const id_len = std.mem.readInt(u16, data[1..3], .little);
                 const name_len = std.mem.readInt(u16, data[3..5], .little);
-                if (data.len < 5 + id_len + name_len) return;
-                const session_id = data[5..][0..id_len];
-                const session_name = data[5 + id_len ..][0..name_len];
-                self.auth_state.createSession(session_id, session_name) catch {
+                const session_role: auth.Role = @enumFromInt(data[5]);
+                if (data.len < 6 + id_len + name_len) return;
+                const session_id = data[6..][0..id_len];
+                const session_name = data[6 + id_len ..][0..name_len];
+                self.auth_state.createSession(session_id, session_name, session_role) catch {
                     self.sendAuthError(conn, "Failed to create session");
                     return;
                 };
@@ -2795,42 +2795,39 @@ const Server = struct {
                 self.auth_state.deleteSession(session_id) catch {};
                 self.sendSessionList(conn);
             },
-            0x95 => { // regenerate_token
+            0x95 => { // regenerate_token: [0x95][id_len:u16][id]
                 if (role != .admin) {
                     self.sendAuthError(conn, "Permission denied");
                     return;
                 }
-                if (data.len < 4) return;
+                if (data.len < 3) return;
                 const id_len = std.mem.readInt(u16, data[1..3], .little);
-                const token_type: auth.TokenType = @enumFromInt(data[3]);
-                if (data.len < 4 + id_len) return;
-                const session_id = data[4..][0..id_len];
-                self.auth_state.regenerateSessionToken(session_id, token_type) catch {};
+                if (data.len < 3 + id_len) return;
+                const session_id = data[3..][0..id_len];
+                self.auth_state.regenerateSessionToken(session_id) catch {};
                 self.sendSessionList(conn);
             },
-            0x96 => { // create_share_link
+            0x96 => { // create_share_link: [0x96][role:u8]
                 if (role != .admin) {
                     self.sendAuthError(conn, "Permission denied");
                     return;
                 }
                 if (data.len < 2) return;
-                const token_type: auth.TokenType = @enumFromInt(data[1]);
-                // Optional: expires_in_secs (i64), max_uses (u32), label
-                const token = self.auth_state.createShareLink(token_type, null, null, null) catch {
+                const link_role: auth.Role = @enumFromInt(data[1]);
+                _ = self.auth_state.createShareLink(link_role, null, null, null) catch {
                     self.sendAuthError(conn, "Failed to create share link");
                     return;
                 };
                 self.sendShareLinks(conn);
-                _ = token;
             },
-            0x97 => { // revoke_share_link
+            0x97 => { // revoke_share_link: [0x97][token_hex:64]
                 if (role != .admin) {
                     self.sendAuthError(conn, "Permission denied");
                     return;
                 }
-                if (data.len < 45) return; // 1 + 44 (token length)
-                const token = data[1..45];
-                self.auth_state.revokeShareLink(token) catch {};
+                if (data.len < 1 + auth.token_hex_len) return;
+                const token_hex = data[1..][0..auth.token_hex_len];
+                self.auth_state.revokeShareLink(token_hex) catch {};
                 self.sendShareLinks(conn);
             },
             0x98 => { // revoke_all_shares
@@ -2936,8 +2933,8 @@ const Server = struct {
             if (auth.extractTokenFromQuery(uri)) |raw_token| {
                 var token_buf: [256]u8 = undefined;
                 const token = auth.decodeToken(&token_buf, raw_token);
-                const role = self.auth_state.validateToken(token);
-                if (role == .none) {
+                const result = self.auth_state.validateToken(token);
+                if (result.role == .none) {
                     if (ip) |ip_str| self.rate_limiter.recordFailure(ip_str);
                 } else {
                     if (ip) |ip_str| self.rate_limiter.recordSuccess(ip_str);
@@ -2946,9 +2943,9 @@ const Server = struct {
                     self.trackJwtInfo(conn, token);
                 }
                 self.mutex.lock();
-                self.connection_roles.put(conn, role) catch {};
+                self.connection_roles.put(conn, result.role) catch {};
                 self.mutex.unlock();
-                return role;
+                return result.role;
             }
         }
 
@@ -2958,7 +2955,7 @@ const Server = struct {
     }
 
     /// Store JWT tracking info for a connection (thread-safe).
-    /// Extracts JWT claims and stores role/session/expiry for auto-renewal.
+    /// Extracts JWT claims and stores session_id/expiry for auto-renewal.
     /// Handles overwrite by freeing the previous session_id.
     fn trackJwtInfo(self: *Server, conn: *ws.Connection, token: []const u8) void {
         if (token.len <= 10 or !std.mem.startsWith(u8, token, "eyJ")) return;
@@ -2968,7 +2965,6 @@ const Server = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.connection_jwt_info.fetchPut(conn, .{
-            .role = claims.role,
             .session_id = duped_sid,
             .expiry = claims.exp,
         }) catch null) |old| {
@@ -3010,20 +3006,20 @@ const Server = struct {
         // Send fresh JWTs (outside mutex — sendBinary does its own I/O)
         for (renew_buf[0..renew_count]) |conn| {
             var jwt_buf: [256]u8 = undefined;
-            var role: auth.Role = .none;
             var session_id: []const u8 = "";
 
             // Read info under mutex
             self.mutex.lock();
             if (self.connection_jwt_info.getPtr(conn)) |info| {
-                role = info.role;
                 session_id = info.session_id;
             }
             self.mutex.unlock();
 
-            if (role == .none) continue;
+            if (session_id.len == 0) continue;
 
-            const jwt = self.auth_state.createJwt(role, session_id, &jwt_buf);
+            // Look up session to get signing key
+            const session = self.auth_state.getSession(session_id) orelse continue;
+            const jwt = self.auth_state.createJwt(session, &jwt_buf);
             if (jwt.len > 0) {
                 // Send JWT_RENEWAL message: [0x0D][jwt_len:u16_le][jwt...]
                 var msg: [3 + 256]u8 = undefined;
@@ -3063,7 +3059,7 @@ const Server = struct {
 
         // Build session list message
         // [0x0B][count:u16][sessions...]
-        // session: [id_len:u16][id][name_len:u16][name][editor_token:44][viewer_token:44]
+        // session: [id_len:u16][id][name_len:u16][name][token_hex:64][role:u8]
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(self.allocator);
 
@@ -3082,8 +3078,12 @@ const Server = struct {
             buf.appendSlice(self.allocator, session.id) catch return;
             buf.writer(self.allocator).writeInt(u16, @intCast(session.name.len), .little) catch return;
             buf.appendSlice(self.allocator, session.name) catch return;
-            buf.appendSlice(self.allocator, &session.editor_token) catch return;
-            buf.appendSlice(self.allocator, &session.viewer_token) catch return;
+            // Token as hex (64 chars)
+            var hex_buf: [auth.token_hex_len]u8 = undefined;
+            auth.hexEncodeToken(&hex_buf, &session.token);
+            buf.appendSlice(self.allocator, &hex_buf) catch return;
+            // Role as u8
+            buf.append(self.allocator, @intFromEnum(session.role)) catch return;
         }
 
         conn.sendBinary(buf.items) catch {};
@@ -3095,7 +3095,7 @@ const Server = struct {
 
         // Build share links message
         // [0x0C][count:u16][links...]
-        // link: [token:44][type:u8][use_count:u32][valid:u8]
+        // link: [token_hex:64][role:u8][use_count:u32][valid:u8]
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(self.allocator);
 
@@ -3103,8 +3103,10 @@ const Server = struct {
         buf.writer(self.allocator).writeInt(u16, @intCast(self.auth_state.share_links.items.len), .little) catch return;
 
         for (self.auth_state.share_links.items) |link| {
-            buf.appendSlice(self.allocator, &link.token) catch return;
-            buf.append(self.allocator, @intFromEnum(link.token_type)) catch return;
+            var hex_buf: [auth.token_hex_len]u8 = undefined;
+            auth.hexEncodeToken(&hex_buf, &link.token);
+            buf.appendSlice(self.allocator, &hex_buf) catch return;
+            buf.append(self.allocator, @intFromEnum(link.role)) catch return;
             buf.writer(self.allocator).writeInt(u32, link.use_count, .little) catch return;
             buf.append(self.allocator, if (link.isValid()) 1 else 0) catch return;
         }
@@ -7201,13 +7203,18 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
     };
 
     // Generate auth tokens for URLs
-    // Admin token: for the person running the server (full access)
-    const admin_token = server.auth_state.createShareLink(.admin, null, null, null) catch null;
-    // Editor token: from default session (for sharing with coworkers)
-    const editor_token: ?[]const u8 = if (server.auth_state.getSession("default")) |session|
-        &session.editor_token
-    else
-        null;
+    // Admin token: share link for the person running the server (full access)
+    const admin_token_ptr = server.auth_state.createShareLink(.admin, null, null, null) catch null;
+    var admin_hex: [auth.token_hex_len]u8 = undefined;
+    if (admin_token_ptr) |ptr| auth.hexEncodeToken(&admin_hex, ptr);
+    const admin_token: ?[]const u8 = if (admin_token_ptr != null) &admin_hex else null;
+
+    // Editor token: hex-encoded from default session (for sharing with coworkers)
+    var editor_hex: [auth.token_hex_len]u8 = undefined;
+    const editor_token: ?[]const u8 = if (server.auth_state.getSession("default")) |session| blk: {
+        auth.hexEncodeToken(&editor_hex, &session.token);
+        break :blk &editor_hex;
+    } else null;
 
     // Start tunnel if a provider was selected
     var tunnel: ?*tunnel_mod.Tunnel = null;

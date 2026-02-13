@@ -111,9 +111,6 @@ export class MuxClient {
   private h264PendingFrames = new Map<number, Uint8Array[]>();
   private controlPendingByPanel = new Map<number, ArrayBuffer[]>();
 
-  /** Original permanent token from URL (edt_/vwr_ prefix), preserved across JWT renewals */
-  permanentToken: string | null = null;
-
   // Callbacks for transfer dialog UI (set by App.svelte)
   onUploadRequest?: () => void;
   onDownloadRequest?: () => void;
@@ -121,12 +118,6 @@ export class MuxClient {
   onDownloadProgress?: (transferId: number, filesCompleted: number, totalFiles: number, bytesTransferred: number, totalBytes: number) => void;
 
   constructor() {
-    // Capture permanent token from URL before JWT renewal replaces it
-    const urlToken = new URL(window.location.href).searchParams.get('token');
-    if (urlToken && (urlToken.startsWith('edt_') || urlToken.startsWith('vwr_'))) {
-      this.permanentToken = urlToken;
-    }
-
     this.fileTransfer = new FileTransferHandler();
     this.fileTransfer.onTransferComplete = (transferId, totalBytes) => {
       console.log(`Transfer ${transferId} completed: ${totalBytes} bytes`);
@@ -886,10 +877,10 @@ export class MuxClient {
         }
 
         case SERVER_MSG.SESSION_LIST: {
-          // [0x0B][count:u16][{id_len:u16, id, name_len:u16, name, editor_token:44, viewer_token:44}*]
+          // [0x0B][count:u16][{id_len:u16, id, name_len:u16, name, token_hex:64, role:u8}*]
           if (data.byteLength < 3) break;
           const count = view.getUint16(1, true);
-          const parsed: Array<{id: string; name: string; createdAt: number; editorToken: string; viewerToken: string}> = [];
+          const parsed: Array<{id: string; name: string; createdAt: number; token: string; role: number}> = [];
           let offset = 3;
           for (let i = 0; i < count; i++) {
             if (offset + 2 > data.byteLength) break;
@@ -900,10 +891,10 @@ export class MuxClient {
             const nameLen = view.getUint16(offset, true); offset += 2;
             if (offset + nameLen > data.byteLength) break;
             const name = sharedTextDecoder.decode(bytes.slice(offset, offset + nameLen)); offset += nameLen;
-            if (offset + 88 > data.byteLength) break;
-            const editorToken = sharedTextDecoder.decode(bytes.slice(offset, offset + 44)); offset += 44;
-            const viewerToken = sharedTextDecoder.decode(bytes.slice(offset, offset + 44)); offset += 44;
-            parsed.push({ id, name, createdAt: 0, editorToken, viewerToken });
+            if (offset + 65 > data.byteLength) break; // 64 hex + 1 role
+            const token = sharedTextDecoder.decode(bytes.slice(offset, offset + 64)); offset += 64;
+            const role = bytes[offset]; offset += 1;
+            parsed.push({ id, name, createdAt: 0, token, role });
           }
           sessions.set(parsed);
           break;
@@ -1987,15 +1978,16 @@ export class MuxClient {
   }
 
   /** Create a new session (admin only) */
-  createSession(id: string, name: string): void {
+  createSession(id: string, name: string, role: number = 1): void {
     const idBytes = sharedTextEncoder.encode(id);
     const nameBytes = sharedTextEncoder.encode(name);
-    const data = new Uint8Array(2 + 2 + idBytes.length + nameBytes.length);
+    const data = new Uint8Array(2 + 2 + 1 + idBytes.length + nameBytes.length);
     const view = new DataView(data.buffer);
     view.setUint16(0, idBytes.length, true);
     view.setUint16(2, nameBytes.length, true);
-    data.set(idBytes, 4);
-    data.set(nameBytes, 4 + idBytes.length);
+    data[4] = role;
+    data.set(idBytes, 5);
+    data.set(nameBytes, 5 + idBytes.length);
     this.sendControlMessage(BinaryCtrlMsg.CREATE_SESSION, data);
   }
 
@@ -2009,14 +2001,13 @@ export class MuxClient {
     this.sendControlMessage(BinaryCtrlMsg.DELETE_SESSION, data);
   }
 
-  /** Regenerate a session token (admin only) */
-  regenerateToken(sessionId: string, tokenType: number): void {
+  /** Regenerate a session's permanent token (admin only) */
+  regenerateToken(sessionId: string): void {
     const idBytes = sharedTextEncoder.encode(sessionId);
-    const data = new Uint8Array(2 + 1 + idBytes.length);
+    const data = new Uint8Array(2 + idBytes.length);
     const view = new DataView(data.buffer);
     view.setUint16(0, idBytes.length, true);
-    data[2] = tokenType;
-    data.set(idBytes, 3);
+    data.set(idBytes, 2);
     this.sendControlMessage(BinaryCtrlMsg.REGEN_TOKEN, data);
   }
 

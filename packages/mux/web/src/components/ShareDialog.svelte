@@ -6,22 +6,27 @@
     onClose?: () => void;
     shareUrl?: string;
     title?: string;
+    loading?: boolean;
   }
 
-  let { open = false, onClose, shareUrl: propUrl, title = 'Share Terminal' }: Props = $props();
+  let { open = false, onClose, shareUrl: propUrl, title = 'Share Terminal', loading = false }: Props = $props();
 
   let qrDataUrl = $state('');
   let copied = $state(false);
   let shareUrl = $state('');
 
   $effect(() => {
-    if (open) {
+    if (open && !loading) {
       shareUrl = propUrl || window.location.href.replace(/[?#].*$/, '');
       QRCode.toDataURL(shareUrl, {
         width: 200,
         margin: 2,
         color: { dark: '#000000', light: '#ffffff' },
       }).then(url => { qrDataUrl = url; }).catch(() => {});
+      copied = false;
+    } else if (open && loading) {
+      qrDataUrl = '';
+      shareUrl = '';
       copied = false;
     }
   });
@@ -52,28 +57,35 @@
     <div class="share-dialog">
       <div class="share-header">{title}</div>
 
-      {#if qrDataUrl}
-        <div class="qr-container">
-          <img src={qrDataUrl} alt="QR Code" class="qr-code" />
+      {#if loading}
+        <div class="spinner-container">
+          <div class="spinner"></div>
+          <div class="spinner-text">Loading share link...</div>
+        </div>
+      {:else}
+        {#if qrDataUrl}
+          <div class="qr-container">
+            <img src={qrDataUrl} alt="QR Code" class="qr-code" />
+          </div>
+        {/if}
+
+        <div class="url-container">
+          <input
+            type="text"
+            class="url-input"
+            value={shareUrl}
+            readonly
+            onclick={(e) => (e.target as HTMLInputElement).select()}
+          />
+          <button type="button" class="copy-btn" class:copied onclick={handleCopy}>
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+
+        <div class="share-hint">
+          Scan the QR code or copy the URL to share this terminal session.
         </div>
       {/if}
-
-      <div class="url-container">
-        <input
-          type="text"
-          class="url-input"
-          value={shareUrl}
-          readonly
-          onclick={(e) => (e.target as HTMLInputElement).select()}
-        />
-        <button type="button" class="copy-btn" class:copied onclick={handleCopy}>
-          {copied ? 'Copied' : 'Copy'}
-        </button>
-      </div>
-
-      <div class="share-hint">
-        Scan the QR code or copy the URL to share this terminal session.
-      </div>
 
       <button type="button" class="close-btn" onclick={() => onClose?.()}>Close</button>
     </div>
@@ -186,5 +198,31 @@
 
   .close-btn:hover {
     background: rgba(128, 128, 128, 0.15);
+  }
+
+  .spinner-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 32px 0;
+  }
+
+  .spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid rgba(128, 128, 128, 0.2);
+    border-top-color: var(--text);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .spinner-text {
+    font-size: 12px;
+    color: var(--text-dim);
   }
 </style>

@@ -5,8 +5,14 @@
 //! - Editor: Can interact with terminal (input, resize)
 //! - Viewer: Read-only access (can only view terminal output)
 //!
+//! Token model:
+//! - Each session has ONE permanent token (256-bit random) and a server-side role.
+//! - The permanent token doubles as the HMAC-SHA256 signing key for JWTs.
+//! - JWTs contain only session_id + expiry; role is looked up server-side.
+//! - Two token types: permanent (identity) and short-lived JWT (proof of auth).
+//!
 //! Features:
-//! - Cryptographically secure token generation (32-byte random + base64)
+//! - 256-bit entropy permanent tokens (as secure as SSH private keys)
 //! - Share links with optional expiration and usage limits
 //! - Session management with persistent tokens
 //! - Password/passkey authentication for admin access
@@ -28,6 +34,12 @@ const jwt_header_encoded = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 /// JWT lifetime: 15 minutes
 const jwt_expiry_secs: i64 = 900;
 
+/// Token length: 32 bytes (256-bit entropy)
+pub const token_len = 32;
+
+/// Hex-encoded token length: 64 chars
+pub const token_hex_len = token_len * 2;
+
 pub const Role = enum(u8) {
     admin = 0,    // Full access, can manage sessions and tokens
     editor = 1,   // Can interact with terminal
@@ -36,36 +48,17 @@ pub const Role = enum(u8) {
 };
 
 
-// Token Types
-
-
-pub const TokenType = enum(u8) {
-    admin = 0,    // Admin token (for admin auth after password/passkey set)
-    editor = 1,   // Editor share token
-    viewer = 2,   // Viewer share token
-};
-
-// Token prefix for identification
-fn tokenPrefix(token_type: TokenType) []const u8 {
-    return switch (token_type) {
-        .admin => "adm_",
-        .editor => "edt_",
-        .viewer => "vwr_",
-    };
-}
-
-
 // Share Link
 
 
 pub const ShareLink = struct {
-    token: [44]u8,        // Base64-encoded 32-byte token
-    token_type: TokenType,
+    token: [token_len]u8,  // 256-bit random token
+    role: Role,
     created_at: i64,
-    expires_at: ?i64,     // null = never expires
+    expires_at: ?i64,      // null = never expires
     use_count: u32,
-    max_uses: ?u32,       // null = unlimited
-    label: ?[]const u8,   // Optional description
+    max_uses: ?u32,        // null = unlimited
+    label: ?[]const u8,    // Optional description
 
     pub fn isValid(self: *const ShareLink) bool {
         // Check expiration
@@ -90,9 +83,11 @@ pub const Session = struct {
     name: []const u8,
     created_at: i64,
 
-    // Tokens for this session
-    editor_token: [44]u8,
-    viewer_token: [44]u8,
+    /// Single permanent token (256-bit). Doubles as HMAC-SHA256 key for JWTs.
+    token: [token_len]u8,
+
+    /// Role granted to users authenticating with this session's token.
+    role: Role,
 };
 
 
@@ -116,9 +111,6 @@ pub const AuthState = struct {
     // Is auth required? (false until admin sets up password/passkey)
     auth_required: bool,
 
-    // JWT signing secret (32 bytes, persisted in auth.json)
-    jwt_secret: [32]u8,
-
     allocator: Allocator,
     config_path: []const u8,
 
@@ -133,13 +125,9 @@ pub const AuthState = struct {
             .share_links = .{},
             .sessions = .{},
             .auth_required = false,
-            .jwt_secret = undefined,
             .allocator = allocator,
             .config_path = "",
         };
-
-        // Generate random JWT secret (overwritten by load() if config exists)
-        crypto.random.bytes(&state.jwt_secret);
 
         // Get config path
         const home = posix.getenv("HOME") orelse "/tmp";
@@ -155,8 +143,8 @@ pub const AuthState = struct {
 
         // Load existing state
         state.load() catch {
-            // No existing state, create default session
-            try state.createSession("default", "Default");
+            // No existing state, create default session with editor role
+            try state.createSession("default", "Default", .editor);
         };
 
         return state;
@@ -190,13 +178,13 @@ pub const AuthState = struct {
     // Session Management
     
 
-    pub fn createSession(self: *AuthState, id: []const u8, name: []const u8) !void {
+    pub fn createSession(self: *AuthState, id: []const u8, name: []const u8, role: Role) !void {
         const session = Session{
             .id = try self.allocator.dupe(u8, id),
             .name = try self.allocator.dupe(u8, name),
             .created_at = std.time.timestamp(),
-            .editor_token = generateToken(.editor),
-            .viewer_token = generateToken(.viewer),
+            .token = generateToken(),
+            .role = role,
         };
 
         const key = try self.allocator.dupe(u8, id);
@@ -231,97 +219,78 @@ pub const AuthState = struct {
     // Token Management
     
 
-    pub fn generateToken(token_type: TokenType) [44]u8 {
-        // 30 random bytes → 40 base64 chars (no padding)
-        // 4 byte prefix + 40 base64 = 44 total
-        var random_bytes: [30]u8 = undefined;
-        crypto.random.bytes(&random_bytes);
-
-        var token: [44]u8 = undefined;
-        const prefix = tokenPrefix(token_type);
-        @memcpy(token[0..4], prefix);
-        _ = std.base64.standard.Encoder.encode(token[4..], &random_bytes);
-
+    /// Generate a 256-bit random token. Used as both identity and HMAC key.
+    pub fn generateToken() [token_len]u8 {
+        var token: [token_len]u8 = undefined;
+        crypto.random.bytes(&token);
         return token;
     }
 
-    pub fn validateToken(self: *AuthState, token: []const u8) Role {
-        if (token.len < 4) return .none;
+    /// Result of token validation: the authenticated role and optional session id.
+    pub const TokenValidation = struct {
+        role: Role,
+        session_id: ?[]const u8,
+    };
+
+    /// Validate a token (permanent or JWT). Returns the role and session_id if valid.
+    /// For permanent tokens, the incoming bytes are hex-decoded and compared constant-time.
+    /// For JWTs, two-pass validation: parse session_id, look up key, verify signature.
+    pub fn validateToken(self: *AuthState, token: []const u8) TokenValidation {
+        if (token.len == 0) return .{ .role = .none, .session_id = null };
 
         // JWT detection: starts with "eyJ" (base64url of '{"')
         if (token.len > 10 and std.mem.startsWith(u8, token, "eyJ")) {
-            return self.validateJwt(token) orelse .none;
+            if (self.validateJwt(token)) |result| {
+                return result;
+            }
+            return .{ .role = .none, .session_id = null };
         }
 
-        // Check session tokens
-        var iter = self.sessions.valueIterator();
-        while (iter.next()) |session| {
-            if (std.mem.eql(u8, &session.editor_token, token)) {
-                return .editor;
+        // Hex-decode the incoming token for comparison
+        var decoded: [token_len]u8 = undefined;
+        const decoded_ok = if (token.len == token_hex_len) blk: {
+            for (0..token_len) |i| {
+                const hi = hexVal(token[i * 2]) orelse break :blk false;
+                const lo = hexVal(token[i * 2 + 1]) orelse break :blk false;
+                decoded[i] = (@as(u8, hi) << 4) | @as(u8, lo);
             }
-            if (std.mem.eql(u8, &session.viewer_token, token)) {
-                return .viewer;
+            break :blk true;
+        } else false;
+
+        if (decoded_ok) {
+            // Check session tokens (constant-time)
+            var iter = self.sessions.valueIterator();
+            while (iter.next()) |session| {
+                if (constantTimeEql(&decoded, &session.token)) {
+                    return .{ .role = session.role, .session_id = session.id };
+                }
+            }
+
+            // Check share links (constant-time)
+            for (self.share_links.items) |*link| {
+                if (constantTimeEql(&decoded, &link.token) and link.isValid()) {
+                    link.use_count += 1;
+                    return .{ .role = link.role, .session_id = null };
+                }
             }
         }
 
-        // Check share links
-        for (self.share_links.items) |*link| {
-            if (std.mem.eql(u8, &link.token, token) and link.isValid()) {
-                link.use_count += 1;
-                return switch (link.token_type) {
-                    .admin => .admin,
-                    .editor => .editor,
-                    .viewer => .viewer,
-                };
-            }
-        }
-
-        return .none;
+        return .{ .role = .none, .session_id = null };
     }
 
-    /// Create a JWT for the given role and session.
-    /// Returns the JWT string written into `buf`.
-    pub fn createJwt(self: *AuthState, role: Role, session_id: []const u8, buf: *[256]u8) []const u8 {
-        const exp = std.time.timestamp() + jwt_expiry_secs;
-
-        // Build payload JSON: {"r":<role>,"s":"<sid>","exp":<exp>}
-        var payload_json: [128]u8 = undefined;
-        const payload_str = std.fmt.bufPrint(&payload_json, "{{\"r\":{},\"s\":\"{s}\",\"exp\":{}}}", .{
-            @intFromEnum(role),
-            session_id,
-            exp,
-        }) catch return buf[0..0];
-
-        // Base64url encode payload
-        const payload_b64_len = b64url.Encoder.calcSize(payload_str.len);
-        var payload_b64: [172]u8 = undefined;
-        _ = b64url.Encoder.encode(payload_b64[0..payload_b64_len], payload_str);
-
-        // Assemble header.payload
-        const hp_len = jwt_header_encoded.len + 1 + payload_b64_len;
-        @memcpy(buf[0..jwt_header_encoded.len], jwt_header_encoded);
-        buf[jwt_header_encoded.len] = '.';
-        @memcpy(buf[jwt_header_encoded.len + 1 ..][0..payload_b64_len], payload_b64[0..payload_b64_len]);
-
-        // Sign with HMAC-SHA256
-        var mac: [HmacSha256.mac_length]u8 = undefined;
-        HmacSha256.create(&mac, buf[0..hp_len], &self.jwt_secret);
-
-        // Base64url encode signature
-        const sig_b64_len = b64url.Encoder.calcSize(HmacSha256.mac_length);
-        var sig_b64: [44]u8 = undefined;
-        _ = b64url.Encoder.encode(sig_b64[0..sig_b64_len], &mac);
-
-        // Append .signature
-        buf[hp_len] = '.';
-        @memcpy(buf[hp_len + 1 ..][0..sig_b64_len], sig_b64[0..sig_b64_len]);
-
-        return buf[0 .. hp_len + 1 + sig_b64_len];
+    /// Create a JWT for a session. Signed with the session's permanent token.
+    /// Payload: {"s":"<session_id>","exp":<timestamp>} — no role (looked up server-side).
+    pub fn createJwt(_: *AuthState, session: *const Session, buf: *[256]u8) []const u8 {
+        return createJwtWithKey(&session.token, session.id, buf);
     }
 
-    /// Validate a JWT: verify HMAC-SHA256 signature and check expiry.
-    /// Returns the role if valid, null if invalid or expired.
-    pub fn validateJwt(self: *AuthState, token: []const u8) ?Role {
+    /// Validate a JWT using two-pass validation:
+    /// 1. Parse payload (untrusted) to extract session_id
+    /// 2. Look up session → get signing key
+    /// 3. Verify HMAC-SHA256 signature
+    /// 4. Check expiry
+    /// Returns TokenValidation with role from session (server-side) if valid.
+    pub fn validateJwt(self: *AuthState, token: []const u8) ?TokenValidation {
         // Split on dots: header.payload.signature
         const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return null;
         const rest = token[first_dot + 1 ..];
@@ -331,9 +300,22 @@ pub const AuthState = struct {
         const header_payload = token[0..second_dot];
         const sig_b64 = token[second_dot + 1 ..];
 
-        // Verify signature
+        // Pass 1: Decode payload to extract session_id (untrusted at this point)
+        const payload_b64 = token[first_dot + 1 .. second_dot];
+        var payload_buf: [128]u8 = undefined;
+        const payload_len = b64url.Decoder.calcSizeForSlice(payload_b64) catch return null;
+        b64url.Decoder.decode(payload_buf[0..payload_len], payload_b64) catch return null;
+        const payload = payload_buf[0..payload_len];
+
+        // Extract session_id from payload
+        const session_id = extractJsonString(payload, "\"s\":\"") orelse return null;
+
+        // Look up session to get signing key
+        const session = self.sessions.getPtr(session_id) orelse return null;
+
+        // Pass 2: Verify signature using session's permanent token as HMAC key
         var expected_mac: [HmacSha256.mac_length]u8 = undefined;
-        HmacSha256.create(&expected_mac, header_payload, &self.jwt_secret);
+        HmacSha256.create(&expected_mac, header_payload, &session.token);
 
         // Decode provided signature
         if (sig_b64.len == 0 or sig_b64.len > 44) return null;
@@ -345,27 +327,17 @@ pub const AuthState = struct {
         // Constant-time comparison
         if (!constantTimeEql(&expected_mac, &decoded_sig)) return null;
 
-        // Decode payload
-        const payload_b64 = token[first_dot + 1 .. second_dot];
-        var payload_buf: [128]u8 = undefined;
-        const payload_len = b64url.Decoder.calcSizeForSlice(payload_b64) catch return null;
-        b64url.Decoder.decode(payload_buf[0..payload_len], payload_b64) catch return null;
-
-        // Parse claims and check expiry
-        const claims = parseJwtClaims(payload_buf[0..payload_len]) orelse return null;
+        // Check expiry
+        const claims = parseJwtClaims(payload) orelse return null;
         const now = std.time.timestamp();
         if (now > claims.exp) return null;
 
-        return claims.role;
+        return .{ .role = session.role, .session_id = session.id };
     }
 
-    pub fn regenerateSessionToken(self: *AuthState, session_id: []const u8, token_type: TokenType) !void {
+    pub fn regenerateSessionToken(self: *AuthState, session_id: []const u8) !void {
         if (self.sessions.getPtr(session_id)) |session| {
-            switch (token_type) {
-                .editor => session.editor_token = generateToken(.editor),
-                .viewer => session.viewer_token = generateToken(.viewer),
-                .admin => {},
-            }
+            session.token = generateToken();
             try self.save();
         }
     }
@@ -374,11 +346,11 @@ pub const AuthState = struct {
     // Share Links
     
 
-    pub fn createShareLink(self: *AuthState, token_type: TokenType, expires_in_secs: ?i64, max_uses: ?u32, label: ?[]const u8) ![]const u8 {
+    pub fn createShareLink(self: *AuthState, role: Role, expires_in_secs: ?i64, max_uses: ?u32, label: ?[]const u8) !*const [token_len]u8 {
         const now = std.time.timestamp();
         const link = ShareLink{
-            .token = generateToken(token_type),
-            .token_type = token_type,
+            .token = generateToken(),
+            .role = role,
             .created_at = now,
             .expires_at = if (expires_in_secs) |secs| now + secs else null,
             .use_count = 0,
@@ -392,9 +364,17 @@ pub const AuthState = struct {
         return &self.share_links.items[self.share_links.items.len - 1].token;
     }
 
-    pub fn revokeShareLink(self: *AuthState, token: []const u8) !void {
+    /// Revoke a share link by hex-encoded token.
+    pub fn revokeShareLink(self: *AuthState, token_hex: []const u8) !void {
+        if (token_hex.len != token_hex_len) return;
+        var decoded: [token_len]u8 = undefined;
+        for (0..token_len) |i| {
+            const hi = hexVal(token_hex[i * 2]) orelse return;
+            const lo = hexVal(token_hex[i * 2 + 1]) orelse return;
+            decoded[i] = (@as(u8, hi) << 4) | @as(u8, lo);
+        }
         for (self.share_links.items, 0..) |link, i| {
-            if (std.mem.eql(u8, &link.token, token)) {
+            if (constantTimeEql(&decoded, &link.token)) {
                 if (link.label) |l| self.allocator.free(l);
                 _ = self.share_links.swapRemove(i);
                 try self.save();
@@ -516,17 +496,6 @@ pub const AuthState = struct {
         const auth_str = std.fmt.bufPrint(&buf, "  \"auth_required\": {},\n", .{self.auth_required}) catch return;
         try file.writeAll(auth_str);
 
-        // jwt_secret (as hex)
-        try file.writeAll("  \"jwt_secret\": \"");
-        {
-            var hex_buf_jwt: [2]u8 = undefined;
-            for (self.jwt_secret) |b| {
-                _ = std.fmt.bufPrint(&hex_buf_jwt, "{x:0>2}", .{b}) catch continue;
-                try file.writeAll(&hex_buf_jwt);
-            }
-        }
-        try file.writeAll("\",\n");
-
         // admin_password_hash
         if (self.admin_password_hash) |hash| {
             try file.writeAll("  \"admin_password_hash\": \"");
@@ -546,17 +515,22 @@ pub const AuthState = struct {
             if (!first) try file.writeAll(",\n");
             first = false;
 
-            // Write session JSON
+            // Write session JSON with token as hex (64 chars) and role as u8
             try file.writeAll("    {\"id\": \"");
             try file.writeAll(session.id);
             try file.writeAll("\", \"name\": \"");
             try file.writeAll(session.name);
-            const created_str = std.fmt.bufPrint(&buf, "\", \"created_at\": {}, \"editor_token\": \"", .{session.created_at}) catch continue;
+            const created_str = std.fmt.bufPrint(&buf, "\", \"created_at\": {}, \"token\": \"", .{session.created_at}) catch continue;
             try file.writeAll(created_str);
-            try file.writeAll(&session.editor_token);
-            try file.writeAll("\", \"viewer_token\": \"");
-            try file.writeAll(&session.viewer_token);
-            try file.writeAll("\"}");
+            {
+                var hex_buf3: [2]u8 = undefined;
+                for (session.token) |b| {
+                    _ = std.fmt.bufPrint(&hex_buf3, "{x:0>2}", .{b}) catch continue;
+                    try file.writeAll(&hex_buf3);
+                }
+            }
+            const role_str = std.fmt.bufPrint(&buf, "\", \"role\": {}}}", .{@intFromEnum(session.role)}) catch continue;
+            try file.writeAll(role_str);
         }
         try file.writeAll("\n  ],\n");
 
@@ -568,9 +542,15 @@ pub const AuthState = struct {
             first = false;
 
             try file.writeAll("    {\"token\": \"");
-            try file.writeAll(&link.token);
-            const link_str = std.fmt.bufPrint(&buf, "\", \"type\": {}, \"created_at\": {}, \"use_count\": {}", .{
-                @intFromEnum(link.token_type),
+            {
+                var hex_buf4: [2]u8 = undefined;
+                for (link.token) |b| {
+                    _ = std.fmt.bufPrint(&hex_buf4, "{x:0>2}", .{b}) catch continue;
+                    try file.writeAll(&hex_buf4);
+                }
+            }
+            const link_str = std.fmt.bufPrint(&buf, "\", \"role\": {}, \"created_at\": {}, \"use_count\": {}", .{
+                @intFromEnum(link.role),
                 link.created_at,
                 link.use_count,
             }) catch continue;
@@ -635,73 +615,76 @@ pub const AuthState = struct {
         const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
-        // Parse JSON (simplified parser)
-        // For now, just check if auth_required is true
+        // Detect old format (has editor_token) — incompatible, start fresh
+        if (std.mem.indexOf(u8, content, "\"editor_token\"") != null) {
+            return error.NoConfig;
+        }
+
+        // Parse auth_required
         if (std.mem.indexOf(u8, content, "\"auth_required\": true")) |_| {
             self.auth_required = true;
         }
 
-        // Parse jwt_secret (64 hex chars → 32 bytes)
-        if (std.mem.indexOf(u8, content, "\"jwt_secret\": \"")) |marker| {
-            const hex_start = marker + 15;
-            if (hex_start + 64 <= content.len) {
-                var secret: [32]u8 = undefined;
-                var valid = true;
-                for (0..32) |i| {
-                    const hi = hexVal(content[hex_start + i * 2]);
-                    const lo = hexVal(content[hex_start + i * 2 + 1]);
+        // Parse sessions: look for "token": "<64 hex>" + "role": <u8> within sessions array
+        if (std.mem.indexOf(u8, content, "\"sessions\":")) |sessions_start| {
+            var pos: usize = sessions_start;
+            while (std.mem.indexOfPos(u8, content, pos, "\"id\": \"")) |start| {
+                const id_start = start + 7;
+                const id_end = std.mem.indexOfPos(u8, content, id_start, "\"") orelse break;
+                const id = content[id_start..id_end];
+
+                // Find name
+                const name_marker = std.mem.indexOfPos(u8, content, id_end, "\"name\": \"") orelse break;
+                const name_start = name_marker + 9;
+                const name_end = std.mem.indexOfPos(u8, content, name_start, "\"") orelse break;
+                const name = content[name_start..name_end];
+
+                // Find token (64 hex chars)
+                const tk_marker = std.mem.indexOfPos(u8, content, name_end, "\"token\": \"") orelse break;
+                const tk_start = tk_marker + 10;
+                if (tk_start + token_hex_len > content.len) break;
+
+                var session_token: [token_len]u8 = undefined;
+                var token_valid = true;
+                for (0..token_len) |i| {
+                    const hi = hexVal(content[tk_start + i * 2]);
+                    const lo = hexVal(content[tk_start + i * 2 + 1]);
                     if (hi != null and lo != null) {
-                        secret[i] = (@as(u8, hi.?) << 4) | @as(u8, lo.?);
+                        session_token[i] = (@as(u8, hi.?) << 4) | @as(u8, lo.?);
                     } else {
-                        valid = false;
+                        token_valid = false;
                         break;
                     }
                 }
-                if (valid) self.jwt_secret = secret;
+                if (!token_valid) { pos = tk_start + token_hex_len; continue; }
+
+                // Find role
+                const role_marker = std.mem.indexOfPos(u8, content, tk_start + token_hex_len, "\"role\": ") orelse break;
+                const role_val_start = role_marker + 8;
+                const role_byte = if (role_val_start < content.len and content[role_val_start] >= '0' and content[role_val_start] <= '9')
+                    content[role_val_start] - '0'
+                else
+                    break;
+                const role: Role = switch (role_byte) {
+                    0 => .admin,
+                    1 => .editor,
+                    2 => .viewer,
+                    else => .none,
+                };
+
+                const session = Session{
+                    .id = try self.allocator.dupe(u8, id),
+                    .name = try self.allocator.dupe(u8, name),
+                    .created_at = std.time.timestamp(),
+                    .token = session_token,
+                    .role = role,
+                };
+
+                const key = try self.allocator.dupe(u8, id);
+                try self.sessions.put(self.allocator, key, session);
+
+                pos = role_val_start + 1;
             }
-        }
-
-        // Parse sessions
-        var pos: usize = 0;
-        while (std.mem.indexOfPos(u8, content, pos, "\"id\": \"")) |start| {
-            const id_start = start + 7;
-            const id_end = std.mem.indexOfPos(u8, content, id_start, "\"") orelse break;
-            const id = content[id_start..id_end];
-
-            // Find name
-            const name_marker = std.mem.indexOfPos(u8, content, id_end, "\"name\": \"") orelse break;
-            const name_start = name_marker + 9;
-            const name_end = std.mem.indexOfPos(u8, content, name_start, "\"") orelse break;
-            const name = content[name_start..name_end];
-
-            // Find editor_token
-            const et_marker = std.mem.indexOfPos(u8, content, name_end, "\"editor_token\": \"") orelse break;
-            const et_start = et_marker + 17;
-            const et_end = std.mem.indexOfPos(u8, content, et_start, "\"") orelse break;
-
-            // Find viewer_token
-            const vt_marker = std.mem.indexOfPos(u8, content, et_end, "\"viewer_token\": \"") orelse break;
-            const vt_start = vt_marker + 17;
-            const vt_end = std.mem.indexOfPos(u8, content, vt_start, "\"") orelse break;
-
-            // Create session
-            var editor_token: [44]u8 = undefined;
-            var viewer_token: [44]u8 = undefined;
-            if (et_end - et_start == 44) @memcpy(&editor_token, content[et_start..et_end]);
-            if (vt_end - vt_start == 44) @memcpy(&viewer_token, content[vt_start..vt_end]);
-
-            const session = Session{
-                .id = try self.allocator.dupe(u8, id),
-                .name = try self.allocator.dupe(u8, name),
-                .created_at = std.time.timestamp(),
-                .editor_token = editor_token,
-                .viewer_token = viewer_token,
-            };
-
-            const key = try self.allocator.dupe(u8, id);
-            try self.sessions.put(self.allocator, key, session);
-
-            pos = vt_end;
         }
     }
 };
@@ -721,45 +704,36 @@ pub const PasskeyCredential = struct {
 // Auth Middleware Helper
 
 
-pub fn getRoleFromRequest(auth_state: *AuthState, token: ?[]const u8) Role {
-    // Check token — all connections must authenticate
+pub fn getRoleFromRequest(auth_state: *AuthState, token: ?[]const u8) AuthState.TokenValidation {
     if (token) |t| {
         return auth_state.validateToken(t);
     }
-
-    return .none;
+    return .{ .role = .none, .session_id = null };
 }
 
-/// Check if a token is a static token (has role prefix adm_, edt_, vwr_).
-pub fn isStaticToken(token: []const u8) bool {
-    return token.len > 4 and (std.mem.startsWith(u8, token, "adm_") or
-        std.mem.startsWith(u8, token, "edt_") or
-        std.mem.startsWith(u8, token, "vwr_"));
-}
-
-/// Resolve a token to its session ID. Returns the session ID if the token
-/// matches a session's editor or viewer token, or null otherwise.
-pub fn getSessionIdForToken(auth_state: *AuthState, token: []const u8) ?[]const u8 {
-    if (token.len < 4) return null;
-    var iter = auth_state.sessions.valueIterator();
-    while (iter.next()) |session| {
-        if (std.mem.eql(u8, &session.editor_token, token) or
-            std.mem.eql(u8, &session.viewer_token, token))
-        {
-            return session.id;
-        }
+/// Check if a token is a permanent token (64 hex chars) as opposed to a JWT.
+pub fn isPermanentToken(token: []const u8) bool {
+    if (token.len != token_hex_len) return false;
+    for (token) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) return false;
     }
-    return null;
+    return true;
+}
+
+/// Resolve a token to its session ID. Works for both hex-encoded permanent
+/// tokens and JWTs (by parsing the payload).
+pub fn getSessionIdForToken(auth_state: *AuthState, token: []const u8) ?[]const u8 {
+    const result = auth_state.validateToken(token);
+    return result.session_id;
 }
 
 /// Claims extracted from a JWT payload.
 pub const JwtClaims = struct {
-    role: Role,
     session_id: []const u8, // Points into sid_buf provided by caller
     exp: i64,
 };
 
-/// Extract claims from a validated JWT token.
+/// Extract claims from a validated JWT token (without verifying signature).
 /// The `sid_buf` holds the session_id string (caller-owned).
 pub fn getJwtClaims(token: []const u8, sid_buf: *[64]u8) ?JwtClaims {
     const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return null;
@@ -772,23 +746,17 @@ pub fn getJwtClaims(token: []const u8, sid_buf: *[64]u8) ?JwtClaims {
     b64url.Decoder.decode(payload_buf[0..payload_len], payload_b64) catch return null;
     const payload = payload_buf[0..payload_len];
 
-    // Parse role
+    // Parse expiry
     const basic = parseJwtClaims(payload) orelse return null;
 
-    // Parse session_id: find "s":"<value>"
-    if (std.mem.indexOf(u8, payload, "\"s\":\"")) |pos| {
-        const val_start = pos + 5;
-        if (std.mem.indexOfPos(u8, payload, val_start, "\"")) |val_end| {
-            const sid = payload[val_start..val_end];
-            if (sid.len <= sid_buf.len) {
-                @memcpy(sid_buf[0..sid.len], sid);
-                return .{
-                    .role = basic.role,
-                    .session_id = sid_buf[0..sid.len],
-                    .exp = basic.exp,
-                };
-            }
-        }
+    // Parse session_id
+    const sid = extractJsonString(payload, "\"s\":\"") orelse return null;
+    if (sid.len <= sid_buf.len) {
+        @memcpy(sid_buf[0..sid.len], sid);
+        return .{
+            .session_id = sid_buf[0..sid.len],
+            .exp = basic.exp,
+        };
     }
     return null;
 }
@@ -875,40 +843,82 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
     return diff == 0;
 }
 
-/// Parse role and expiry from JWT payload JSON: {"r":<role>,"s":"...","exp":<exp>}
-const BasicJwtClaims = struct { role: Role, exp: i64 };
+/// Parse expiry from JWT payload JSON: {"s":"...","exp":<exp>}
+const BasicJwtClaims = struct { exp: i64 };
 
 fn parseJwtClaims(payload: []const u8) ?BasicJwtClaims {
-    var role: ?Role = null;
-    var exp: ?i64 = null;
-
-    // Parse "r":
-    if (std.mem.indexOf(u8, payload, "\"r\":")) |pos| {
-        const val_start = pos + 4;
-        if (val_start < payload.len and payload[val_start] >= '0' and payload[val_start] <= '9') {
-            role = switch (payload[val_start] - '0') {
-                0 => .admin,
-                1 => .editor,
-                2 => .viewer,
-                else => null,
-            };
-        }
-    }
-
     // Parse "exp":
     if (std.mem.indexOf(u8, payload, "\"exp\":")) |pos| {
         const val_start = pos + 6;
         var end = val_start;
         while (end < payload.len and payload[end] >= '0' and payload[end] <= '9') : (end += 1) {}
         if (end > val_start) {
-            exp = std.fmt.parseInt(i64, payload[val_start..end], 10) catch null;
+            const exp = std.fmt.parseInt(i64, payload[val_start..end], 10) catch return null;
+            return .{ .exp = exp };
         }
     }
+    return null;
+}
 
-    if (role != null and exp != null) {
-        return .{ .role = role.?, .exp = exp.? };
+/// Extract a JSON string value given a prefix like `"key":"`.
+/// Returns the value between the prefix's closing quote and the next quote.
+fn extractJsonString(payload: []const u8, prefix: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, payload, prefix)) |pos| {
+        const val_start = pos + prefix.len;
+        if (std.mem.indexOfPos(u8, payload, val_start, "\"")) |val_end| {
+            return payload[val_start..val_end];
+        }
     }
     return null;
+}
+
+/// Create a JWT signed with an arbitrary key. Used by both AuthState.createJwt
+/// and for standalone JWT creation (e.g., for share links).
+/// Payload: {"s":"<session_id>","exp":<timestamp>}
+pub fn createJwtWithKey(key: *const [token_len]u8, session_id: []const u8, buf: *[256]u8) []const u8 {
+    const exp = std.time.timestamp() + jwt_expiry_secs;
+
+    // Build payload JSON: {"s":"<sid>","exp":<exp>}
+    var payload_json: [128]u8 = undefined;
+    const payload_str = std.fmt.bufPrint(&payload_json, "{{\"s\":\"{s}\",\"exp\":{}}}", .{
+        session_id,
+        exp,
+    }) catch return buf[0..0];
+
+    // Base64url encode payload
+    const payload_b64_len = b64url.Encoder.calcSize(payload_str.len);
+    var payload_b64: [172]u8 = undefined;
+    _ = b64url.Encoder.encode(payload_b64[0..payload_b64_len], payload_str);
+
+    // Assemble header.payload
+    const hp_len = jwt_header_encoded.len + 1 + payload_b64_len;
+    @memcpy(buf[0..jwt_header_encoded.len], jwt_header_encoded);
+    buf[jwt_header_encoded.len] = '.';
+    @memcpy(buf[jwt_header_encoded.len + 1 ..][0..payload_b64_len], payload_b64[0..payload_b64_len]);
+
+    // Sign with HMAC-SHA256 using the provided key
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, buf[0..hp_len], key);
+
+    // Base64url encode signature
+    const sig_b64_len = b64url.Encoder.calcSize(HmacSha256.mac_length);
+    var sig_b64: [44]u8 = undefined;
+    _ = b64url.Encoder.encode(sig_b64[0..sig_b64_len], &mac);
+
+    // Append .signature
+    buf[hp_len] = '.';
+    @memcpy(buf[hp_len + 1 ..][0..sig_b64_len], sig_b64[0..sig_b64_len]);
+
+    return buf[0 .. hp_len + 1 + sig_b64_len];
+}
+
+/// Hex-encode a token into a caller-provided buffer.
+pub fn hexEncodeToken(out: *[token_hex_len]u8, token: *const [token_len]u8) void {
+    const hex_chars = "0123456789abcdef";
+    for (0..token_len) |i| {
+        out[i * 2] = hex_chars[token[i] >> 4];
+        out[i * 2 + 1] = hex_chars[token[i] & 0x0f];
+    }
 }
 
 /// Per-IP rate limiter for failed authentication attempts.
@@ -1182,12 +1192,8 @@ test "RateLimiter: independent per-IP tracking" {
 
 // --- JWT Tests ---
 
-test "JWT: createJwt produces valid token" {
-    // Create a minimal AuthState-like struct for testing
-    var secret: [32]u8 = undefined;
-    @memset(&secret, 0x42);
-
-    // We need a full AuthState for createJwt — use a test helper
+/// Helper to create a test AuthState with a session pre-loaded.
+fn testStateWithSession(id: []const u8, role: Role, tok: [token_len]u8) AuthState {
     var state = AuthState{
         .admin_password_hash = null,
         .admin_password_salt = null,
@@ -1195,13 +1201,29 @@ test "JWT: createJwt produces valid token" {
         .share_links = .{},
         .sessions = .{},
         .auth_required = false,
-        .jwt_secret = secret,
         .allocator = std.testing.allocator,
         .config_path = "",
     };
+    // Insert session directly (no save — no config_path)
+    state.sessions.put(std.testing.allocator, @constCast(id), Session{
+        .id = @constCast(id),
+        .name = @constCast(id),
+        .created_at = 0,
+        .token = tok,
+        .role = role,
+    }) catch {};
+    return state;
+}
 
+test "JWT: createJwt produces valid token" {
+    var tok: [token_len]u8 = undefined;
+    @memset(&tok, 0x42);
+    var state = testStateWithSession("default", .editor, tok);
+    defer state.sessions.deinit(std.testing.allocator);
+
+    const session = state.sessions.getPtr("default").?;
     var buf: [256]u8 = undefined;
-    const jwt = state.createJwt(.editor, "default", &buf);
+    const jwt = state.createJwt(session, &buf);
 
     // Should start with the constant header
     try std.testing.expect(std.mem.startsWith(u8, jwt, jwt_header_encoded));
@@ -1213,126 +1235,100 @@ test "JWT: createJwt produces valid token" {
     }
     try std.testing.expectEqual(@as(usize, 2), dot_count);
 
-    // Should be validatable
-    const role = state.validateJwt(jwt);
-    try std.testing.expect(role != null);
-    try std.testing.expectEqual(Role.editor, role.?);
+    // Should be validatable — returns editor role from session
+    const result = state.validateJwt(jwt);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(Role.editor, result.?.role);
+    try std.testing.expectEqualStrings("default", result.?.session_id.?);
 }
 
 test "JWT: validateJwt rejects tampered signature" {
-    var secret: [32]u8 = undefined;
-    @memset(&secret, 0x42);
+    var tok: [token_len]u8 = undefined;
+    @memset(&tok, 0x42);
+    var state = testStateWithSession("test", .viewer, tok);
+    defer state.sessions.deinit(std.testing.allocator);
 
-    var state = AuthState{
-        .admin_password_hash = null,
-        .admin_password_salt = null,
-        .passkey_credentials = .{},
-        .share_links = .{},
-        .sessions = .{},
-        .auth_required = false,
-        .jwt_secret = secret,
-        .allocator = std.testing.allocator,
-        .config_path = "",
-    };
-
+    const session = state.sessions.getPtr("test").?;
     var buf: [256]u8 = undefined;
-    const jwt = state.createJwt(.viewer, "test", &buf);
+    const jwt = state.createJwt(session, &buf);
 
     // Tamper with the last character of the signature
     var tampered: [256]u8 = undefined;
     @memcpy(tampered[0..jwt.len], jwt);
     tampered[jwt.len - 1] = if (jwt[jwt.len - 1] == 'A') 'B' else 'A';
 
-    const role = state.validateJwt(tampered[0..jwt.len]);
-    try std.testing.expect(role == null);
+    const result = state.validateJwt(tampered[0..jwt.len]);
+    try std.testing.expect(result == null);
 }
 
-test "JWT: validateJwt rejects wrong secret" {
-    var secret1: [32]u8 = undefined;
-    @memset(&secret1, 0x42);
-    var secret2: [32]u8 = undefined;
-    @memset(&secret2, 0x99);
+test "JWT: validateJwt rejects JWT signed with different session token" {
+    var tok1: [token_len]u8 = undefined;
+    @memset(&tok1, 0x42);
+    var tok2: [token_len]u8 = undefined;
+    @memset(&tok2, 0x99);
 
-    var state1 = AuthState{
-        .admin_password_hash = null,
-        .admin_password_salt = null,
-        .passkey_credentials = .{},
-        .share_links = .{},
-        .sessions = .{},
-        .auth_required = false,
-        .jwt_secret = secret1,
-        .allocator = std.testing.allocator,
-        .config_path = "",
+    // Create JWT with session A's token
+    const session_a = Session{
+        .id = @constCast("default"),
+        .name = @constCast("Default"),
+        .created_at = 0,
+        .token = tok1,
+        .role = .admin,
     };
-
-    var state2 = state1;
-    state2.jwt_secret = secret2;
-
     var buf: [256]u8 = undefined;
-    const jwt = state1.createJwt(.admin, "default", &buf);
+    const jwt = createJwtWithKey(&session_a.token, session_a.id, &buf);
 
-    // Different secret should reject
-    try std.testing.expect(state2.validateJwt(jwt) == null);
+    // State has session "default" with different token (tok2)
+    var state = testStateWithSession("default", .admin, tok2);
+    defer state.sessions.deinit(std.testing.allocator);
+
+    // Should reject — signature doesn't match
+    try std.testing.expect(state.validateJwt(jwt) == null);
 }
 
-test "JWT: validateToken routes JWT vs static" {
-    var secret: [32]u8 = undefined;
-    @memset(&secret, 0x42);
-
-    var state = AuthState{
-        .admin_password_hash = null,
-        .admin_password_salt = null,
-        .passkey_credentials = .{},
-        .share_links = .{},
-        .sessions = .{},
-        .auth_required = false,
-        .jwt_secret = secret,
-        .allocator = std.testing.allocator,
-        .config_path = "",
-    };
-
-    var buf: [256]u8 = undefined;
-    const jwt = state.createJwt(.editor, "default", &buf);
+test "JWT: validateToken routes JWT vs permanent token" {
+    var tok: [token_len]u8 = undefined;
+    @memset(&tok, 0x42);
+    var state = testStateWithSession("default", .editor, tok);
+    defer state.sessions.deinit(std.testing.allocator);
 
     // JWT should validate
-    try std.testing.expectEqual(Role.editor, state.validateToken(jwt));
+    const session = state.sessions.getPtr("default").?;
+    var buf: [256]u8 = undefined;
+    const jwt = state.createJwt(session, &buf);
+    const jwt_result = state.validateToken(jwt);
+    try std.testing.expectEqual(Role.editor, jwt_result.role);
+
+    // Hex-encoded permanent token should validate
+    var hex_token: [token_hex_len]u8 = undefined;
+    hexEncodeToken(&hex_token, &tok);
+    const perm_result = state.validateToken(&hex_token);
+    try std.testing.expectEqual(Role.editor, perm_result.role);
+    try std.testing.expectEqualStrings("default", perm_result.session_id.?);
 
     // Random garbage should not
-    try std.testing.expectEqual(Role.none, state.validateToken("not_a_token"));
+    const bad_result = state.validateToken("not_a_token");
+    try std.testing.expectEqual(Role.none, bad_result.role);
 }
 
-test "JWT: isStaticToken detects prefixes" {
-    try std.testing.expect(isStaticToken("adm_abc123"));
-    try std.testing.expect(isStaticToken("edt_abc123"));
-    try std.testing.expect(isStaticToken("vwr_abc123"));
-    try std.testing.expect(!isStaticToken("eyJhbGciOiJIUzI1NiJ9.payload.sig"));
-    try std.testing.expect(!isStaticToken("abc"));
-    try std.testing.expect(!isStaticToken(""));
+test "JWT: isPermanentToken detects hex tokens" {
+    try std.testing.expect(isPermanentToken("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!isPermanentToken("eyJhbGciOiJIUzI1NiJ9.payload.sig"));
+    try std.testing.expect(!isPermanentToken("abc"));
+    try std.testing.expect(!isPermanentToken(""));
+    try std.testing.expect(!isPermanentToken("zzzz456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
 }
 
 test "JWT: getJwtClaims extracts session_id" {
-    var secret: [32]u8 = undefined;
-    @memset(&secret, 0x42);
-
-    var state = AuthState{
-        .admin_password_hash = null,
-        .admin_password_salt = null,
-        .passkey_credentials = .{},
-        .share_links = .{},
-        .sessions = .{},
-        .auth_required = false,
-        .jwt_secret = secret,
-        .allocator = std.testing.allocator,
-        .config_path = "",
-    };
+    var tok: [token_len]u8 = undefined;
+    @memset(&tok, 0x42);
 
     var jwt_buf: [256]u8 = undefined;
-    const jwt = state.createJwt(.viewer, "my-session", &jwt_buf);
+    const jwt = createJwtWithKey(&tok, "my-session", &jwt_buf);
 
     var sid_buf: [64]u8 = undefined;
     const claims = getJwtClaims(jwt, &sid_buf);
     try std.testing.expect(claims != null);
-    try std.testing.expectEqual(Role.viewer, claims.?.role);
     try std.testing.expectEqualStrings("my-session", claims.?.session_id);
     try std.testing.expect(claims.?.exp > std.time.timestamp());
 }

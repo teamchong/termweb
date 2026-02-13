@@ -33,6 +33,7 @@
   let shareDialogOpen = $state(false);
   let shareDialogUrl = $state('');
   let shareDialogTitle = $state('Share Terminal');
+  let shareDialogLoading = $state(false);
 
   // Admin shares dialog state
   let adminSharesOpen = $state(false);
@@ -180,6 +181,8 @@
 
   // Share menu (admin vs non-admin)
   let shareMenuItems = $derived<MenuItem[]>($ui.isAdmin ? [
+    { label: 'Share URL', action: '_share_url' },
+    { separator: true },
     { label: 'Share Current Panel', action: '_share_panel' },
     { label: 'Share Current Tab', action: '_share_tab' },
     { separator: true },
@@ -319,7 +322,7 @@
       if (found) {
         setTimeout(() => unsub()); // unsubscribe after this tick
         muxClient!.assignPanel(panel.serverId!, sessionId);
-        shareDialogUrl = `${window.location.origin}?token=${found.editorToken}`;
+        shareDialogUrl = `${window.location.origin}?token=${found.token}`;
         shareDialogTitle = `Share: ${sessionName}`;
         shareDialogOpen = true;
       }
@@ -342,7 +345,7 @@
         for (const pid of panelIds) {
           muxClient!.assignPanel(pid, sessionId);
         }
-        shareDialogUrl = `${window.location.origin}?token=${found.editorToken}`;
+        shareDialogUrl = `${window.location.origin}?token=${found.token}`;
         shareDialogTitle = `Share: ${sessionName}`;
         shareDialogOpen = true;
       }
@@ -351,7 +354,7 @@
 
   // Handle "show QR" action from admin shares dialog
   function handleShareSession(session: Session) {
-    shareDialogUrl = `${window.location.origin}?token=${session.editorToken}`;
+    shareDialogUrl = `${window.location.origin}?token=${session.token}`;
     shareDialogTitle = `Share: ${session.name || session.id}`;
     shareDialogOpen = true;
   }
@@ -503,15 +506,25 @@
         }).catch(() => {});
         break;
       case '_share_url': {
-        // Non-admin: show permanent token URL or base URL
-        const token = muxClient?.permanentToken;
-        if (token) {
-          shareDialogUrl = `${window.location.origin}?token=${token}`;
-        } else {
-          shareDialogUrl = window.location.href.replace(/[?#].*$/, '');
-        }
+        if (!muxClient) break;
+        // Open dialog with spinner, fetch permanent token from server
         shareDialogTitle = 'Share Terminal';
+        shareDialogUrl = '';
+        shareDialogLoading = true;
         shareDialogOpen = true;
+        // Request session list to get the default session's permanent editor token
+        muxClient.requestSessionList();
+        let settled = false;
+        const unsub = sessions.subscribe(list => {
+          if (settled) return;
+          const defaultSession = list.find(s => s.id === 'default');
+          if (defaultSession?.editorToken) {
+            settled = true;
+            setTimeout(() => unsub());
+            shareDialogUrl = `${window.location.origin}?token=${encodeURIComponent(defaultSession.token)}`;
+            shareDialogLoading = false;
+          }
+        });
         break;
       }
       case '_share_panel':
@@ -918,9 +931,10 @@
   <!-- Share Dialog -->
   <ShareDialog
     open={shareDialogOpen}
-    onClose={() => shareDialogOpen = false}
+    onClose={() => { shareDialogOpen = false; shareDialogLoading = false; }}
     shareUrl={shareDialogUrl}
     title={shareDialogTitle}
+    loading={shareDialogLoading}
   />
 
   <!-- Admin Shares Dialog -->

@@ -267,8 +267,8 @@ pub const HttpServer = struct {
             const token = if (raw_token) |t| auth.decodeToken(&token_buf, t) else null;
 
             if (token) |t| {
-                const role = auth_st.validateToken(t);
-                if (role == .none) {
+                const result = auth_st.validateToken(t);
+                if (result.role == .none) {
                     if (self.rate_limiter) |rl| rl.recordFailure(ip_str);
                     self.sendError(stream, 401, "Unauthorized");
                     stream.close();
@@ -276,14 +276,16 @@ pub const HttpServer = struct {
                 }
                 if (self.rate_limiter) |rl| rl.recordSuccess(ip_str);
 
-                // Static token on non-WebSocket request → exchange for JWT and redirect
-                if (auth.isStaticToken(t) and !self.isWebSocketUpgrade(request)) {
-                    const session_id = auth.getSessionIdForToken(auth_st, t) orelse "default";
-                    var jwt_buf: [256]u8 = undefined;
-                    const jwt = auth_st.createJwt(role, session_id, &jwt_buf);
-                    self.sendRedirectPage(stream, jwt);
-                    stream.close();
-                    return;
+                // Permanent token on non-WebSocket request → exchange for JWT and redirect
+                if (auth.isPermanentToken(t) and !self.isWebSocketUpgrade(request)) {
+                    const session_id = result.session_id orelse "default";
+                    if (auth_st.getSession(session_id)) |session| {
+                        var jwt_buf: [256]u8 = undefined;
+                        const jwt = auth_st.createJwt(session, &jwt_buf);
+                        self.sendRedirectPage(stream, jwt);
+                        stream.close();
+                        return;
+                    }
                 }
             } else {
                 // No token at all

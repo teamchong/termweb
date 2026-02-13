@@ -496,12 +496,15 @@ fn tokenList(state: *auth.AuthState) void {
         const session = entry.value_ptr;
         std.debug.print("  {s} ({s})\n", .{ session.id, session.name });
 
-        var enc_buf: [192]u8 = undefined;
-        const editor_enc = auth.percentEncodeToken(&enc_buf, &session.editor_token);
-        std.debug.print("    Editor: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, editor_enc });
-
-        const viewer_enc = auth.percentEncodeToken(&enc_buf, &session.viewer_token);
-        std.debug.print("    Viewer: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, viewer_enc });
+        var hex_buf: [auth.token_hex_len]u8 = undefined;
+        auth.hexEncodeToken(&hex_buf, &session.token);
+        const role_str: []const u8 = switch (session.role) {
+            .admin => "admin",
+            .editor => "editor",
+            .viewer => "viewer",
+            .none => "none",
+        };
+        std.debug.print("    Token:  http://localhost:{d}/?token={s}  (role: {s})\n", .{ mux.default_http_port, &hex_buf, role_str });
     }
     if (!has_sessions) {
         std.debug.print("  (no sessions)\n", .{});
@@ -511,16 +514,17 @@ fn tokenList(state: *auth.AuthState) void {
     if (state.share_links.items.len > 0) {
         std.debug.print("\nShare links: {d} active\n", .{state.share_links.items.len});
         for (state.share_links.items) |link| {
-            var enc_buf2: [192]u8 = undefined;
-            const tok_enc = auth.percentEncodeToken(&enc_buf2, &link.token);
+            var hex_buf2: [auth.token_hex_len]u8 = undefined;
+            auth.hexEncodeToken(&hex_buf2, &link.token);
 
-            const role_str: []const u8 = switch (link.token_type) {
+            const role_str: []const u8 = switch (link.role) {
                 .admin => "admin",
                 .editor => "editor",
                 .viewer => "viewer",
+                .none => "none",
             };
 
-            std.debug.print("  {s}  {s}", .{ tok_enc[0..@min(tok_enc.len, 12)], role_str });
+            std.debug.print("  {s}  {s}", .{ hex_buf2[0..12], role_str });
 
             // Expiry info
             if (link.expires_at) |exp| {
@@ -559,30 +563,23 @@ fn tokenRegenerate(state: *auth.AuthState, session_id: []const u8) void {
         std.process.exit(1);
     }
 
-    state.regenerateSessionToken(session_id, .editor) catch {
-        std.debug.print("Error regenerating editor token\n", .{});
-        std.process.exit(1);
-    };
-    state.regenerateSessionToken(session_id, .viewer) catch {
-        std.debug.print("Error regenerating viewer token\n", .{});
+    state.regenerateSessionToken(session_id) catch {
+        std.debug.print("Error regenerating token\n", .{});
         std.process.exit(1);
     };
 
-    std.debug.print("Tokens regenerated for session: {s}\n\n", .{session_id});
+    std.debug.print("Token regenerated for session: {s}\n\n", .{session_id});
 
-    // Print new tokens
+    // Print new token
     if (state.getSession(session_id)) |session| {
-        var enc_buf: [192]u8 = undefined;
-        const editor_enc = auth.percentEncodeToken(&enc_buf, &session.editor_token);
-        std.debug.print("  Editor: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, editor_enc });
-
-        const viewer_enc = auth.percentEncodeToken(&enc_buf, &session.viewer_token);
-        std.debug.print("  Viewer: http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, viewer_enc });
+        var hex_buf: [auth.token_hex_len]u8 = undefined;
+        auth.hexEncodeToken(&hex_buf, &session.token);
+        std.debug.print("  http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, &hex_buf });
     }
 }
 
 fn tokenShare(state: *auth.AuthState, args: []const []const u8) void {
-    var role: auth.TokenType = .viewer;
+    var role: auth.Role = .viewer;
     var expires_secs: ?i64 = null;
     var max_uses: ?u32 = null;
     var label: ?[]const u8 = null;
@@ -629,22 +626,23 @@ fn tokenShare(state: *auth.AuthState, args: []const []const u8) void {
         }
     }
 
-    const token = state.createShareLink(role, expires_secs, max_uses, label) catch {
+    const token_ptr = state.createShareLink(role, expires_secs, max_uses, label) catch {
         std.debug.print("Error creating share link\n", .{});
         std.process.exit(1);
     };
 
-    var enc_buf: [192]u8 = undefined;
-    const tok_enc = auth.percentEncodeToken(&enc_buf, token);
+    var hex_buf: [auth.token_hex_len]u8 = undefined;
+    auth.hexEncodeToken(&hex_buf, token_ptr);
 
     const role_str: []const u8 = switch (role) {
         .admin => "admin",
         .editor => "editor",
         .viewer => "viewer",
+        .none => "none",
     };
 
     std.debug.print("Share link created ({s}):\n", .{role_str});
-    std.debug.print("  http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, tok_enc });
+    std.debug.print("  http://localhost:{d}/?token={s}\n", .{ mux.default_http_port, &hex_buf });
 }
 
 fn tokenRevoke(state: *auth.AuthState, args: []const []const u8) void {

@@ -72,13 +72,13 @@ export interface Session {
   id: string;
   name: string;
   createdAt: number;
-  editorToken: string;
-  viewerToken: string;
+  token: string;  // Hex-encoded 256-bit permanent token
+  role: number;   // Server-side role (0=admin, 1=editor, 2=viewer)
 }
 
 export interface ShareLink {
-  token: string;
-  type: number;
+  token: string;  // Hex-encoded 256-bit token
+  role: number;   // 0=admin, 1=editor, 2=viewer
   createdAt: number;
   expiresAt: number | null;
   useCount: number;
