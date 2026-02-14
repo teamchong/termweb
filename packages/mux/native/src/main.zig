@@ -1804,7 +1804,7 @@ const Server = struct {
         const defaults_path = "/tmp/termweb-ghostty-defaults.conf";
         if (std.fs.cwd().createFile(defaults_path, .{})) |f| {
             defer f.close();
-            f.writeAll("cursor-style = bar\ncursor-style-blink = false\ncursor-opacity = 0\n") catch {};
+            f.writeAll("keybind = clear\ncursor-style = bar\ncursor-style-blink = false\ncursor-opacity = 0\n") catch {};
             c.ghostty_config_load_file(config, defaults_path);
         } else |_| {}
 
@@ -2078,7 +2078,7 @@ const Server = struct {
         const defaults_path = "/tmp/termweb-ghostty-defaults.conf";
         if (std.fs.cwd().createFile(defaults_path, .{})) |f| {
             defer f.close();
-            f.writeAll("cursor-style = bar\ncursor-style-blink = false\ncursor-opacity = 0\n") catch {};
+            f.writeAll("keybind = clear\ncursor-style = bar\ncursor-style-blink = false\ncursor-opacity = 0\n") catch {};
             c.ghostty_config_load_file(config, defaults_path);
         } else |_| {}
 
