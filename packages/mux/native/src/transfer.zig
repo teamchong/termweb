@@ -2548,20 +2548,15 @@ pub fn parseUploadFileList(allocator: Allocator, data: []const u8) !struct { tra
     var files = try allocator.alloc(FileEntry, file_count);
     errdefer allocator.free(files);
 
+    var initialized: usize = 0;
+    errdefer for (files[0..initialized]) |*f| f.deinit(allocator);
+
     for (0..file_count) |i| {
-        if (offset + 2 > data.len) {
-            for (files[0..i]) |*f| f.deinit(allocator);
-            allocator.free(files);
-            return error.MessageTooShort;
-        }
+        if (offset + 2 > data.len) return error.MessageTooShort;
         const path_len = std.mem.readInt(u16, data[offset..][0..2], .little);
         offset += 2;
 
-        if (offset + path_len + 9 > data.len) {
-            for (files[0..i]) |*f| f.deinit(allocator);
-            allocator.free(files);
-            return error.MessageTooShort;
-        }
+        if (offset + path_len + 9 > data.len) return error.MessageTooShort;
         const path = try allocator.dupe(u8, data[offset..][0..path_len]);
         offset += path_len;
 
@@ -2578,6 +2573,7 @@ pub fn parseUploadFileList(allocator: Allocator, data: []const u8) !struct { tra
             .hash = 0,
             .is_dir = is_dir,
         };
+        initialized = i + 1;
     }
 
     return .{ .transfer_id = transfer_id, .files = files, .total_bytes = total_bytes };

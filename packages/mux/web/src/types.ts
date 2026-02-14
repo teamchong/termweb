@@ -86,6 +86,12 @@ export interface ShareLink {
   label: string | null;
 }
 
+// Keybinding from server config
+export interface KeyBinding {
+  key: string;       // JS key name: "k", "/", "arrowup", "enter"
+  mods: string[];    // "super", "shift", "alt", "ctrl"
+}
+
 // Command palette action
 export interface CommandAction {
   id: string;
@@ -99,6 +105,7 @@ export interface CommandAction {
 export interface AppConfig {
   wsPath?: boolean; // True if using path-based WebSocket on same port
   colors?: Record<string, string>;
+  keybindings?: Record<string, KeyBinding>;
 }
 
 // Layout data for restoration

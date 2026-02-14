@@ -205,6 +205,16 @@ pub const AuthState = struct {
         return self.sessions.getPtr(id);
     }
 
+    /// Find the first session matching a given role.
+    /// Used when a share link (which has no session_id) needs a session for JWT exchange.
+    pub fn getSessionByRole(self: *AuthState, role: Role) ?*Session {
+        var iter = self.sessions.valueIterator();
+        while (iter.next()) |session| {
+            if (session.role == role) return session;
+        }
+        return null;
+    }
+
     pub fn listSessions(self: *AuthState) []Session {
         // Return values as slice
         var list = std.ArrayList(Session).init(self.allocator);

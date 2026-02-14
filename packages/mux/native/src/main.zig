@@ -173,7 +173,10 @@ pub const BinaryCtrlMsg = enum(u8) {
     session_identity = 0x13,  // Multiplayer: your session identity [type:u8][session_id_len:u8][session_id:...]
     cursor_state = 0x14,  // Cursor position/style/color for frontend CSS blink [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8] = 18 bytes
     surface_dims = 0x15,  // Surface pixel dimensions (sent on resize, not per-frame) [type:u8][panel_id:u32][width:u16][height:u16] = 9 bytes
+    screen_dump = 0x16,   // Screen/selection content for browser download [type:u8][filename_len:u8][filename...][content_len:u32_le][content...]
+    config_content = 0x20, // Config file content: [type:u8][path_len:u16_le][path...][content_len:u32_le][content...]
     inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
+    config_updated = 0x1F,  // Config reloaded: clients should refetch /config
 
     // Auth/Session Server → Client (0x0A-0x0F)
     auth_state = 0x0A,      // Current auth state (role, sessions, tokens)
@@ -192,6 +195,7 @@ pub const BinaryCtrlMsg = enum(u8) {
     set_overview = 0x89,  // Set overview open/closed state
     set_quick_terminal = 0x8A,  // Set quick terminal open/closed state
     set_inspector = 0x8B,  // Set inspector open/closed state
+    save_config = 0x8D,    // Save config file: [type:u8][content_len:u32_le][content...]
 
     // Batch envelope (both directions)
     batch = 0xFE,  // [type:u8][count:u16_le][len1:u16_le][msg1...][len2:u16_le][msg2...]...
@@ -471,6 +475,22 @@ pub const Layout = struct {
         }
 
         return false;
+    }
+
+    /// Move a tab by delta positions (-1 = left, +1 = right). Returns true if moved.
+    pub fn moveTab(self: *Layout, tab_id: u32, delta: i32) bool {
+        const idx: usize = for (self.tabs.items, 0..) |tab, i| {
+            if (tab.id == tab_id) break i;
+        } else return false;
+
+        const new_idx_i64 = @as(i64, @intCast(idx)) + delta;
+        if (new_idx_i64 < 0 or new_idx_i64 >= @as(i64, @intCast(self.tabs.items.len))) return false;
+        const new_idx: usize = @intCast(new_idx_i64);
+
+        const tmp = self.tabs.items[idx];
+        self.tabs.items[idx] = self.tabs.items[new_idx];
+        self.tabs.items[new_idx] = tmp;
+        return true;
     }
 
     // Serialize layout to JSON string
@@ -1550,6 +1570,8 @@ const Server = struct {
     // Ghostty app/config - lazy initialized on first panel, freed when last panel closes
     app: ?c.ghostty_app_t,
     config: ?c.ghostty_config_t,
+    config_json: ?[]const u8,  // Pre-built JSON for config (colors + keybindings)
+    ghostty_initialized: bool,  // Whether ghostty_init() has been called
     panels: std.AutoHashMap(u32, *Panel),
     h264_connections: std.ArrayList(*ws.Connection),
     control_connections: std.ArrayList(*ws.Connection),
@@ -1585,6 +1607,7 @@ const Server = struct {
     mutex: std.Thread.Mutex,
     selection_clipboard: ?[]u8,  // Selection clipboard buffer
     standard_clipboard: ?[]u8,  // Standard clipboard buffer (from browser paste)
+    screen_dump_pending: std.atomic.Value(bool),  // Flag: next clipboard write is a screen dump file path
     initial_cwd: []const u8,  // CWD where termweb was started
     initial_cwd_allocated: bool,  // Whether initial_cwd was allocated (vs static "/")
     tmux_shim_dir: []const u8,  // Temp directory containing mock tmux script (prepended to PATH)
@@ -1668,6 +1691,8 @@ const Server = struct {
         server.* = .{
             .app = null, // Lazy init on first panel
             .config = null,
+            .config_json = null,
+            .ghostty_initialized = false,
             .panels = std.AutoHashMap(u32, *Panel).init(allocator),
             .h264_connections = .{},
             .control_connections = .{},
@@ -1702,6 +1727,7 @@ const Server = struct {
             .mutex = .{},
             .selection_clipboard = null,
             .standard_clipboard = null,
+            .screen_dump_pending = std.atomic.Value(bool).init(false),
             .initial_cwd = undefined,
             .initial_cwd_allocated = false,
             .tmux_shim_dir = shim_result.bin_dir,
@@ -1751,8 +1777,11 @@ const Server = struct {
 
         if (self.app != null) return; // Already initialized
 
-        const init_result = c.ghostty_init(0, null);
-        if (init_result != c.GHOSTTY_SUCCESS) return error.GhosttyInitFailed;
+        if (!self.ghostty_initialized) {
+            const init_result = c.ghostty_init(0, null);
+            if (init_result != c.GHOSTTY_SUCCESS) return error.GhosttyInitFailed;
+            self.ghostty_initialized = true;
+        }
 
         // Load ghostty config: termweb defaults first, then user overrides
         const config = c.ghostty_config_new();
@@ -1787,6 +1816,267 @@ const Server = struct {
 
         self.app = app;
         self.config = config;
+
+        // Build config JSON (colors + keybindings) for HTTP endpoint
+        if (self.config_json) |old| self.allocator.free(old);
+        self.config_json = self.buildConfigJson(config) catch null;
+        self.http_server.config_json = self.config_json;
+    }
+
+    /// Color struct matching ghostty_config_color_s
+    const Color = extern struct { r: u8, g: u8, b: u8 };
+
+    /// Keybinding entry: maps termweb action → ghostty action + default key/mods
+    const KeybindEntry = struct {
+        termweb_action: []const u8,
+        ghostty_action: ?[]const u8, // null = no ghostty equivalent
+        default_key: []const u8,
+        default_mods: []const u8, // JSON array string e.g. "[\"super\",\"shift\"]"
+    };
+
+    const keybind_table = [_]KeybindEntry{
+        .{ .termweb_action = "_command_palette", .ghostty_action = "toggle_command_palette", .default_key = "k", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_new_tab", .ghostty_action = "new_tab", .default_key = "/", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "_close", .ghostty_action = "close_surface", .default_key = ".", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "_close_tab", .ghostty_action = "close_tab", .default_key = ".", .default_mods = "[\"super\",\"alt\"]" },
+        .{ .termweb_action = "_close_window", .ghostty_action = "close_window", .default_key = ".", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_split_right", .ghostty_action = "new_split:right", .default_key = "d", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "_split_down", .ghostty_action = "new_split:down", .default_key = "d", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_show_all_tabs", .ghostty_action = "toggle_tab_overview", .default_key = "a", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_toggle_fullscreen", .ghostty_action = "toggle_fullscreen", .default_key = "f", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_quick_terminal", .ghostty_action = "toggle_quick_terminal", .default_key = "\\", .default_mods = "[\"super\",\"alt\"]" },
+        .{ .termweb_action = "_toggle_inspector", .ghostty_action = "inspector:toggle", .default_key = "i", .default_mods = "[\"super\",\"alt\"]" },
+        .{ .termweb_action = "_zoom_split", .ghostty_action = "toggle_split_zoom", .default_key = "enter", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "copy_to_clipboard", .ghostty_action = "copy_to_clipboard", .default_key = "c", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "paste_from_clipboard", .ghostty_action = "paste_from_clipboard", .default_key = "v", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "paste_from_selection", .ghostty_action = "paste_from_selection", .default_key = "v", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "select_all", .ghostty_action = "select_all", .default_key = "a", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "increase_font_size:1", .ghostty_action = "increase_font_size:1", .default_key = "=", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "decrease_font_size:1", .ghostty_action = "decrease_font_size:1", .default_key = "-", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "reset_font_size", .ghostty_action = "reset_font_size", .default_key = "0", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "reload_config", .ghostty_action = "reload_config", .default_key = ",", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_previous_split", .ghostty_action = "goto_split:previous", .default_key = "[", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "_next_split", .ghostty_action = "goto_split:next", .default_key = "]", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "_previous_tab", .ghostty_action = "previous_tab", .default_key = "[", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_next_tab", .ghostty_action = "next_tab", .default_key = "]", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_upload", .ghostty_action = null, .default_key = "u", .default_mods = "[\"super\"]" },
+        .{ .termweb_action = "_download", .ghostty_action = null, .default_key = "s", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_select_split_up", .ghostty_action = null, .default_key = "arrowup", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_select_split_down", .ghostty_action = null, .default_key = "arrowdown", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_select_split_left", .ghostty_action = null, .default_key = "arrowleft", .default_mods = "[\"super\",\"shift\"]" },
+        .{ .termweb_action = "_select_split_right", .ghostty_action = null, .default_key = "arrowright", .default_mods = "[\"super\",\"shift\"]" },
+    };
+
+    /// Convert ghostty key enum to JS key string
+    fn ghosttyKeyToJs(key: c_uint) ?[]const u8 {
+        return switch (key) {
+            c.GHOSTTY_KEY_A => "a", c.GHOSTTY_KEY_B => "b", c.GHOSTTY_KEY_C => "c",
+            c.GHOSTTY_KEY_D => "d", c.GHOSTTY_KEY_E => "e", c.GHOSTTY_KEY_F => "f",
+            c.GHOSTTY_KEY_G => "g", c.GHOSTTY_KEY_H => "h", c.GHOSTTY_KEY_I => "i",
+            c.GHOSTTY_KEY_J => "j", c.GHOSTTY_KEY_K => "k", c.GHOSTTY_KEY_L => "l",
+            c.GHOSTTY_KEY_M => "m", c.GHOSTTY_KEY_N => "n", c.GHOSTTY_KEY_O => "o",
+            c.GHOSTTY_KEY_P => "p", c.GHOSTTY_KEY_Q => "q", c.GHOSTTY_KEY_R => "r",
+            c.GHOSTTY_KEY_S => "s", c.GHOSTTY_KEY_T => "t", c.GHOSTTY_KEY_U => "u",
+            c.GHOSTTY_KEY_V => "v", c.GHOSTTY_KEY_W => "w", c.GHOSTTY_KEY_X => "x",
+            c.GHOSTTY_KEY_Y => "y", c.GHOSTTY_KEY_Z => "z",
+            c.GHOSTTY_KEY_DIGIT_0 => "0", c.GHOSTTY_KEY_DIGIT_1 => "1",
+            c.GHOSTTY_KEY_DIGIT_2 => "2", c.GHOSTTY_KEY_DIGIT_3 => "3",
+            c.GHOSTTY_KEY_DIGIT_4 => "4", c.GHOSTTY_KEY_DIGIT_5 => "5",
+            c.GHOSTTY_KEY_DIGIT_6 => "6", c.GHOSTTY_KEY_DIGIT_7 => "7",
+            c.GHOSTTY_KEY_DIGIT_8 => "8", c.GHOSTTY_KEY_DIGIT_9 => "9",
+            c.GHOSTTY_KEY_MINUS => "-", c.GHOSTTY_KEY_EQUAL => "=",
+            c.GHOSTTY_KEY_BRACKET_LEFT => "[", c.GHOSTTY_KEY_BRACKET_RIGHT => "]",
+            c.GHOSTTY_KEY_BACKSLASH => "\\", c.GHOSTTY_KEY_SEMICOLON => ";",
+            c.GHOSTTY_KEY_QUOTE => "'", c.GHOSTTY_KEY_BACKQUOTE => "`",
+            c.GHOSTTY_KEY_COMMA => ",", c.GHOSTTY_KEY_PERIOD => ".",
+            c.GHOSTTY_KEY_SLASH => "/", c.GHOSTTY_KEY_SPACE => " ",
+            c.GHOSTTY_KEY_ENTER => "enter", c.GHOSTTY_KEY_TAB => "tab",
+            c.GHOSTTY_KEY_BACKSPACE => "backspace", c.GHOSTTY_KEY_ESCAPE => "escape",
+            c.GHOSTTY_KEY_ARROW_UP => "arrowup", c.GHOSTTY_KEY_ARROW_DOWN => "arrowdown",
+            c.GHOSTTY_KEY_ARROW_LEFT => "arrowleft", c.GHOSTTY_KEY_ARROW_RIGHT => "arrowright",
+            c.GHOSTTY_KEY_HOME => "home", c.GHOSTTY_KEY_END => "end",
+            c.GHOSTTY_KEY_PAGE_UP => "pageup", c.GHOSTTY_KEY_PAGE_DOWN => "pagedown",
+            c.GHOSTTY_KEY_DELETE => "delete", c.GHOSTTY_KEY_INSERT => "insert",
+            c.GHOSTTY_KEY_F1 => "f1", c.GHOSTTY_KEY_F2 => "f2", c.GHOSTTY_KEY_F3 => "f3",
+            c.GHOSTTY_KEY_F4 => "f4", c.GHOSTTY_KEY_F5 => "f5", c.GHOSTTY_KEY_F6 => "f6",
+            c.GHOSTTY_KEY_F7 => "f7", c.GHOSTTY_KEY_F8 => "f8", c.GHOSTTY_KEY_F9 => "f9",
+            c.GHOSTTY_KEY_F10 => "f10", c.GHOSTTY_KEY_F11 => "f11", c.GHOSTTY_KEY_F12 => "f12",
+            else => null,
+        };
+    }
+
+    const ModsList = struct { items: [4][]const u8, len: usize };
+
+    /// Convert ghostty mod bitmask to a bounded list of modifier name strings.
+    fn ghosttyModsToList(mods: c_uint) ModsList {
+        var result: ModsList = .{ .items = undefined, .len = 0 };
+        if (mods & c.GHOSTTY_MODS_CTRL != 0) { result.items[result.len] = "ctrl"; result.len += 1; }
+        if (mods & c.GHOSTTY_MODS_ALT != 0) { result.items[result.len] = "alt"; result.len += 1; }
+        if (mods & c.GHOSTTY_MODS_SHIFT != 0) { result.items[result.len] = "shift"; result.len += 1; }
+        if (mods & c.GHOSTTY_MODS_SUPER != 0) { result.items[result.len] = "super"; result.len += 1; }
+        return result;
+    }
+
+    /// Parse a default_mods string like `["super","shift"]` into a bounded list.
+    fn parseDefaultMods(mods_str: []const u8) ModsList {
+        var result: ModsList = .{ .items = undefined, .len = 0 };
+        // Simple parser: find quoted strings between [ and ]
+        var i: usize = 0;
+        while (i < mods_str.len) : (i += 1) {
+            if (mods_str[i] == '"') {
+                const start = i + 1;
+                i += 1;
+                while (i < mods_str.len and mods_str[i] != '"') : (i += 1) {}
+                if (i < mods_str.len and result.len < 4) {
+                    result.items[result.len] = mods_str[start..i];
+                    result.len += 1;
+                }
+            }
+        }
+        return result;
+    }
+
+    /// Build the config JSON using std.json.Stringify for correct encoding.
+    /// Caller owns the returned slice and must free with allocator.
+    fn buildConfigJson(self: *Server, config: c.ghostty_config_t) ![]const u8 {
+        const json = std.json;
+
+        var aw: std.io.Writer.Allocating = .init(self.allocator);
+        errdefer aw.deinit();
+        var jw: json.Stringify = .{ .writer = &aw.writer };
+
+        // Get colors
+        var bg: Color = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
+        var fg: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+        _ = c.ghostty_config_get(config, &bg, "background", 10);
+        _ = c.ghostty_config_get(config, &fg, "foreground", 10);
+
+        var bg_hex: [7]u8 = undefined;
+        _ = std.fmt.bufPrint(&bg_hex, "#{x:0>2}{x:0>2}{x:0>2}", .{ bg.r, bg.g, bg.b }) catch unreachable;
+        var fg_hex: [7]u8 = undefined;
+        _ = std.fmt.bufPrint(&fg_hex, "#{x:0>2}{x:0>2}{x:0>2}", .{ fg.r, fg.g, fg.b }) catch unreachable;
+
+        // Root object
+        jw.beginObject() catch return error.OutOfMemory;
+
+        // "wsPath": true
+        jw.objectField("wsPath") catch return error.OutOfMemory;
+        jw.write(true) catch return error.OutOfMemory;
+
+        // "colors": { "background": "#rrggbb", "foreground": "#rrggbb" }
+        jw.objectField("colors") catch return error.OutOfMemory;
+        jw.beginObject() catch return error.OutOfMemory;
+        jw.objectField("background") catch return error.OutOfMemory;
+        jw.write(&bg_hex) catch return error.OutOfMemory;
+        jw.objectField("foreground") catch return error.OutOfMemory;
+        jw.write(&fg_hex) catch return error.OutOfMemory;
+        jw.endObject() catch return error.OutOfMemory;
+
+        // "keybindings": { ... }
+        jw.objectField("keybindings") catch return error.OutOfMemory;
+        jw.beginObject() catch return error.OutOfMemory;
+
+        for (keybind_table) |entry| {
+            var key_str: []const u8 = entry.default_key;
+            var mods_list = parseDefaultMods(entry.default_mods);
+
+            // Query ghostty config for user override
+            if (entry.ghostty_action) |ga| {
+                const trigger = c.ghostty_config_trigger(config, ga.ptr, ga.len);
+                if (trigger.tag != c.GHOSTTY_TRIGGER_CATCH_ALL) {
+                    const ghost_key: c_uint = if (trigger.tag == c.GHOSTTY_TRIGGER_UNICODE)
+                        c.GHOSTTY_KEY_UNIDENTIFIED
+                    else
+                        trigger.key.physical;
+
+                    if (ghost_key != c.GHOSTTY_KEY_UNIDENTIFIED) {
+                        if (ghosttyKeyToJs(ghost_key)) |js_key| {
+                            key_str = js_key;
+                            mods_list = ghosttyModsToList(trigger.mods);
+                        }
+                    }
+                }
+            }
+
+            // "action_name": { "key": "k", "mods": ["super", "shift"] }
+            jw.objectField(entry.termweb_action) catch return error.OutOfMemory;
+            jw.beginObject() catch return error.OutOfMemory;
+            jw.objectField("key") catch return error.OutOfMemory;
+            jw.write(key_str) catch return error.OutOfMemory;
+            jw.objectField("mods") catch return error.OutOfMemory;
+            jw.beginArray() catch return error.OutOfMemory;
+            for (mods_list.items[0..mods_list.len]) |mod| {
+                jw.write(mod) catch return error.OutOfMemory;
+            }
+            jw.endArray() catch return error.OutOfMemory;
+            jw.endObject() catch return error.OutOfMemory;
+        }
+
+        jw.endObject() catch return error.OutOfMemory; // end keybindings
+        jw.endObject() catch return error.OutOfMemory; // end root
+
+        return aw.toOwnedSlice();
+    }
+
+    /// Broadcast config_updated with the latest config JSON payload.
+    /// Message format: [opcode 0x1F][config_json_bytes...]
+    fn broadcastConfigUpdated(self: *Server) void {
+        const json = self.config_json orelse {
+            // No config available — send opcode-only as fallback
+            var buf: [1]u8 = .{@intFromEnum(BinaryCtrlMsg.config_updated)};
+            self.broadcastControlData(&buf);
+            return;
+        };
+        // Allocate opcode + json payload
+        const msg = self.allocator.alloc(u8, 1 + json.len) catch {
+            var buf: [1]u8 = .{@intFromEnum(BinaryCtrlMsg.config_updated)};
+            self.broadcastControlData(&buf);
+            return;
+        };
+        defer self.allocator.free(msg);
+        msg[0] = @intFromEnum(BinaryCtrlMsg.config_updated);
+        @memcpy(msg[1..], json);
+        self.broadcastControlData(msg);
+    }
+
+    /// Load ghostty config and build config JSON without creating app/surfaces.
+    /// Called at server startup so the first page load has config embedded in HTML.
+    fn loadConfigOnly(self: *Server) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Skip if config already loaded (ensureGhosttyInit already ran)
+        if (self.config_json != null) return;
+
+        // Initialize ghostty runtime (safe to call before app creation)
+        if (!self.ghostty_initialized) {
+            const init_result = c.ghostty_init(0, null);
+            if (init_result != c.GHOSTTY_SUCCESS) {
+                std.debug.print("Warning: ghostty_init failed, config unavailable\n", .{});
+                return;
+            }
+            self.ghostty_initialized = true;
+        }
+
+        const config = c.ghostty_config_new();
+
+        // Write termweb defaults to temp file (user's ghostty config overrides these)
+        const defaults_path = "/tmp/termweb-ghostty-defaults.conf";
+        if (std.fs.cwd().createFile(defaults_path, .{})) |f| {
+            defer f.close();
+            f.writeAll("cursor-style = bar\ncursor-style-blink = false\ncursor-opacity = 0\n") catch {};
+            c.ghostty_config_load_file(config, defaults_path);
+        } else |_| {}
+
+        c.ghostty_config_load_default_files(config);
+        c.ghostty_config_finalize(config);
+
+        self.config_json = self.buildConfigJson(config) catch null;
+        self.http_server.config_json = self.config_json;
+
+        // Free the config — we only needed it to extract JSON.
+        // ensureGhosttyInit will load its own config when the first panel is created.
+        c.ghostty_config_free(config);
     }
 
     // Free ghostty when last panel is closed (scale to zero)
@@ -1803,7 +2093,8 @@ const Server = struct {
             return; // Already freed
         }
 
-        // Take ownership of app/config while holding mutex
+        // Take ownership of app/config while holding mutex.
+        // Keep config_json alive — it's needed for new page loads even with no panels.
         const app = self.app.?;
         const cfg = self.config.?;
         self.app = null;
@@ -1903,6 +2194,18 @@ const Server = struct {
         }
         self.panel_assignments.deinit();
         self.control_client_ids.deinit();
+        // Free heap-allocated keys in session_active_panels
+        {
+            var it = self.session_active_panels.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+        }
+        self.session_active_panels.deinit();
+        // Free heap-allocated keys in session_viewports
+        {
+            var it = self.session_viewports.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+        }
+        self.session_viewports.deinit();
         if (self.selection_clipboard) |clip| self.allocator.free(clip);
         if (self.standard_clipboard) |clip| self.allocator.free(clip);
         if (self.initial_cwd_allocated) self.allocator.free(@constCast(self.initial_cwd));
@@ -1931,6 +2234,7 @@ const Server = struct {
         // Only free ghostty if it was initialized
         if (self.app) |app| c.ghostty_app_free(app);
         if (self.config) |cfg| c.ghostty_config_free(cfg);
+        if (self.config_json) |json| self.allocator.free(json);
         self.allocator.destroy(self);
     }
 
@@ -2673,6 +2977,83 @@ const Server = struct {
             const action_len = data[5];
             if (data.len < 6 + action_len) return;
             const action = data[6..][0..action_len];
+
+            // Handle reload_config: reload ghostty config and broadcast updated keybindings
+            if (std.mem.eql(u8, action, "reload_config")) {
+                if (self.config) |_| {
+                    const new_config = c.ghostty_config_new();
+                    c.ghostty_config_load_default_files(new_config);
+                    c.ghostty_config_finalize(new_config);
+                    if (self.config_json) |old| self.allocator.free(old);
+                    self.config_json = self.buildConfigJson(new_config) catch null;
+                    self.http_server.config_json = self.config_json;
+                    self.broadcastConfigUpdated();
+                    // Also update the app config so terminal settings reload
+                    if (self.app) |app| c.ghostty_app_update_config(app, new_config);
+                    // Free old config, keep new one
+                    const old_cfg = self.config.?;
+                    self.config = new_config;
+                    c.ghostty_config_free(old_cfg);
+                }
+            }
+
+            // Handle open_config: read config file and send content to requesting client
+            if (std.mem.eql(u8, action, "open_config")) {
+                self.sendConfigContent(conn);
+                return; // Don't pass to ghostty
+            }
+
+            // Handle save_config via view_action (alternative path)
+            if (std.mem.startsWith(u8, action, "save_config:")) {
+                // Content is too large for view_action; use dedicated 0x8D message instead
+                return;
+            }
+
+            // Handle move_tab: reorder tabs
+            if (std.mem.startsWith(u8, action, "move_tab:")) {
+                const delta_str = action["move_tab:".len..];
+                const delta = std.fmt.parseInt(i32, delta_str, 10) catch return;
+                self.mutex.lock();
+                const tab = self.layout.findTabByPanel(panel_id);
+                if (tab) |t| {
+                    if (self.layout.moveTab(t.id, delta)) {
+                        self.mutex.unlock();
+                        self.broadcastLayoutUpdate();
+                    } else {
+                        self.mutex.unlock();
+                    }
+                } else {
+                    self.mutex.unlock();
+                }
+                return; // Handled client-side via layout update
+            }
+
+            // Handle write_screen_file / write_selection_file: capture and send to client
+            if (std.mem.startsWith(u8, action, "write_screen_file:") or
+                std.mem.startsWith(u8, action, "write_selection_file:"))
+            {
+                // Set flag so writeClipboardCallback knows to intercept the file path
+                self.screen_dump_pending.store(true, .release);
+
+                // Rewrite action to use :copy variant (ghostty writes file + sets clipboard to path)
+                var rewritten_buf: [64]u8 = undefined;
+                const prefix = if (std.mem.startsWith(u8, action, "write_screen_file:"))
+                    "write_screen_file:copy"
+                else
+                    "write_selection_file:copy";
+                @memcpy(rewritten_buf[0..prefix.len], prefix);
+
+                self.mutex.lock();
+                if (self.panels.get(panel_id)) |panel| {
+                    self.mutex.unlock();
+                    _ = c.ghostty_surface_binding_action(panel.surface, &rewritten_buf, prefix.len);
+                } else {
+                    self.mutex.unlock();
+                    self.screen_dump_pending.store(false, .release);
+                }
+                return; // Don't pass original action to ghostty
+            }
+
             self.mutex.lock();
             if (self.panels.get(panel_id)) |panel| {
                 self.mutex.unlock();
@@ -2719,6 +3100,13 @@ const Server = struct {
             if (self.standard_clipboard) |old| self.allocator.free(old);
             self.standard_clipboard = self.allocator.dupe(u8, text) catch null;
             self.mutex.unlock();
+        } else if (msg_type == 0x8D) { // save_config
+            // [0x8D][content_len:u32_le][content...]
+            if (data.len < 5) return;
+            const content_len = std.mem.readInt(u32, data[1..5], .little);
+            if (data.len < 5 + content_len) return;
+            const content = data[5..][0..content_len];
+            self.handleSaveConfig(conn, content);
         } else {
             std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type});
         }
@@ -3125,16 +3513,109 @@ const Server = struct {
     }
 
 
+    /// Get the ghostty config file path.
+    fn getConfigPath(buf: *[512]u8) ?[]const u8 {
+        if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
+            return std.fmt.bufPrint(buf, "{s}/ghostty/config", .{xdg}) catch null;
+        }
+        const home = std.posix.getenv("HOME") orelse return null;
+        return std.fmt.bufPrint(buf, "{s}/.config/ghostty/config", .{home}) catch null;
+    }
+
+    /// Read the ghostty config file and send its content to a single connection.
+    fn sendConfigContent(self: *Server, conn: *ws.Connection) void {
+        var path_buf: [512]u8 = undefined;
+        const config_path = getConfigPath(&path_buf) orelse return;
+
+        // Read config file
+        const file = std.fs.openFileAbsolute(config_path, .{}) catch |err| {
+            // File doesn't exist yet — send empty content so client can create it
+            if (err == error.FileNotFound) {
+                self.sendConfigContentMsg(conn, config_path, "");
+                return;
+            }
+            std.log.warn("Failed to open config file: {}", .{err});
+            return;
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            std.log.warn("Failed to read config file: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(content);
+
+        self.sendConfigContentMsg(conn, config_path, content);
+    }
+
+    /// Build and send config_content message to a single connection.
+    fn sendConfigContentMsg(self: *Server, conn: *ws.Connection, path: []const u8, content: []const u8) void {
+        // [0x20][path_len:u16_le][path...][content_len:u32_le][content...]
+        const msg_len = 1 + 2 + path.len + 4 + content.len;
+        const msg = self.allocator.alloc(u8, msg_len) catch return;
+        defer self.allocator.free(msg);
+        msg[0] = @intFromEnum(BinaryCtrlMsg.config_content);
+        std.mem.writeInt(u16, msg[1..3], @intCast(path.len), .little);
+        @memcpy(msg[3..][0..path.len], path);
+        const content_offset = 3 + path.len;
+        std.mem.writeInt(u32, msg[content_offset..][0..4], @intCast(content.len), .little);
+        @memcpy(msg[content_offset + 4 ..][0..content.len], content);
+        conn.sendBinary(msg) catch {};
+    }
+
+    /// Handle save_config: write content to config file and trigger reload.
+    fn handleSaveConfig(self: *Server, conn: *ws.Connection, content: []const u8) void {
+        _ = conn;
+        var path_buf: [512]u8 = undefined;
+        const config_path = getConfigPath(&path_buf) orelse return;
+
+        // Ensure parent directory exists
+        if (std.fs.path.dirname(config_path)) |dir| {
+            std.fs.makeDirAbsolute(dir) catch |err| {
+                if (err != error.PathAlreadyExists) {
+                    std.log.warn("Failed to create config dir: {}", .{err});
+                    return;
+                }
+            };
+        }
+
+        // Write config file
+        const file = std.fs.createFileAbsolute(config_path, .{}) catch |err| {
+            std.log.warn("Failed to create config file: {}", .{err});
+            return;
+        };
+        defer file.close();
+        file.writeAll(content) catch |err| {
+            std.log.warn("Failed to write config file: {}", .{err});
+            return;
+        };
+
+        // Trigger config reload (same as reload_config view action)
+        if (self.config) |_| {
+            const new_config = c.ghostty_config_new();
+            c.ghostty_config_load_default_files(new_config);
+            c.ghostty_config_finalize(new_config);
+            if (self.config_json) |old| self.allocator.free(old);
+            self.config_json = self.buildConfigJson(new_config) catch null;
+            self.http_server.config_json = self.config_json;
+            self.broadcastConfigUpdated();
+            if (self.app) |app| c.ghostty_app_update_config(app, new_config);
+            const old_cfg = self.config.?;
+            self.config = new_config;
+            c.ghostty_config_free(old_cfg);
+        }
+    }
+
     // Binary control message handler
     // 0x10 = file_upload, 0x11 = file_download, 0x14 = folder_download (zip)
-    // 0x81-0x88 = client control messages (close, resize, focus, split, etc.)
+    // 0x81-0x8D = client control messages (close, resize, focus, split, config, etc.)
     fn handleBinaryControlMessage(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len < 1) return;
 
         const msg_type = data[0];
         switch (msg_type) {
             // Client control messages
-            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B => {
+            0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D => {
                 self.handleBinaryControlMessageFromClient(conn, data);
             },
             else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type}),
@@ -3539,6 +4020,54 @@ const Server = struct {
                     conn.sendBinary(msg_buf) catch {};
                 }
             };
+        }
+    }
+
+    /// Read a screen dump temp file and broadcast its content to all clients.
+    /// Called from writeClipboardCallback when screen_dump_pending is set.
+    fn handleScreenDumpFile(self: *Server, file_path: []const u8) void {
+        // Read the temp file content
+        const file_content = std.fs.cwd().readFileAlloc(self.allocator, file_path, 4 * 1024 * 1024) catch |err| {
+            std.debug.print("Failed to read screen dump file '{s}': {}\n", .{ file_path, err });
+            return;
+        };
+        defer self.allocator.free(file_content);
+
+        // Extract filename from path (e.g., "/tmp/ghostty-abc/screen.txt" → "screen.txt")
+        const filename = if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |idx|
+            file_path[idx + 1 ..]
+        else
+            file_path;
+
+        self.broadcastScreenDump(filename, file_content);
+
+        // Clean up: delete the temp file and try to remove the temp directory
+        std.fs.cwd().deleteFile(file_path) catch {};
+        if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |idx| {
+            std.fs.cwd().deleteDir(file_path[0..idx]) catch {};
+        }
+    }
+
+    /// Broadcast screen/selection content to all clients for browser download.
+    /// Format: [type:u8][filename_len:u8][filename...][content_len:u32_le][content...]
+    fn broadcastScreenDump(self: *Server, filename: []const u8, content: []const u8) void {
+        const fname_len: u8 = @intCast(@min(filename.len, 255));
+        const content_len: u32 = @intCast(@min(content.len, 4 * 1024 * 1024));
+        const total_len = 1 + 1 + fname_len + 4 + content_len;
+
+        const msg_buf = self.allocator.alloc(u8, total_len) catch return;
+        defer self.allocator.free(msg_buf);
+
+        msg_buf[0] = @intFromEnum(BinaryCtrlMsg.screen_dump);
+        msg_buf[1] = fname_len;
+        @memcpy(msg_buf[2..][0..fname_len], filename[0..fname_len]);
+        std.mem.writeInt(u32, msg_buf[2 + fname_len ..][0..4], content_len, .little);
+        @memcpy(msg_buf[6 + fname_len ..][0..content_len], content[0..content_len]);
+
+        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
+        const conns = self.snapshotControlConns(&conn_buf);
+        for (conns) |conn| {
+            conn.sendBinary(msg_buf) catch {};
         }
     }
 
@@ -4973,6 +5502,15 @@ const Server = struct {
             // Notify tmux API caller if this was an API-originated request
             if (req.from_api) _ = self.tmux_api_response_ch.send(panel.id);
 
+            // Switch encoding focus to the new panel so the server immediately
+            // starts encoding its tab. The client sends FOCUS_PANEL later to confirm,
+            // but this avoids the gap where the new panel gets no frames.
+            if (req.kind == .regular) {
+                self.mutex.lock();
+                self.layout.active_panel_id = panel.id;
+                self.mutex.unlock();
+            }
+
             // Panel starts streaming immediately. Initial dimensions are approximate;
             // each client's ResizeObserver sends the correct viewport-based resize
             // within one animation frame (~16ms).
@@ -5816,6 +6354,10 @@ const Server = struct {
             std.debug.print("Warning: tmux shim socket failed to start: {}\n", .{err});
         };
 
+        // Load ghostty config at startup so the first page has keybindings/colors in HTML.
+        // This avoids blank shortcut labels until the first panel triggers ensureGhosttyInit.
+        self.loadConfigOnly();
+
         // Start HTTP server in background (handles all WebSocket via path-based routing)
         const http_thread = try std.Thread.spawn(.{}, runHttpServer, .{self});
 
@@ -6191,6 +6733,14 @@ fn writeClipboardCallback(userdata: ?*anyopaque, clipboard: c.ghostty_clipboard_
                     }
                     self.selection_clipboard = self.allocator.dupe(u8, data) catch null;
                 } else if (clipboard == c.GHOSTTY_CLIPBOARD_STANDARD) {
+                    // Check if this is a screen dump response (write_screen_file/write_selection_file)
+                    if (self.screen_dump_pending.swap(false, .acq_rel)) {
+                        // The clipboard content is a temp file path — read and broadcast
+                        if (std.mem.startsWith(u8, data, "/tmp/ghostty-")) {
+                            self.handleScreenDumpFile(data);
+                            return;
+                        }
+                    }
                     // Send standard clipboard to all connected clients
                     self.broadcastClipboard(data);
                 }
@@ -7203,11 +7753,15 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
     };
 
     // Generate auth tokens for URLs
-    // Admin token: share link for the person running the server (full access)
-    const admin_token_ptr = server.auth_state.createShareLink(.admin, null, null, null) catch null;
+    // Admin session: ensure one exists for the person running the server (full access)
+    if (server.auth_state.getSession("admin") == null) {
+        server.auth_state.createSession("admin", "Admin", .admin) catch {};
+    }
     var admin_hex: [auth.token_hex_len]u8 = undefined;
-    if (admin_token_ptr) |ptr| auth.hexEncodeToken(&admin_hex, ptr);
-    const admin_token: ?[]const u8 = if (admin_token_ptr != null) &admin_hex else null;
+    const admin_token: ?[]const u8 = if (server.auth_state.getSession("admin")) |session| blk: {
+        auth.hexEncodeToken(&admin_hex, &session.token);
+        break :blk &admin_hex;
+    } else null;
 
     // Editor token: hex-encoded from default session (for sharing with coworkers)
     var editor_hex: [auth.token_hex_len]u8 = undefined;

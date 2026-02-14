@@ -1765,7 +1765,6 @@ export class FileTransferHandler {
 
   private saveFile(path: string, data: Uint8Array): boolean {
     const filename = path.split('/').pop() || path;
-    // Ensure data is backed by regular ArrayBuffer (not SharedArrayBuffer)
     const blob = new Blob([new Uint8Array(data)]);
     const url = URL.createObjectURL(blob);
     try {

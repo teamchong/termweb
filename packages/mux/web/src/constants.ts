@@ -11,7 +11,6 @@ export const WS_PATHS = {
   FILE: '/ws/file',
 } as const;
 
-export const CONFIG_ENDPOINT = '/config';
 
 // ============================================================================
 // Timing Constants (milliseconds)
@@ -316,8 +315,14 @@ export const SERVER_MSG = {
   CURSOR_STATE: 0x14,
   /** Surface pixel dimensions per panel (sent on resize, not per-frame) */
   SURFACE_DIMS: 0x15,
+  /** Screen/selection content for browser download */
+  SCREEN_DUMP: 0x16,
   /** Inspector open/closed state */
   INSPECTOR_OPEN_STATE: 0x1E,
+  /** Config reloaded: payload contains updated config JSON */
+  CONFIG_UPDATED: 0x1F,
+  /** Config file content: [type:u8][path_len:u16_le][path...][content_len:u32_le][content...] */
+  CONFIG_CONTENT: 0x20,
 } as const;
 
 // ============================================================================

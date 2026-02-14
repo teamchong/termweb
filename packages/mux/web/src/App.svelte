@@ -7,12 +7,14 @@
   import QuickTerminal from './components/QuickTerminal.svelte';
   import TabOverview from './components/TabOverview.svelte';
   import ShareDialog from './components/ShareDialog.svelte';
+  import ConfigEditor from './components/ConfigEditor.svelte';
   import AdminSharesDialog from './components/AdminSharesDialog.svelte';
   import TransferDialog, { type TransferConfig } from './components/TransferDialog.svelte';
   import DownloadProgressDialog from './components/DownloadProgressDialog.svelte';
-  import { tabs, activeTabId, activeTab, panels, ui, sessions } from './stores/index';
+  import { tabs, activeTabId, activeTab, panels, ui, sessions, keybindings } from './stores/index';
   import { connectionStatus, initialLayoutLoaded, initMuxClient, type MuxClient } from './services/mux';
-  import type { Session } from './types';
+  import { formatShortcut } from './dialogs';
+  import type { Session, KeyBinding } from './types';
 
   // MuxClient instance
   let muxClient: MuxClient | null = $state(null);
@@ -34,6 +36,12 @@
   let shareDialogUrl = $state('');
   let shareDialogTitle = $state('Share Terminal');
   let shareDialogLoading = $state(false);
+
+  // Config editor state
+  let configEditorOpen = $state(false);
+  let configEditorPath = $state('');
+  let configEditorContent = $state('');
+  let configEditorLoading = $state(false);
 
   // Admin shares dialog state
   let adminSharesOpen = $state(false);
@@ -84,48 +92,54 @@
   // Show loading while waiting for initial layout from server
   let isLoading = $derived(showLoading || !layoutLoaded);
 
-  // Menu definitions - disabled state based on hasTabs
+  // Helper: get shortcut label for an action from server keybindings
+  function shortcutFor(action: string): string | undefined {
+    const binding = $keybindings[action];
+    return binding ? formatShortcut(binding) : undefined;
+  }
+
+  // Menu definitions - disabled state based on hasTabs, shortcuts from server config
   // File menu: New Tab, Upload/Download, Split operations, Close Tab/All
   let fileMenuItems = $derived<MenuItem[]>([
-    { label: 'New Tab', action: '_new_tab', shortcut: '⌘/', icon: '⊞' },
+    { label: 'New Tab', action: '_new_tab', shortcut: shortcutFor('_new_tab'), icon: '⊞' },
     { separator: true },
-    { label: 'Upload...', action: '_upload', shortcut: '⌘U', icon: '⬆', disabled: !hasTabs },
-    { label: 'Download...', action: '_download', shortcut: '⌘⇧S', icon: '⬇', disabled: !hasTabs },
+    { label: 'Upload...', action: '_upload', shortcut: shortcutFor('_upload'), icon: '⬆', disabled: !hasTabs },
+    { label: 'Download...', action: '_download', shortcut: shortcutFor('_download'), icon: '⬇', disabled: !hasTabs },
     { label: 'Transfer Monitor', action: '_transfer_monitor', icon: '⚡' },
     { separator: true },
-    { label: 'Split Right', action: '_split_right', shortcut: '⌘D', icon: '⬚▐', disabled: !hasTabs },
-    { label: 'Split Down', action: '_split_down', shortcut: '⌘⇧D', icon: '⬚▄', disabled: !hasTabs },
+    { label: 'Split Right', action: '_split_right', shortcut: shortcutFor('_split_right'), icon: '⬚▐', disabled: !hasTabs },
+    { label: 'Split Down', action: '_split_down', shortcut: shortcutFor('_split_down'), icon: '⬚▄', disabled: !hasTabs },
     { label: 'Split Left', action: '_split_left', icon: '▌⬚', disabled: !hasTabs },
     { label: 'Split Up', action: '_split_up', icon: '▀⬚', disabled: !hasTabs },
     { separator: true },
-    { label: 'Close', action: '_close', shortcut: '⌘.', icon: '✕', disabled: !hasTabs },
-    { label: 'Close Tab', action: '_close_tab', shortcut: '⌥⌘.', icon: '⊠', disabled: !hasTabs },
+    { label: 'Close', action: '_close', shortcut: shortcutFor('_close'), icon: '✕', disabled: !hasTabs },
+    { label: 'Close Tab', action: '_close_tab', shortcut: shortcutFor('_close_tab'), icon: '⊠', disabled: !hasTabs },
     { label: 'Close Other Tabs', action: '_close_other_tabs', icon: '⊟', disabled: !hasTabs },
-    { label: 'Close Window', action: '_close_window', shortcut: '⌘⇧.', icon: '⊠', disabled: !hasTabs },
+    { label: 'Close Window', action: '_close_window', shortcut: shortcutFor('_close_window'), icon: '⊠', disabled: !hasTabs },
   ]);
 
   // Edit menu: Copy, Paste, Select All
   let editMenuItems = $derived<MenuItem[]>([
-    { label: 'Copy', action: 'copy_to_clipboard', shortcut: '⌘C', icon: '⧉', disabled: !hasTabs },
-    { label: 'Paste', action: 'paste_from_clipboard', shortcut: '⌘V', icon: '📋', disabled: !hasTabs },
-    { label: 'Paste Selection', action: 'paste_from_selection', shortcut: '⌘⇧V', icon: '📄', disabled: !hasTabs },
-    { label: 'Select All', action: 'select_all', shortcut: '⌘A', icon: '▣', disabled: !hasTabs },
+    { label: 'Copy', action: 'copy_to_clipboard', shortcut: shortcutFor('copy_to_clipboard'), icon: '⧉', disabled: !hasTabs },
+    { label: 'Paste', action: 'paste_from_clipboard', shortcut: shortcutFor('paste_from_clipboard'), icon: '📋', disabled: !hasTabs },
+    { label: 'Paste Selection', action: 'paste_from_selection', shortcut: shortcutFor('paste_from_selection'), icon: '📄', disabled: !hasTabs },
+    { label: 'Select All', action: 'select_all', shortcut: shortcutFor('select_all'), icon: '▣', disabled: !hasTabs },
   ]);
 
   // View menu: Show All Tabs, Font, Command Palette, Change Title, Quick Terminal, Inspector
   let viewMenuItems = $derived<MenuItem[]>([
-    { label: 'Show All Tabs', action: '_show_all_tabs', shortcut: '⌘⇧A', icon: '⊞', disabled: !hasTabs },
+    { label: 'Show All Tabs', action: '_show_all_tabs', shortcut: shortcutFor('_show_all_tabs'), icon: '⊞', disabled: !hasTabs },
     { separator: true },
-    { label: 'Increase Font', action: 'increase_font_size:1', shortcut: '⌘=', icon: 'A+', disabled: !hasTabs },
-    { label: 'Decrease Font', action: 'decrease_font_size:1', shortcut: '⌘-', icon: 'A−', disabled: !hasTabs },
-    { label: 'Reset Font', action: 'reset_font_size', shortcut: '⌘0', icon: 'A', disabled: !hasTabs },
+    { label: 'Increase Font', action: 'increase_font_size:1', shortcut: shortcutFor('increase_font_size:1'), icon: 'A+', disabled: !hasTabs },
+    { label: 'Decrease Font', action: 'decrease_font_size:1', shortcut: shortcutFor('decrease_font_size:1'), icon: 'A−', disabled: !hasTabs },
+    { label: 'Reset Font', action: 'reset_font_size', shortcut: shortcutFor('reset_font_size'), icon: 'A', disabled: !hasTabs },
     { separator: true },
-    { label: 'Command Palette', action: '_command_palette', shortcut: '⌘⇧K', icon: '⌘' },
+    { label: 'Command Palette', action: '_command_palette', shortcut: shortcutFor('_command_palette'), icon: '⌘' },
     { label: 'Change Title...', action: '_change_title', icon: '✎', disabled: !hasTabs },
     { separator: true },
-    { label: 'Quick Terminal', action: '_quick_terminal', shortcut: '⌥⌘\\', icon: '▼' },
+    { label: 'Quick Terminal', action: '_quick_terminal', shortcut: shortcutFor('_quick_terminal'), icon: '▼' },
     { separator: true },
-    { label: 'Toggle Inspector', action: '_toggle_inspector', shortcut: '⌥⌘I', icon: '🔍', disabled: !hasTabs },
+    { label: 'Toggle Inspector', action: '_toggle_inspector', shortcut: shortcutFor('_toggle_inspector'), icon: '🔍', disabled: !hasTabs },
   ]);
 
   // Window menu: Fullscreen, Tab navigation, Split navigation/resize
@@ -140,24 +154,24 @@
   );
 
   let windowMenuItems = $derived<MenuItem[]>([
-    { label: 'Toggle Full Screen', action: '_toggle_fullscreen', shortcut: '⌘⇧F', icon: '⛶' },
-    { label: 'Show Previous Tab', action: '_previous_tab', icon: '◀', disabled: !hasMultipleTabs },
-    { label: 'Show Next Tab', action: '_next_tab', icon: '▶', disabled: !hasMultipleTabs },
+    { label: 'Toggle Full Screen', action: '_toggle_fullscreen', shortcut: shortcutFor('_toggle_fullscreen'), icon: '⛶' },
+    { label: 'Show Previous Tab', action: '_previous_tab', shortcut: shortcutFor('_previous_tab'), icon: '◀', disabled: !hasMultipleTabs },
+    { label: 'Show Next Tab', action: '_next_tab', shortcut: shortcutFor('_next_tab'), icon: '▶', disabled: !hasMultipleTabs },
     { separator: true },
     // Split menu items (split-menu-item class in original - visible only when splits exist)
-    { label: 'Zoom Split', action: '_zoom_split', shortcut: '⌘⇧↵', icon: '⤢', disabled: !hasTabs },
-    { label: 'Select Previous Split', action: '_previous_split', shortcut: '⌘[', icon: '⇤', disabled: !hasTabs },
-    { label: 'Select Next Split', action: '_next_split', shortcut: '⌘]', icon: '⇥', disabled: !hasTabs },
+    { label: 'Zoom Split', action: '_zoom_split', shortcut: shortcutFor('_zoom_split'), icon: '⤢', disabled: !hasTabs },
+    { label: 'Select Previous Split', action: '_previous_split', shortcut: shortcutFor('_previous_split'), icon: '⇤', disabled: !hasTabs },
+    { label: 'Select Next Split', action: '_next_split', shortcut: shortcutFor('_next_split'), icon: '⇥', disabled: !hasTabs },
     // Select Split submenu
     {
       label: 'Select Split',
       icon: '◫',
       disabled: !hasTabs,
       submenu: [
-        { label: 'Select Split Above', action: '_select_split_up', shortcut: '⌘⇧↑', icon: '↑', disabled: !hasTabs },
-        { label: 'Select Split Below', action: '_select_split_down', shortcut: '⌘⇧↓', icon: '↓', disabled: !hasTabs },
-        { label: 'Select Split Left', action: '_select_split_left', shortcut: '⌘⇧←', icon: '←', disabled: !hasTabs },
-        { label: 'Select Split Right', action: '_select_split_right', shortcut: '⌘⇧→', icon: '→', disabled: !hasTabs },
+        { label: 'Select Split Above', action: '_select_split_up', shortcut: shortcutFor('_select_split_up'), icon: '↑', disabled: !hasTabs },
+        { label: 'Select Split Below', action: '_select_split_down', shortcut: shortcutFor('_select_split_down'), icon: '↓', disabled: !hasTabs },
+        { label: 'Select Split Left', action: '_select_split_left', shortcut: shortcutFor('_select_split_left'), icon: '←', disabled: !hasTabs },
+        { label: 'Select Split Right', action: '_select_split_right', shortcut: shortcutFor('_select_split_right'), icon: '→', disabled: !hasTabs },
       ],
     },
     // Resize Split submenu
@@ -518,7 +532,7 @@
         const unsub = sessions.subscribe(list => {
           if (settled) return;
           const defaultSession = list.find(s => s.id === 'default');
-          if (defaultSession?.editorToken) {
+          if (defaultSession?.token) {
             settled = true;
             setTimeout(() => unsub());
             shareDialogUrl = `${window.location.origin}?token=${encodeURIComponent(defaultSession.token)}`;
@@ -535,6 +549,24 @@
         break;
       case '_manage_shares':
         adminSharesOpen = true;
+        break;
+      case 'reload_config':
+        muxClient?.sendViewAction('reload_config');
+        break;
+      case 'open_config':
+        configEditorLoading = true;
+        configEditorOpen = true;
+        muxClient?.sendViewAction('open_config');
+        break;
+      case 'move_tab:-1':
+      case 'move_tab:1':
+        muxClient?.sendViewAction(action);
+        break;
+      case '_save_screen':
+        muxClient?.sendViewAction('write_screen_file:copy');
+        break;
+      case '_save_selection':
+        muxClient?.sendViewAction('write_selection_file:copy');
         break;
       default:
         // Handle dynamic tab selection from Window Tab List
@@ -556,6 +588,11 @@
         // Wire transfer dialog callbacks
         muxClient.onUploadRequest = () => openUploadDialog();
         muxClient.onDownloadRequest = () => openDownloadDialog();
+        muxClient.onConfigContent = (path: string, content: string) => {
+          configEditorPath = path;
+          configEditorContent = content;
+          configEditorLoading = false;
+        };
         muxClient.onFileDropRequest = (_panel, files, dirHandle) => openFileDropDialog(files, dirHandle);
 
         // Initialize download entry when transfer starts (creates single entry with correct totals)
@@ -674,6 +711,18 @@
     muxClient?.destroy();
   });
 
+  // Check if a keyboard event matches a keybinding
+  function matchesBinding(e: KeyboardEvent, binding: KeyBinding): boolean {
+    const key = e.key.toLowerCase();
+    if (key !== binding.key) return false;
+    const hasMod = (mod: string) => binding.mods.includes(mod);
+    if (hasMod('super') !== e.metaKey) return false;
+    if (hasMod('shift') !== e.shiftKey) return false;
+    if (hasMod('alt') !== e.altKey) return false;
+    if (hasMod('ctrl') !== e.ctrlKey) return false;
+    return true;
+  }
+
   // Setup keyboard shortcuts and input forwarding
   function handleKeydown(e: KeyboardEvent) {
     // Skip if dialog is open - let them handle their own keyboard events
@@ -683,115 +732,13 @@
 
     const key = e.key.toLowerCase();
 
-    // Application shortcuts (Cmd+key combinations)
-    if (e.metaKey && e.shiftKey && key === 'k') {
-      e.preventDefault();
-      commandPaletteOpen = true;
+    // Special case: Cmd+V (native paste) — must not preventDefault
+    if (e.metaKey && key === 'v' && !e.shiftKey && !e.altKey) {
       return;
-    } else if (e.metaKey && key === '/') {
-      e.preventDefault();
-      handleNewTab();
-      return;
-    } else if (e.metaKey && e.shiftKey && key === '.') {
-      e.preventDefault();
-      if (!e.repeat) handleCommand('_close_window');
-      return;
-    } else if (e.metaKey && e.altKey && key === '.') {
-      e.preventDefault();
-      if (!e.repeat) handleCommand('_close_tab');
-      return;
-    } else if (e.metaKey && key === '.') {
-      e.preventDefault();
-      if (!e.repeat) handleCommand('_close');
-      return;
-    } else if (e.metaKey && key === 'd') {
-      e.preventDefault();
-      if (e.shiftKey) {
-        handleCommand('_split_down');
-      } else {
-        handleCommand('_split_right');
-      }
-      return;
-    } else if (e.metaKey && e.shiftKey && (key === 'a' || key === '\\')) {
-      e.preventDefault();
-      handleShowAllTabs();
-      return;
-    } else if (e.metaKey && key === 'u') {
-      e.preventDefault();
-      handleCommand('_upload');
-      return;
-    } else if (e.metaKey && e.shiftKey && key === 's') {
-      e.preventDefault();
-      handleCommand('_download');
-      return;
-    } else if (e.metaKey && e.shiftKey && key === 'f') {
-      e.preventDefault();
-      handleCommand('_toggle_fullscreen');
-      return;
-    } else if (e.metaKey && e.altKey && e.code === 'Backslash') {
-      e.preventDefault();
-      handleCommand('_quick_terminal');
-      return;
-    } else if (e.metaKey && e.shiftKey && key === '[') {
-      e.preventDefault();
-      handleCommand('_previous_tab');
-      return;
-    } else if (e.metaKey && e.shiftKey && key === ']') {
-      e.preventDefault();
-      handleCommand('_next_tab');
-      return;
-    } else if (e.metaKey && key === '[') {
-      e.preventDefault();
-      handleCommand('_previous_split');
-      return;
-    } else if (e.metaKey && key === ']') {
-      e.preventDefault();
-      handleCommand('_next_split');
-      return;
-    } else if (e.metaKey && e.shiftKey && key === 'enter') {
-      e.preventDefault();
-      handleCommand('_zoom_split');
-      return;
-    } else if (e.metaKey && e.shiftKey) {
-      if (key === 'v') {
-        e.preventDefault();
-        handleCommand('paste_from_selection');
-        return;
-      } else if (key === 'arrowup') {
-        e.preventDefault();
-        handleCommand('_select_split_up');
-        return;
-      } else if (key === 'arrowdown') {
-        e.preventDefault();
-        handleCommand('_select_split_down');
-        return;
-      } else if (key === 'arrowleft') {
-        e.preventDefault();
-        handleCommand('_select_split_left');
-        return;
-      } else if (key === 'arrowright') {
-        e.preventDefault();
-        handleCommand('_select_split_right');
-        return;
-      }
-    } else if (e.metaKey && e.altKey && e.code === 'KeyI') {
-      e.preventDefault();
-      handleCommand('_toggle_inspector');
-      return;
-    } else if (e.metaKey && key === '=') {
-      e.preventDefault();
-      handleCommand('increase_font_size:1');
-      return;
-    } else if (e.metaKey && key === '-') {
-      e.preventDefault();
-      handleCommand('decrease_font_size:1');
-      return;
-    } else if (e.metaKey && key === '0') {
-      e.preventDefault();
-      handleCommand('reset_font_size');
-      return;
-    } else if (e.metaKey && key >= '1' && key <= '9') {
-      // Tab switching with Cmd+1-9
+    }
+
+    // Special case: Tab switching with Cmd+1-9
+    if (e.metaKey && !e.shiftKey && !e.altKey && key >= '1' && key <= '9') {
       e.preventDefault();
       const tabIndex = parseInt(key) - 1;
       const tabArray = Array.from($tabs.values());
@@ -799,18 +746,20 @@
         muxClient?.selectTab(tabArray[tabIndex].id);
       }
       return;
-    } else if (e.metaKey && key === 'c' && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      handleCommand('copy_to_clipboard');
-      return;
-    } else if (e.metaKey && key === 'v' && !e.shiftKey && !e.altKey) {
-      // Don't preventDefault — let the browser fire native paste event on the focused panel.
-      // Panel.svelte's handlePaste detects files (→ upload) vs text (→ terminal paste).
-      return;
-    } else if (e.metaKey && key === 'a' && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      handleCommand('select_all');
-      return;
+    }
+
+    // Dynamic keybinding matching from server config
+    const bindings = $keybindings;
+    for (const [action, binding] of Object.entries(bindings)) {
+      if (matchesBinding(e, binding)) {
+        e.preventDefault();
+        // Close/destroy actions should not fire on key repeat
+        if (e.repeat && (action === '_close' || action === '_close_tab' || action === '_close_window')) {
+          return;
+        }
+        handleCommand(action);
+        return;
+      }
     }
 
     // Forward all other keys to active panel
@@ -892,10 +841,10 @@
         <h2>Welcome to Termweb</h2>
         <div class="shortcuts">
           <button type="button" class="shortcut" onclick={handleNewTab}>
-            <span>New Tab</span><kbd>⌘/</kbd>
+            <span>New Tab</span><kbd>{shortcutFor('_new_tab') || '⌘/'}</kbd>
           </button>
           <button type="button" class="shortcut" onclick={() => commandPaletteOpen = true}>
-            <span>Command Palette</span><kbd>⌘⇧K</kbd>
+            <span>Command Palette</span><kbd>{shortcutFor('_command_palette') || '⌘⇧K'}</kbd>
           </button>
         </div>
       </div>
@@ -935,6 +884,16 @@
     shareUrl={shareDialogUrl}
     title={shareDialogTitle}
     loading={shareDialogLoading}
+  />
+
+  <!-- Config Editor -->
+  <ConfigEditor
+    open={configEditorOpen}
+    onClose={() => { configEditorOpen = false; configEditorLoading = false; }}
+    onSave={(content) => muxClient?.saveConfig(content)}
+    configPath={configEditorPath}
+    configContent={configEditorContent}
+    loading={configEditorLoading}
   />
 
   <!-- Admin Shares Dialog -->
@@ -1218,11 +1177,16 @@
     left: 0;
     width: 100%;
     height: 100%;
-    display: none;
+    display: flex;
+    visibility: hidden;
+    pointer-events: none;
+    z-index: 0;
   }
 
   :global(.tab-content.active) {
-    display: flex;
+    visibility: visible;
+    pointer-events: auto;
+    z-index: 1;
   }
 
   :global(.panel) {

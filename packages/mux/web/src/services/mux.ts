@@ -4,15 +4,15 @@
  */
 import { writable, get } from 'svelte/store';
 import { mount, unmount } from 'svelte';
-import { tabs, activeTabId as activeTabIdStore, panels, activePanelId, ui, sessions, createPanelInfo, createTabInfo } from '../stores/index';
+import { tabs, activeTabId as activeTabIdStore, panels, activePanelId, ui, sessions, keybindings, createPanelInfo, createTabInfo } from '../stores/index';
 import PanelComponent from '../components/Panel.svelte';
 import { SplitContainer, type PanelLike } from '../split-container';
 import { FileTransferHandler } from '../file-transfer';
 import type { DryRunReport, TransferOptions } from '../file-transfer';
 import type { AppConfig, LayoutData, LayoutNode, LayoutTab } from '../types';
 import type { PanelStatus } from '../stores/types';
-import { applyColors, generateId, getWsUrl, getAuthUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
-import { TIMING, WS_PATHS, CONFIG_ENDPOINT, SERVER_MSG, UI } from '../constants';
+import { applyColors, generateId, getWsUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
+import { TIMING, WS_PATHS, SERVER_MSG, UI } from '../constants';
 import { BinaryCtrlMsg, Role } from '../protocol';
 import { initZstd, compressZstd, decompressZstd } from '../zstd-wasm';
 
@@ -114,6 +114,7 @@ export class MuxClient {
   // Callbacks for transfer dialog UI (set by App.svelte)
   onUploadRequest?: () => void;
   onDownloadRequest?: () => void;
+  onConfigContent?: (path: string, content: string) => void;
   onFileDropRequest?: (panel: PanelInstance, files: File[], dirHandle?: FileSystemDirectoryHandle) => void;
   onDownloadProgress?: (transferId: number, filesCompleted: number, totalFiles: number, bytesTransferred: number, totalBytes: number) => void;
 
@@ -516,10 +517,8 @@ export class MuxClient {
     await initZstd();
     this.zstdReady = true;
 
-    const config = await this.fetchConfig();
-    if (config.colors) {
-      applyColors(config.colors);
-    }
+    const config: AppConfig = (window as any).__TERMWEB_CONFIG__ || {};
+    this.applyConfig(config);
 
     const initialPanelListPromise = new Promise<void>((resolve) => {
       this.initialPanelListResolve = resolve;
@@ -579,14 +578,9 @@ export class MuxClient {
     this.previousActivePanel = null;
   }
 
-  private async fetchConfig(): Promise<AppConfig> {
-    try {
-      const response = await fetch(getAuthUrl(CONFIG_ENDPOINT));
-      if (!response.ok) return {};
-      return await response.json();
-    } catch {
-      return {};
-    }
+  private applyConfig(config: AppConfig): void {
+    if (config.colors) applyColors(config.colors);
+    if (config.keybindings) keybindings.set(config.keybindings);
   }
 
   private connectControl(): void {
@@ -952,6 +946,18 @@ export class MuxClient {
           if (panel) panel.handleInspectorState(state);
           break;
         }
+        case SERVER_MSG.CONFIG_UPDATED: {
+          if (data.byteLength > 1) {
+            try {
+              const jsonBytes = new Uint8Array(data, 1);
+              const updatedConfig: AppConfig = JSON.parse(sharedTextDecoder.decode(jsonBytes));
+              this.applyConfig(updatedConfig);
+            } catch (err) {
+              console.error('Failed to parse CONFIG_UPDATED payload:', err);
+            }
+          }
+          break;
+        }
         case SERVER_MSG.INSPECTOR_OPEN_STATE: {
           // [type:u8][open:u8] = 2 bytes
           if (data.byteLength < 2) break;
@@ -962,6 +968,41 @@ export class MuxClient {
               panel.toggleInspector(true);
             }
           }
+          break;
+        }
+        case SERVER_MSG.CONFIG_CONTENT: {
+          // [type:u8][path_len:u16_le][path...][content_len:u32_le][content...]
+          if (data.byteLength < 7) break;
+          const pathLen = view.getUint16(1, true);
+          if (data.byteLength < 3 + pathLen + 4) break;
+          const configPath = sharedTextDecoder.decode(bytes.slice(3, 3 + pathLen));
+          const contentLen = view.getUint32(3 + pathLen, true);
+          const contentStart = 7 + pathLen;
+          if (data.byteLength < contentStart + contentLen) break;
+          const configContent = sharedTextDecoder.decode(bytes.slice(contentStart, contentStart + contentLen));
+          this.onConfigContent?.(configPath, configContent);
+          break;
+        }
+        case SERVER_MSG.SCREEN_DUMP: {
+          // [type:u8][filename_len:u8][filename...][content_len:u32_le][content...]
+          if (data.byteLength < 6) break;
+          const filenameLen = view.getUint8(1);
+          if (data.byteLength < 2 + filenameLen + 4) break;
+          const filename = sharedTextDecoder.decode(bytes.slice(2, 2 + filenameLen));
+          const contentLen = view.getUint32(2 + filenameLen, true);
+          const contentStart = 6 + filenameLen;
+          if (data.byteLength < contentStart + contentLen) break;
+          const content = bytes.slice(contentStart, contentStart + contentLen);
+          // Trigger browser download
+          const blob = new Blob([content], { type: 'text/plain' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename || 'screen.txt';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
           break;
         }
         default:
@@ -997,11 +1038,67 @@ export class MuxClient {
   }
 
   private handleLayoutUpdate(layout: LayoutData): void {
+    // Build a set of server tab IDs for later cleanup
+    const serverTabIds = new Set(layout.tabs.map(t => String(t.id)));
+
     // Handle new tabs incrementally — create only what's missing
     for (const tabLayout of layout.tabs) {
-      if (!this.tabInstances.has(String(tabLayout.id))) {
-        console.log(`[MUX] Layout has new tab ${tabLayout.id} — creating`);
-        this.restoreTab(tabLayout);
+      const serverTabId = String(tabLayout.id);
+      if (!this.tabInstances.has(serverTabId)) {
+        // Before creating a duplicate, check if an existing client tab already
+        // has the same panel(s) — this happens when the client creates a tab
+        // locally (with a client-generated ID) before the server assigns its own ID.
+        const serverPanelIds = new Set<number>();
+        this.collectLayoutPanelIds(tabLayout.root, serverPanelIds);
+
+        let remapped = false;
+        for (const [clientTabId, clientTab] of this.tabInstances) {
+          if (serverTabIds.has(clientTabId)) continue; // Already matched to a server tab
+          const clientPanels = clientTab.root.getAllPanels();
+          const overlap = clientPanels.some(p => p.serverId !== null && serverPanelIds.has(p.serverId));
+          if (overlap) {
+            // Remap: update the client tab ID to match the server's
+            console.log(`[MUX] Remapping client tab ${clientTabId} → server tab ${serverTabId}`);
+            this.tabInstances.delete(clientTabId);
+            clientTab.id = serverTabId;
+            clientTab.element.dataset.tabId = serverTabId;
+            this.tabInstances.set(serverTabId, clientTab);
+            tabs.remove(clientTabId);
+            tabs.add({ id: serverTabId, title: clientTab.title, panelIds: clientPanels.map(p => p.id) });
+            // Fix tab history references
+            this.tabHistory = this.tabHistory.map(id => id === clientTabId ? serverTabId : id);
+            // Fix active tab store if it pointed to the old ID
+            if (get(activeTabIdStore) === clientTabId) {
+              activeTabIdStore.set(serverTabId);
+            }
+            this.nextTabId = Math.max(this.nextTabId, tabLayout.id + 1);
+            remapped = true;
+            break;
+          }
+        }
+
+        if (!remapped) {
+          console.log(`[MUX] Layout has new tab ${tabLayout.id} — creating`);
+          this.restoreTab(tabLayout);
+        }
+      }
+    }
+
+    // Remove client tabs that no longer exist in the server layout
+    for (const clientTabId of Array.from(this.tabInstances.keys())) {
+      if (!serverTabIds.has(clientTabId)) {
+        // Check if this tab has any panels — if it has unmatched panels, it might
+        // be a local-only tab that hasn't been assigned a server ID yet
+        const clientTab = this.tabInstances.get(clientTabId);
+        if (clientTab) {
+          const clientPanels = clientTab.root.getAllPanels();
+          const hasUnassignedPanel = clientPanels.some(p => p.serverId === null);
+          if (!hasUnassignedPanel) {
+            // All panels have server IDs but tab isn't in server layout — stale, remove it
+            console.log(`[MUX] Removing stale client tab ${clientTabId} (not in server layout)`);
+            this.closeTab(clientTabId);
+          }
+        }
       }
     }
 
@@ -1227,6 +1324,12 @@ export class MuxClient {
           const scale = window.devicePixelRatio || 1;
           this.sendResizePanelWithScale(panelId, w, h, scale);
         }
+        // Now that we have a real serverId, re-activate this panel if it's the
+        // current active one. This sends FOCUS_PANEL to the server (skipped
+        // earlier because serverId was null) and ensures the tab is properly shown.
+        if (this.currentActivePanel?.id === panel.id) {
+          this.setActivePanel(panel);
+        }
         break;
       }
     }
@@ -1302,6 +1405,16 @@ export class MuxClient {
   selectTab(tabId: string): void {
     const tab = this.tabInstances.get(tabId);
     if (!tab) return;
+
+    // Always update DOM state: remove 'active' from all tabs, add to this one
+    for (const t of this.tabInstances.values()) {
+      t.element.classList.remove('active');
+    }
+    tab.element.classList.add('active');
+    activeTabIdStore.set(tabId);
+    this.tabHistory = this.tabHistory.filter(id => id !== tabId);
+    this.tabHistory.push(tabId);
+
     const allPanels = tab.root.getAllPanels();
     if (allPanels.length > 0) {
       this.setActivePanel(allPanels[0] as PanelInstance);
@@ -1472,18 +1585,20 @@ export class MuxClient {
       this.currentActivePanel = panel;
       panel.focus();
 
-      // Derive active tab from the panel's tab
+      // Always sync tab DOM state from the panel's tab
       const tabId = this.findTabIdForPanel(panel);
-      if (tabId && tabId !== get(activeTabIdStore)) {
+      if (tabId) {
         for (const t of this.tabInstances.values()) {
           t.element.classList.remove('active');
         }
         const tab = this.tabInstances.get(tabId);
         if (tab) tab.element.classList.add('active');
-        activeTabIdStore.set(tabId);
-        this.tabHistory = this.tabHistory.filter(id => id !== tabId);
-        this.tabHistory.push(tabId);
-        // Update browser title to match the new active tab
+        if (tabId !== get(activeTabIdStore)) {
+          activeTabIdStore.set(tabId);
+          this.tabHistory = this.tabHistory.filter(id => id !== tabId);
+          this.tabHistory.push(tabId);
+        }
+        // Update browser title
         const tabInfo = tabs.get(tabId);
         document.title = tabInfo?.title || '👻';
       }
@@ -1949,6 +2064,15 @@ export class MuxClient {
     data[4] = actionBytes.length;
     data.set(actionBytes, 5);
     this.sendControlMessage(BinaryCtrlMsg.VIEW_ACTION, data);
+  }
+
+  saveConfig(content: string): void {
+    const contentBytes = sharedTextEncoder.encode(content);
+    const data = new Uint8Array(4 + contentBytes.length);
+    const view = new DataView(data.buffer);
+    view.setUint32(0, contentBytes.length, true);
+    data.set(contentBytes, 4);
+    this.sendControlMessage(BinaryCtrlMsg.SAVE_CONFIG, data);
   }
 
   // --- Multiplayer: Pane Assignment ---

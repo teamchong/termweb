@@ -1,6 +1,7 @@
 // Dialog components - command palette, upload/download, access control
 
 import { formatBytes } from './utils';
+import type { KeyBinding } from './types';
 
 import { TIMING } from './constants';
 
@@ -15,13 +16,9 @@ export interface Command {
 
 // Cached sorted commands (computed once at module load)
 const cachedCommands: Command[] = [
-  // Copy to File Operations (require active panel)
-  { title: 'Copy Screen to Temporary File and Copy Path', action: 'write_screen_file:copy', description: 'Save screen to temp file and copy path', shortcut: '⌃⇧⌘J', requiresPanel: true },
-  { title: 'Copy Screen to Temporary File and Open', action: 'write_screen_file:open', description: 'Save screen to temp file and open it', shortcut: '⌥⇧⌘J', requiresPanel: true },
-  { title: 'Copy Screen to Temporary File and Paste Path', action: 'write_screen_file:paste', description: 'Save screen to temp file and paste path', shortcut: '⇧⌘J', requiresPanel: true },
-  { title: 'Copy Selection to Temporary File and Copy Path', action: 'write_selection_file:copy', description: 'Save selection to temp file and copy path', requiresPanel: true },
-  { title: 'Copy Selection to Temporary File and Open', action: 'write_selection_file:open', description: 'Save selection to temp file and open it', requiresPanel: true },
-  { title: 'Copy Selection to Temporary File and Paste Path', action: 'write_selection_file:paste', description: 'Save selection to temp file and paste path', requiresPanel: true },
+  // Screen/Selection Download (require active panel)
+  { title: 'Save Screen to File', action: '_save_screen', description: 'Download terminal screen content', shortcut: '⇧⌘J', requiresPanel: true },
+  { title: 'Save Selection to File', action: '_save_selection', description: 'Download selected text', requiresPanel: true },
   { title: 'Copy Terminal Title to Clipboard', action: 'copy_title_to_clipboard', description: 'Copy terminal title to clipboard', requiresPanel: true },
 
   // Text Operations (require active panel)
@@ -61,15 +58,15 @@ const cachedCommands: Command[] = [
   { title: 'Split Left', action: '_split_left', description: 'Split pane to the left', requiresPanel: true },
   { title: 'Split Up', action: '_split_up', description: 'Split pane upward', requiresPanel: true },
 
-  // Navigation (require active panel)
-  { title: 'Focus Split: Left', action: 'goto_split:left', description: 'Focus left split', shortcut: '⌥⌘←', requiresPanel: true },
-  { title: 'Focus Split: Right', action: 'goto_split:right', description: 'Focus right split', shortcut: '⌥⌘→', requiresPanel: true },
-  { title: 'Focus Split: Up', action: 'goto_split:up', description: 'Focus split above', shortcut: '⌥⌘↑', requiresPanel: true },
-  { title: 'Focus Split: Down', action: 'goto_split:down', description: 'Focus split below', shortcut: '⌥⌘↓', requiresPanel: true },
-  { title: 'Focus Split: Previous', action: 'goto_split:previous', description: 'Focus previous split', requiresPanel: true },
-  { title: 'Focus Split: Next', action: 'goto_split:next', description: 'Focus next split', requiresPanel: true },
-  { title: 'Toggle Split Zoom', action: 'toggle_split_zoom', description: 'Toggle zoom on current split', shortcut: '⇧⌘↩', requiresPanel: true },
-  { title: 'Equalize Splits', action: 'equalize_splits', description: 'Make all splits equal size', requiresPanel: true },
+  // Navigation (require active panel) — uses client-side handlers (_select_split_*, _zoom_split, _equalize_splits)
+  { title: 'Focus Split: Left', action: '_select_split_left', description: 'Focus left split', shortcut: '⌥⌘←', requiresPanel: true },
+  { title: 'Focus Split: Right', action: '_select_split_right', description: 'Focus right split', shortcut: '⌥⌘→', requiresPanel: true },
+  { title: 'Focus Split: Up', action: '_select_split_up', description: 'Focus split above', shortcut: '⌥⌘↑', requiresPanel: true },
+  { title: 'Focus Split: Down', action: '_select_split_down', description: 'Focus split below', shortcut: '⌥⌘↓', requiresPanel: true },
+  { title: 'Focus Split: Previous', action: '_previous_split', description: 'Focus previous split', requiresPanel: true },
+  { title: 'Focus Split: Next', action: '_next_split', description: 'Focus next split', requiresPanel: true },
+  { title: 'Toggle Split Zoom', action: '_zoom_split', description: 'Toggle zoom on current split', shortcut: '⇧⌘↩', requiresPanel: true },
+  { title: 'Equalize Splits', action: '_equalize_splits', description: 'Make all splits equal size', requiresPanel: true },
 
   // Terminal Control (require active panel)
   { title: 'Reset Terminal', action: 'reset', description: 'Reset terminal state', requiresPanel: true },
@@ -90,11 +87,36 @@ const cachedCommands: Command[] = [
   { title: 'Ghostty', action: 'text:👻', description: 'Add a little ghost to your terminal', requiresPanel: true },
 ].sort((a, b) => a.title.localeCompare(b.title));
 
+const keyDisplayMap: Record<string, string> = {
+  'enter': '↵', 'arrowup': '↑', 'arrowdown': '↓',
+  'arrowleft': '←', 'arrowright': '→', 'backslash': '\\',
+  'backquote': '`', ' ': '␣', 'escape': 'Esc', 'tab': '⇥',
+  'delete': '⌫', 'backspace': '⌫',
+};
+
+/** Format a keybinding as a human-readable shortcut string (e.g. "⌘⇧K") */
+export function formatShortcut(binding: KeyBinding): string {
+  let result = '';
+  if (binding.mods.includes('ctrl')) result += '⌃';
+  if (binding.mods.includes('alt')) result += '⌥';
+  if (binding.mods.includes('shift')) result += '⇧';
+  if (binding.mods.includes('super')) result += '⌘';
+  result += keyDisplayMap[binding.key] || binding.key.toUpperCase();
+  return result;
+}
+
 /**
- * Get the list of available commands (cached, sorted alphabetically)
+ * Get the list of available commands, optionally with dynamic shortcuts from server.
  */
-export function getCommands(): Command[] {
-  return cachedCommands;
+export function getCommands(bindings?: Record<string, KeyBinding>): Command[] {
+  if (!bindings || Object.keys(bindings).length === 0) return cachedCommands;
+  return cachedCommands.map(cmd => {
+    const binding = bindings[cmd.action];
+    if (binding) {
+      return { ...cmd, shortcut: formatShortcut(binding) };
+    }
+    return cmd;
+  });
 }
 
 export class CommandPalette {

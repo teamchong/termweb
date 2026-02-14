@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getCommands, type Command } from '../dialogs';
-  import { tabs, activePanelId } from '../stores/index';
+  import { tabs, activePanelId, keybindings } from '../stores/index';
 
   interface Props {
     open?: boolean;
@@ -21,8 +21,8 @@
   let hasTabs = $derived($tabs.size > 0);
   let hasActivePanel = $derived($activePanelId !== null);
 
-  // Commands
-  const allCommands = getCommands();
+  // Commands (reactive to keybinding changes from server)
+  let allCommands = $derived(getCommands($keybindings));
 
   // Filtered commands
   let filteredCommands = $derived.by(() => {

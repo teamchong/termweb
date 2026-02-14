@@ -37,6 +37,7 @@ export const BinaryCtrlMsg = {
   PANEL_INPUT: 0x86,      // Coworker input to assigned panel: [panel_id:u32][input_msg...]
   PANEL_MSG: 0x87,        // Panel message envelope: [type:u8][panel_id:u32][inner_msg...] — routes panel input through zstd WS
   SET_INSPECTOR: 0x8B,    // Set inspector open/closed state: [type:u8][open:u8]
+  SAVE_CONFIG: 0x8D,      // Save config file: [type:u8][content_len:u32_le][content...]
   // Auth messages (must match server AuthMsg enum 0x90-0x9F)
   GET_AUTH_STATE: 0x90,
   SET_PASSWORD: 0x91,
@@ -67,6 +68,7 @@ export const ServerCtrlMsg = {
   QUICK_TERMINAL_STATE: 0x0F,  // Quick terminal open/closed state
   MAIN_CLIENT_STATE: 0x10,  // Main client election: [type:u8][is_main:u8][client_id:u32]
   INSPECTOR_OPEN_STATE: 0x1E,  // Inspector open/closed state
+  CONFIG_UPDATED: 0x1F,  // Config reloaded: clients should refetch /config
 } as const;
 
 // Transfer protocol message types

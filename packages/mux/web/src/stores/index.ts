@@ -3,7 +3,7 @@
  */
 import { writable, derived, get } from 'svelte/store';
 import type { PanelInfo, TabInfo, UIState, PanelStatus } from './types';
-import type { Session } from '../types';
+import type { Session, KeyBinding } from '../types';
 
 // Re-export types
 export * from './types';
@@ -135,6 +135,12 @@ export function toggleCommandPalette() {
 // ============================================================================
 
 export const sessions = writable<Session[]>([]);
+
+// ============================================================================
+// Keybindings Store (from server config)
+// ============================================================================
+
+export const keybindings = writable<Record<string, KeyBinding>>({});
 
 // ============================================================================
 // Helpers
