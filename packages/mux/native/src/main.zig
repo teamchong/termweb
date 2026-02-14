@@ -214,6 +214,9 @@ pub const BinaryCtrlMsg = enum(u8) {
     remove_passkey = 0x9A,       // Remove passkey credential
     get_session_list = 0x9B,     // Request session list (admin only)
     get_share_links = 0x9C,      // Request share links (admin only)
+    get_oauth_config = 0x9D,     // Request OAuth provider status (admin only)
+    set_oauth_config = 0x8E,     // Set OAuth provider config (admin only)
+    remove_oauth_config = 0x8F,  // Remove OAuth provider config (admin only)
 };
 
 // Layout Management (persisted to disk)
@@ -3248,6 +3251,48 @@ const Server = struct {
                 if (role != .admin) return;
                 self.sendShareLinks(conn);
             },
+            0x9D => { // get_oauth_config
+                if (role != .admin) return;
+                self.sendOAuthConfig(conn);
+            },
+            0x8E => { // set_oauth_config: [0x8E][provider_len:u8][provider][id_len:u16][id][secret_len:u16][secret]
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 2) return;
+                const prov_len = data[1];
+                if (data.len < 2 + prov_len + 4) return;
+                const provider_name = data[2..][0..prov_len];
+                var off: usize = 2 + prov_len;
+                const id_len = std.mem.readInt(u16, data[off..][0..2], .little);
+                off += 2;
+                if (data.len < off + id_len + 2) return;
+                const client_id = data[off..][0..id_len];
+                off += id_len;
+                const secret_len = std.mem.readInt(u16, data[off..][0..2], .little);
+                off += 2;
+                if (data.len < off + secret_len) return;
+                const client_secret = data[off..][0..secret_len];
+
+                self.auth_state.setOAuthProvider(provider_name, client_id, client_secret) catch {
+                    self.sendAuthError(conn, "Failed to save OAuth config");
+                    return;
+                };
+                self.sendOAuthConfig(conn);
+            },
+            0x8F => { // remove_oauth_config: [0x8F][provider_len:u8][provider]
+                if (role != .admin) {
+                    self.sendAuthError(conn, "Permission denied");
+                    return;
+                }
+                if (data.len < 2) return;
+                const prov_len = data[1];
+                if (data.len < 2 + prov_len) return;
+                const provider_name = data[2..][0..prov_len];
+                self.auth_state.removeOAuthProvider(provider_name) catch {};
+                self.sendOAuthConfig(conn);
+            },
             else => {
                 std.log.warn("Unknown auth message type: 0x{x:0>2}", .{msg_type});
             },
@@ -3444,13 +3489,30 @@ const Server = struct {
         const role = self.getConnectionRole(conn);
 
         // Build auth state message
-        // [0x0A][role:u8][auth_required:u8][has_password:u8][passkey_count:u8]
-        var msg: [5]u8 = undefined;
+        // [0x0A][role:u8][auth_required:u8][has_password:u8][passkey_count:u8][github_configured:u8][google_configured:u8]
+        var msg: [7]u8 = undefined;
         msg[0] = 0x0A; // auth_state
         msg[1] = @intFromEnum(role);
         msg[2] = if (self.auth_state.auth_required) 1 else 0;
         msg[3] = if (self.auth_state.admin_password_hash != null) 1 else 0;
         msg[4] = @intCast(self.auth_state.passkey_credentials.items.len);
+        msg[5] = if (self.auth_state.github_oauth != null) 1 else 0;
+        msg[6] = if (self.auth_state.google_oauth != null) 1 else 0;
+
+        conn.sendBinary(&msg) catch {};
+    }
+
+    /// Send OAuth provider configuration status to admin client.
+    /// [0x1A][github_configured:u8][google_configured:u8][default_role:u8]
+    fn sendOAuthConfig(self: *Server, conn: *ws.Connection) void {
+        const role = self.getConnectionRole(conn);
+        if (role != .admin) return;
+
+        var msg: [4]u8 = undefined;
+        msg[0] = 0x1A; // oauth_config
+        msg[1] = if (self.auth_state.github_oauth != null) 1 else 0;
+        msg[2] = if (self.auth_state.google_oauth != null) 1 else 0;
+        msg[3] = @intFromEnum(self.auth_state.oauth_default_role);
 
         conn.sendBinary(&msg) catch {};
     }

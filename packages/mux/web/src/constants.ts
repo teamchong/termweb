@@ -323,6 +323,8 @@ export const SERVER_MSG = {
   CONFIG_UPDATED: 0x1F,
   /** Config file content: [type:u8][path_len:u16_le][path...][content_len:u32_le][content...] */
   CONFIG_CONTENT: 0x20,
+  /** OAuth config status: [type:u8][github:u8][google:u8][default_role:u8] */
+  OAUTH_CONFIG: 0x1A,
 } as const;
 
 // ============================================================================

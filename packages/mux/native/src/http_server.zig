@@ -52,6 +52,78 @@ const html_after_config = embedded_index_html[config_split_pos + config_marker.l
 const config_script_prefix = "<script>window.__TERMWEB_CONFIG__=";
 const config_script_suffix = "</script>";
 
+// PWA manifest (served without auth)
+const pwa_manifest =
+    \\{"name":"termweb","short_name":"termweb","start_url":"/","display":"standalone",
+    \\"background_color":"#1a1a2e","theme_color":"#1a1a2e",
+    \\"icons":[{"src":"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👻</text></svg>","sizes":"any","type":"image/svg+xml"}]}
+;
+
+// Login page HTML template. GitHub/Google buttons are conditionally shown via data attributes
+// injected at serve time. The page is a simple centered card with token input and OAuth buttons.
+const login_page_html =
+    \\<!DOCTYPE html><html><head>
+    \\<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    \\<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👻</text></svg>">
+    \\<link rel="manifest" href="/manifest.json">
+    \\<title>termweb - Login</title>
+    \\<style>
+    \\*{margin:0;padding:0;box-sizing:border-box}
+    \\body{background:#1a1a2e;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    \\height:100vh;display:flex;align-items:center;justify-content:center}
+    \\.card{background:#16213e;border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:32px;
+    \\width:360px;max-width:90vw;text-align:center}
+    \\.logo{font-size:48px;margin-bottom:8px}
+    \\h1{font-size:20px;font-weight:600;margin-bottom:4px;color:#fff}
+    \\.subtitle{font-size:13px;color:#888;margin-bottom:24px}
+    \\.divider{border:none;border-top:1px solid rgba(255,255,255,0.1);margin:16px 0}
+    \\form{display:flex;flex-direction:column;gap:8px}
+    \\input[type=text]{background:#0f1629;border:1px solid rgba(255,255,255,0.15);border-radius:6px;
+    \\padding:10px 12px;color:#fff;font-size:14px;outline:none}
+    \\input[type=text]:focus{border-color:#7c3aed}
+    \\input[type=text]::placeholder{color:#555}
+    \\.btn{padding:10px 16px;border:none;border-radius:6px;font-size:14px;font-weight:500;
+    \\cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;width:100%;
+    \\transition:background .15s}
+    \\.btn-primary{background:#7c3aed;color:#fff}
+    \\.btn-primary:hover{background:#6d28d9}
+    \\.btn-github{background:#24292e;color:#fff}
+    \\.btn-github:hover{background:#2f363d}
+    \\.btn-google{background:#fff;color:#333}
+    \\.btn-google:hover{background:#f0f0f0}
+    \\.oauth-section{display:flex;flex-direction:column;gap:8px}
+    \\.error{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);
+    \\border-radius:6px;padding:8px;font-size:13px;color:#ef4444;margin-bottom:8px}
+    \\.hidden{display:none}
+    \\</style></head><body>
+    \\<div class="card">
+    \\<div class="logo">👻</div>
+    \\<h1>termweb</h1>
+    \\<div class="subtitle">Terminal in your browser</div>
+    \\<div id="error" class="error hidden"></div>
+    \\<div class="oauth-section">
+    \\<a id="gh-btn" class="btn btn-github hidden" href="/auth/github">
+    \\<svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+    \\Sign in with GitHub</a>
+    \\<a id="gg-btn" class="btn btn-google hidden" href="/auth/google">
+    \\<svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+    \\Sign in with Google</a>
+    \\</div>
+    \\<hr class="divider">
+    \\<form method="POST" action="/auth/login">
+    \\<input type="text" name="token" placeholder="Paste access token..." autocomplete="off" autofocus>
+    \\<button type="submit" class="btn btn-primary">Sign in with Token</button>
+    \\</form>
+    \\</div>
+    \\<script>
+    \\var p=new URLSearchParams(location.search);
+    \\if(p.get('error')){var e=document.getElementById('error');e.textContent=p.get('error');e.classList.remove('hidden')}
+    \\if(document.body.dataset.github==='1')document.getElementById('gh-btn').classList.remove('hidden');
+    \\if(document.body.dataset.google==='1')document.getElementById('gg-btn').classList.remove('hidden');
+    \\</script></body></html>
+;
+
+
 // Common headers for all responses:
 // - CORP cross-origin: allows resources to be loaded in cross-origin contexts
 // - No frame-ancestors CSP: omitted so non-network schemes (e.g. vscode-file://) can embed
@@ -236,49 +308,101 @@ pub const HttpServer = struct {
         // Split path from query string
         const path = if (std.mem.indexOf(u8, full_path, "?")) |idx| full_path[0..idx] else full_path;
 
-        if (!std.mem.eql(u8, method, "GET")) {
+        const is_get = std.mem.eql(u8, method, "GET");
+        const is_post = std.mem.eql(u8, method, "POST");
+        if (!is_get and !is_post) {
             self.sendError(stream, 405, "Method Not Allowed");
             stream.close();
             return;
         }
 
-        // Auth check — all requests require a valid token in query param
-        if (self.auth_state) |auth_st| {
-            const raw_token = auth.extractTokenFromQuery(full_path);
-            var token_buf: [256]u8 = undefined;
-            const token = if (raw_token) |t| auth.decodeToken(&token_buf, t) else null;
+        // Public paths — no auth required
+        const is_public = std.mem.eql(u8, path, "/manifest.json") or
+            std.mem.eql(u8, path, "/favicon.ico") or
+            std.mem.startsWith(u8, path, "/auth/");
 
-            if (token) |t| {
-                const result = auth_st.validateToken(t);
-                if (result.role == .none) {
-                    if (self.rate_limiter) |rl| rl.recordFailure(ip_str);
+        // Auth check — all requests except public paths require a valid token
+        if (!is_public) {
+            if (self.auth_state) |auth_st| {
+                const raw_token = auth.extractTokenFromQuery(full_path);
+                var token_buf: [256]u8 = undefined;
+                const token = if (raw_token) |t| auth.decodeToken(&token_buf, t) else null;
+
+                if (token) |t| {
+                    const result = auth_st.validateToken(t);
+                    if (result.role == .none) {
+                        if (self.rate_limiter) |rl| rl.recordFailure(ip_str);
+                        self.sendError(stream, 401, "Unauthorized");
+                        stream.close();
+                        return;
+                    }
+                    if (self.rate_limiter) |rl| rl.recordSuccess(ip_str);
+
+                    // Permanent token on non-WebSocket request → exchange for JWT and redirect
+                    if (auth.isPermanentToken(t) and !self.isWebSocketUpgrade(request)) {
+                        // For share links (no session_id), find a session matching the link's role
+                        const session = if (result.session_id) |sid|
+                            auth_st.getSession(sid)
+                        else
+                            auth_st.getSessionByRole(result.role) orelse auth_st.getSession("default");
+                        if (session) |s| {
+                            var jwt_buf: [256]u8 = undefined;
+                            const jwt = auth_st.createJwt(s, &jwt_buf);
+                            self.sendRedirectPage(stream, jwt);
+                            stream.close();
+                            return;
+                        }
+                    }
+                } else {
+                    // No token — serve login page on GET / instead of 401
+                    if (is_get and (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html"))) {
+                        self.sendLoginPage(stream);
+                        stream.close();
+                        return;
+                    }
                     self.sendError(stream, 401, "Unauthorized");
                     stream.close();
                     return;
                 }
-                if (self.rate_limiter) |rl| rl.recordSuccess(ip_str);
-
-                // Permanent token on non-WebSocket request → exchange for JWT and redirect
-                if (auth.isPermanentToken(t) and !self.isWebSocketUpgrade(request)) {
-                    // For share links (no session_id), find a session matching the link's role
-                    const session = if (result.session_id) |sid|
-                        auth_st.getSession(sid)
-                    else
-                        auth_st.getSessionByRole(result.role) orelse auth_st.getSession("default");
-                    if (session) |s| {
-                        var jwt_buf: [256]u8 = undefined;
-                        const jwt = auth_st.createJwt(s, &jwt_buf);
-                        self.sendRedirectPage(stream, jwt);
-                        stream.close();
-                        return;
-                    }
-                }
-            } else {
-                // No token at all
-                self.sendError(stream, 401, "Unauthorized");
-                stream.close();
-                return;
             }
+        }
+
+        // Handle POST routes
+        if (is_post) {
+            defer stream.close();
+            if (std.mem.eql(u8, path, "/auth/login")) {
+                self.handleAuthLogin(stream, request, n);
+            } else {
+                self.sendError(stream, 404, "Not Found");
+            }
+            return;
+        }
+
+        // Handle public GET routes
+        if (std.mem.eql(u8, path, "/manifest.json")) {
+            self.sendStaticContent(stream, "application/json", pwa_manifest);
+            stream.close();
+            return;
+        }
+        if (std.mem.eql(u8, path, "/auth/github")) {
+            self.handleOAuthRedirect(stream, "github", request);
+            stream.close();
+            return;
+        }
+        if (std.mem.eql(u8, path, "/auth/google")) {
+            self.handleOAuthRedirect(stream, "google", request);
+            stream.close();
+            return;
+        }
+        if (std.mem.eql(u8, path, "/auth/github/callback")) {
+            self.handleOAuthCallback(stream, "github", full_path, request);
+            stream.close();
+            return;
+        }
+        if (std.mem.eql(u8, path, "/auth/google/callback")) {
+            self.handleOAuthCallback(stream, "google", full_path, request);
+            stream.close();
+            return;
         }
 
         // Check for WebSocket upgrade
@@ -430,6 +554,379 @@ pub const HttpServer = struct {
         _ = stream.write(response) catch {};
     }
 
+    /// Serve the login page with OAuth provider flags injected as data attributes.
+    fn sendLoginPage(self: *HttpServer, stream: net.Stream) void {
+        // Determine which OAuth providers are configured
+        const has_github: bool = if (self.auth_state) |as| as.github_oauth != null else false;
+        const has_google: bool = if (self.auth_state) |as| as.google_oauth != null else false;
+
+        // Inject data attributes into the <body> tag
+        // The login page JS reads these to show/hide OAuth buttons
+        const body_attrs_buf = blk: {
+            var tmp: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "<body data-github=\"{}\" data-google=\"{}\">", .{
+                @as(u8, if (has_github) 1 else 0),
+                @as(u8, if (has_google) 1 else 0),
+            }) catch break :blk "<body>";
+            break :blk s;
+        };
+
+        // Replace <body> with <body data-...> in the login page
+        const body_tag = "<body>";
+        const before_body = if (std.mem.indexOf(u8, login_page_html, body_tag)) |pos|
+            login_page_html[0..pos]
+        else
+            login_page_html;
+        const after_body = if (std.mem.indexOf(u8, login_page_html, body_tag)) |pos|
+            login_page_html[pos + body_tag.len ..]
+        else
+            "";
+
+        const total_len = before_body.len + body_attrs_buf.len + after_body.len;
+
+        var header_buf: [512]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{total_len}) catch return;
+        _ = stream.write(header) catch return;
+        _ = stream.write(before_body) catch return;
+        _ = stream.write(body_attrs_buf) catch return;
+        _ = stream.write(after_body) catch return;
+    }
+
+    /// Send a static content response with given content type.
+    fn sendStaticContent(_: *HttpServer, stream: net.Stream, content_type: []const u8, content: []const u8) void {
+        var header_buf: [512]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{ content_type, content.len }) catch return;
+        _ = stream.write(header) catch return;
+        _ = stream.write(content) catch return;
+    }
+
+    /// Handle POST /auth/login — validate submitted token, create JWT, redirect.
+    fn handleAuthLogin(self: *HttpServer, stream: net.Stream, request: []const u8, request_len: usize) void {
+        const auth_st = self.auth_state orelse {
+            self.sendError(stream, 500, "Auth not configured");
+            return;
+        };
+
+        // Find request body (after \r\n\r\n)
+        const body = findRequestBody(request, request_len) orelse {
+            self.sendLoginRedirectWithError(stream, "No token provided");
+            return;
+        };
+
+        // Parse form body: token=<value>
+        const token_value = extractFormValue(body, "token") orelse {
+            self.sendLoginRedirectWithError(stream, "No token provided");
+            return;
+        };
+
+        if (token_value.len == 0) {
+            self.sendLoginRedirectWithError(stream, "No token provided");
+            return;
+        }
+
+        // URL-decode the token
+        var decode_buf: [256]u8 = undefined;
+        const decoded_token = auth.decodeToken(&decode_buf, token_value);
+
+        // Validate the token
+        const result = auth_st.validateToken(decoded_token);
+        if (result.role == .none) {
+            self.sendLoginRedirectWithError(stream, "Invalid token");
+            return;
+        }
+
+        // Find session for JWT creation
+        const session = if (result.session_id) |sid|
+            auth_st.getSession(sid)
+        else
+            auth_st.getSessionByRole(result.role) orelse auth_st.getSession("default");
+
+        if (session) |s| {
+            var jwt_buf: [256]u8 = undefined;
+            const jwt = auth_st.createJwt(s, &jwt_buf);
+            self.sendRedirectPage(stream, jwt);
+        } else {
+            self.sendLoginRedirectWithError(stream, "Session not found");
+        }
+    }
+
+    /// Redirect to OAuth provider's authorization URL.
+    fn handleOAuthRedirect(self: *HttpServer, stream: net.Stream, provider: []const u8, request: []const u8) void {
+        const auth_st = self.auth_state orelse {
+            self.sendLoginRedirectWithError(stream, "Auth not configured");
+            return;
+        };
+
+        // Detect redirect URI from Host header
+        var redirect_uri_buf: [512]u8 = undefined;
+        const redirect_uri = self.buildRedirectUri(&redirect_uri_buf, provider, request) orelse {
+            self.sendLoginRedirectWithError(stream, "Cannot determine redirect URI");
+            return;
+        };
+
+        if (std.mem.eql(u8, provider, "github")) {
+            const gh = auth_st.github_oauth orelse {
+                self.sendLoginRedirectWithError(stream, "GitHub OAuth not configured");
+                return;
+            };
+            // Redirect to GitHub authorization
+            var url_buf: [1024]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://github.com/login/oauth/authorize?client_id={s}&redirect_uri={s}&scope=user:email", .{
+                gh.client_id,
+                redirect_uri,
+            }) catch {
+                self.sendLoginRedirectWithError(stream, "URL too long");
+                return;
+            };
+            self.sendHttpRedirect(stream, url);
+        } else if (std.mem.eql(u8, provider, "google")) {
+            const gg = auth_st.google_oauth orelse {
+                self.sendLoginRedirectWithError(stream, "Google OAuth not configured");
+                return;
+            };
+            var url_buf: [1024]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://accounts.google.com/o/oauth2/v2/auth?client_id={s}&redirect_uri={s}&response_type=code&scope=openid+email+profile", .{
+                gg.client_id,
+                redirect_uri,
+            }) catch {
+                self.sendLoginRedirectWithError(stream, "URL too long");
+                return;
+            };
+            self.sendHttpRedirect(stream, url);
+        } else {
+            self.sendLoginRedirectWithError(stream, "Unknown OAuth provider");
+        }
+    }
+
+    /// Handle OAuth callback — exchange code for token, get user info, create session.
+    fn handleOAuthCallback(self: *HttpServer, stream: net.Stream, provider: []const u8, full_path: []const u8, request: []const u8) void {
+        const auth_st = self.auth_state orelse {
+            self.sendLoginRedirectWithError(stream, "Auth not configured");
+            return;
+        };
+
+        // Extract code from query string and URL-decode it
+        const raw_code = extractQueryParam(full_path, "code") orelse {
+            self.sendLoginRedirectWithError(stream, "No authorization code");
+            return;
+        };
+        var code_buf: [256]u8 = undefined;
+        const code = auth.decodeToken(&code_buf, raw_code);
+
+        // Build redirect URI for token exchange (must match the one used in the redirect)
+        var redirect_uri_buf: [512]u8 = undefined;
+        const redirect_uri = self.buildRedirectUri(&redirect_uri_buf, provider, request) orelse {
+            self.sendLoginRedirectWithError(stream, "Cannot determine redirect URI");
+            return;
+        };
+
+        if (std.mem.eql(u8, provider, "github")) {
+            self.handleGitHubCallback(stream, auth_st, code, redirect_uri);
+        } else if (std.mem.eql(u8, provider, "google")) {
+            self.handleGoogleCallback(stream, auth_st, code, redirect_uri);
+        } else {
+            self.sendLoginRedirectWithError(stream, "Unknown provider");
+        }
+    }
+
+    /// GitHub OAuth: exchange code → access token → user info → create session → redirect with JWT.
+    fn handleGitHubCallback(self: *HttpServer, stream: net.Stream, auth_st: *auth.AuthState, code: []const u8, redirect_uri: []const u8) void {
+        const gh = auth_st.github_oauth orelse {
+            self.sendLoginRedirectWithError(stream, "GitHub OAuth not configured");
+            return;
+        };
+
+        // Step 1: Exchange code for access token
+        var post_body_buf: [1024]u8 = undefined;
+        const post_body = std.fmt.bufPrint(&post_body_buf, "client_id={s}&client_secret={s}&code={s}&redirect_uri={s}", .{
+            gh.client_id,
+            gh.client_secret,
+            code,
+            redirect_uri,
+        }) catch {
+            self.sendLoginRedirectWithError(stream, "Request too large");
+            return;
+        };
+
+        var response_buf: [4096]u8 = undefined;
+        const token_response = httpPost(
+            self.allocator,
+            "github.com",
+            "/login/oauth/access_token",
+            post_body,
+            "application/x-www-form-urlencoded",
+            "application/json",
+            &response_buf,
+        ) orelse {
+            self.sendLoginRedirectWithError(stream, "Failed to exchange code with GitHub");
+            return;
+        };
+
+        // Parse access_token from response JSON: {"access_token":"...","token_type":"bearer",...}
+        const access_token = extractJsonString(token_response, "\"access_token\":\"") orelse {
+            self.sendLoginRedirectWithError(stream, "GitHub did not return access token");
+            return;
+        };
+
+        // Step 2: Get user info
+        var user_response_buf: [4096]u8 = undefined;
+        const user_response = httpGetWithAuth(
+            self.allocator,
+            "api.github.com",
+            "/user",
+            access_token,
+            &user_response_buf,
+        ) orelse {
+            self.sendLoginRedirectWithError(stream, "Failed to get GitHub user info");
+            return;
+        };
+
+        // Parse user info: {"id":12345,"login":"username",...}
+        const user_id_str = extractJsonValue(user_response, "\"id\":") orelse {
+            self.sendLoginRedirectWithError(stream, "Failed to parse GitHub user");
+            return;
+        };
+        const login = extractJsonString(user_response, "\"login\":\"") orelse "github-user";
+
+        // Step 3: Find or create session
+        const session = auth_st.findOrCreateOAuthSession("github", user_id_str, login) catch {
+            self.sendLoginRedirectWithError(stream, "Failed to create session");
+            return;
+        };
+
+        // Step 4: Create JWT and redirect
+        var jwt_buf: [256]u8 = undefined;
+        const jwt = auth_st.createJwt(session, &jwt_buf);
+        self.sendRedirectPage(stream, jwt);
+    }
+
+    /// Google OAuth: exchange code → ID token → parse claims → create session → redirect with JWT.
+    fn handleGoogleCallback(self: *HttpServer, stream: net.Stream, auth_st: *auth.AuthState, code: []const u8, redirect_uri: []const u8) void {
+        const gg = auth_st.google_oauth orelse {
+            self.sendLoginRedirectWithError(stream, "Google OAuth not configured");
+            return;
+        };
+
+        // Step 1: Exchange code for tokens
+        var post_body_buf: [1024]u8 = undefined;
+        const post_body = std.fmt.bufPrint(&post_body_buf, "client_id={s}&client_secret={s}&code={s}&redirect_uri={s}&grant_type=authorization_code", .{
+            gg.client_id,
+            gg.client_secret,
+            code,
+            redirect_uri,
+        }) catch {
+            self.sendLoginRedirectWithError(stream, "Request too large");
+            return;
+        };
+
+        var response_buf: [8192]u8 = undefined;
+        const token_response = httpPost(
+            self.allocator,
+            "oauth2.googleapis.com",
+            "/token",
+            post_body,
+            "application/x-www-form-urlencoded",
+            "application/json",
+            &response_buf,
+        ) orelse {
+            self.sendLoginRedirectWithError(stream, "Failed to exchange code with Google");
+            return;
+        };
+
+        // Parse id_token from response (it's a JWT with user claims)
+        const id_token = extractJsonString(token_response, "\"id_token\":\"") orelse {
+            self.sendLoginRedirectWithError(stream, "Google did not return ID token");
+            return;
+        };
+
+        // Decode ID token payload (we trust Google's response, no need to verify signature here)
+        const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse {
+            self.sendLoginRedirectWithError(stream, "Invalid ID token format");
+            return;
+        };
+        const rest = id_token[first_dot + 1 ..];
+        const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse {
+            self.sendLoginRedirectWithError(stream, "Invalid ID token format");
+            return;
+        };
+        const payload_b64 = id_token[first_dot + 1 ..][0..second_dot];
+        var payload_buf: [2048]u8 = undefined;
+        const payload_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload_b64) catch {
+            self.sendLoginRedirectWithError(stream, "Invalid ID token encoding");
+            return;
+        };
+        if (payload_len > payload_buf.len) {
+            self.sendLoginRedirectWithError(stream, "ID token too large");
+            return;
+        }
+        std.base64.url_safe_no_pad.Decoder.decode(payload_buf[0..payload_len], payload_b64) catch {
+            self.sendLoginRedirectWithError(stream, "Invalid ID token encoding");
+            return;
+        };
+        const payload = payload_buf[0..payload_len];
+
+        // Extract claims: sub (user ID), name, email
+        const sub = extractJsonString(payload, "\"sub\":\"") orelse {
+            self.sendLoginRedirectWithError(stream, "No user ID in Google token");
+            return;
+        };
+        const name = extractJsonString(payload, "\"name\":\"") orelse
+            extractJsonString(payload, "\"email\":\"") orelse "google-user";
+
+        // Step 2: Find or create session
+        const session = auth_st.findOrCreateOAuthSession("google", sub, name) catch {
+            self.sendLoginRedirectWithError(stream, "Failed to create session");
+            return;
+        };
+
+        // Step 3: Create JWT and redirect
+        var jwt_buf: [256]u8 = undefined;
+        const jwt = auth_st.createJwt(session, &jwt_buf);
+        self.sendRedirectPage(stream, jwt);
+    }
+
+    /// Build the OAuth redirect URI from the request's Host header.
+    fn buildRedirectUri(self: *HttpServer, buf: *[512]u8, provider: []const u8, request: []const u8) ?[]const u8 {
+        _ = self;
+        const host = extractHeader(request, "Host:") orelse return null;
+
+        // Detect protocol from X-Forwarded-Proto or default to http for localhost
+        const proto = extractHeader(request, "X-Forwarded-Proto:") orelse
+            (if (std.mem.startsWith(u8, host, "localhost") or std.mem.startsWith(u8, host, "127.0.0.1")) "http" else "https");
+
+        return std.fmt.bufPrint(buf, "{s}://{s}/auth/{s}/callback", .{ proto, host, provider }) catch null;
+    }
+
+    /// Send a 302 redirect.
+    fn sendHttpRedirect(_: *HttpServer, stream: net.Stream, location: []const u8) void {
+        var header_buf: [1536]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{location}) catch return;
+        _ = stream.write(header) catch {};
+    }
+
+    /// Redirect back to login page with error message (URL-encodes spaces).
+    fn sendLoginRedirectWithError(_: *HttpServer, stream: net.Stream, message: []const u8) void {
+        // URL-encode the message: replace spaces with %20
+        var encoded_buf: [256]u8 = undefined;
+        var encoded_len: usize = 0;
+        for (message) |c| {
+            if (encoded_len + 3 > encoded_buf.len) break;
+            if (c == ' ') {
+                encoded_buf[encoded_len] = '%';
+                encoded_buf[encoded_len + 1] = '2';
+                encoded_buf[encoded_len + 2] = '0';
+                encoded_len += 3;
+            } else {
+                encoded_buf[encoded_len] = c;
+                encoded_len += 1;
+            }
+        }
+        const encoded = encoded_buf[0..encoded_len];
+        var header_buf: [512]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 302 Found\r\nLocation: /?error={s}\r\nContent-Length: 0\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{encoded}) catch return;
+        _ = stream.write(header) catch {};
+    }
+
     fn getContentType(path: []const u8) []const u8 {
         if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
         if (std.mem.endsWith(u8, path, ".js")) return "application/javascript";
@@ -442,3 +939,155 @@ pub const HttpServer = struct {
         return "application/octet-stream";
     }
 };
+
+// --- Free functions for HTTP client and helpers ---
+
+/// Extract a header value from raw HTTP request (case-insensitive key match).
+fn extractHeader(request: []const u8, header_name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < request.len) {
+        const line_start = i;
+        while (i < request.len and request[i] != '\r') : (i += 1) {}
+        const line = request[line_start..i];
+        if (i + 1 < request.len and request[i] == '\r' and request[i + 1] == '\n') {
+            i += 2;
+        } else break;
+
+        if (line.len >= header_name.len) {
+            if (std.ascii.eqlIgnoreCase(line[0..header_name.len], header_name)) {
+                return std.mem.trim(u8, line[header_name.len..], " \t");
+            }
+        }
+    }
+    return null;
+}
+
+/// Find the body of an HTTP request (content after \r\n\r\n).
+fn findRequestBody(request: []const u8, request_len: usize) ?[]const u8 {
+    if (std.mem.indexOf(u8, request[0..request_len], "\r\n\r\n")) |pos| {
+        const body_start = pos + 4;
+        if (body_start < request_len) {
+            return request[body_start..request_len];
+        }
+    }
+    return null;
+}
+
+/// Extract a value from URL-encoded form data (e.g., "token=abc&foo=bar" → "abc" for key "token").
+fn extractFormValue(body: []const u8, key: []const u8) ?[]const u8 {
+    // Look for key= at start or after &
+    var search_buf: [64]u8 = undefined;
+    const search_prefix = std.fmt.bufPrint(&search_buf, "{s}=", .{key}) catch return null;
+
+    var start: usize = 0;
+    if (std.mem.startsWith(u8, body, search_prefix)) {
+        start = search_prefix.len;
+    } else {
+        var amp_search_buf: [65]u8 = undefined;
+        const amp_prefix = std.fmt.bufPrint(&amp_search_buf, "&{s}=", .{key}) catch return null;
+        if (std.mem.indexOf(u8, body, amp_prefix)) |pos| {
+            start = pos + amp_prefix.len;
+        } else return null;
+    }
+
+    var end = start;
+    while (end < body.len and body[end] != '&') : (end += 1) {}
+    return body[start..end];
+}
+
+/// Extract a query parameter value from a URL path.
+fn extractQueryParam(full_path: []const u8, key: []const u8) ?[]const u8 {
+    const query_start = std.mem.indexOf(u8, full_path, "?") orelse return null;
+    const query = full_path[query_start + 1 ..];
+    return extractFormValue(query, key);
+}
+
+/// Extract a JSON string value given a prefix like `"key":"`.
+fn extractJsonString(data: []const u8, prefix: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, data, prefix)) |pos| {
+        const val_start = pos + prefix.len;
+        if (std.mem.indexOfPos(u8, data, val_start, "\"")) |val_end| {
+            return data[val_start..val_end];
+        }
+    }
+    return null;
+}
+
+/// Extract a JSON numeric/unquoted value (e.g., "id": 12345).
+fn extractJsonValue(data: []const u8, prefix: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, data, prefix)) |pos| {
+        var start = pos + prefix.len;
+        // Skip whitespace
+        while (start < data.len and (data[start] == ' ' or data[start] == '\t')) : (start += 1) {}
+        var end = start;
+        while (end < data.len and data[end] != ',' and data[end] != '}' and data[end] != ' ' and data[end] != '\n') : (end += 1) {}
+        if (end > start) return data[start..end];
+    }
+    return null;
+}
+
+/// Make an HTTPS POST request and return the response body.
+fn httpPost(
+    allocator: Allocator,
+    host: []const u8,
+    path: []const u8,
+    body: []const u8,
+    content_type: []const u8,
+    accept: []const u8,
+    response_buf: []u8,
+) ?[]const u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var uri_buf: [1024]u8 = undefined;
+    const uri_str = std.fmt.bufPrint(&uri_buf, "https://{s}{s}", .{ host, path }) catch return null;
+
+    var writer = std.Io.Writer.fixed(response_buf);
+    const result = client.fetch(.{
+        .location = .{ .url = uri_str },
+        .method = .POST,
+        .payload = body,
+        .response_writer = &writer,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = content_type },
+            .{ .name = "Accept", .value = accept },
+            .{ .name = "User-Agent", .value = "termweb/1.0" },
+        },
+    }) catch return null;
+
+    if (result.status != .ok) return null;
+    return response_buf[0..writer.end];
+}
+
+/// Make an HTTPS GET request with Bearer auth and return the response body.
+fn httpGetWithAuth(
+    allocator: Allocator,
+    host: []const u8,
+    path: []const u8,
+    bearer_token: []const u8,
+    response_buf: []u8,
+) ?[]const u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var uri_buf: [1024]u8 = undefined;
+    const uri_str = std.fmt.bufPrint(&uri_buf, "https://{s}{s}", .{ host, path }) catch return null;
+
+    var auth_header_buf: [256]u8 = undefined;
+    const auth_header = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{bearer_token}) catch return null;
+
+    var writer = std.Io.Writer.fixed(response_buf);
+    const result = client.fetch(.{
+        .location = .{ .url = uri_str },
+        .method = .GET,
+        .response_writer = &writer,
+        .extra_headers = &.{
+            .{ .name = "Authorization", .value = auth_header },
+            .{ .name = "Accept", .value = "application/json" },
+            .{ .name = "User-Agent", .value = "termweb/1.0" },
+        },
+    }) catch return null;
+
+    if (result.status != .ok) return null;
+    return response_buf[0..writer.end];
+}

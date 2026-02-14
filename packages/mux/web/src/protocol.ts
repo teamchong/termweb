@@ -52,6 +52,9 @@ export const BinaryCtrlMsg = {
   REMOVE_PASSKEY: 0x9A,
   GET_SESSION_LIST: 0x9B,
   GET_SHARE_LINKS: 0x9C,
+  GET_OAUTH_CONFIG: 0x9D,
+  SET_OAUTH_CONFIG: 0x8E,
+  REMOVE_OAUTH_CONFIG: 0x8F,
 } as const;
 
 // Server -> client auth response types
@@ -59,6 +62,7 @@ export const AuthResponseType = {
   AUTH_STATE: 0x0A,
   SESSION_LIST: 0x0B,
   SHARE_LINKS: 0x0C,
+  OAUTH_CONFIG: 0x1A,
 } as const;
 
 // Server -> client control message types

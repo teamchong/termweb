@@ -88,6 +88,18 @@ pub const Session = struct {
 
     /// Role granted to users authenticating with this session's token.
     role: Role,
+
+    /// OAuth provider that created this session (null = manual/token-based).
+    provider: ?[]const u8 = null,
+
+    /// OAuth provider's user ID (e.g., GitHub user ID, Google sub claim).
+    provider_user_id: ?[]const u8 = null,
+};
+
+/// OAuth provider configuration (client credentials for GitHub/Google).
+pub const OAuthProvider = struct {
+    client_id: []const u8,
+    client_secret: []const u8,
 };
 
 
@@ -111,6 +123,13 @@ pub const AuthState = struct {
     // Is auth required? (false until admin sets up password/passkey)
     auth_required: bool,
 
+    // OAuth provider configurations (null = not configured)
+    github_oauth: ?OAuthProvider = null,
+    google_oauth: ?OAuthProvider = null,
+
+    /// Default role assigned to new OAuth users.
+    oauth_default_role: Role = .editor,
+
     allocator: Allocator,
     config_path: []const u8,
 
@@ -125,6 +144,9 @@ pub const AuthState = struct {
             .share_links = .{},
             .sessions = .{},
             .auth_required = false,
+            .github_oauth = null,
+            .google_oauth = null,
+            .oauth_default_role = .editor,
             .allocator = allocator,
             .config_path = "",
         };
@@ -167,8 +189,19 @@ pub const AuthState = struct {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.id);
             self.allocator.free(entry.value_ptr.name);
+            if (entry.value_ptr.provider) |p| self.allocator.free(p);
+            if (entry.value_ptr.provider_user_id) |p| self.allocator.free(p);
         }
         self.sessions.deinit(self.allocator);
+
+        if (self.github_oauth) |oauth| {
+            self.allocator.free(oauth.client_id);
+            self.allocator.free(oauth.client_secret);
+        }
+        if (self.google_oauth) |oauth| {
+            self.allocator.free(oauth.client_id);
+            self.allocator.free(oauth.client_secret);
+        }
 
         self.allocator.free(self.config_path);
         self.allocator.destroy(self);
@@ -197,6 +230,8 @@ pub const AuthState = struct {
             self.allocator.free(entry.key);
             self.allocator.free(entry.value.id);
             self.allocator.free(entry.value.name);
+            if (entry.value.provider) |p| self.allocator.free(p);
+            if (entry.value.provider_user_id) |p| self.allocator.free(p);
             try self.save();
         }
     }
@@ -225,9 +260,108 @@ pub const AuthState = struct {
         return list.toOwnedSlice() catch &[_]Session{};
     }
 
-    
+
+    // OAuth Provider Management
+
+
+    /// Set or update an OAuth provider's credentials.
+    pub fn setOAuthProvider(self: *AuthState, provider: []const u8, client_id: []const u8, client_secret: []const u8) !void {
+        const new_id = try self.allocator.dupe(u8, client_id);
+        errdefer self.allocator.free(new_id);
+        const new_secret = try self.allocator.dupe(u8, client_secret);
+        errdefer self.allocator.free(new_secret);
+
+        const oauth = OAuthProvider{ .client_id = new_id, .client_secret = new_secret };
+
+        if (std.mem.eql(u8, provider, "github")) {
+            if (self.github_oauth) |old| {
+                self.allocator.free(old.client_id);
+                self.allocator.free(old.client_secret);
+            }
+            self.github_oauth = oauth;
+        } else if (std.mem.eql(u8, provider, "google")) {
+            if (self.google_oauth) |old| {
+                self.allocator.free(old.client_id);
+                self.allocator.free(old.client_secret);
+            }
+            self.google_oauth = oauth;
+        } else {
+            self.allocator.free(new_id);
+            self.allocator.free(new_secret);
+            return;
+        }
+
+        try self.save();
+    }
+
+    /// Remove an OAuth provider's credentials.
+    pub fn removeOAuthProvider(self: *AuthState, provider: []const u8) !void {
+        if (std.mem.eql(u8, provider, "github")) {
+            if (self.github_oauth) |old| {
+                self.allocator.free(old.client_id);
+                self.allocator.free(old.client_secret);
+                self.github_oauth = null;
+            }
+        } else if (std.mem.eql(u8, provider, "google")) {
+            if (self.google_oauth) |old| {
+                self.allocator.free(old.client_id);
+                self.allocator.free(old.client_secret);
+                self.google_oauth = null;
+            }
+        }
+        try self.save();
+    }
+
+    /// Find an existing session for an OAuth user, or create one.
+    /// Returns the session's permanent token as hex for JWT creation.
+    pub fn findOrCreateOAuthSession(
+        self: *AuthState,
+        provider: []const u8,
+        provider_user_id: []const u8,
+        display_name: []const u8,
+    ) !*Session {
+        // Look for existing session with matching provider + provider_user_id
+        var iter = self.sessions.valueIterator();
+        while (iter.next()) |session| {
+            if (session.provider) |p| {
+                if (session.provider_user_id) |puid| {
+                    if (std.mem.eql(u8, p, provider) and std.mem.eql(u8, puid, provider_user_id)) {
+                        return session;
+                    }
+                }
+            }
+        }
+
+        // Create new session for this OAuth user
+        const session_id = try std.fmt.allocPrint(self.allocator, "oauth-{s}-{s}", .{ provider, provider_user_id });
+        errdefer self.allocator.free(session_id);
+        const session_name = try self.allocator.dupe(u8, display_name);
+        errdefer self.allocator.free(session_name);
+        const prov_dup = try self.allocator.dupe(u8, provider);
+        errdefer self.allocator.free(prov_dup);
+        const puid_dup = try self.allocator.dupe(u8, provider_user_id);
+        errdefer self.allocator.free(puid_dup);
+
+        const session = Session{
+            .id = session_id,
+            .name = session_name,
+            .created_at = std.time.timestamp(),
+            .token = generateToken(),
+            .role = self.oauth_default_role,
+            .provider = prov_dup,
+            .provider_user_id = puid_dup,
+        };
+
+        const key = try self.allocator.dupe(u8, session_id);
+        try self.sessions.put(self.allocator, key, session);
+        try self.save();
+
+        return self.sessions.getPtr(session_id).?;
+    }
+
+
     // Token Management
-    
+
 
     /// Generate a 256-bit random token. Used as both identity and HMAC key.
     pub fn generateToken() [token_len]u8 {
@@ -539,8 +673,19 @@ pub const AuthState = struct {
                     try file.writeAll(&hex_buf3);
                 }
             }
-            const role_str = std.fmt.bufPrint(&buf, "\", \"role\": {}}}", .{@intFromEnum(session.role)}) catch continue;
+            const role_str = std.fmt.bufPrint(&buf, "\", \"role\": {}", .{@intFromEnum(session.role)}) catch continue;
             try file.writeAll(role_str);
+            if (session.provider) |prov| {
+                try file.writeAll(", \"provider\": \"");
+                try file.writeAll(prov);
+                try file.writeAll("\"");
+            }
+            if (session.provider_user_id) |puid| {
+                try file.writeAll(", \"provider_user_id\": \"");
+                try file.writeAll(puid);
+                try file.writeAll("\"");
+            }
+            try file.writeAll("}");
         }
         try file.writeAll("\n  ],\n");
 
@@ -582,6 +727,26 @@ pub const AuthState = struct {
             try file.writeAll("}");
         }
         try file.writeAll("\n  ],\n");
+
+        // oauth_providers
+        try file.writeAll("  \"oauth\": {\n");
+        if (self.github_oauth) |gh| {
+            try file.writeAll("    \"github\": {\"client_id\": \"");
+            try file.writeAll(gh.client_id);
+            try file.writeAll("\", \"client_secret\": \"");
+            try file.writeAll(gh.client_secret);
+            try file.writeAll("\"},\n");
+        }
+        if (self.google_oauth) |gg| {
+            try file.writeAll("    \"google\": {\"client_id\": \"");
+            try file.writeAll(gg.client_id);
+            try file.writeAll("\", \"client_secret\": \"");
+            try file.writeAll(gg.client_secret);
+            try file.writeAll("\"},\n");
+        }
+        const role_str2 = std.fmt.bufPrint(&buf, "    \"default_role\": {}\n", .{@intFromEnum(self.oauth_default_role)}) catch "    \"default_role\": 1\n";
+        try file.writeAll(role_str2);
+        try file.writeAll("  },\n");
 
         // passkey_credentials
         try file.writeAll("  \"passkey_credentials\": [\n");
@@ -635,6 +800,58 @@ pub const AuthState = struct {
             self.auth_required = true;
         }
 
+        // Parse OAuth providers
+        if (std.mem.indexOf(u8, content, "\"oauth\":")) |_| {
+            // GitHub — scope client_secret search to the github block
+            if (std.mem.indexOf(u8, content, "\"github\": {\"client_id\": \"")) |gh_pos| {
+                const gh_section = content[gh_pos..];
+                if (extractJsonString(gh_section, "\"client_id\": \"")) |gh_id| {
+                    if (extractJsonString(gh_section, "\"client_secret\": \"")) |gh_secret| {
+                        const id = self.allocator.dupe(u8, gh_id) catch null;
+                        const secret = self.allocator.dupe(u8, gh_secret) catch null;
+                        if (id != null and secret != null) {
+                            self.github_oauth = .{ .client_id = id.?, .client_secret = secret.? };
+                        } else {
+                            if (id) |i| self.allocator.free(i);
+                            if (secret) |s| self.allocator.free(s);
+                        }
+                    }
+                }
+            }
+            // Google — scope client_secret search to the google block
+            if (std.mem.indexOf(u8, content, "\"google\": {\"client_id\": \"")) |google_pos| {
+                const google_section = content[google_pos..];
+                if (extractJsonString(google_section, "\"client_id\": \"")) |gg_id| {
+                    if (extractJsonString(google_section, "\"client_secret\": \"")) |gg_secret| {
+                        const id = self.allocator.dupe(u8, gg_id) catch null;
+                        const secret = self.allocator.dupe(u8, gg_secret) catch null;
+                        if (id != null and secret != null) {
+                            self.google_oauth = .{ .client_id = id.?, .client_secret = secret.? };
+                        } else {
+                            if (id) |i| self.allocator.free(i);
+                            if (secret) |s| self.allocator.free(s);
+                        }
+                    }
+                }
+            }
+            // default_role
+            if (std.mem.indexOf(u8, content, "\"default_role\":")) |dr_pos| {
+                const dr_start = dr_pos + 15;
+                var dr_end = dr_start;
+                while (dr_end < content.len and (content[dr_end] == ' ' or (content[dr_end] >= '0' and content[dr_end] <= '9'))) : (dr_end += 1) {}
+                const trimmed = std.mem.trim(u8, content[dr_start..dr_end], " ");
+                if (trimmed.len > 0) {
+                    const role_byte = trimmed[0] - '0';
+                    self.oauth_default_role = switch (role_byte) {
+                        0 => .admin,
+                        1 => .editor,
+                        2 => .viewer,
+                        else => .editor,
+                    };
+                }
+            }
+        }
+
         // Parse sessions: look for "token": "<64 hex>" + "role": <u8> within sessions array
         if (std.mem.indexOf(u8, content, "\"sessions\":")) |sessions_start| {
             var pos: usize = sessions_start;
@@ -682,12 +899,28 @@ pub const AuthState = struct {
                     else => .none,
                 };
 
+                // Parse optional provider/provider_user_id fields from the session object
+                // Find the closing "}" for this session entry
+                const session_end = std.mem.indexOfPos(u8, content, role_val_start, "}") orelse role_val_start + 1;
+                const session_slice = content[role_val_start..session_end];
+
+                const prov = if (extractJsonString(session_slice, "\"provider\": \"")) |p|
+                    try self.allocator.dupe(u8, p)
+                else
+                    null;
+                const puid = if (extractJsonString(session_slice, "\"provider_user_id\": \"")) |p|
+                    try self.allocator.dupe(u8, p)
+                else
+                    null;
+
                 const session = Session{
                     .id = try self.allocator.dupe(u8, id),
                     .name = try self.allocator.dupe(u8, name),
                     .created_at = std.time.timestamp(),
                     .token = session_token,
                     .role = role,
+                    .provider = prov,
+                    .provider_user_id = puid,
                 };
 
                 const key = try self.allocator.dupe(u8, id);

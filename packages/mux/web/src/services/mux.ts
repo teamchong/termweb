@@ -62,11 +62,15 @@ export const authState = writable<{
   authRequired: boolean;
   hasPassword: boolean;
   passkeyCount: number;
+  githubConfigured: boolean;
+  googleConfigured: boolean;
 }>({
   role: 0,
   authRequired: false,
   hasPassword: false,
   passkeyCount: 0,
+  githubConfigured: false,
+  googleConfigured: false,
 });
 
 // Internal tab info with DOM references
@@ -762,6 +766,8 @@ export class MuxClient {
             authRequired: view.getUint8(2) === 1,
             hasPassword: view.getUint8(3) === 1,
             passkeyCount: view.getUint8(4),
+            githubConfigured: data.byteLength > 5 ? view.getUint8(5) === 1 : false,
+            googleConfigured: data.byteLength > 6 ? view.getUint8(6) === 1 : false,
           });
           // Update UI isAdmin flag
           const isAdmin = role === Role.ADMIN;
@@ -1003,6 +1009,17 @@ export class MuxClient {
           a.click();
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
+          break;
+        }
+        case SERVER_MSG.OAUTH_CONFIG: {
+          // [0x1A][github:u8][google:u8][default_role:u8]
+          if (data.byteLength >= 4) {
+            authState.update(s => ({
+              ...s,
+              githubConfigured: view.getUint8(1) === 1,
+              googleConfigured: view.getUint8(2) === 1,
+            }));
+          }
           break;
         }
         default:
@@ -2133,6 +2150,37 @@ export class MuxClient {
     view.setUint16(0, idBytes.length, true);
     data.set(idBytes, 2);
     this.sendControlMessage(BinaryCtrlMsg.REGEN_TOKEN, data);
+  }
+
+  /** Request OAuth config from server (admin only) */
+  requestOAuthConfig(): void {
+    this.sendControlMessage(BinaryCtrlMsg.GET_OAUTH_CONFIG, new Uint8Array(0));
+  }
+
+  /** Set OAuth provider config (admin only) */
+  setOAuthConfig(provider: string, clientId: string, clientSecret: string): void {
+    const provBytes = sharedTextEncoder.encode(provider);
+    const idBytes = sharedTextEncoder.encode(clientId);
+    const secretBytes = sharedTextEncoder.encode(clientSecret);
+    const data = new Uint8Array(1 + provBytes.length + 2 + idBytes.length + 2 + secretBytes.length);
+    const view = new DataView(data.buffer);
+    let off = 0;
+    data[off] = provBytes.length; off += 1;
+    data.set(provBytes, off); off += provBytes.length;
+    view.setUint16(off, idBytes.length, true); off += 2;
+    data.set(idBytes, off); off += idBytes.length;
+    view.setUint16(off, secretBytes.length, true); off += 2;
+    data.set(secretBytes, off);
+    this.sendControlMessage(BinaryCtrlMsg.SET_OAUTH_CONFIG, data);
+  }
+
+  /** Remove OAuth provider config (admin only) */
+  removeOAuthConfig(provider: string): void {
+    const provBytes = sharedTextEncoder.encode(provider);
+    const data = new Uint8Array(1 + provBytes.length);
+    data[0] = provBytes.length;
+    data.set(provBytes, 1);
+    this.sendControlMessage(BinaryCtrlMsg.REMOVE_OAUTH_CONFIG, data);
   }
 
   /** Send input to assigned panel via control WS (coworker mode) */
