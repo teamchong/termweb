@@ -2363,7 +2363,7 @@ pub fn parseTransferInit(allocator: Allocator, data: []const u8) !TransferInitDa
 
     var offset: usize = 1; // Skip msg type
 
-    const direction: TransferDirection = @enumFromInt(data[offset]);
+    const direction: TransferDirection = std.meta.intToEnum(TransferDirection, data[offset]) catch return error.InvalidDirection;
     offset += 1;
 
     const flags: TransferFlags = @bitCast(data[offset]);

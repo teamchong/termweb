@@ -549,7 +549,7 @@ const InputEvent = union(enum) {
     text: struct { data: [256]u8, len: usize },
     mouse_pos: struct { x: f64, y: f64, mods: c.ghostty_input_mods_e },
     mouse_button: struct { state: c.ghostty_input_mouse_state_e, button: c.ghostty_input_mouse_button_e, mods: c.ghostty_input_mods_e },
-    mouse_scroll: struct { x: f64, y: f64, dx: f64, dy: f64 },
+    mouse_scroll: struct { x: f64, y: f64, dx: f64, dy: f64, precision: bool = false },
     resize: struct { width: u32, height: u32 },
 };
 
@@ -1054,7 +1054,9 @@ const Panel = struct {
                 },
                 .mouse_scroll => |scroll| {
                     c.ghostty_surface_mouse_pos(self.surface, scroll.x, scroll.y, 0);
-                    c.ghostty_surface_mouse_scroll(self.surface, scroll.dx, scroll.dy, 0);
+                    // ScrollMods packed struct: bit 0 = precision (trackpad pixel scroll)
+                    const scroll_mods: c_int = if (scroll.precision) 1 else 0;
+                    c.ghostty_surface_mouse_scroll(self.surface, scroll.dx, scroll.dy, scroll_mods);
                 },
                 .resize => |size| {
                     self.resizeInternal(size.width, size.height, 0) catch {};
@@ -1378,7 +1380,14 @@ const Panel = struct {
                 },
                 .keycode = keycode,
                 .mods = convertMods(mods),
-                .consumed_mods = 0,
+                // When text is produced, Shift was "consumed" by the input method
+                // to generate the uppercase/shifted character (e.g., Shift+c → "C").
+                // Without this, ghostty's effectiveMods() still sees Shift as active,
+                // causing escape sequence encoding instead of plain text output.
+                .consumed_mods = if (text_len > 0 and (mods & 0x01) != 0)
+                    @intCast(c.GHOSTTY_MODS_SHIFT)
+                else
+                    0,
                 .text = null,
                 .unshifted_codepoint = unshifted,
                 .composing = false,
@@ -1455,7 +1464,7 @@ const Panel = struct {
     }
 
     // Handle mouse scroll - queues events for main thread
-    // Format: [x:f64][y:f64][dx:f64][dy:f64][mods:u8] = 33 bytes
+    // Format: [x:f64][y:f64][dx:f64][dy:f64][mods:u8][precision:u8] = 34 bytes
     fn handleMouseScroll(self: *Panel, data: []const u8) void {
         if (data.len < 33) return;
 
@@ -1464,12 +1473,14 @@ const Panel = struct {
         const dx: f64 = @bitCast(std.mem.readInt(u64, data[16..24], .little));
         const dy: f64 = @bitCast(std.mem.readInt(u64, data[24..32], .little));
         const mods = convertMods(data[32]);
+        // Precision flag from browser: 1 = pixel-precise (trackpad), 0 = discrete wheel
+        const precision: bool = if (data.len > 33) data[33] != 0 else false;
 
         self.mutex.lock();
         defer self.mutex.unlock();
         // Queue position update first, then scroll event
         self.input_queue.append(self.allocator, .{ .mouse_pos = .{ .x = x, .y = y, .mods = mods } }) catch {};
-        self.input_queue.append(self.allocator, .{ .mouse_scroll = .{ .x = x, .y = y, .dx = dx, .dy = dy } }) catch {};
+        self.input_queue.append(self.allocator, .{ .mouse_scroll = .{ .x = x, .y = y, .dx = dx, .dy = dy, .precision = precision } }) catch {};
     }
 
     // Handle client message

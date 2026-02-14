@@ -131,7 +131,7 @@
   const mouseMoveView = new DataView(mouseMoveBuffer);
   const mouseButtonBuffer = new ArrayBuffer(20);
   const mouseButtonView = new DataView(mouseButtonBuffer);
-  const wheelBuffer = new ArrayBuffer(34);
+  const wheelBuffer = new ArrayBuffer(35);
   const wheelView = new DataView(wheelBuffer);
   const resizeBuffer = new ArrayBuffer(5);
   const resizeView = new DataView(resizeBuffer);
@@ -805,8 +805,9 @@
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    let dx = e.deltaX;
-    let dy = e.deltaY;
+    // Negate: browser deltaY positive = down, ghostty expects positive = up
+    let dx = -e.deltaX;
+    let dy = -e.deltaY;
     if (e.deltaMode === WHEEL_MODE.LINE) {
       dx *= PANEL.LINE_SCROLL_MULTIPLIER;
       dy *= PANEL.LINE_SCROLL_MULTIPLIER;
@@ -815,12 +816,15 @@
       dy *= canvasEl.clientHeight;
     }
 
+    // deltaMode 0 (PIXEL) = precision scroll (trackpad/smooth), 1/2 = discrete wheel
+    const precision = e.deltaMode === WHEEL_MODE.PIXEL ? 1 : 0;
     wheelView.setUint8(0, ClientMsg.MOUSE_SCROLL);
     wheelView.setFloat64(1, x, true);
     wheelView.setFloat64(9, y, true);
     wheelView.setFloat64(17, dx, true);
     wheelView.setFloat64(25, dy, true);
     wheelView.setUint8(33, getModifiers(e));
+    wheelView.setUint8(34, precision);
     sendInput(wheelBuffer);
   }
 
