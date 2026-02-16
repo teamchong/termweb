@@ -3842,32 +3842,23 @@ const Server = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Get layout JSON
         const layout_json = self.layout.toJson(self.allocator) catch return;
         defer self.allocator.free(layout_json);
 
         // Binary: [type:u8][count:u8][panel_id:u32, title_len:u8, title...]*[layout_len:u16][layout_json]
-        // Calculate total size
+        // Upper bound: each panel ≤ 260 bytes (4 + 1 + 255)
         const panel_count = self.panels.count();
-        var total_panel_data_size: usize = 0;
-        var it = self.panels.iterator();
-        while (it.next()) |entry| {
-            const panel = entry.value_ptr.*;
-            // panel_id:u32 + title_len:u8 + title
-            total_panel_data_size += 4 + 1 + @min(panel.title.len, 255);
-        }
-
         const layout_len: u16 = @intCast(@min(layout_json.len, 65535));
-        const msg_size = 1 + 1 + total_panel_data_size + 2 + layout_len;
-        const msg_buf = self.allocator.alloc(u8, msg_size) catch return;
+        const msg_buf = self.allocator.alloc(u8, 2 + panel_count * 260 + 2 + layout_len) catch return;
         defer self.allocator.free(msg_buf);
 
         msg_buf[0] = @intFromEnum(BinaryCtrlMsg.panel_list);
         msg_buf[1] = @intCast(@min(panel_count, 255));
 
+        // Single pass: write panel data and send pwd messages
         var offset: usize = 2;
-        var it2 = self.panels.iterator();
-        while (it2.next()) |entry| {
+        var it = self.panels.iterator();
+        while (it.next()) |entry| {
             const panel = entry.value_ptr.*;
             std.mem.writeInt(u32, msg_buf[offset..][0..4], panel.id, .little);
             offset += 4;
@@ -3882,14 +3873,13 @@ const Server = struct {
         offset += 2;
         @memcpy(msg_buf[offset..][0..layout_len], layout_json[0..layout_len]);
 
-        conn.sendBinary(msg_buf) catch {};
+        conn.sendBinary(msg_buf[0..offset + layout_len]) catch {};
 
-        // Send pwd for each panel (titles are already in PANEL_LIST message)
-        var it3 = self.panels.iterator();
-        while (it3.next()) |entry| {
+        // Send pwd for each panel separately (pwd messages use their own format)
+        var it2 = self.panels.iterator();
+        while (it2.next()) |entry| {
             const panel = entry.value_ptr.*;
             if (panel.pwd.len > 0) {
-                // Binary: [type:u8][panel_id:u32][pwd_len:u16][pwd...]
                 const pwd_len: u16 = @intCast(@min(panel.pwd.len, 1024));
                 var pwd_buf: [1031]u8 = undefined;
                 pwd_buf[0] = @intFromEnum(BinaryCtrlMsg.panel_pwd);
