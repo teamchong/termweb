@@ -136,20 +136,7 @@ pub fn promptConnectionMode() ?Provider {
         return null;
     };
 
-    if (choice == 1 or choice == 0) return null; // local
-    if (choice >= 2 and choice <= 4) {
-        const provider = all_providers[choice - 2];
-        if (!binaryExists(provider.binary())) {
-            std.debug.print("\n'{s}' is not installed. Install it from:\n", .{provider.binary()});
-            printInstallUrl(provider);
-            std.debug.print("Using local only.\n\n", .{});
-            return null;
-        }
-        return provider;
-    }
-
-    std.debug.print("Invalid choice, using local only.\n", .{});
-    return null;
+    return resolveChoice(choice);
 }
 
 /// Fallback for when terminal raw mode is unavailable (piped stdin, etc.)
@@ -165,6 +152,11 @@ fn promptConnectionModeFallback() ?Provider {
         return null;
     };
 
+    return resolveChoice(choice);
+}
+
+/// Validate a numeric tunnel choice and return the provider (or null for local).
+fn resolveChoice(choice: u8) ?Provider {
     if (choice == 1 or choice == 0) return null;
     if (choice >= 2 and choice <= 4) {
         const provider = all_providers[choice - 2];
@@ -176,7 +168,6 @@ fn promptConnectionModeFallback() ?Provider {
         }
         return provider;
     }
-
     std.debug.print("Invalid choice, using local only.\n", .{});
     return null;
 }
@@ -374,10 +365,7 @@ pub const Tunnel = struct {
 
             // Get URL from `tailscale serve status` (config is now applied)
             if (getTailscaleStatusUrl(allocator)) |url| {
-                const len = @min(url.len, tun.public_url.len);
-                @memcpy(tun.public_url[0..len], url[0..len]);
-                tun.url_len = len;
-                tun.url_ready.set();
+                tun.setPublicUrl(url);
                 allocator.free(url);
             }
 
@@ -476,6 +464,14 @@ pub const Tunnel = struct {
         self.allocator.destroy(self);
     }
 
+    /// Store a URL into the public_url buffer and signal readiness.
+    fn setPublicUrl(self: *Tunnel, url: []const u8) void {
+        const len = @min(url.len, self.public_url.len);
+        @memcpy(self.public_url[0..len], url[0..len]);
+        self.url_len = len;
+        self.url_ready.set();
+    }
+
     /// Reader thread: reads subprocess output line by line, parses URL.
     /// Also prints error/status lines from the tunnel subprocess so the user
     /// can see authentication errors, config issues, etc.
@@ -519,10 +515,7 @@ pub const Tunnel = struct {
                     // Try to extract URL
                     if (self.url_len == 0) {
                         if (self.extractUrl(line)) |url| {
-                            const len = @min(url.len, self.public_url.len);
-                            @memcpy(self.public_url[0..len], url[0..len]);
-                            self.url_len = len;
-                            self.url_ready.set();
+                            self.setPublicUrl(url);
                         }
                     }
 
@@ -603,23 +596,9 @@ pub const Tunnel = struct {
         return after[0..end];
     }
 
-    /// ngrok: parse JSON log line containing "url":"https://..." or "url": "https://..."
+    /// ngrok: parse JSON log line containing "url":"https://..."
     fn extractNgrokUrl(line: []const u8) ?[]const u8 {
-        // Find "url" key in JSON (handles optional spaces: "url":"..." or "url": "...")
-        const key = "\"url\"";
-        const key_pos = std.mem.indexOf(u8, line, key) orelse return null;
-        var i = key_pos + key.len;
-        // Skip : and optional whitespace
-        while (i < line.len and (line[i] == ':' or line[i] == ' ')) : (i += 1) {}
-        // Expect opening quote
-        if (i >= line.len or line[i] != '"') return null;
-        i += 1;
-        // Find URL start
-        const url_start = i;
-        // Find closing quote
-        const end = std.mem.indexOfScalar(u8, line[url_start..], '"') orelse return null;
-        const url = line[url_start .. url_start + end];
-        // Must be https://
+        const url = extractJsonField(line, "url") orelse return null;
         if (!std.mem.startsWith(u8, url, "https://")) return null;
         return url;
     }

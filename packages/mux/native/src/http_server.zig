@@ -743,16 +743,8 @@ pub const HttpServer = struct {
         };
         const login = extractJsonString(user_response, "\"login\":\"") orelse "github-user";
 
-        // Step 3: Find or create session
-        const session = auth_st.findOrCreateOAuthSession("github", user_id_str, login) catch {
-            self.sendLoginRedirectWithError(stream, "Failed to create session");
-            return;
-        };
-
-        // Step 4: Create JWT and redirect
-        var jwt_buf: [256]u8 = undefined;
-        const jwt = auth_st.createJwt(session, &jwt_buf);
-        self.sendRedirectPage(stream, jwt);
+        // Step 3: Create session and redirect
+        self.createOAuthSessionAndRedirect(stream, auth_st, "github", user_id_str, login);
     }
 
     /// Google OAuth: exchange code → ID token → parse claims → create session → redirect with JWT.
@@ -824,16 +816,8 @@ pub const HttpServer = struct {
         const name = extractJsonString(payload, "\"name\":\"") orelse
             extractJsonString(payload, "\"email\":\"") orelse "google-user";
 
-        // Step 2: Find or create session
-        const session = auth_st.findOrCreateOAuthSession("google", sub, name) catch {
-            self.sendLoginRedirectWithError(stream, "Failed to create session");
-            return;
-        };
-
-        // Step 3: Create JWT and redirect
-        var jwt_buf: [256]u8 = undefined;
-        const jwt = auth_st.createJwt(session, &jwt_buf);
-        self.sendRedirectPage(stream, jwt);
+        // Step 2: Create session and redirect
+        self.createOAuthSessionAndRedirect(stream, auth_st, "google", sub, name);
     }
 
     /// Build the OAuth redirect URI from the request's Host header.
@@ -846,6 +830,17 @@ pub const HttpServer = struct {
             (if (std.mem.startsWith(u8, host, "localhost") or std.mem.startsWith(u8, host, "127.0.0.1")) "http" else "https");
 
         return std.fmt.bufPrint(buf, "{s}://{s}/auth/{s}/callback", .{ proto, host, provider }) catch null;
+    }
+
+    /// Find or create an OAuth session and redirect to the app with a JWT.
+    fn createOAuthSessionAndRedirect(self: *HttpServer, stream: net.Stream, auth_st: *auth.AuthState, provider: []const u8, user_id: []const u8, username: []const u8) void {
+        const session = auth_st.findOrCreateOAuthSession(provider, user_id, username) catch {
+            self.sendLoginRedirectWithError(stream, "Failed to create session");
+            return;
+        };
+        var jwt_buf: [256]u8 = undefined;
+        const jwt = auth_st.createJwt(session, &jwt_buf);
+        self.sendRedirectPage(stream, jwt);
     }
 
     /// Send a 302 redirect.

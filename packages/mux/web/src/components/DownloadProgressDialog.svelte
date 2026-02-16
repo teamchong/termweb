@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { formatBytes } from '../utils';
+
   let {
     downloads,
     pendingPath = null,
@@ -30,11 +32,6 @@
     onClearCompleted?: () => void;
   } = $props();
 
-  function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  }
 
   function getProgress(d: { files: number; total: number; bytes: number; totalBytes: number }): number {
     return d.totalBytes > 0 ? Math.round((d.bytes / d.totalBytes) * 100) : 0;
