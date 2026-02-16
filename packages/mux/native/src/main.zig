@@ -7095,15 +7095,24 @@ fn percentDecode(input: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
             const hi = hexDigit(input[i + 1]);
             const lo = hexDigit(input[i + 2]);
             if (hi != null and lo != null) {
-                buf.append(allocator, (hi.? << 4) | lo.?) catch return null;
+                buf.append(allocator, (hi.? << 4) | lo.?) catch {
+                    buf.deinit(allocator);
+                    return null;
+                };
                 i += 3;
                 continue;
             }
         }
-        buf.append(allocator, input[i]) catch return null;
+        buf.append(allocator, input[i]) catch {
+            buf.deinit(allocator);
+            return null;
+        };
         i += 1;
     }
-    return buf.toOwnedSlice(allocator) catch null;
+    return buf.toOwnedSlice(allocator) catch {
+        buf.deinit(allocator);
+        return null;
+    };
 }
 
 fn hexDigit(char: u8) ?u8 {
@@ -7200,24 +7209,34 @@ fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.A
     }
 
     // Return empty string for empty pane list (not null, which would cause 400)
-    return if (buf.items.len > 0) (buf.toOwnedSlice(allocator) catch null) else (allocator.dupe(u8, "") catch null);
+    if (buf.items.len > 0) {
+        return buf.toOwnedSlice(allocator) catch {
+            buf.deinit(allocator);
+            return null;
+        };
+    }
+    buf.deinit(allocator);
+    return allocator.dupe(u8, "") catch null;
 }
 
 fn handleTmuxDisplayMessage(server: *Server, pane_id: u32, format: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     server.mutex.lock();
+    defer server.mutex.unlock();
+
     const p = server.panels.get(pane_id) orelse {
-        server.mutex.unlock();
         return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
     };
-    const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == pane_id) @as(u8, 1) else @as(u8, 0)) else 0;
-    server.mutex.unlock();
 
     if (format.len == 0) return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
 
+    const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == pane_id) @as(u8, 1) else @as(u8, 0)) else 0;
     var buf: std.ArrayListUnmanaged(u8) = .{};
     interpolateTmuxFormat(&buf, format, p.id, p.width, p.height, active, if (p.pwd.len > 0) p.pwd else server.initial_cwd, if (p.title.len > 0) p.title else "shell", allocator);
     buf.append(allocator, '\n') catch {};
-    return buf.toOwnedSlice(allocator) catch null;
+    return buf.toOwnedSlice(allocator) catch {
+        buf.deinit(allocator);
+        return null;
+    };
 }
 
 fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
@@ -7229,33 +7248,32 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         const dir_str = jsonGetString(body, "dir") orelse "v";
         const direction: SplitDirection = if (std.mem.eql(u8, dir_str, "h")) .horizontal else .vertical;
 
-        // Derive new panel dimensions: prefer panel owner's viewport, fall back to parent panel
+        // Derive new panel dimensions: prefer panel owner's viewport, fall back to parent panel.
+        // Copy all values while holding the lock to avoid reading freed Panel memory.
         var width: u32 = 800;
         var height: u32 = 600;
         var scale: f64 = 2.0;
         {
             server.mutex.lock();
-            const parent = server.panels.get(pane_id);
+            defer server.mutex.unlock();
             const owner_viewport: ?SessionViewport = blk: {
                 if (server.panel_assignments.get(pane_id)) |owner_sid| {
                     if (server.session_viewports.get(owner_sid)) |vp| break :blk vp;
                 }
                 break :blk null;
             };
-            server.mutex.unlock();
-
             if (owner_viewport) |vp| {
                 width = vp.width;
                 height = vp.height;
                 scale = vp.scale;
-            } else if (parent) |p| {
-                width = p.width;
-                height = p.height;
-                scale = p.scale;
+            } else if (server.panels.get(pane_id)) |parent| {
+                width = parent.width;
+                height = parent.height;
+                scale = parent.scale;
             }
-            // Halve along the split axis
-            if (direction == .horizontal) { width /= 2; } else { height /= 2; }
         }
+        // Halve along the split axis (outside lock — only uses local copies)
+        if (direction == .horizontal) { width /= 2; } else { height /= 2; }
 
         // Record next_panel_id before sending request
         const expected_id = @atomicLoad(u32, &server.next_panel_id, .acquire);
