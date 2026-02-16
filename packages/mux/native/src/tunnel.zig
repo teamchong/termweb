@@ -637,3 +637,70 @@ pub const Tunnel = struct {
         return rest[0..end];
     }
 };
+
+
+// Tests
+
+
+test "extractCloudflareUrl: finds trycloudflare.com URL" {
+    const url = Tunnel.extractCloudflareUrl("INF |  https://abc-123.trycloudflare.com connection registered");
+    try std.testing.expectEqualStrings("https://abc-123.trycloudflare.com", url.?);
+}
+
+test "extractCloudflareUrl: returns null for non-cloudflare URL" {
+    try std.testing.expect(Tunnel.extractCloudflareUrl("https://example.com/other") == null);
+}
+
+test "extractCloudflareUrl: returns null for no URL" {
+    try std.testing.expect(Tunnel.extractCloudflareUrl("some random text") == null);
+}
+
+test "extractNgrokUrl: parses URL from JSON log" {
+    const url = Tunnel.extractNgrokUrl("{\"url\":\"https://abc.ngrok.io\",\"other\":1}");
+    try std.testing.expectEqualStrings("https://abc.ngrok.io", url.?);
+}
+
+test "extractNgrokUrl: rejects http URL" {
+    try std.testing.expect(Tunnel.extractNgrokUrl("{\"url\":\"http://abc.ngrok.io\"}") == null);
+}
+
+test "extractNgrokUrl: returns null when no url field" {
+    try std.testing.expect(Tunnel.extractNgrokUrl("{\"msg\":\"started\"}") == null);
+}
+
+test "extractJsonField: extracts string value" {
+    const val = Tunnel.extractJsonField("{\"name\":\"Alice\",\"age\":30}", "name");
+    try std.testing.expectEqualStrings("Alice", val.?);
+}
+
+test "extractJsonField: handles space after colon" {
+    const val = Tunnel.extractJsonField("{\"url\": \"https://example.com\"}", "url");
+    try std.testing.expectEqualStrings("https://example.com", val.?);
+}
+
+test "extractJsonField: returns null for missing key" {
+    try std.testing.expect(Tunnel.extractJsonField("{\"other\":\"value\"}", "name") == null);
+}
+
+test "extractJsonField: handles escaped quotes" {
+    const val = Tunnel.extractJsonField("{\"msg\":\"say \\\"hello\\\"\"}", "msg");
+    try std.testing.expectEqualStrings("say \\\"hello\\\"", val.?);
+}
+
+test "extractTailscaleUrl: extracts URL before parenthesis" {
+    const url = Tunnel.extractTailscaleUrl("https://hostname.ts.net (tailnet only)");
+    try std.testing.expectEqualStrings("https://hostname.ts.net", url.?);
+}
+
+test "extractTailscaleUrl: extracts URL at end of line" {
+    const url = Tunnel.extractTailscaleUrl("Available at https://myhost.ts.net");
+    try std.testing.expectEqualStrings("https://myhost.ts.net", url.?);
+}
+
+test "extractTailscaleUrl: returns null for no https prefix" {
+    try std.testing.expect(Tunnel.extractTailscaleUrl("http://hostname.ts.net") == null);
+}
+
+test "extractTailscaleUrl: returns null for bare https://" {
+    try std.testing.expect(Tunnel.extractTailscaleUrl("just https:// alone") == null);
+}

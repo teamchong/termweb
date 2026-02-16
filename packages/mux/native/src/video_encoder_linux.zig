@@ -1510,3 +1510,40 @@ pub const VideoEncoder = struct {
         _ = f.write(line) catch {};
     }
 };
+
+
+// Tests
+
+
+test "calcAlignedDimensions: 16-pixel alignment" {
+    const dims = VideoEncoder.calcAlignedDimensions(1920, 1080, 1920 * 1080 * 2);
+    // 1920 is already aligned, 1080 rounds up to 1088
+    try std.testing.expectEqual(@as(u32, 1920), dims.w);
+    try std.testing.expectEqual(@as(u32, 1088), dims.h);
+}
+
+test "calcAlignedDimensions: exceeds dimension limit" {
+    const dims = VideoEncoder.calcAlignedDimensions(5000, 3000, 20_000_000);
+    // Both should be <= 4096 after scaling
+    try std.testing.expect(dims.w <= 4096);
+    try std.testing.expect(dims.h <= 4096);
+    // Should be 16-aligned
+    try std.testing.expectEqual(@as(u32, 0), dims.w % 16);
+    try std.testing.expectEqual(@as(u32, 0), dims.h % 16);
+}
+
+test "calcAlignedDimensions: pixel budget limits" {
+    // 2560x1440 = 3,686,400 pixels, budget 786,432 (1024*768)
+    const dims = VideoEncoder.calcAlignedDimensions(2560, 1440, 1024 * 768);
+    const pixels: u64 = @as(u64, dims.w) * @as(u64, dims.h);
+    // Should be near or slightly above budget due to alignment rounding
+    try std.testing.expect(pixels <= 1024 * 768 + 32 * 32);
+    try std.testing.expectEqual(@as(u32, 0), dims.w % 16);
+    try std.testing.expectEqual(@as(u32, 0), dims.h % 16);
+}
+
+test "calcAlignedDimensions: small dimensions stay small" {
+    const dims = VideoEncoder.calcAlignedDimensions(320, 240, 1_000_000);
+    try std.testing.expectEqual(@as(u32, 320), dims.w);
+    try std.testing.expectEqual(@as(u32, 240), dims.h); // 240 is already 16-aligned
+}

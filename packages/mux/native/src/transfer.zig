@@ -3008,3 +3008,157 @@ pub const TransferManager = struct {
         return session;
     }
 };
+
+
+// Tests
+
+
+test "matchGlob: exact match" {
+    try std.testing.expect(matchGlob("hello.txt", "hello.txt"));
+}
+
+test "matchGlob: wildcard extension" {
+    try std.testing.expect(matchGlob("*.md", "README.md"));
+}
+
+test "matchGlob: wildcard prefix" {
+    try std.testing.expect(matchGlob("test*", "testing123"));
+}
+
+test "matchGlob: question mark" {
+    try std.testing.expect(matchGlob("test?.log", "test1.log"));
+}
+
+test "matchGlob: no match" {
+    try std.testing.expect(!matchGlob("*.md", "file.txt"));
+}
+
+test "matchGlob: empty pattern matches empty string" {
+    try std.testing.expect(matchGlob("", ""));
+}
+
+test "matchGlob: star matches everything" {
+    try std.testing.expect(matchGlob("*", "anything.txt"));
+}
+
+test "matchGlob: multiple wildcards" {
+    try std.testing.expect(matchGlob("*.test.*", "foo.test.js"));
+}
+
+test "containsGlobChars: detects star" {
+    try std.testing.expect(containsGlobChars("src/*.zig"));
+}
+
+test "containsGlobChars: detects question mark" {
+    try std.testing.expect(containsGlobChars("test?.txt"));
+}
+
+test "containsGlobChars: detects bracket" {
+    try std.testing.expect(containsGlobChars("file[0-9].txt"));
+}
+
+test "containsGlobChars: no metacharacters" {
+    try std.testing.expect(!containsGlobChars("/home/user/file.txt"));
+}
+
+test "containsDoublestar: detects doublestar" {
+    try std.testing.expect(containsDoublestar("src/**/*.ts"));
+}
+
+test "containsDoublestar: single star only" {
+    try std.testing.expect(!containsDoublestar("src/*.ts"));
+}
+
+test "containsDoublestar: empty string" {
+    try std.testing.expect(!containsDoublestar(""));
+}
+
+test "splitGlobPath: splits at glob boundary" {
+    const result = splitGlobPath("/home/user/*.md");
+    try std.testing.expectEqualStrings("/home/user", result.base);
+    try std.testing.expectEqualStrings("*.md", result.pattern.?);
+}
+
+test "splitGlobPath: recursive glob" {
+    const result = splitGlobPath("/tmp/**/*.ts");
+    try std.testing.expectEqualStrings("/tmp", result.base);
+    try std.testing.expectEqualStrings("**/*.ts", result.pattern.?);
+}
+
+test "splitGlobPath: no glob chars" {
+    const result = splitGlobPath("/home/user/file.txt");
+    try std.testing.expectEqualStrings("/home/user/file.txt", result.base);
+    try std.testing.expect(result.pattern == null);
+}
+
+test "splitGlobPath: root level glob" {
+    const result = splitGlobPath("/*.txt");
+    try std.testing.expectEqualStrings("/", result.base);
+    try std.testing.expectEqualStrings("*.txt", result.pattern.?);
+}
+
+test "matchGlobPath: star does not cross slash" {
+    try std.testing.expect(!matchGlobPath("*.zig", "src/main.zig"));
+}
+
+test "matchGlobPath: star matches within segment" {
+    try std.testing.expect(matchGlobPath("src/*.zig", "src/main.zig"));
+}
+
+test "matchGlobPath: doublestar crosses directories" {
+    try std.testing.expect(matchGlobPath("src/**/*.zig", "src/nested/deep/file.zig"));
+}
+
+test "matchGlobPath: doublestar at end matches everything" {
+    try std.testing.expect(matchGlobPath("src/**", "src/a/b/c.txt"));
+}
+
+test "matchGlobPath: exact path match" {
+    try std.testing.expect(matchGlobPath("src/main.zig", "src/main.zig"));
+}
+
+test "computeBlockSize: zero size returns minimum" {
+    try std.testing.expectEqual(@as(u32, 512), computeBlockSize(0));
+}
+
+test "computeBlockSize: small file clamps to minimum" {
+    try std.testing.expectEqual(@as(u32, 512), computeBlockSize(1024));
+}
+
+test "computeBlockSize: medium file uses sqrt" {
+    // sqrt(1048576) = 1024
+    try std.testing.expectEqual(@as(u32, 1024), computeBlockSize(1048576));
+}
+
+test "computeBlockSize: large file clamps to maximum" {
+    try std.testing.expectEqual(@as(u32, 65536), computeBlockSize(10_000_000_000));
+}
+
+test "RollingChecksum: compute empty data" {
+    const cs = RollingChecksum.compute("");
+    try std.testing.expectEqual(@as(u16, 0), cs.a);
+    try std.testing.expectEqual(@as(u16, 0), cs.b);
+    try std.testing.expectEqual(@as(u32, 0), cs.count);
+}
+
+test "RollingChecksum: compute single byte" {
+    const cs = RollingChecksum.compute("A");
+    try std.testing.expectEqual(@as(u16, 0x41), cs.a);
+    try std.testing.expectEqual(@as(u16, 0x41), cs.b);
+    try std.testing.expectEqual(@as(u32, 1), cs.count);
+}
+
+test "RollingChecksum: hash combines a and b" {
+    const cs = RollingChecksum{ .a = 0x1234, .b = 0x5678, .count = 0 };
+    try std.testing.expectEqual(@as(u32, 0x56781234), cs.hash());
+}
+
+test "RollingChecksum: roll produces same result as full compute" {
+    const data = "BCDE";
+    // Compute over ABCD, then roll A out / E in → should equal compute("BCDE")
+    var rolling = RollingChecksum.compute("ABCD");
+    rolling.roll('A', 'E');
+    const direct = RollingChecksum.compute(data);
+    try std.testing.expectEqual(direct.a, rolling.a);
+    try std.testing.expectEqual(direct.b, rolling.b);
+}
