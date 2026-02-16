@@ -165,8 +165,8 @@ pub const AuthState = struct {
 
         // Load existing state
         state.load() catch {
-            // No existing state, create default session with editor role
-            try state.createSession("default", "Default", .editor);
+            // No existing state, create default session with admin role
+            try state.createSession("default", "Default", .admin);
         };
 
         return state;

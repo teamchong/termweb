@@ -3272,7 +3272,6 @@ const Server = struct {
                 self.sendShareLinks(conn);
             },
             0x9B => { // get_session_list
-                if (role != .admin) return;
                 self.sendSessionList(conn);
             },
             0x9C => { // get_share_links
@@ -3547,7 +3546,18 @@ const Server = struct {
 
     fn sendSessionList(self: *Server, conn: *ws.Connection) void {
         const role = self.getConnectionRole(conn);
-        if (role != .admin) return;
+        if (role == .none) return;
+
+        // Non-admins only see their own session
+        const is_admin = role == .admin;
+        const own_session_id: ?[]const u8 = if (!is_admin) blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk self.connection_sessions.get(conn);
+        } else null;
+
+        // Non-admin with no tracked session — nothing to return
+        if (!is_admin and own_session_id == null) return;
 
         // Build session list message
         // [0x0B][count:u16][sessions...]
@@ -3558,10 +3568,24 @@ const Server = struct {
         buf.append(self.allocator, 0x0B) catch return; // session_list
 
         const sessions = self.auth_state.sessions;
-        buf.writer(self.allocator).writeInt(u16, @intCast(sessions.count()), .little) catch return;
+
+        // Count sessions to include
+        const count: u16 = if (is_admin)
+            @intCast(sessions.count())
+        else if (own_session_id) |sid|
+            if (sessions.get(sid) != null) 1 else 0
+        else
+            0;
+
+        buf.writer(self.allocator).writeInt(u16, count, .little) catch return;
 
         var iter = sessions.valueIterator();
         while (iter.next()) |session| {
+            // Non-admins: only include their own session
+            if (own_session_id) |sid| {
+                if (!std.mem.eql(u8, session.id, sid)) continue;
+            }
+
             buf.writer(self.allocator).writeInt(u16, @intCast(session.id.len), .little) catch return;
             buf.appendSlice(self.allocator, session.id) catch return;
             buf.writer(self.allocator).writeInt(u16, @intCast(session.name.len), .little) catch return;

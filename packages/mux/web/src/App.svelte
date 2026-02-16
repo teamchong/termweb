@@ -526,16 +526,16 @@
         shareDialogUrl = '';
         shareDialogLoading = true;
         shareDialogOpen = true;
-        // Request session list to get the default session's permanent editor token
+        // Request session list to get the session's permanent token
         muxClient.requestSessionList();
         let settled = false;
         const unsub = sessions.subscribe(list => {
           if (settled) return;
-          const defaultSession = list.find(s => s.id === 'default');
-          if (defaultSession?.token) {
+          const session = list.find(s => s.id === 'default') || list[0];
+          if (session?.token) {
             settled = true;
             setTimeout(() => unsub());
-            shareDialogUrl = `${window.location.origin}?token=${encodeURIComponent(defaultSession.token)}`;
+            shareDialogUrl = `${window.location.origin}?token=${encodeURIComponent(session.token)}`;
             shareDialogLoading = false;
           }
         });
