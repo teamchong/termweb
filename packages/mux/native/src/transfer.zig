@@ -1354,94 +1354,7 @@ pub const TransferSession = struct {
     }
 
     fn walkDirectory(self: *TransferSession, dir: fs.Dir, prefix: []const u8) !void {
-        // Abort early if transfer was cancelled or server is shutting down
-        if (!@atomicLoad(bool, &self.is_active, .acquire)) return;
-
-        const has_include = self.include_pattern != null;
-        const should_recurse = if (self.include_pattern) |p|
-            containsDoublestar(p) or std.mem.indexOfScalar(u8, p, '/') != null
-        else
-            true;
-
-        var iter = dir.iterate();
-        while (try iter.next()) |entry| {
-            // Build relative path
-            const rel_path = if (prefix.len > 0)
-                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, entry.name })
-            else
-                try self.allocator.dupe(u8, entry.name);
-
-            if (entry.kind == .directory) {
-                // Check directory exclusion (includes .git auto-skip and name matching)
-                if (self.isDirExcluded(entry.name, rel_path)) {
-                    self.allocator.free(rel_path);
-                    continue;
-                }
-
-                if (has_include) {
-                    if (should_recurse) {
-                        var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch {
-                            self.allocator.free(rel_path);
-                            continue;
-                        };
-                        defer subdir.close();
-                        try self.walkDirectory(subdir, rel_path);
-                    }
-                    self.allocator.free(rel_path);
-                } else {
-                    try self.files.append(self.allocator, .{
-                        .path = rel_path,
-                        .size = 0,
-                        .mtime = 0,
-                        .hash = 0,
-                        .is_dir = true,
-                    });
-
-                    var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-                    defer subdir.close();
-                    try self.walkDirectory(subdir, rel_path);
-                }
-            } else if (entry.kind == .file) {
-                // Check file exclusion
-                if (self.isExcluded(rel_path)) {
-                    self.allocator.free(rel_path);
-                    continue;
-                }
-
-                if (has_include and !self.isIncluded(rel_path)) {
-                    self.allocator.free(rel_path);
-                    continue;
-                }
-
-                const stat = dir.statFile(entry.name) catch continue;
-
-                // Skip files that exceed size limit to prevent OOM/disk exhaustion
-                if (stat.size > max_file_size) {
-                    std.debug.print("[Transfer] Skipping large file ({d} MB > {d} MB): {s}\n", .{
-                        stat.size / (1024 * 1024),
-                        max_file_size / (1024 * 1024),
-                        rel_path,
-                    });
-                    self.allocator.free(rel_path);
-                    continue;
-                }
-
-                const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
-                const hash = self.hashFileMmap(dir, entry.name) catch 0;
-
-                try self.files.append(self.allocator, .{
-                    .path = rel_path,
-                    .size = stat.size,
-                    .mtime = mtime,
-                    .hash = hash,
-                    .is_dir = false,
-                });
-
-                self.total_bytes += stat.size;
-            } else {
-                self.allocator.free(rel_path);
-            }
-        }
+        return self.walkDirectoryImpl(dir, prefix, true);
     }
 
     // Hash a file using mmap + xxHash64 (zero-copy)
@@ -1551,7 +1464,10 @@ pub const TransferSession = struct {
     /// directory entries are omitted, and recursion is skipped unless the pattern
     /// contains `**` or `/`.
     fn walkDirectoryNoHash(self: *TransferSession, dir: fs.Dir, prefix: []const u8) !void {
-        // Abort early if transfer was cancelled or server is shutting down
+        return self.walkDirectoryImpl(dir, prefix, false);
+    }
+
+    fn walkDirectoryImpl(self: *TransferSession, dir: fs.Dir, prefix: []const u8, compute_hash: bool) !void {
         if (!@atomicLoad(bool, &self.is_active, .acquire)) return;
 
         const has_include = self.include_pattern != null;
@@ -1568,21 +1484,19 @@ pub const TransferSession = struct {
                 try self.allocator.dupe(u8, entry.name);
 
             if (entry.kind == .directory) {
-                // Check directory exclusion (includes .git auto-skip and name matching)
                 if (self.isDirExcluded(entry.name, rel_path)) {
                     self.allocator.free(rel_path);
                     continue;
                 }
 
                 if (has_include) {
-                    // Glob mode: skip directory entries, only recurse if pattern needs it
                     if (should_recurse) {
                         var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch {
                             self.allocator.free(rel_path);
                             continue;
                         };
                         defer subdir.close();
-                        try self.walkDirectoryNoHash(subdir, rel_path);
+                        try self.walkDirectoryImpl(subdir, rel_path, compute_hash);
                     }
                     self.allocator.free(rel_path);
                 } else {
@@ -1596,15 +1510,13 @@ pub const TransferSession = struct {
 
                     var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
                     defer subdir.close();
-                    try self.walkDirectoryNoHash(subdir, rel_path);
+                    try self.walkDirectoryImpl(subdir, rel_path, compute_hash);
                 }
             } else if (entry.kind == .file) {
-                // Check file exclusion
                 if (self.isExcluded(rel_path)) {
                     self.allocator.free(rel_path);
                     continue;
                 }
-                // Check include pattern
                 if (has_include and !self.isIncluded(rel_path)) {
                     self.allocator.free(rel_path);
                     continue;
@@ -1612,7 +1524,6 @@ pub const TransferSession = struct {
 
                 const stat = dir.statFile(entry.name) catch continue;
 
-                // Skip files that exceed size limit to prevent OOM/disk exhaustion
                 if (stat.size > max_file_size) {
                     std.debug.print("[Transfer] Skipping large file ({d} MB > {d} MB): {s}\n", .{
                         stat.size / (1024 * 1024),
@@ -1624,12 +1535,13 @@ pub const TransferSession = struct {
                 }
 
                 const mtime: u64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+                const hash: u64 = if (compute_hash) self.hashFileMmap(dir, entry.name) catch 0 else 0;
 
                 try self.files.append(self.allocator, .{
                     .path = rel_path,
                     .size = stat.size,
                     .mtime = mtime,
-                    .hash = 0, // Deferred — will be batch-hashed
+                    .hash = hash,
                     .is_dir = false,
                 });
 
@@ -2079,35 +1991,10 @@ fn buildFileListImpl(allocator: Allocator, session: *const TransferSession, msg_
 // Build FILE_REQUEST message (for download - server sends file chunk to browser)
 // [0x32][transfer_id:u32][file_index:u32][chunk_offset:u64][chunk_size:u32][compressed_data...]
 pub fn buildFileChunk(allocator: Allocator, session: *TransferSession, file_index: u32, chunk_offset: u64, chunk_size: usize) ![]u8 {
-    // Read and compress directly from mmap (zero-copy read)
     const compressed = try session.compressFromMapped(file_index, chunk_offset, chunk_size);
     defer allocator.free(compressed);
-
-    // Get actual uncompressed size
     const chunk = try session.readFileChunk(file_index, chunk_offset, chunk_size);
-
-    const header_len: usize = 1 + 4 + 4 + 8 + 4;
-    var msg = try allocator.alloc(u8, header_len + compressed.len);
-
-    var offset: usize = 0;
-    msg[offset] = @intFromEnum(ServerMsgType.file_request);
-    offset += 1;
-
-    std.mem.writeInt(u32, msg[offset..][0..4], session.id, .little);
-    offset += 4;
-
-    std.mem.writeInt(u32, msg[offset..][0..4], file_index, .little);
-    offset += 4;
-
-    std.mem.writeInt(u64, msg[offset..][0..8], chunk_offset, .little);
-    offset += 8;
-
-    std.mem.writeInt(u32, msg[offset..][0..4], @intCast(chunk.len), .little);
-    offset += 4;
-
-    @memcpy(msg[offset..], compressed);
-
-    return msg;
+    return buildFileChunkPrecompressed(allocator, session.id, file_index, chunk_offset, @intCast(chunk.len), compressed);
 }
 
 /// Build FILE_REQUEST message from pre-compressed data (used by pipelined download).
