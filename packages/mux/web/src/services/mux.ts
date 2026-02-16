@@ -250,12 +250,8 @@ export class MuxClient {
         this.fileTransfer.setSend((data) => {
           if (this.fileWs && this.fileWs.readyState === WebSocket.OPEN) {
             try {
-              // Prepend zstd framing flag (0x00 = uncompressed)
               // File data is already zstd-compressed at the application level
-              const frame = new Uint8Array(1 + data.length);
-              frame[0] = 0x00;
-              frame.set(data, 1);
-              this.fileWs.send(frame);
+              this.fileWs.send(MuxClient.frameWithFlag(0x00, data));
               this.resetFileWsIdleTimer();
             } catch (err) {
               console.error('[FileWS] Send failed, connection is dead:', err);
@@ -396,12 +392,9 @@ export class MuxClient {
    *  Used for latency-sensitive input (keystrokes, mouse clicks). */
   private sendControlImmediate(data: Uint8Array): void {
     if (!this.isControlWsOpen()) return;
-    // Small messages (keystrokes ~5-15 bytes): skip zstd, send with 0x00 flag
+    // Small messages (keystrokes ~5-15 bytes): skip zstd overhead
     if (data.length < 32) {
-      const frame = new Uint8Array(1 + data.length);
-      frame[0] = 0x00;
-      frame.set(data, 1);
-      this.controlWs!.send(frame);
+      this.controlWs!.send(MuxClient.frameWithFlag(0x00, data));
       return;
     }
     this.sendRawCompressed(data);
@@ -445,22 +438,31 @@ export class MuxClient {
     this.sendRawCompressed(batch);
   }
 
+  /** Encode a uint32 as a 4-byte little-endian Uint8Array */
+  private static u32Bytes(value: number): Uint8Array {
+    const buf = new Uint8Array(4);
+    new DataView(buf.buffer).setUint32(0, value, true);
+    return buf;
+  }
+
+  /** Prepend a 1-byte flag to data: 0x00=uncompressed, 0x01=zstd-compressed */
+  private static frameWithFlag(flag: number, data: Uint8Array): Uint8Array {
+    const frame = new Uint8Array(1 + data.length);
+    frame[0] = flag;
+    frame.set(data, 1);
+    return frame;
+  }
+
   /** Compress and send a single zstd-framed message on the control WS */
   private sendRawCompressed(data: Uint8Array): void {
     try {
       const compressed = compressZstd(data);
-      if (compressed.length + 1 < data.length + 1) {
-        const frame = new Uint8Array(1 + compressed.length);
-        frame[0] = 0x01;
-        frame.set(compressed, 1);
-        this.controlWs!.send(frame);
+      if (compressed.length < data.length) {
+        this.controlWs!.send(MuxClient.frameWithFlag(0x01, compressed));
         return;
       }
-    } catch { /* compression didn't shrink — send with uncompressed flag */ }
-    const frame = new Uint8Array(1 + data.length);
-    frame[0] = 0x00;
-    frame.set(data, 1);
-    this.controlWs!.send(frame);
+    } catch { /* compression didn't shrink — send uncompressed */ }
+    this.controlWs!.send(MuxClient.frameWithFlag(0x00, data));
   }
 
   /** Send control WS resize (0x82) with scale for a single panel */
@@ -1622,9 +1624,7 @@ export class MuxClient {
 
       // Notify server so it persists the active panel/tab
       if (panel.serverId !== null) {
-        const data = new Uint8Array(4);
-        new DataView(data.buffer).setUint32(0, panel.serverId, true);
-        this.sendControlMessage(BinaryCtrlMsg.FOCUS_PANEL, data);
+        this.sendControlMessage(BinaryCtrlMsg.FOCUS_PANEL, MuxClient.u32Bytes(panel.serverId));
       }
     } else {
       activePanelId.set(null);
@@ -2027,36 +2027,30 @@ export class MuxClient {
     this.sendControlBinary(data);
   }
 
-  /** Wrap a panel message in PANEL_MSG envelope and send via control WS */
-  private sendPanelMsg(serverId: number, msg: ArrayBuffer | ArrayBufferView): void {
+  /** Build a [type:u8][serverId:u32][payload...] envelope from an input message */
+  private static buildEnvelope(type: number, serverId: number, msg: ArrayBuffer | ArrayBufferView): Uint8Array {
     const inputBytes = msg instanceof ArrayBuffer
       ? new Uint8Array(msg)
       : new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
     const envelope = new Uint8Array(1 + 4 + inputBytes.length);
-    envelope[0] = BinaryCtrlMsg.PANEL_MSG;
+    envelope[0] = type;
     new DataView(envelope.buffer).setUint32(1, serverId, true);
     envelope.set(inputBytes, 5);
-    this.sendControlBinary(envelope);
+    return envelope;
   }
 
-  /** Wrap a panel message in PANEL_MSG envelope and send immediately (no rAF).
-   *  Used for latency-sensitive input (keystrokes, mouse clicks). */
+  /** Wrap a panel message in PANEL_MSG envelope and send via control WS */
+  private sendPanelMsg(serverId: number, msg: ArrayBuffer | ArrayBufferView): void {
+    this.sendControlBinary(MuxClient.buildEnvelope(BinaryCtrlMsg.PANEL_MSG, serverId, msg));
+  }
+
+  /** Wrap a panel message in PANEL_MSG envelope and send immediately (no rAF). */
   private sendPanelMsgImmediate(serverId: number, msg: ArrayBuffer | ArrayBufferView): void {
-    const inputBytes = msg instanceof ArrayBuffer
-      ? new Uint8Array(msg)
-      : new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
-    const envelope = new Uint8Array(1 + 4 + inputBytes.length);
-    envelope[0] = BinaryCtrlMsg.PANEL_MSG;
-    new DataView(envelope.buffer).setUint32(1, serverId, true);
-    envelope.set(inputBytes, 5);
-    this.sendControlImmediate(envelope);
+    this.sendControlImmediate(MuxClient.buildEnvelope(BinaryCtrlMsg.PANEL_MSG, serverId, msg));
   }
 
   private sendClosePanel(serverId: number): void {
-    const data = new Uint8Array(4);
-    const view = new DataView(data.buffer);
-    view.setUint32(0, serverId, true);
-    this.sendControlMessage(BinaryCtrlMsg.CLOSE_PANEL, data);
+    this.sendControlMessage(BinaryCtrlMsg.CLOSE_PANEL, MuxClient.u32Bytes(serverId));
   }
 
   sendClipboard(text: string): void {
@@ -2107,10 +2101,7 @@ export class MuxClient {
 
   /** Admin unassigns a panel */
   unassignPanel(serverId: number): void {
-    const data = new Uint8Array(4);
-    const view = new DataView(data.buffer);
-    view.setUint32(0, serverId, true);
-    this.sendControlMessage(BinaryCtrlMsg.UNASSIGN_PANEL, data);
+    this.sendControlMessage(BinaryCtrlMsg.UNASSIGN_PANEL, MuxClient.u32Bytes(serverId));
   }
 
   /** Request session list from server (admin only) */
@@ -2185,28 +2176,12 @@ export class MuxClient {
 
   /** Send input to assigned panel via control WS (coworker mode) */
   private sendPanelInputViaControl(serverId: number, inputMsg: ArrayBuffer | ArrayBufferView): void {
-    const inputBytes = inputMsg instanceof ArrayBuffer
-      ? new Uint8Array(inputMsg)
-      : new Uint8Array(inputMsg.buffer, inputMsg.byteOffset, inputMsg.byteLength);
-    const msg = new Uint8Array(1 + 4 + inputBytes.length);
-    msg[0] = BinaryCtrlMsg.PANEL_INPUT;
-    const view = new DataView(msg.buffer);
-    view.setUint32(1, serverId, true);
-    msg.set(inputBytes, 5);
-    this.sendControlBinary(msg);
+    this.sendControlBinary(MuxClient.buildEnvelope(BinaryCtrlMsg.PANEL_INPUT, serverId, inputMsg));
   }
 
   /** Send input immediately to assigned panel via control WS (coworker mode) */
   private sendPanelInputViaControlImmediate(serverId: number, inputMsg: ArrayBuffer | ArrayBufferView): void {
-    const inputBytes = inputMsg instanceof ArrayBuffer
-      ? new Uint8Array(inputMsg)
-      : new Uint8Array(inputMsg.buffer, inputMsg.byteOffset, inputMsg.byteLength);
-    const msg = new Uint8Array(1 + 4 + inputBytes.length);
-    msg[0] = BinaryCtrlMsg.PANEL_INPUT;
-    const view = new DataView(msg.buffer);
-    view.setUint32(1, serverId, true);
-    msg.set(inputBytes, 5);
-    this.sendControlImmediate(msg);
+    this.sendControlImmediate(MuxClient.buildEnvelope(BinaryCtrlMsg.PANEL_INPUT, serverId, inputMsg));
   }
 
   /** Wire up coworker input for a panel */
