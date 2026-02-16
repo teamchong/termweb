@@ -607,7 +607,7 @@ const Panel = struct {
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
     consecutive_unchanged: u32, // Consecutive frames with no pixel change (for adaptive frame rate)
     idle_keyframe_sent: bool, // One-shot: sent a quality keyframe during this idle period
-    had_keypress: bool, // Set by processInputQueue on key events, cleared by render loop
+    had_input: bool, // Set by processInputQueue on key/scroll events, cleared by render loop
 
     // Cursor state tracking (for frontend CSS blink overlay)
     last_cursor_col: u16 = 0,
@@ -775,7 +775,7 @@ const Panel = struct {
             .ticks_since_connect = 0,
             .consecutive_unchanged = 0,
             .idle_keyframe_sent = false,
-            .had_keypress = false,
+            .had_input = false,
         };
 
         return panel;
@@ -1041,7 +1041,7 @@ const Panel = struct {
                         key_event.input.text = @ptrCast(&key_event.text_buf);
                     }
                     _ = c.ghostty_surface_key(self.surface, key_event.input);
-                    self.had_keypress = true;
+                    self.had_input = true;
                 },
                 .text => |text| {
                     c.ghostty_surface_text(self.surface, &text.data, text.len);
@@ -1060,6 +1060,7 @@ const Panel = struct {
                     // ScrollMods packed struct: bit 0 = precision (trackpad pixel scroll)
                     const scroll_mods: c_int = if (scroll.precision) 1 else 0;
                     c.ghostty_surface_mouse_scroll(self.surface, scroll.dx, scroll.dy, scroll_mods);
+                    self.had_input = true;
                 },
                 .resize => |size| {
                     self.resizeInternal(size.width, size.height, 0) catch {};
@@ -6343,28 +6344,28 @@ const Server = struct {
                 _ = self.wake_signal.waitTimeout(remaining);
                 // Process input immediately after waking from sleep — don't wait
                 // for the next full loop iteration to handle the keystroke.
-                var keypress_woke = false;
+                var input_woke = false;
                 for (panels_buf[0..panels_count]) |panel| {
                     if (panel.hasQueuedInput()) {
                         panel.processInputQueue();
-                        if (panel.had_keypress) {
-                            keypress_woke = true;
-                            panel.had_keypress = false;
+                        if (panel.had_input) {
+                            input_woke = true;
+                            panel.had_input = false;
                         }
                     }
                 }
-                // After keypress, pull last_frame backward so the next frame
-                // boundary arrives within ~5ms instead of up to 33ms. This
-                // reduces keypress-to-display latency without extra encoder calls.
-                if (keypress_woke) {
-                    const max_key_delay_ns: i128 = 5 * std.time.ns_per_ms;
+                // After key/scroll input, pull last_frame backward so the next
+                // frame boundary arrives within ~5ms instead of up to 33ms. This
+                // reduces input-to-display latency without extra encoder calls.
+                if (input_woke) {
+                    const max_input_delay_ns: i128 = 5 * std.time.ns_per_ms;
                     const now_ts = std.time.nanoTimestamp();
                     const since = now_ts - last_frame;
                     const remaining_to_frame = @as(i128, frame_time_ns) - since;
-                    if (remaining_to_frame > max_key_delay_ns) {
+                    if (remaining_to_frame > max_input_delay_ns) {
                         // Too long until next frame — advance last_frame so
-                        // only max_key_delay_ns remains
-                        last_frame = now_ts - (@as(i128, frame_time_ns) - max_key_delay_ns);
+                        // only max_input_delay_ns remains
+                        last_frame = now_ts - (@as(i128, frame_time_ns) - max_input_delay_ns);
                     }
                 }
             }
