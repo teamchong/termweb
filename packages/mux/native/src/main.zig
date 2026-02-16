@@ -5118,12 +5118,7 @@ const Server = struct {
 
         // Flush remaining small files
         std.debug.print("[pushDownloadFiles] Flushing remaining: small_indices={d}, batch_entries={d}, large_file_count={d}\n", .{ small_indices.items.len, batch_entries.items.len, large_file_count });
-        if (small_indices.items.len > 0) {
-            self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
-        }
-        if (batch_entries.items.len > 0) {
-            self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
-        }
+        self.flushRemaining(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
 
         // Receive compressed results from goroutines on this (WS handler) thread.
         // GChannel's recv() uses condition variable fallback for OS threads.
@@ -5220,12 +5215,7 @@ const Server = struct {
                 continue;
             }
 
-            if (small_indices.items.len > 0) {
-                self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
-            }
-            if (batch_entries.items.len > 0) {
-                self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
-            }
+            self.flushRemaining(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
 
             // Serial: read via platform I/O, compress, send
             const owned_buf: ?[]u8 = if (comptime is_linux) blk: {
@@ -5293,12 +5283,7 @@ const Server = struct {
             }
         }
 
-        if (small_indices.items.len > 0) {
-            self.flushSmallBatch(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
-        }
-        if (batch_entries.items.len > 0) {
-            self.flushBatch(conn, session, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent);
-        }
+        self.flushRemaining(conn, session, &small_indices, &small_sizes, &small_bytes, &batch_entries, &batch_data_bufs, &batch_bytes, &bytes_sent, chunk_size);
 
         const complete_msg = transfer.buildTransferComplete(self.allocator, session.id, bytes_sent) catch return;
         defer self.allocator.free(complete_msg);
@@ -5356,6 +5341,26 @@ const Server = struct {
         batch_data_bufs.clearRetainingCapacity();
         batch_entries.clearRetainingCapacity();
         batch_bytes.* = 0;
+    }
+
+    /// Flush any pending small-file and batch buffers.
+    fn flushRemaining(
+        self: *Server,
+        conn: *ws.Connection,
+        session: *transfer.TransferSession,
+        small_indices: *std.ArrayListUnmanaged(u32),
+        small_sizes: *std.ArrayListUnmanaged(u64),
+        small_bytes: *u64,
+        batch_entries: *std.ArrayListUnmanaged(transfer.BatchEntry),
+        batch_data_bufs: *std.ArrayListUnmanaged([]const u8),
+        batch_bytes: *u64,
+        bytes_sent: *u64,
+        chunk_size: usize,
+    ) void {
+        if (small_indices.items.len > 0)
+            self.flushSmallBatch(conn, session, small_indices, small_sizes, small_bytes, batch_entries, batch_data_bufs, batch_bytes, bytes_sent, chunk_size);
+        if (batch_entries.items.len > 0)
+            self.flushBatch(conn, session, batch_entries, batch_data_bufs, batch_bytes, bytes_sent);
     }
 
     /// Batch-read accumulated small files via MultiFileReader
