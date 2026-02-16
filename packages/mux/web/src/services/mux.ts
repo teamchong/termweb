@@ -445,12 +445,19 @@ export class MuxClient {
     return buf;
   }
 
+  // Reusable frame buffer for frameWithFlag — safe because output is always
+  // immediately consumed by WebSocket.send() which copies before returning.
+  private static frameBuf = new Uint8Array(256);
+
   /** Prepend a 1-byte flag to data: 0x00=uncompressed, 0x01=zstd-compressed */
   private static frameWithFlag(flag: number, data: Uint8Array): Uint8Array {
-    const frame = new Uint8Array(1 + data.length);
-    frame[0] = flag;
-    frame.set(data, 1);
-    return frame;
+    const needed = 1 + data.length;
+    if (needed > MuxClient.frameBuf.length) {
+      MuxClient.frameBuf = new Uint8Array(Math.max(needed, MuxClient.frameBuf.length * 2));
+    }
+    MuxClient.frameBuf[0] = flag;
+    MuxClient.frameBuf.set(data, 1);
+    return MuxClient.frameBuf.subarray(0, needed);
   }
 
   /** Compress and send a single zstd-framed message on the control WS */

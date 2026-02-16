@@ -348,25 +348,35 @@
     renderFrame(frame);
   }
 
-  function parseNalUnits(data: Uint8Array): Uint8Array[] {
-    const units: Uint8Array[] = [];
+  // Reusable NAL unit index buffer — avoids per-frame allocations.
+  // Typical H.264 frames have 3-5 NAL units; 64 is generous headroom.
+  const MAX_NAL_UNITS = 64;
+  const nalStarts = new Uint32Array(MAX_NAL_UNITS);
+  const nalEnds = new Uint32Array(MAX_NAL_UNITS);
+  let nalCount = 0;
+
+  /** Scan frame for NAL unit boundaries, storing indices in reusable buffers. */
+  function scanNalUnits(data: Uint8Array): void {
+    nalCount = 0;
     let start = 0;
 
     for (let i = 0; i < data.length - 3; i++) {
       if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
-        if (i > start) {
-          units.push(data.slice(start, i));
+        if (i > start && nalCount < MAX_NAL_UNITS) {
+          nalStarts[nalCount] = start;
+          nalEnds[nalCount] = i;
+          nalCount++;
         }
         start = i + 4;
         i += 3;
       }
     }
 
-    if (start < data.length) {
-      units.push(data.slice(start));
+    if (start < data.length && nalCount < MAX_NAL_UNITS) {
+      nalStarts[nalCount] = start;
+      nalEnds[nalCount] = data.length;
+      nalCount++;
     }
-
-    return units;
   }
 
   function getCodecFromSps(sps: Uint8Array): string {
@@ -379,17 +389,21 @@
 
   // Convert Annex B (start-code prefixed) to AVCC (length-prefixed) in-place.
   // Both use 4-byte prefixes so this is a zero-allocation swap.
+  // Reusable position buffer for Annex B → AVCC conversion
+  const MAX_POSITIONS = 128;
+  const avccPositions = new Uint32Array(MAX_POSITIONS);
+
   function convertAnnexBToAvcc(data: Uint8Array): void {
-    const positions: number[] = [];
+    let posCount = 0;
     for (let i = 0; i < data.length - 3; i++) {
       if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
-        positions.push(i);
+        if (posCount < MAX_POSITIONS) avccPositions[posCount++] = i;
         i += 3;
       }
     }
-    for (let k = 0; k < positions.length; k++) {
-      const pos = positions[k];
-      const end = k + 1 < positions.length ? positions[k + 1] : data.length;
+    for (let k = 0; k < posCount; k++) {
+      const pos = avccPositions[k];
+      const end = k + 1 < posCount ? avccPositions[k + 1] : data.length;
       const nalLen = end - pos - 4;
       data[pos]     = (nalLen >>> 24) & 0xFF;
       data[pos + 1] = (nalLen >>> 16) & 0xFF;
@@ -445,22 +459,25 @@
 
     if (!decoder) { console.debug('[Panel] handleFrame: no decoder'); return; }
 
-    // Parse NAL units to detect SPS/PPS/IDR
-    const nalUnits = parseNalUnits(frameData);
+    // Scan NAL units to detect SPS/PPS/IDR (index-based, zero allocations)
+    scanNalUnits(frameData);
     let isKeyframe = false;
-    let sps: Uint8Array | null = null;
-    let pps: Uint8Array | null = null;
+    let spsStart = -1, spsEnd = -1;
+    let ppsStart = -1, ppsEnd = -1;
 
-    for (const nal of nalUnits) {
-      if (nal.length === 0) continue;
-      const nalType = nal[0] & NAL.TYPE_MASK;
-      if (nalType === NAL.TYPE_SPS) sps = nal;
-      else if (nalType === NAL.TYPE_PPS) pps = nal;
+    for (let n = 0; n < nalCount; n++) {
+      const s = nalStarts[n];
+      if (s >= frameData.length) continue;
+      const nalType = frameData[s] & NAL.TYPE_MASK;
+      if (nalType === NAL.TYPE_SPS) { spsStart = s; spsEnd = nalEnds[n]; }
+      else if (nalType === NAL.TYPE_PPS) { ppsStart = s; ppsEnd = nalEnds[n]; }
       else if (nalType === NAL.TYPE_IDR) isKeyframe = true;
     }
 
     // Configure decoder with avc1 codec + AVCDecoderConfigurationRecord description.
-    if (sps && pps) {
+    if (spsStart >= 0 && ppsStart >= 0) {
+      const sps = frameData.subarray(spsStart, spsEnd);
+      const pps = frameData.subarray(ppsStart, ppsEnd);
       const codec = getCodecFromSps(sps);
       const needReconfigure = !decoderConfigured || codec !== lastCodec;
       if (needReconfigure) {
