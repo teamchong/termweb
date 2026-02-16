@@ -7088,8 +7088,6 @@ fn handleTmuxQuery(server: *Server, query: []const u8) ?[]const u8 {
 
 /// Decode percent-encoded URL strings (e.g., %23 → #, %7B → {).
 fn percentDecode(input: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
-    // Fast path: no percent signs
-    if (std.mem.indexOfScalar(u8, input, '%') == null) return allocator.dupe(u8, input) catch null;
     var buf: std.ArrayListUnmanaged(u8) = .{};
     var i: usize = 0;
     while (i < input.len) {
@@ -7115,6 +7113,50 @@ fn hexDigit(char: u8) ?u8 {
     return null;
 }
 
+/// Interpolate tmux format variables (e.g., #{pane_id} → %1) into buf.
+fn interpolateTmuxFormat(
+    buf: *std.ArrayListUnmanaged(u8),
+    format: []const u8,
+    panel_id: u32,
+    width: u32,
+    height: u32,
+    active: u8,
+    pwd: []const u8,
+    title: []const u8,
+    allocator: std.mem.Allocator,
+) void {
+    var i: usize = 0;
+    while (i < format.len) {
+        if (i + 1 < format.len and format[i] == '#' and format[i + 1] == '{') {
+            const close = std.mem.indexOfPos(u8, format, i + 2, "}") orelse {
+                buf.append(allocator, format[i]) catch break;
+                i += 1;
+                continue;
+            };
+            const var_name = format[i + 2 .. close];
+            if (std.mem.eql(u8, var_name, "pane_id")) {
+                std.fmt.format(buf.writer(allocator), "%{d}", .{panel_id}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_index")) {
+                std.fmt.format(buf.writer(allocator), "{d}", .{panel_id}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_active")) {
+                std.fmt.format(buf.writer(allocator), "{d}", .{active}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_width")) {
+                std.fmt.format(buf.writer(allocator), "{d}", .{width}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_height")) {
+                std.fmt.format(buf.writer(allocator), "{d}", .{height}) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_current_path")) {
+                buf.appendSlice(allocator, pwd) catch {};
+            } else if (std.mem.eql(u8, var_name, "pane_title") or std.mem.eql(u8, var_name, "pane_current_command")) {
+                buf.appendSlice(allocator, title) catch {};
+            }
+            i = close + 1;
+        } else {
+            buf.append(allocator, format[i]) catch break;
+            i += 1;
+        }
+    }
+}
+
 fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .{};
 
@@ -7127,39 +7169,18 @@ fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.A
         const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == panel.id) @as(u8, 1) else @as(u8, 0)) else 0;
 
         if (format.len > 0) {
-            // Simple format string interpolation
             var line: std.ArrayListUnmanaged(u8) = .{};
-            var i: usize = 0;
-            const f = format;
-            while (i < f.len) {
-                if (i + 1 < f.len and f[i] == '#' and f[i + 1] == '{') {
-                    const close = std.mem.indexOfPos(u8, f, i + 2, "}") orelse {
-                        line.append(allocator, f[i]) catch break;
-                        i += 1;
-                        continue;
-                    };
-                    const var_name = f[i + 2 .. close];
-                    if (std.mem.eql(u8, var_name, "pane_id")) {
-                        std.fmt.format(line.writer(allocator), "%{d}", .{panel.id}) catch {};
-                    } else if (std.mem.eql(u8, var_name, "pane_index")) {
-                        std.fmt.format(line.writer(allocator), "{d}", .{panel.id}) catch {};
-                    } else if (std.mem.eql(u8, var_name, "pane_active")) {
-                        std.fmt.format(line.writer(allocator), "{d}", .{active}) catch {};
-                    } else if (std.mem.eql(u8, var_name, "pane_width")) {
-                        std.fmt.format(line.writer(allocator), "{d}", .{panel.width}) catch {};
-                    } else if (std.mem.eql(u8, var_name, "pane_height")) {
-                        std.fmt.format(line.writer(allocator), "{d}", .{panel.height}) catch {};
-                    } else if (std.mem.eql(u8, var_name, "pane_current_path")) {
-                        line.appendSlice(allocator, if (panel.pwd.len > 0) panel.pwd else server.initial_cwd) catch {};
-                    } else if (std.mem.eql(u8, var_name, "pane_title") or std.mem.eql(u8, var_name, "pane_current_command")) {
-                        line.appendSlice(allocator, if (panel.title.len > 0) panel.title else "shell") catch {};
-                    }
-                    i = close + 1;
-                } else {
-                    line.append(allocator, f[i]) catch break;
-                    i += 1;
-                }
-            }
+            interpolateTmuxFormat(
+                &line,
+                format,
+                panel.id,
+                panel.width,
+                panel.height,
+                active,
+                if (panel.pwd.len > 0) panel.pwd else server.initial_cwd,
+                if (panel.title.len > 0) panel.title else "shell",
+                allocator,
+            );
             line.append(allocator, '\n') catch {};
             buf.appendSlice(allocator, line.items) catch {};
             line.deinit(allocator);
@@ -7179,6 +7200,7 @@ fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.A
 fn handleTmuxDisplayMessage(server: *Server, pane_id: u32, format: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     server.mutex.lock();
     const panel = server.panels.get(pane_id);
+    const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == pane_id) @as(u8, 1) else @as(u8, 0)) else 0;
     server.mutex.unlock();
 
     if (panel == null) {
@@ -7190,32 +7212,18 @@ fn handleTmuxDisplayMessage(server: *Server, pane_id: u32, format: []const u8, a
         return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
     }
 
-    // Simple format string interpolation
     var buf: std.ArrayListUnmanaged(u8) = .{};
-    var i: usize = 0;
-    while (i < format.len) {
-        if (i + 1 < format.len and format[i] == '#' and format[i + 1] == '{') {
-            const close = std.mem.indexOfPos(u8, format, i + 2, "}") orelse {
-                buf.append(allocator, format[i]) catch break;
-                i += 1;
-                continue;
-            };
-            const var_name = format[i + 2 .. close];
-            if (std.mem.eql(u8, var_name, "pane_id")) {
-                std.fmt.format(buf.writer(allocator), "%{d}", .{p.id}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_width")) {
-                std.fmt.format(buf.writer(allocator), "{d}", .{p.width}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_height")) {
-                std.fmt.format(buf.writer(allocator), "{d}", .{p.height}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_current_path")) {
-                buf.appendSlice(allocator, if (p.pwd.len > 0) p.pwd else server.initial_cwd) catch {};
-            }
-            i = close + 1;
-        } else {
-            buf.append(allocator, format[i]) catch break;
-            i += 1;
-        }
-    }
+    interpolateTmuxFormat(
+        &buf,
+        format,
+        p.id,
+        p.width,
+        p.height,
+        active,
+        if (p.pwd.len > 0) p.pwd else server.initial_cwd,
+        if (p.title.len > 0) p.title else "shell",
+        allocator,
+    );
     buf.append(allocator, '\n') catch {};
 
     return buf.toOwnedSlice(allocator) catch null;
@@ -8322,4 +8330,158 @@ test "tmuxKeyLookup resolves all C-a through C-z" {
         // Verify CTRL modifier is set
         try std.testing.expectEqual(c.GHOSTTY_MODS_CTRL, k.mods);
     }
+}
+
+// ==========================================================================
+// interpolateTmuxFormat tests
+// ==========================================================================
+
+test "interpolateTmuxFormat resolves pane_id" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "#{pane_id}", 5, 800, 600, 1, "/home", "shell", std.testing.allocator);
+    try std.testing.expectEqualStrings("%5", buf.items);
+}
+
+test "interpolateTmuxFormat resolves width and height" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "#{pane_width}x#{pane_height}", 1, 800, 600, 0, "/home", "shell", std.testing.allocator);
+    try std.testing.expectEqualStrings("800x600", buf.items);
+}
+
+test "interpolateTmuxFormat resolves pane_active" {
+    var buf1: std.ArrayListUnmanaged(u8) = .{};
+    defer buf1.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf1, "#{pane_active}", 1, 80, 24, 1, "/", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("1", buf1.items);
+
+    var buf0: std.ArrayListUnmanaged(u8) = .{};
+    defer buf0.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf0, "#{pane_active}", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("0", buf0.items);
+}
+
+test "interpolateTmuxFormat resolves pane_current_path" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "#{pane_current_path}", 1, 80, 24, 0, "/home/user", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("/home/user", buf.items);
+}
+
+test "interpolateTmuxFormat resolves pane_title" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "#{pane_title}", 1, 80, 24, 0, "/", "vim", std.testing.allocator);
+    try std.testing.expectEqualStrings("vim", buf.items);
+}
+
+test "interpolateTmuxFormat resolves pane_current_command same as title" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "#{pane_current_command}", 1, 80, 24, 0, "/", "vim", std.testing.allocator);
+    try std.testing.expectEqualStrings("vim", buf.items);
+}
+
+test "interpolateTmuxFormat resolves pane_index without percent prefix" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "#{pane_index}", 5, 80, 24, 0, "/", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("5", buf.items);
+}
+
+test "interpolateTmuxFormat skips unknown variables" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "a#{foo}b", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("ab", buf.items);
+}
+
+test "interpolateTmuxFormat handles unclosed brace" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "#{pane_id", 5, 80, 24, 0, "/", "sh", std.testing.allocator);
+    // Unclosed brace: '#' is passed through literally, then remaining chars
+    try std.testing.expectEqualStrings("#{pane_id", buf.items);
+}
+
+test "interpolateTmuxFormat mixed literals and variables" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "id=#{pane_id} w=#{pane_width}", 5, 800, 600, 1, "/", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("id=%5 w=800", buf.items);
+}
+
+test "interpolateTmuxFormat empty format" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("", buf.items);
+}
+
+test "interpolateTmuxFormat plain text passthrough" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    interpolateTmuxFormat(&buf, "hello world", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
+    try std.testing.expectEqualStrings("hello world", buf.items);
+}
+
+// ==========================================================================
+// Additional percentDecode tests
+// ==========================================================================
+
+test "percentDecode multi-variable URL-encoded format" {
+    const result = percentDecode("%23%7Bpane_id%7D%20%23%7Bpane_width%7D", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("#{pane_id} #{pane_width}", result);
+}
+
+test "percentDecode consecutive percent encodings" {
+    const result = percentDecode("%41%42%43", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("ABC", result);
+}
+
+test "percentDecode does not decode plus as space" {
+    const result = percentDecode("a+b", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("a+b", result);
+}
+
+test "percentDecode decodes percent-encoded percent" {
+    const result = percentDecode("%25", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("%", result);
+}
+
+// ==========================================================================
+// Additional JSON edge case tests
+// ==========================================================================
+
+test "jsonGetString with unicode value" {
+    try std.testing.expectEqualStrings("日本語", jsonGetString("{\"k\":\"日本語\"}", "k").?);
+}
+
+test "jsonGetInt with leading zeros" {
+    try std.testing.expectEqual(@as(?u32, 7), jsonGetInt("{\"n\":007}", "n"));
+}
+
+test "jsonGetArray with nested objects" {
+    const arr = jsonGetArray("{\"a\":[{\"x\":1}]}", "a").?;
+    try std.testing.expectEqualStrings("{\"x\":1}", arr);
+}
+
+test "jsonFindValue returns first occurrence for duplicate keys" {
+    // Two "k" keys — should find the first one
+    const pos = jsonFindValue("{\"k\":\"first\",\"k\":\"second\"}", "k").?;
+    // First value starts at the opening quote of "first"
+    try std.testing.expect(pos < 20);
+    const str = jsonGetString("{\"k\":\"first\",\"k\":\"second\"}", "k").?;
+    try std.testing.expectEqualStrings("first", str);
+}
+
+test "jsonGetString matches exact key not substring" {
+    const json = "{\"cmd_extra\":\"x\",\"cmd\":\"y\"}";
+    try std.testing.expectEqualStrings("y", jsonGetString(json, "cmd").?);
+    try std.testing.expectEqualStrings("x", jsonGetString(json, "cmd_extra").?);
 }
