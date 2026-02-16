@@ -781,6 +781,17 @@ pub const VideoEncoder = struct {
 };
 
 // Callback when encoded data is ready
+/// Append an Annex B NAL unit (start code + data) to the output buffer.
+fn appendNalUnit(encoder: *VideoEncoder, nal_data: []const u8) void {
+    if (encoder.output_len + 4 + nal_data.len > encoder.output_buffer.len) return;
+    encoder.output_buffer[encoder.output_len] = 0;
+    encoder.output_buffer[encoder.output_len + 1] = 0;
+    encoder.output_buffer[encoder.output_len + 2] = 0;
+    encoder.output_buffer[encoder.output_len + 3] = 1;
+    @memcpy(encoder.output_buffer[encoder.output_len + 4 ..][0..nal_data.len], nal_data);
+    encoder.output_len += 4 + nal_data.len;
+}
+
 fn compressionOutputCallback(
     output_callback_ref_con: ?*anyopaque,
     source_frame_ref_con: ?*anyopaque,
@@ -827,23 +838,8 @@ fn compressionOutputCallback(
             format_desc, 1, &pps_ptr, &pps_size, &pps_count, null,
         );
 
-        if (sps_size > 0 and encoder.output_len + 4 + sps_size < encoder.output_buffer.len) {
-            encoder.output_buffer[encoder.output_len] = 0;
-            encoder.output_buffer[encoder.output_len + 1] = 0;
-            encoder.output_buffer[encoder.output_len + 2] = 0;
-            encoder.output_buffer[encoder.output_len + 3] = 1;
-            @memcpy(encoder.output_buffer[encoder.output_len + 4 ..][0..sps_size], sps_ptr[0..sps_size]);
-            encoder.output_len += 4 + sps_size;
-        }
-
-        if (pps_size > 0 and encoder.output_len + 4 + pps_size < encoder.output_buffer.len) {
-            encoder.output_buffer[encoder.output_len] = 0;
-            encoder.output_buffer[encoder.output_len + 1] = 0;
-            encoder.output_buffer[encoder.output_len + 2] = 0;
-            encoder.output_buffer[encoder.output_len + 3] = 1;
-            @memcpy(encoder.output_buffer[encoder.output_len + 4 ..][0..pps_size], pps_ptr[0..pps_size]);
-            encoder.output_len += 4 + pps_size;
-        }
+        if (sps_size > 0) appendNalUnit(encoder, sps_ptr[0..sps_size]);
+        if (pps_size > 0) appendNalUnit(encoder, pps_ptr[0..pps_size]);
     }
 
     // Get encoded data
@@ -866,14 +862,7 @@ fn compressionOutputCallback(
         offset += 4;
 
         if (offset + nal_length > length) break;
-        if (encoder.output_len + 4 + nal_length > encoder.output_buffer.len) break;
-
-        encoder.output_buffer[encoder.output_len] = 0;
-        encoder.output_buffer[encoder.output_len + 1] = 0;
-        encoder.output_buffer[encoder.output_len + 2] = 0;
-        encoder.output_buffer[encoder.output_len + 3] = 1;
-        @memcpy(encoder.output_buffer[encoder.output_len + 4 ..][0..nal_length], data_ptr[offset..][0..nal_length]);
-        encoder.output_len += 4 + nal_length;
+        appendNalUnit(encoder, data_ptr[offset..][0..nal_length]);
 
         offset += nal_length;
     }
