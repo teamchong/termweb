@@ -802,38 +802,8 @@ pub const AuthState = struct {
 
         // Parse OAuth providers
         if (std.mem.indexOf(u8, content, "\"oauth\":")) |_| {
-            // GitHub — scope client_secret search to the github block
-            if (std.mem.indexOf(u8, content, "\"github\": {\"client_id\": \"")) |gh_pos| {
-                const gh_section = content[gh_pos..];
-                if (extractJsonString(gh_section, "\"client_id\": \"")) |gh_id| {
-                    if (extractJsonString(gh_section, "\"client_secret\": \"")) |gh_secret| {
-                        const id = self.allocator.dupe(u8, gh_id) catch null;
-                        const secret = self.allocator.dupe(u8, gh_secret) catch null;
-                        if (id != null and secret != null) {
-                            self.github_oauth = .{ .client_id = id.?, .client_secret = secret.? };
-                        } else {
-                            if (id) |i| self.allocator.free(i);
-                            if (secret) |s| self.allocator.free(s);
-                        }
-                    }
-                }
-            }
-            // Google — scope client_secret search to the google block
-            if (std.mem.indexOf(u8, content, "\"google\": {\"client_id\": \"")) |google_pos| {
-                const google_section = content[google_pos..];
-                if (extractJsonString(google_section, "\"client_id\": \"")) |gg_id| {
-                    if (extractJsonString(google_section, "\"client_secret\": \"")) |gg_secret| {
-                        const id = self.allocator.dupe(u8, gg_id) catch null;
-                        const secret = self.allocator.dupe(u8, gg_secret) catch null;
-                        if (id != null and secret != null) {
-                            self.google_oauth = .{ .client_id = id.?, .client_secret = secret.? };
-                        } else {
-                            if (id) |i| self.allocator.free(i);
-                            if (secret) |s| self.allocator.free(s);
-                        }
-                    }
-                }
-            }
+            self.github_oauth = parseOAuthBlock(self.allocator, content, "github");
+            self.google_oauth = parseOAuthBlock(self.allocator, content, "google");
             // default_role
             if (std.mem.indexOf(u8, content, "\"default_role\":")) |dr_pos| {
                 const dr_start = dr_pos + 15;
@@ -1101,6 +1071,23 @@ fn parseJwtClaims(payload: []const u8) ?BasicJwtClaims {
         }
     }
     return null;
+}
+
+/// Parse an OAuth provider block from JSON content. Looks for `"<name>": {"client_id": "...", "client_secret": "..."}`.
+fn parseOAuthBlock(allocator: Allocator, content: []const u8, name: []const u8) ?OAuthProvider {
+    // Build search prefix: "<name>": {"client_id": "
+    var prefix_buf: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "\"{s}\": {{\"client_id\": \"", .{name}) catch return null;
+    const block_pos = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const section = content[block_pos..];
+    const raw_id = extractJsonString(section, "\"client_id\": \"") orelse return null;
+    const raw_secret = extractJsonString(section, "\"client_secret\": \"") orelse return null;
+    const id = allocator.dupe(u8, raw_id) catch return null;
+    const secret = allocator.dupe(u8, raw_secret) catch {
+        allocator.free(id);
+        return null;
+    };
+    return .{ .client_id = id, .client_secret = secret };
 }
 
 /// Extract a JSON string value given a prefix like `"key":"`.

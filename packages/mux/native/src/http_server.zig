@@ -123,6 +123,12 @@ const login_page_html =
     \\</script></body></html>
 ;
 
+// Comptime split of login page around <body> tag for data attribute injection
+const login_body_tag = "<body>";
+const login_body_pos = std.mem.indexOf(u8, login_page_html, login_body_tag) orelse @compileError("<body> tag not found in login page");
+const login_before_body = login_page_html[0..login_body_pos];
+const login_after_body = login_page_html[login_body_pos + login_body_tag.len ..];
+
 
 // Common headers for all responses:
 // - CORP cross-origin: allows resources to be loaded in cross-origin contexts
@@ -499,34 +505,9 @@ pub const HttpServer = struct {
         _ = stream.write(html_after_config) catch return;
     }
 
-    fn isWebSocketUpgrade(self: *HttpServer, request: []const u8) bool {
-        _ = self;
-        // Check for "Upgrade: websocket" header (case-insensitive)
-        var i: usize = 0;
-        while (i < request.len) {
-            // Find next line
-            const line_start = i;
-            while (i < request.len and request[i] != '\r') : (i += 1) {}
-            const line = request[line_start..i];
-
-            // Skip \r\n
-            if (i + 1 < request.len and request[i] == '\r' and request[i + 1] == '\n') {
-                i += 2;
-            } else {
-                break;
-            }
-
-            // Check for Upgrade header
-            if (line.len >= 18) { // "Upgrade: websocket"
-                if (std.ascii.eqlIgnoreCase(line[0..8], "Upgrade:")) {
-                    const value = std.mem.trim(u8, line[8..], " \t");
-                    if (std.ascii.eqlIgnoreCase(value, "websocket")) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
+    fn isWebSocketUpgrade(_: *HttpServer, request: []const u8) bool {
+        const value = extractHeader(request, "Upgrade:") orelse return false;
+        return std.ascii.eqlIgnoreCase(value, "websocket");
     }
 
     /// Send a minimal HTML page with a spinner that redirects to the JWT URL.
@@ -556,40 +537,22 @@ pub const HttpServer = struct {
 
     /// Serve the login page with OAuth provider flags injected as data attributes.
     fn sendLoginPage(self: *HttpServer, stream: net.Stream) void {
-        // Determine which OAuth providers are configured
         const has_github: bool = if (self.auth_state) |as| as.github_oauth != null else false;
         const has_google: bool = if (self.auth_state) |as| as.google_oauth != null else false;
 
-        // Inject data attributes into the <body> tag
-        // The login page JS reads these to show/hide OAuth buttons
-        const body_attrs_buf = blk: {
-            var tmp: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "<body data-github=\"{}\" data-google=\"{}\">", .{
-                @as(u8, if (has_github) 1 else 0),
-                @as(u8, if (has_google) 1 else 0),
-            }) catch break :blk "<body>";
-            break :blk s;
-        };
+        var body_tag_buf: [64]u8 = undefined;
+        const body_tag = std.fmt.bufPrint(&body_tag_buf, "<body data-github=\"{}\" data-google=\"{}\">", .{
+            @as(u8, if (has_github) 1 else 0),
+            @as(u8, if (has_google) 1 else 0),
+        }) catch "<body>";
 
-        // Replace <body> with <body data-...> in the login page
-        const body_tag = "<body>";
-        const before_body = if (std.mem.indexOf(u8, login_page_html, body_tag)) |pos|
-            login_page_html[0..pos]
-        else
-            login_page_html;
-        const after_body = if (std.mem.indexOf(u8, login_page_html, body_tag)) |pos|
-            login_page_html[pos + body_tag.len ..]
-        else
-            "";
-
-        const total_len = before_body.len + body_attrs_buf.len + after_body.len;
-
+        const total_len = login_before_body.len + body_tag.len + login_after_body.len;
         var header_buf: [512]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{total_len}) catch return;
         _ = stream.write(header) catch return;
-        _ = stream.write(before_body) catch return;
-        _ = stream.write(body_attrs_buf) catch return;
-        _ = stream.write(after_body) catch return;
+        _ = stream.write(login_before_body) catch return;
+        _ = stream.write(body_tag) catch return;
+        _ = stream.write(login_after_body) catch return;
     }
 
     /// Send a static content response with given content type.
@@ -749,15 +712,11 @@ pub const HttpServer = struct {
         };
 
         var response_buf: [4096]u8 = undefined;
-        const token_response = httpPost(
-            self.allocator,
-            "github.com",
-            "/login/oauth/access_token",
-            post_body,
-            "application/x-www-form-urlencoded",
-            "application/json",
-            &response_buf,
-        ) orelse {
+        const token_response = httpFetch(self.allocator, "github.com", "/login/oauth/access_token", &response_buf, .{
+            .method = .POST,
+            .payload = post_body,
+            .content_type = "application/x-www-form-urlencoded",
+        }) orelse {
             self.sendLoginRedirectWithError(stream, "Failed to exchange code with GitHub");
             return;
         };
@@ -770,13 +729,9 @@ pub const HttpServer = struct {
 
         // Step 2: Get user info
         var user_response_buf: [4096]u8 = undefined;
-        const user_response = httpGetWithAuth(
-            self.allocator,
-            "api.github.com",
-            "/user",
-            access_token,
-            &user_response_buf,
-        ) orelse {
+        const user_response = httpFetch(self.allocator, "api.github.com", "/user", &user_response_buf, .{
+            .bearer_token = access_token,
+        }) orelse {
             self.sendLoginRedirectWithError(stream, "Failed to get GitHub user info");
             return;
         };
@@ -820,15 +775,11 @@ pub const HttpServer = struct {
         };
 
         var response_buf: [8192]u8 = undefined;
-        const token_response = httpPost(
-            self.allocator,
-            "oauth2.googleapis.com",
-            "/token",
-            post_body,
-            "application/x-www-form-urlencoded",
-            "application/json",
-            &response_buf,
-        ) orelse {
+        const token_response = httpFetch(self.allocator, "oauth2.googleapis.com", "/token", &response_buf, .{
+            .method = .POST,
+            .payload = post_body,
+            .content_type = "application/x-www-form-urlencoded",
+        }) orelse {
             self.sendLoginRedirectWithError(stream, "Failed to exchange code with Google");
             return;
         };
@@ -975,24 +926,22 @@ fn findRequestBody(request: []const u8, request_len: usize) ?[]const u8 {
 
 /// Extract a value from URL-encoded form data (e.g., "token=abc&foo=bar" → "abc" for key "token").
 fn extractFormValue(body: []const u8, key: []const u8) ?[]const u8 {
-    // Look for key= at start or after &
-    var search_buf: [64]u8 = undefined;
-    const search_prefix = std.fmt.bufPrint(&search_buf, "{s}=", .{key}) catch return null;
-
-    var start: usize = 0;
-    if (std.mem.startsWith(u8, body, search_prefix)) {
-        start = search_prefix.len;
-    } else {
-        var amp_search_buf: [65]u8 = undefined;
-        const amp_prefix = std.fmt.bufPrint(&amp_search_buf, "&{s}=", .{key}) catch return null;
-        if (std.mem.indexOf(u8, body, amp_prefix)) |pos| {
-            start = pos + amp_prefix.len;
-        } else return null;
+    // Find key= at start of body or after &
+    var pos: usize = 0;
+    while (true) {
+        if (pos == 0 or (pos < body.len and body[pos - 1] == '&')) {
+            if (pos + key.len < body.len and
+                std.mem.eql(u8, body[pos..][0..key.len], key) and
+                body[pos + key.len] == '=')
+            {
+                const start = pos + key.len + 1;
+                var end = start;
+                while (end < body.len and body[end] != '&') : (end += 1) {}
+                return body[start..end];
+            }
+        }
+        pos = (std.mem.indexOfScalarPos(u8, body, pos, '&') orelse return null) + 1;
     }
-
-    var end = start;
-    while (end < body.len and body[end] != '&') : (end += 1) {}
-    return body[start..end];
 }
 
 /// Extract a query parameter value from a URL path.
@@ -1026,15 +975,20 @@ fn extractJsonValue(data: []const u8, prefix: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Make an HTTPS POST request and return the response body.
-fn httpPost(
+/// Make an HTTPS request (GET or POST) and return the response body.
+/// For POST: pass payload, content_type, and accept. For GET with Bearer auth: pass bearer_token.
+fn httpFetch(
     allocator: Allocator,
     host: []const u8,
     path: []const u8,
-    body: []const u8,
-    content_type: []const u8,
-    accept: []const u8,
     response_buf: []u8,
+    opts: struct {
+        method: std.http.Method = .GET,
+        payload: ?[]const u8 = null,
+        content_type: ?[]const u8 = null,
+        accept: []const u8 = "application/json",
+        bearer_token: ?[]const u8 = null,
+    },
 ) ?[]const u8 {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -1042,52 +996,99 @@ fn httpPost(
     var uri_buf: [1024]u8 = undefined;
     const uri_str = std.fmt.bufPrint(&uri_buf, "https://{s}{s}", .{ host, path }) catch return null;
 
+    // Build extra headers (up to 4)
+    var headers: [4]std.http.Header = undefined;
+    var header_count: usize = 0;
+    if (opts.content_type) |ct| {
+        headers[header_count] = .{ .name = "Content-Type", .value = ct };
+        header_count += 1;
+    }
+    var auth_header_buf: [256]u8 = undefined;
+    if (opts.bearer_token) |token| {
+        const auth_val = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{token}) catch return null;
+        headers[header_count] = .{ .name = "Authorization", .value = auth_val };
+        header_count += 1;
+    }
+    headers[header_count] = .{ .name = "Accept", .value = opts.accept };
+    header_count += 1;
+    headers[header_count] = .{ .name = "User-Agent", .value = "termweb/1.0" };
+    header_count += 1;
+
     var writer = std.Io.Writer.fixed(response_buf);
     const result = client.fetch(.{
         .location = .{ .url = uri_str },
-        .method = .POST,
-        .payload = body,
+        .method = opts.method,
+        .payload = opts.payload,
         .response_writer = &writer,
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = content_type },
-            .{ .name = "Accept", .value = accept },
-            .{ .name = "User-Agent", .value = "termweb/1.0" },
-        },
+        .extra_headers = headers[0..header_count],
     }) catch return null;
 
     if (result.status != .ok) return null;
     return response_buf[0..writer.end];
 }
 
-/// Make an HTTPS GET request with Bearer auth and return the response body.
-fn httpGetWithAuth(
-    allocator: Allocator,
-    host: []const u8,
-    path: []const u8,
-    bearer_token: []const u8,
-    response_buf: []u8,
-) ?[]const u8 {
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
+// --- Tests for free functions ---
 
-    var uri_buf: [1024]u8 = undefined;
-    const uri_str = std.fmt.bufPrint(&uri_buf, "https://{s}{s}", .{ host, path }) catch return null;
+test "extractHeader: finds case-insensitive header" {
+    const req = "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n";
+    try std.testing.expectEqualStrings("example.com", extractHeader(req, "Host:").?);
+    try std.testing.expectEqualStrings("websocket", extractHeader(req, "Upgrade:").?);
+    try std.testing.expectEqualStrings("websocket", extractHeader(req, "upgrade:").?);
+    try std.testing.expect(extractHeader(req, "Missing:") == null);
+}
 
-    var auth_header_buf: [256]u8 = undefined;
-    const auth_header = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{bearer_token}) catch return null;
+test "extractHeader: trims whitespace" {
+    const req = "GET / HTTP/1.1\r\nContent-Type:  application/json  \r\n\r\n";
+    try std.testing.expectEqualStrings("application/json", extractHeader(req, "Content-Type:").?);
+}
 
-    var writer = std.Io.Writer.fixed(response_buf);
-    const result = client.fetch(.{
-        .location = .{ .url = uri_str },
-        .method = .GET,
-        .response_writer = &writer,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_header },
-            .{ .name = "Accept", .value = "application/json" },
-            .{ .name = "User-Agent", .value = "termweb/1.0" },
-        },
-    }) catch return null;
+test "findRequestBody: extracts body after blank line" {
+    const req = "POST /auth HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqualStrings("hello", findRequestBody(req, req.len).?);
+}
 
-    if (result.status != .ok) return null;
-    return response_buf[0..writer.end];
+test "findRequestBody: returns null when no body" {
+    const req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    try std.testing.expect(findRequestBody(req, req.len) == null);
+}
+
+test "extractFormValue: first key" {
+    try std.testing.expectEqualStrings("abc", extractFormValue("token=abc&foo=bar", "token").?);
+}
+
+test "extractFormValue: middle key" {
+    try std.testing.expectEqualStrings("bar", extractFormValue("token=abc&foo=bar&baz=1", "foo").?);
+}
+
+test "extractFormValue: last key" {
+    try std.testing.expectEqualStrings("1", extractFormValue("token=abc&baz=1", "baz").?);
+}
+
+test "extractFormValue: missing key" {
+    try std.testing.expect(extractFormValue("token=abc", "missing") == null);
+}
+
+test "extractFormValue: partial key match does not match" {
+    // "tok" should not match "token=abc"
+    try std.testing.expect(extractFormValue("token=abc", "tok") == null);
+}
+
+test "extractQueryParam: extracts from URL" {
+    try std.testing.expectEqualStrings("xyz", extractQueryParam("/path?code=xyz&state=1", "code").?);
+    try std.testing.expectEqualStrings("1", extractQueryParam("/path?code=xyz&state=1", "state").?);
+    try std.testing.expect(extractQueryParam("/path?code=xyz", "missing") == null);
+    try std.testing.expect(extractQueryParam("/path", "code") == null);
+}
+
+test "extractJsonString: parses string values" {
+    const json = "{\"name\":\"alice\",\"role\":\"admin\"}";
+    try std.testing.expectEqualStrings("alice", extractJsonString(json, "\"name\":\"").?);
+    try std.testing.expectEqualStrings("admin", extractJsonString(json, "\"role\":\"").?);
+    try std.testing.expect(extractJsonString(json, "\"missing\":\"") == null);
+}
+
+test "extractJsonValue: parses numeric values" {
+    const json = "{\"id\": 12345, \"count\":99}";
+    try std.testing.expectEqualStrings("12345", extractJsonValue(json, "\"id\":").?);
+    try std.testing.expectEqualStrings("99", extractJsonValue(json, "\"count\":").?);
 }

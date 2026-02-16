@@ -1410,6 +1410,42 @@ const Panel = struct {
         self.input_queue.append(self.allocator, event) catch {};
     }
 
+    /// Queue a key press+release event (used by tmux send-keys for special keys).
+    /// This bypasses bracketed paste mode — Enter actually executes commands.
+    fn queueKeyEvent(self: *Panel, keycode: u32, mods: u32, text: ?[]const u8) void {
+        // Press event
+        var press: InputEvent = .{ .key = .{
+            .input = c.ghostty_input_key_s{
+                .action = c.GHOSTTY_ACTION_PRESS,
+                .keycode = keycode,
+                .mods = @intCast(mods),
+                .consumed_mods = 0,
+                .text = null,
+                .unshifted_codepoint = 0,
+                .composing = false,
+            },
+            .text_buf = undefined,
+            .text_len = 0,
+        } };
+        if (text) |t| {
+            const len: u8 = @min(@as(u8, @intCast(t.len)), 7);
+            @memcpy(press.key.text_buf[0..len], t[0..len]);
+            press.key.text_buf[len] = 0;
+            press.key.text_len = len;
+        }
+
+        // Release event (same keycode, no text)
+        var release = press;
+        release.key.input.action = c.GHOSTTY_ACTION_RELEASE;
+        release.key.input.text = null;
+        release.key.text_len = 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.input_queue.append(self.allocator, press) catch {};
+        self.input_queue.append(self.allocator, release) catch {};
+    }
+
     // Handle text input (for IME, paste, etc.) - queues event for main thread
     fn handleTextInput(self: *Panel, data: []const u8) void {
         if (data.len == 0) return;
@@ -6945,7 +6981,7 @@ const tmux_shim_script =
     \\
     \\  send-keys)
     \\    target="$PANE"; literal=0
-    \\    while [ $# -gt 1 ]; do
+    \\    while [ $# -gt 0 ]; do
     \\      case "$1" in
     \\        -t) target=$(echo "$2" | sed 's/^%//'); shift 2 ;;
     \\        -l) literal=1; shift ;;
@@ -6953,10 +6989,17 @@ const tmux_shim_script =
     \\        *) break ;;
     \\      esac
     \\    done
-    \\    keys="$*"
+    \\    # Build JSON array of arguments to preserve boundaries
+    \\    args="["; sep=""
+    \\    for arg in "$@"; do
+    \\      escaped=$(printf '%s' "$arg" | sed 's/\\/\\\\/g;s/"/\\"/g')
+    \\      args="$args${sep}\"$escaped\""
+    \\      sep=","
+    \\    done
+    \\    args="$args]"
     \\    curl -sf --max-time 5 --unix-socket "$SOCK" -X POST "$API/api/tmux" \
     \\      -H "Content-Type: application/json" \
-    \\      -d "{\"cmd\":\"send-keys\",\"target\":$target,\"keys\":\"$keys\"}"
+    \\      -d "{\"cmd\":\"send-keys\",\"target\":$target,\"args\":$args}"
     \\    ;;
     \\
     \\  list-panes)
@@ -7357,64 +7400,48 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
 
     if (std.mem.eql(u8, cmd, "send-keys")) {
         const target_id = jsonGetInt(body, "target") orelse 1;
-        const keys = jsonGetString(body, "keys") orelse return null;
 
         server.mutex.lock();
         const panel = server.panels.get(target_id);
         server.mutex.unlock();
 
         if (panel) |p| {
-            // Convert tmux key names to actual bytes
-            var converted: std.ArrayListUnmanaged(u8) = .{};
-            defer converted.deinit(allocator);
+            // Collect arguments from JSON array or legacy "keys" string
+            var args_list: std.ArrayListUnmanaged([]const u8) = .{};
+            defer args_list.deinit(allocator);
 
-            var i: usize = 0;
-            while (i < keys.len) {
-                // Check for known key names (space-separated in tmux)
-                const remaining = keys[i..];
-                if (std.mem.startsWith(u8, remaining, "Enter")) {
-                    converted.append(allocator, '\r') catch {};
-                    i += 5;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else if (std.mem.startsWith(u8, remaining, "Space")) {
-                    converted.append(allocator, ' ') catch {};
-                    i += 5;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else if (std.mem.startsWith(u8, remaining, "Tab")) {
-                    converted.append(allocator, '\t') catch {};
-                    i += 3;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else if (std.mem.startsWith(u8, remaining, "Escape")) {
-                    converted.append(allocator, 0x1b) catch {};
-                    i += 6;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else if (std.mem.startsWith(u8, remaining, "C-c")) {
-                    converted.append(allocator, 0x03) catch {};
-                    i += 3;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else if (std.mem.startsWith(u8, remaining, "C-d")) {
-                    converted.append(allocator, 0x04) catch {};
-                    i += 3;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else if (std.mem.startsWith(u8, remaining, "C-l")) {
-                    converted.append(allocator, 0x0c) catch {};
-                    i += 3;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else if (std.mem.startsWith(u8, remaining, "C-z")) {
-                    converted.append(allocator, 0x1a) catch {};
-                    i += 3;
-                    if (i < keys.len and keys[i] == ' ') i += 1;
-                } else {
-                    converted.append(allocator, keys[i]) catch {};
-                    i += 1;
+            if (jsonGetArray(body, "args")) |args_slice| {
+                var iter = JsonArrayIterator.init(args_slice);
+                while (iter.next()) |arg| {
+                    args_list.append(allocator, arg) catch {};
+                }
+            } else if (jsonGetString(body, "keys")) |keys| {
+                // Legacy: split by spaces, try to match key names
+                var i: usize = 0;
+                while (i < keys.len) {
+                    while (i < keys.len and keys[i] == ' ') i += 1;
+                    if (i >= keys.len) break;
+                    const start = i;
+                    while (i < keys.len and keys[i] != ' ') i += 1;
+                    args_list.append(allocator, keys[start..i]) catch {};
                 }
             }
 
-            if (converted.items.len > 0) {
-                p.handleTextInput(converted.items);
-                p.has_pending_input.store(true, .release);
-                server.wake_signal.notify();
+            // Process each argument: key names → key events, literal text → text input
+            for (args_list.items) |arg| {
+                if (tmuxKeyLookup(arg)) |key| {
+                    // Send as key press+release event (bypasses bracketed paste)
+                    p.queueKeyEvent(key.keycode, key.mods, key.text);
+                } else {
+                    // Literal text → paste via ghostty_surface_text
+                    if (arg.len > 0) {
+                        p.handleTextInput(arg);
+                    }
+                }
             }
+
+            p.has_pending_input.store(true, .release);
+            server.wake_signal.notify();
         }
 
         return allocator.dupe(u8, "{\"ok\":true}\n") catch null;
@@ -7424,48 +7451,139 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
 }
 
 /// Simple JSON string field extractor — finds "key":"value" and returns value slice.
-fn jsonGetString(json: []const u8, key: []const u8) ?[]const u8 {
-    // Search for "key":"
+/// Find the byte position of the value for "key" in JSON. Returns index of first non-whitespace
+/// character after the colon, or null if key not found.
+fn jsonFindValue(json: []const u8, key: []const u8) ?usize {
     var i: usize = 0;
     while (i + key.len + 4 < json.len) : (i += 1) {
         if (json[i] == '"' and i + 1 + key.len < json.len and
             std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
             json[i + 1 + key.len] == '"')
         {
-            // Found key, skip to value
             var j = i + 1 + key.len + 1; // past closing quote of key
             while (j < json.len and (json[j] == ':' or json[j] == ' ')) : (j += 1) {}
-            if (j < json.len and json[j] == '"') {
-                j += 1; // past opening quote of value
-                const start = j;
-                while (j < json.len and json[j] != '"') : (j += 1) {}
-                return json[start..j];
+            return j;
+        }
+    }
+    return null;
+}
+
+fn jsonGetString(json: []const u8, key: []const u8) ?[]const u8 {
+    const pos = jsonFindValue(json, key) orelse return null;
+    if (pos >= json.len or json[pos] != '"') return null;
+    const start = pos + 1;
+    const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
+    return json[start..end];
+}
+
+fn jsonGetInt(json: []const u8, key: []const u8) ?u32 {
+    const pos = jsonFindValue(json, key) orelse return null;
+    var end = pos;
+    while (end < json.len and json[end] >= '0' and json[end] <= '9') : (end += 1) {}
+    if (end == pos) return null;
+    return std.fmt.parseInt(u32, json[pos..end], 10) catch null;
+}
+
+/// Tmux key name → XKB keycode + mods + text. Single lookup replaces two functions.
+const TmuxKey = struct { keycode: u32, mods: u32 = 0, text: ?[]const u8 = null };
+
+/// Named key map using comptime StaticStringMap for O(1) lookup.
+const tmux_key_map = std.StaticStringMap(TmuxKey).initComptime(.{
+    .{ "Enter", TmuxKey{ .keycode = 0x0024, .text = "\r" } },
+    .{ "Space", TmuxKey{ .keycode = 0x0041, .text = " " } },
+    .{ "Tab", TmuxKey{ .keycode = 0x0017, .text = "\t" } },
+    .{ "Escape", TmuxKey{ .keycode = 0x0009 } },
+    .{ "BSpace", TmuxKey{ .keycode = 0x0016, .text = "\x7f" } },
+    .{ "DC", TmuxKey{ .keycode = 0x0077 } },
+    .{ "Up", TmuxKey{ .keycode = 0x006f } },
+    .{ "Down", TmuxKey{ .keycode = 0x0074 } },
+    .{ "Left", TmuxKey{ .keycode = 0x0071 } },
+    .{ "Right", TmuxKey{ .keycode = 0x0072 } },
+    .{ "Home", TmuxKey{ .keycode = 0x006e } },
+    .{ "End", TmuxKey{ .keycode = 0x0073 } },
+    .{ "PageUp", TmuxKey{ .keycode = 0x0070 } },
+    .{ "PageDown", TmuxKey{ .keycode = 0x0075 } },
+});
+
+/// Static table for C-a (0x01) through C-z (0x1a) text bytes.
+const ctrl_text_table: [26][1]u8 = blk: {
+    var t: [26][1]u8 = undefined;
+    for (0..26) |i| t[i] = .{@intCast(i + 1)};
+    break :blk t;
+};
+
+/// Resolve a tmux key name to keycode/mods/text. Handles named keys and C-<letter>.
+fn tmuxKeyLookup(name: []const u8) ?TmuxKey {
+    if (tmux_key_map.get(name)) |k| return k;
+    // C-<letter>: derive keycode from mapKeyCode("Key" + upper(letter))
+    if (name.len == 3 and name[0] == 'C' and name[1] == '-') {
+        const letter = name[2];
+        if (letter >= 'a' and letter <= 'z') {
+            var code_buf = [_]u8{ 'K', 'e', 'y', letter - 32 }; // "KeyA" etc.
+            const keycode = Panel.mapKeyCode(&code_buf);
+            if (keycode != 0) {
+                return .{ .keycode = keycode, .mods = c.GHOSTTY_MODS_CTRL, .text = &ctrl_text_table[letter - 'a'] };
             }
         }
     }
     return null;
 }
 
-/// Simple JSON integer field extractor — finds "key":123 and returns the integer.
-fn jsonGetInt(json: []const u8, key: []const u8) ?u32 {
-    var i: usize = 0;
-    while (i + key.len + 4 < json.len) : (i += 1) {
-        if (json[i] == '"' and i + 1 + key.len < json.len and
-            std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
-            json[i + 1 + key.len] == '"')
-        {
-            var j = i + 1 + key.len + 1;
-            while (j < json.len and (json[j] == ':' or json[j] == ' ')) : (j += 1) {}
-            // Parse integer
-            const start = j;
-            while (j < json.len and json[j] >= '0' and json[j] <= '9') : (j += 1) {}
-            if (j > start) {
-                return std.fmt.parseInt(u32, json[start..j], 10) catch null;
-            }
+/// Find a JSON array value for a given key. Returns the inner content (without brackets).
+fn jsonGetArray(json: []const u8, key: []const u8) ?[]const u8 {
+    const pos = jsonFindValue(json, key) orelse return null;
+    if (pos >= json.len or json[pos] != '[') return null;
+    var j = pos + 1;
+    const start = j;
+    var depth: usize = 1;
+    var in_str = false;
+    var escaped = false;
+    while (j < json.len and depth > 0) : (j += 1) {
+        if (escaped) { escaped = false; continue; }
+        if (json[j] == '\\' and in_str) { escaped = true; continue; }
+        if (json[j] == '"') in_str = !in_str;
+        if (!in_str) {
+            if (json[j] == '[') depth += 1;
+            if (json[j] == ']') depth -= 1;
         }
     }
-    return null;
+    return if (depth == 0) json[start .. j - 1] else null;
 }
+
+/// Iterator over JSON array string elements: "a","b","c"
+const JsonArrayIterator = struct {
+    data: []const u8,
+    pos: usize,
+
+    fn init(data: []const u8) JsonArrayIterator {
+        return .{ .data = data, .pos = 0 };
+    }
+
+    fn next(self: *JsonArrayIterator) ?[]const u8 {
+        // Skip whitespace and commas
+        while (self.pos < self.data.len and (self.data[self.pos] == ' ' or self.data[self.pos] == ',' or self.data[self.pos] == '\n')) {
+            self.pos += 1;
+        }
+        if (self.pos >= self.data.len) return null;
+        if (self.data[self.pos] != '"') return null;
+        self.pos += 1; // skip opening quote
+        const start = self.pos;
+        // Find closing quote (handle backslash escapes)
+        while (self.pos < self.data.len) {
+            if (self.data[self.pos] == '\\' and self.pos + 1 < self.data.len) {
+                self.pos += 2; // skip escaped char
+                continue;
+            }
+            if (self.data[self.pos] == '"') {
+                const result = self.data[start..self.pos];
+                self.pos += 1; // skip closing quote
+                return result;
+            }
+            self.pos += 1;
+        }
+        return null;
+    }
+};
 
 
 // Main
@@ -7954,4 +8072,105 @@ pub fn main() !void {
 
     const args = try parseArgs(allocator);
     try run(allocator, args.http_port, args.mode);
+}
+
+// ==========================================================================
+// Tests
+// ==========================================================================
+
+test "jsonFindValue locates value position" {
+    const json = "{\"cmd\":\"send-keys\",\"target\":3}";
+    try std.testing.expectEqual(@as(?usize, 7), jsonFindValue(json, "cmd"));
+    try std.testing.expectEqual(@as(?usize, 28), jsonFindValue(json, "target"));
+    try std.testing.expectEqual(@as(?usize, null), jsonFindValue(json, "missing"));
+}
+
+test "jsonGetString extracts string values" {
+    const json = "{\"cmd\":\"send-keys\",\"name\":\"hello world\"}";
+    try std.testing.expectEqualStrings("send-keys", jsonGetString(json, "cmd").?);
+    try std.testing.expectEqualStrings("hello world", jsonGetString(json, "name").?);
+    try std.testing.expect(jsonGetString(json, "missing") == null);
+    // Integer value shouldn't match as string
+    try std.testing.expect(jsonGetString("{\"n\":42}", "n") == null);
+}
+
+test "jsonGetInt extracts integer values" {
+    try std.testing.expectEqual(@as(?u32, 3), jsonGetInt("{\"target\":3}", "target"));
+    try std.testing.expectEqual(@as(?u32, 12345), jsonGetInt("{\"id\":12345,\"x\":1}", "id"));
+    try std.testing.expect(jsonGetInt("{\"target\":\"str\"}", "target") == null);
+    try std.testing.expect(jsonGetInt("{\"x\":1}", "missing") == null);
+}
+
+test "jsonGetArray extracts array contents" {
+    const json = "{\"args\":[\"ls\",\"Enter\"],\"x\":1}";
+    const arr = jsonGetArray(json, "args").?;
+    try std.testing.expectEqualStrings("\"ls\",\"Enter\"", arr);
+    try std.testing.expect(jsonGetArray(json, "x") == null);
+    try std.testing.expect(jsonGetArray(json, "missing") == null);
+    // Nested brackets
+    const nested = "{\"a\":[[1],2]}";
+    try std.testing.expectEqualStrings("[1],2", jsonGetArray(nested, "a").?);
+}
+
+test "jsonGetArray handles escaped quotes" {
+    const json = "{\"args\":[\"echo \\\"hi\\\"\"]}";
+    const arr = jsonGetArray(json, "args").?;
+    try std.testing.expectEqualStrings("\"echo \\\"hi\\\"\"", arr);
+}
+
+test "JsonArrayIterator parses string elements" {
+    var iter = JsonArrayIterator.init("\"ls -la\",\"Enter\",\"C-c\"");
+    try std.testing.expectEqualStrings("ls -la", iter.next().?);
+    try std.testing.expectEqualStrings("Enter", iter.next().?);
+    try std.testing.expectEqualStrings("C-c", iter.next().?);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "JsonArrayIterator handles empty array" {
+    var iter = JsonArrayIterator.init("");
+    try std.testing.expect(iter.next() == null);
+}
+
+test "JsonArrayIterator handles escaped quotes in values" {
+    var iter = JsonArrayIterator.init("\"echo \\\"hi\\\"\"");
+    try std.testing.expectEqualStrings("echo \\\"hi\\\"", iter.next().?);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "tmuxKeyLookup resolves named keys" {
+    const enter = tmuxKeyLookup("Enter").?;
+    try std.testing.expectEqual(@as(u32, 0x0024), enter.keycode);
+    try std.testing.expectEqual(@as(u32, 0), enter.mods);
+    try std.testing.expectEqualStrings("\r", enter.text.?);
+
+    const esc = tmuxKeyLookup("Escape").?;
+    try std.testing.expectEqual(@as(u32, 0x0009), esc.keycode);
+    try std.testing.expect(esc.text == null);
+
+    try std.testing.expect(tmuxKeyLookup("NotAKey") == null);
+    try std.testing.expect(tmuxKeyLookup("") == null);
+}
+
+test "tmuxKeyLookup resolves C-<letter> keys" {
+    const ctrl_c = tmuxKeyLookup("C-c").?;
+    try std.testing.expectEqual(c.GHOSTTY_MODS_CTRL, ctrl_c.mods);
+    try std.testing.expectEqualStrings("\x03", ctrl_c.text.?);
+
+    const ctrl_a = tmuxKeyLookup("C-a").?;
+    try std.testing.expectEqualStrings("\x01", ctrl_a.text.?);
+
+    const ctrl_z = tmuxKeyLookup("C-z").?;
+    try std.testing.expectEqualStrings("\x1a", ctrl_z.text.?);
+
+    // Invalid C- patterns
+    try std.testing.expect(tmuxKeyLookup("C-A") == null); // uppercase
+    try std.testing.expect(tmuxKeyLookup("C-1") == null); // digit
+    try std.testing.expect(tmuxKeyLookup("C-") == null); // too short
+}
+
+test "tmuxKeyLookup covers all navigation keys" {
+    const keys = [_][]const u8{ "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown", "BSpace", "DC", "Tab", "Space" };
+    for (keys) |name| {
+        try std.testing.expect(tmuxKeyLookup(name) != null);
+    }
 }
