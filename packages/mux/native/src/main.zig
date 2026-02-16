@@ -215,8 +215,8 @@ pub const BinaryCtrlMsg = enum(u8) {
     get_session_list = 0x9B,     // Request session list (admin only)
     get_share_links = 0x9C,      // Request share links (admin only)
     get_oauth_config = 0x9D,     // Request OAuth provider status (admin only)
-    set_oauth_config = 0x8E,     // Set OAuth provider config (admin only)
-    remove_oauth_config = 0x8F,  // Remove OAuth provider config (admin only)
+    set_oauth_config = 0x9E,     // Set OAuth provider config (admin only)
+    remove_oauth_config = 0x9F,  // Remove OAuth provider config (admin only)
 };
 
 // Layout Management (persisted to disk)
@@ -3281,7 +3281,7 @@ const Server = struct {
                 if (role != .admin) return;
                 self.sendOAuthConfig(conn);
             },
-            0x8E => { // set_oauth_config: [0x8E][provider_len:u8][provider][id_len:u16][id][secret_len:u16][secret]
+            0x9E => { // set_oauth_config: [0x9E][provider_len:u8][provider][id_len:u16][id][secret_len:u16][secret]
                 if (role != .admin) {
                     self.sendAuthError(conn, "Permission denied");
                     return;
@@ -3307,7 +3307,7 @@ const Server = struct {
                 };
                 self.sendOAuthConfig(conn);
             },
-            0x8F => { // remove_oauth_config: [0x8F][provider_len:u8][provider]
+            0x9F => { // remove_oauth_config: [0x9F][provider_len:u8][provider]
                 if (role != .admin) {
                     self.sendAuthError(conn, "Permission denied");
                     return;
