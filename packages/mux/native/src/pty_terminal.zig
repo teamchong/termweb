@@ -13,6 +13,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
+const cell_width: u32 = 8;
+const cell_height: u32 = 16;
+
 pub const Terminal = struct {
     allocator: std.mem.Allocator,
     master_fd: posix.fd_t,
@@ -55,24 +58,14 @@ pub const Terminal = struct {
         const term = try allocator.create(Terminal);
         errdefer allocator.destroy(term);
 
-        // Calculate terminal size (assume 8x16 character cells)
-        const cell_width: u32 = 8;
-        const cell_height: u32 = 16;
         const cols = width / cell_width;
         const rows = height / cell_height;
 
-        // Allocate framebuffer
-        const fb_size = width * height * 4;
-        const framebuffer = try allocator.alloc(u8, fb_size);
+        const framebuffer = try allocateFramebuffer(allocator, width, height);
         errdefer allocator.free(framebuffer);
-        @memset(framebuffer, 0); // Black background
 
-        // Allocate cell grid
-        const cells = try allocator.alloc(Cell, cols * rows);
+        const cells = try allocateCells(allocator, cols, rows);
         errdefer allocator.free(cells);
-        for (cells) |*cell| {
-            cell.* = Cell{};
-        }
 
         // Open PTY
         const pty = try openPty();
@@ -162,23 +155,14 @@ pub const Terminal = struct {
     }
 
     pub fn resize(self: *Terminal, width: u32, height: u32) !void {
-        const cell_width: u32 = 8;
-        const cell_height: u32 = 16;
         const cols = width / cell_width;
         const rows = height / cell_height;
 
-        // Reallocate framebuffer
         self.allocator.free(self.framebuffer);
-        const fb_size = width * height * 4;
-        self.framebuffer = try self.allocator.alloc(u8, fb_size);
-        @memset(self.framebuffer, 0);
+        self.framebuffer = try allocateFramebuffer(self.allocator, width, height);
 
-        // Reallocate cells
         self.allocator.free(self.cells);
-        self.cells = try self.allocator.alloc(Cell, cols * rows);
-        for (self.cells) |*cell| {
-            cell.* = Cell{};
-        }
+        self.cells = try allocateCells(self.allocator, cols, rows);
 
         self.width = width;
         self.height = height;
@@ -384,6 +368,23 @@ pub const Terminal = struct {
         };
     }
 };
+
+/// Allocate and zero-initialize a framebuffer (RGBA, 4 bytes per pixel).
+fn allocateFramebuffer(allocator: std.mem.Allocator, width: u32, height: u32) ![]u8 {
+    const fb_size = width * height * 4;
+    const framebuffer = try allocator.alloc(u8, fb_size);
+    @memset(framebuffer, 0);
+    return framebuffer;
+}
+
+/// Allocate and default-initialize a cell grid.
+fn allocateCells(allocator: std.mem.Allocator, cols: u32, rows: u32) ![]Terminal.Cell {
+    const cells = try allocator.alloc(Terminal.Cell, cols * rows);
+    for (cells) |*c| {
+        c.* = Terminal.Cell{};
+    }
+    return cells;
+}
 
 // PTY helpers
 const PtyPair = struct {
