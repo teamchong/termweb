@@ -3564,13 +3564,9 @@ const Server = struct {
         buf.append(self.allocator, 0x0B) catch return; // session_list
 
         const sessions = self.auth_state.sessions;
-        var count: u16 = 0;
+        buf.writer(self.allocator).writeInt(u16, @intCast(sessions.count()), .little) catch return;
+
         var iter = sessions.valueIterator();
-        while (iter.next()) |_| count += 1;
-
-        buf.writer(self.allocator).writeInt(u16, count, .little) catch return;
-
-        iter = sessions.valueIterator();
         while (iter.next()) |session| {
             buf.writer(self.allocator).writeInt(u16, @intCast(session.id.len), .little) catch return;
             buf.appendSlice(self.allocator, session.id) catch return;
