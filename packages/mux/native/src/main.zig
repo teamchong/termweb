@@ -2939,27 +2939,18 @@ const Server = struct {
     fn handleBinaryControlMessageFromClient(self: *Server, conn: *ws.Connection, data: []const u8) void {
         if (data.len < 1) return;
 
-        const msg_type = data[0];
-        if (msg_type == 0x84) { // assign_panel
-            self.handleAssignPanel(conn, data);
-            return;
-        } else if (msg_type == 0x85) { // unassign_panel
-            self.handleUnassignPanel(conn, data);
-            return;
-        } else if (msg_type == 0x86) { // panel_input
-            self.handlePanelInput(conn, data);
-            return;
-        } else if (msg_type == 0x87) { // panel_msg envelope
-            self.handlePanelMsg(conn, data);
-            return;
-        }
-
-        if (msg_type == 0x81) { // close_panel
-            if (data.len < 5) return;
-            const panel_id = std.mem.readInt(u32, data[1..5], .little);
-            _ = self.pending_destroys_ch.send(.{ .id = panel_id });
-            self.wake_signal.notify();
-        } else if (msg_type == 0x82) { // resize_panel
+        switch (data[0]) {
+            0x84 => return self.handleAssignPanel(conn, data),
+            0x85 => return self.handleUnassignPanel(conn, data),
+            0x86 => return self.handlePanelInput(conn, data),
+            0x87 => return self.handlePanelMsg(conn, data),
+            0x81 => { // close_panel
+                if (data.len < 5) return;
+                const panel_id = std.mem.readInt(u32, data[1..5], .little);
+                _ = self.pending_destroys_ch.send(.{ .id = panel_id });
+                self.wake_signal.notify();
+            },
+            0x82 => { // resize_panel
             if (data.len < 9) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
             const width: u32 = std.mem.readInt(u16, data[5..7], .little);
@@ -2992,7 +2983,8 @@ const Server = struct {
                 _ = self.pending_resizes_ch.send(.{ .id = panel_id, .width = @intCast(width), .height = @intCast(height), .scale = scale });
                 self.wake_signal.notify();
             }
-        } else if (msg_type == 0x83) { // focus_panel
+            },
+            0x83 => { // focus_panel
             if (data.len < 5) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
             self.mutex.lock();
@@ -3024,7 +3016,8 @@ const Server = struct {
             self.mutex.unlock();
 
             self.wake_signal.notify();
-        } else if (msg_type == 0x88) { // view_action
+            },
+            0x88 => { // view_action
             if (data.len < 6) return;
             const panel_id = std.mem.readInt(u32, data[1..5], .little);
             const action_len = data[5];
@@ -3114,7 +3107,8 @@ const Server = struct {
             } else {
                 self.mutex.unlock();
             }
-        } else if (msg_type == 0x89) { // set_overview
+            },
+            0x89 => { // set_overview
             if (data.len < 2) return;
             self.mutex.lock();
             const was_open = self.overview_open;
@@ -3131,19 +3125,22 @@ const Server = struct {
             self.wake_signal.notify();
             // Broadcast to all control connections so other clients can sync
             self.broadcastOverviewState();
-        } else if (msg_type == 0x8A) { // set_quick_terminal
+            },
+            0x8A => { // set_quick_terminal
             if (data.len < 2) return;
             self.mutex.lock();
             self.quick_terminal_open = data[1] != 0;
             self.mutex.unlock();
             self.broadcastQuickTerminalState();
-        } else if (msg_type == 0x8B) { // set_inspector
+            },
+            0x8B => { // set_inspector
             if (data.len < 2) return;
             self.mutex.lock();
             self.inspector_open = data[1] != 0;
             self.mutex.unlock();
             self.broadcastInspectorOpenState();
-        } else if (msg_type == 0x8C) { // set_clipboard
+            },
+            0x8C => { // set_clipboard
             // [0x8C][panel_id:u32][len:u32][text...]
             if (data.len < 9) return;
             const text_len = std.mem.readInt(u32, data[5..9], .little);
@@ -3153,15 +3150,16 @@ const Server = struct {
             if (self.standard_clipboard) |old| self.allocator.free(old);
             self.standard_clipboard = self.allocator.dupe(u8, text) catch null;
             self.mutex.unlock();
-        } else if (msg_type == 0x8D) { // save_config
+            },
+            0x8D => { // save_config
             // [0x8D][content_len:u32_le][content...]
             if (data.len < 5) return;
             const content_len = std.mem.readInt(u32, data[1..5], .little);
             if (data.len < 5 + content_len) return;
             const content = data[5..][0..content_len];
             self.handleSaveConfig(conn, content);
-        } else {
-            std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{msg_type});
+            },
+            else => std.log.warn("Unknown binary control message type: 0x{x:0>2}", .{data[0]}),
         }
     }
 
@@ -3859,7 +3857,7 @@ const Server = struct {
             total_panel_data_size += 4 + 1 + @min(panel.title.len, 255);
         }
 
-        const layout_len: u16 = @min(@as(u16, @intCast(@min(layout_json.len, 65535))), 65535);
+        const layout_len: u16 = @intCast(@min(layout_json.len, 65535));
         const msg_size = 1 + 1 + total_panel_data_size + 2 + layout_len;
         const msg_buf = self.allocator.alloc(u8, msg_size) catch return;
         defer self.allocator.free(msg_buf);
@@ -3903,32 +3901,22 @@ const Server = struct {
         }
     }
 
-    fn broadcastPanelCreated(self: *Server, panel_id: u32) void {
-        // Binary: [type:u8][panel_id:u32] = 5 bytes
+    /// Broadcast a [type:u8][panel_id:u32] message (5 bytes).
+    fn broadcastPanelMsg(self: *Server, msg_type: BinaryCtrlMsg, panel_id: u32) void {
         var buf: [5]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_created);
-        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
-        self.broadcastControlData(&buf);
-    }
-
-    fn broadcastPanelClosed(self: *Server, panel_id: u32) void {
-        // Binary: [type:u8][panel_id:u32] = 5 bytes
-        var buf: [5]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_closed);
+        buf[0] = @intFromEnum(msg_type);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
         self.broadcastControlData(&buf);
     }
 
     fn broadcastPanelTitle(self: *Server, panel_id: u32, title: []const u8) void {
-        // Binary: [type:u8][panel_id:u32][title_len:u8][title...] = 6 + title.len bytes
-        const title_len: u8 = @min(@as(u8, @intCast(@min(title.len, 255))), 255);
-        var buf: [262]u8 = undefined; // 1 + 4 + 1 + 256
+        const title_len: u8 = @intCast(@min(title.len, 255));
+        var buf: [262]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_title);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
         buf[5] = title_len;
         @memcpy(buf[6..][0..title_len], title[0..title_len]);
 
-        // Update panel data under mutex
         self.mutex.lock();
         if (self.panels.get(panel_id)) |panel| {
             if (panel.title.len > 0) self.allocator.free(panel.title);
@@ -3939,24 +3927,14 @@ const Server = struct {
         self.broadcastControlData(buf[0 .. 6 + title_len]);
     }
 
-    fn broadcastPanelBell(self: *Server, panel_id: u32) void {
-        // Binary: [type:u8][panel_id:u32] = 5 bytes
-        var buf: [5]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.panel_bell);
-        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
-        self.broadcastControlData(&buf);
-    }
-
     fn broadcastPanelPwd(self: *Server, panel_id: u32, pwd: []const u8) void {
-        // Binary: [type:u8][panel_id:u32][pwd_len:u16][pwd...] = 7 + pwd.len bytes
-        const pwd_len: u16 = @min(@as(u16, @intCast(@min(pwd.len, 1024))), 1024);
-        var buf: [1031]u8 = undefined; // 1 + 4 + 2 + 1024
+        const pwd_len: u16 = @intCast(@min(pwd.len, 1024));
+        var buf: [1031]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_pwd);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
         std.mem.writeInt(u16, buf[5..7], pwd_len, .little);
         @memcpy(buf[7..][0..pwd_len], pwd[0..pwd_len]);
 
-        // Update panel data under mutex
         self.mutex.lock();
         if (self.panels.get(panel_id)) |panel| {
             if (panel.pwd.len > 0) self.allocator.free(panel.pwd);
@@ -3968,11 +3946,10 @@ const Server = struct {
     }
 
     fn broadcastPanelNotification(self: *Server, panel_id: u32, title: []const u8, body: []const u8) void {
-        // Binary: [type:u8][panel_id:u32][title_len:u8][title...][body_len:u16][body...] = 8 + title.len + body.len bytes
-        const title_len: u8 = @min(@as(u8, @intCast(@min(title.len, 255))), 255);
-        const body_len: u16 = @min(@as(u16, @intCast(@min(body.len, 1024))), 1024);
+        const title_len: u8 = @intCast(@min(title.len, 255));
+        const body_len: u16 = @intCast(@min(body.len, 1024));
         const total_len: usize = 1 + 4 + 1 + title_len + 2 + body_len;
-        var buf: [1287]u8 = undefined; // 1 + 4 + 1 + 255 + 2 + 1024
+        var buf: [1287]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.panel_notification);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
         buf[5] = title_len;
@@ -3998,7 +3975,7 @@ const Server = struct {
         defer self.allocator.free(layout_json);
 
         // Binary: [type:u8][layout_len:u16][layout_json...] = 3 + layout.len bytes
-        const layout_len: u16 = @min(@as(u16, @intCast(@min(layout_json.len, 65535))), 65535);
+        const layout_len: u16 = @intCast(@min(layout_json.len, 65535));
         const msg_buf = self.allocator.alloc(u8, 3 + layout_len) catch return;
         defer self.allocator.free(msg_buf);
 
@@ -4051,63 +4028,49 @@ const Server = struct {
         }
     }
 
-    fn broadcastOverviewState(self: *Server) void {
-        // Binary: [type:u8][open:u8] = 2 bytes
-        var buf: [2]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.overview_state);
-        buf[1] = if (self.overview_open) 1 else 0;
+    /// Broadcast a [type:u8][bool:u8] message to all control connections.
+    fn broadcastBoolState(self: *Server, msg_type: BinaryCtrlMsg, value: bool) void {
+        const buf = [2]u8{ @intFromEnum(msg_type), @intFromBool(value) };
         self.broadcastControlData(&buf);
+    }
+
+    /// Send a [type:u8][bool:u8] message to a single connection.
+    fn sendBoolState(_: *Server, msg_type: BinaryCtrlMsg, value: bool, conn: *ws.Connection) void {
+        const buf = [2]u8{ @intFromEnum(msg_type), @intFromBool(value) };
+        conn.sendBinary(&buf) catch {};
+    }
+
+    fn broadcastOverviewState(self: *Server) void {
+        self.broadcastBoolState(.overview_state, self.overview_open);
     }
 
     fn sendOverviewState(self: *Server, conn: *ws.Connection) void {
-        // Binary: [type:u8][open:u8] = 2 bytes
-        var buf: [2]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.overview_state);
         self.mutex.lock();
-        buf[1] = if (self.overview_open) 1 else 0;
+        const open = self.overview_open;
         self.mutex.unlock();
-        conn.sendBinary(&buf) catch {};
+        self.sendBoolState(.overview_state, open, conn);
     }
 
     fn broadcastQuickTerminalState(self: *Server) void {
-        // Binary: [type:u8][open:u8] = 2 bytes
-        var buf: [2]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.quick_terminal_state);
-        buf[1] = if (self.quick_terminal_open) 1 else 0;
-        self.broadcastControlData(&buf);
+        self.broadcastBoolState(.quick_terminal_state, self.quick_terminal_open);
     }
 
     fn sendQuickTerminalState(self: *Server, conn: *ws.Connection) void {
-        // Binary: [type:u8][open:u8] = 2 bytes
-        var buf: [2]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.quick_terminal_state);
         self.mutex.lock();
-        buf[1] = if (self.quick_terminal_open) 1 else 0;
+        const open = self.quick_terminal_open;
         self.mutex.unlock();
-        conn.sendBinary(&buf) catch {};
+        self.sendBoolState(.quick_terminal_state, open, conn);
     }
 
     fn broadcastInspectorOpenState(self: *Server) void {
-        // Binary: [type:u8][open:u8] = 2 bytes
-        var buf: [2]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state_open);
-        buf[1] = if (self.inspector_open) 1 else 0;
-
-        var conn_buf: [max_broadcast_conns]*ws.Connection = undefined;
-        const conns = self.snapshotControlConns(&conn_buf);
-        for (conns) |conn| {
-            conn.sendBinary(&buf) catch {};
-        }
+        self.broadcastBoolState(.inspector_state_open, self.inspector_open);
     }
 
     fn sendInspectorOpenState(self: *Server, conn: *ws.Connection) void {
-        // Binary: [type:u8][open:u8] = 2 bytes
-        var buf: [2]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state_open);
         self.mutex.lock();
-        buf[1] = if (self.inspector_open) 1 else 0;
+        const open = self.inspector_open;
         self.mutex.unlock();
-        conn.sendBinary(&buf) catch {};
+        self.sendBoolState(.inspector_state_open, open, conn);
     }
 
     fn broadcastClipboard(self: *Server, text: []const u8) void {
@@ -5626,7 +5589,7 @@ const Server = struct {
             // Panel starts streaming immediately. Initial dimensions are approximate;
             // each client's ResizeObserver sends the correct viewport-based resize
             // within one animation frame (~16ms).
-            self.broadcastPanelCreated(panel.id);
+            self.broadcastPanelMsg(.panel_created, panel.id);
             // Only broadcast layout update for regular panels (quick terminal is outside layout)
             if (req.kind == .regular) {
                 self.broadcastLayoutUpdate();
@@ -5675,7 +5638,7 @@ const Server = struct {
                 panel.deinit();
 
                 // Notify clients
-                self.broadcastPanelClosed(req.id);
+                self.broadcastPanelMsg(.panel_closed, req.id);
 
                 // Broadcast unassignment if panel was assigned
                 if (had_assignment) {
@@ -5741,7 +5704,7 @@ const Server = struct {
             // Initial dimensions are approximate (parent halved). Each client's
             // ResizeObserver will send the correct viewport-based resize within
             // one animation frame (~16ms), which triggers a keyframe at the right size.
-            self.broadcastPanelCreated(panel.id);
+            self.broadcastPanelMsg(.panel_created, panel.id);
             self.broadcastLayoutUpdate();
 
             // Broadcast initial pwd (inherit from parent or use initial_cwd)
@@ -6744,7 +6707,7 @@ fn actionCallback(app: c.ghostty_app_t, target: c.ghostty_target_s, action: c.gh
                     const panel = panel_ptr.*;
                     if (panel.surface == surface) {
                         self.mutex.unlock();
-                        self.broadcastPanelBell(panel.id);
+                        self.broadcastPanelMsg(.panel_bell, panel.id);
                         return true;
                     }
                 }
