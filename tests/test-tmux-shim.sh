@@ -189,7 +189,15 @@ OUTPUT=$(curl -sf --max-time 3 --unix-socket "$SOCK" \
   "http://localhost/api/tmux?cmd=display-message&pane=1&format=%23%7Bpane_id%7D" 2>/dev/null)
 RC=$?
 assert_exit "GET display-message returns 200" 0 $RC
-assert_matches "display-message body has pane_id" "^%[0-9]+" "$OUTPUT"
+# Verify it's exactly %<digits> (interpolated pane ID), not literal %23...
+assert_matches "display-message body has pane_id" "^%[0-9]+$" "$OUTPUT"
+
+# Verify interpolation worked (result should be short like "%1", not "%23%7Bpane_id%7D")
+if [ ${#OUTPUT} -le 5 ]; then
+  pass "display-message format was interpolated (got '$OUTPUT')"
+else
+  fail "display-message format was interpolated" "output too long: '$OUTPUT' — likely not decoded"
+fi
 
 # =========================================================
 # Test group 9: Raw Unix socket — POST endpoints

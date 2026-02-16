@@ -1019,11 +1019,10 @@ const Panel = struct {
             self.mutex.unlock();
             return;
         }
-        // Copy events locally to release mutex quickly
-        var events_buf: [256]InputEvent = undefined;
-        const events_count = @min(count, events_buf.len);
-        @memcpy(events_buf[0..events_count], items[0..events_count]);
-        self.input_queue.clearRetainingCapacity();
+        // Take ownership of the queue's backing storage to release mutex quickly.
+        // Swap with an empty list so new events can be queued immediately.
+        var local_queue = self.input_queue;
+        self.input_queue = .{};
         self.has_pending_input.store(false, .release);
         // Reset adaptive idle mode so the next frame capture runs immediately.
         // Without this, processInputQueue clears has_pending_input before the
@@ -1032,8 +1031,9 @@ const Panel = struct {
         // Debug: log the next 30 frames after input to see if hash changes
         self.dbg_input_countdown = 30;
         self.mutex.unlock();
+        defer local_queue.deinit(self.allocator);
 
-        for (events_buf[0..events_count]) |*event| {
+        for (local_queue.items) |*event| {
             switch (event.*) {
                 .key => |*key_event| {
                     // Set text pointer to our stored buffer
@@ -1048,12 +1048,14 @@ const Panel = struct {
                 },
                 .mouse_pos => |pos| {
                     c.ghostty_surface_mouse_pos(self.surface, pos.x, pos.y, pos.mods);
+                    self.had_input = true;
                 },
                 .mouse_button => |btn| {
                     // Send position first, then button event.
                     // ghostty_surface_mouse_button may trigger selection/clipboard
                     // operations internally.
                     _ = c.ghostty_surface_mouse_button(self.surface, btn.state, btn.button, btn.mods);
+                    self.had_input = true;
                 },
                 .mouse_scroll => |scroll| {
                     c.ghostty_surface_mouse_pos(self.surface, scroll.x, scroll.y, 0);
@@ -6355,10 +6357,10 @@ const Server = struct {
                     }
                 }
                 // After key/scroll input, pull last_frame backward so the next
-                // frame boundary arrives within ~5ms instead of up to 33ms. This
+                // frame boundary arrives within ~2ms instead of up to 33ms. This
                 // reduces input-to-display latency without extra encoder calls.
                 if (input_woke) {
-                    const max_input_delay_ns: i128 = 5 * std.time.ns_per_ms;
+                    const max_input_delay_ns: i128 = 2 * std.time.ns_per_ms;
                     const now_ts = std.time.nanoTimestamp();
                     const since = now_ts - last_frame;
                     const remaining_to_frame = @as(i128, frame_time_ns) - since;
@@ -6862,19 +6864,19 @@ const tmux_shim_script =
     \\    ;;
     \\
     \\  new-window)
-    \\    name=""; cwd=""
+    \\    name=""; cwd=""; run=""
     \\    while [ $# -gt 0 ]; do
     \\      case "$1" in
     \\        -n) name="$2"; shift 2 ;;
     \\        -c) cwd="$2"; shift 2 ;;
     \\        -t) shift 2 ;;
     \\        -*) shift ;;
-    \\        *) break ;;
+    \\        *) run="$*"; break ;;
     \\      esac
     \\    done
     \\    curl -sf --max-time 10 --unix-socket "$SOCK" -X POST "$API/api/tmux" \
     \\      -H "Content-Type: application/json" \
-    \\      -d "{\"cmd\":\"new-window\",\"cwd\":\"$cwd\",\"name\":\"$name\"}"
+    \\      -d "{\"cmd\":\"new-window\",\"cwd\":\"$cwd\",\"name\":\"$name\",\"command\":\"$run\"}"
     \\    ;;
     \\
     \\  send-keys)
@@ -7068,15 +7070,48 @@ fn handleTmuxQuery(server: *Server, query: []const u8) ?[]const u8 {
         }
     }
 
+    // Percent-decode the format string (shim sends literal #{}, raw curl sends %23%7B%7D)
+    const decoded_format = if (format.len > 0) (percentDecode(format, allocator) orelse format) else format;
+    defer if (decoded_format.ptr != format.ptr) allocator.free(decoded_format);
+
     if (std.mem.eql(u8, cmd, "list-panes")) {
-        return handleTmuxListPanes(server, format, allocator);
+        return handleTmuxListPanes(server, decoded_format, allocator);
     }
 
     if (std.mem.eql(u8, cmd, "display-message")) {
         const pane_id = std.fmt.parseInt(u32, pane_str, 10) catch 1;
-        return handleTmuxDisplayMessage(server, pane_id, format, allocator);
+        return handleTmuxDisplayMessage(server, pane_id, decoded_format, allocator);
     }
 
+    return null;
+}
+
+/// Decode percent-encoded URL strings (e.g., %23 → #, %7B → {).
+fn percentDecode(input: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    // Fast path: no percent signs
+    if (std.mem.indexOfScalar(u8, input, '%') == null) return allocator.dupe(u8, input) catch null;
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const hi = hexDigit(input[i + 1]);
+            const lo = hexDigit(input[i + 2]);
+            if (hi != null and lo != null) {
+                buf.append(allocator, (hi.? << 4) | lo.?) catch return null;
+                i += 3;
+                continue;
+            }
+        }
+        buf.append(allocator, input[i]) catch return null;
+        i += 1;
+    }
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
+fn hexDigit(char: u8) ?u8 {
+    if (char >= '0' and char <= '9') return char - '0';
+    if (char >= 'a' and char <= 'f') return char - 'a' + 10;
+    if (char >= 'A' and char <= 'F') return char - 'A' + 10;
     return null;
 }
 
@@ -7249,6 +7284,13 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         // Block waiting for the panel to be created (with timeout)
         const new_id = server.tmux_api_response_ch.recv() orelse expected_id;
 
+        // If a command was specified, send it to the new panel (like real tmux)
+        if (jsonGetString(body, "command")) |cmd_str| {
+            if (cmd_str.len > 0) {
+                sendCommandToPanel(server, new_id, cmd_str);
+            }
+        }
+
         return std.fmt.allocPrint(allocator, "{{\"pane_id\":\"%{d}\"}}\n", .{new_id}) catch null;
     }
 
@@ -7292,6 +7334,13 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         server.wake_signal.notify();
 
         const new_id = server.tmux_api_response_ch.recv() orelse expected_id;
+
+        // If a command was specified, send it to the new panel
+        if (jsonGetString(body, "command")) |cmd_str| {
+            if (cmd_str.len > 0) {
+                sendCommandToPanel(server, new_id, cmd_str);
+            }
+        }
 
         return std.fmt.allocPrint(allocator, "{{\"pane_id\":\"%{d}\"}}\n", .{new_id}) catch null;
     }
@@ -7346,6 +7395,29 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
     }
 
     return null;
+}
+
+/// Send a command string to a panel as text input followed by Enter.
+/// Used by tmux shim's split-window and new-window to run commands in new panels.
+/// Waits briefly for the shell to initialize before sending.
+fn sendCommandToPanel(server: *Server, panel_id: u32, command: []const u8) void {
+    // Brief delay to let the shell initialize in the new panel.
+    // Without this, the command arrives before the shell prompt is ready
+    // and gets lost or partially consumed by shell init sequences.
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    server.mutex.lock();
+    const panel = server.panels.get(panel_id);
+    server.mutex.unlock();
+
+    if (panel) |p| {
+        // Send the command as text input
+        p.handleTextInput(command);
+        // Send Enter key to execute it
+        p.queueKeyEvent(0x0024, 0, "\r");
+        p.has_pending_input.store(true, .release);
+        server.wake_signal.notify();
+    }
 }
 
 /// Simple JSON string field extractor — finds "key":"value" and returns value slice.
@@ -8070,5 +8142,184 @@ test "tmuxKeyLookup covers all navigation keys" {
     const keys = [_][]const u8{ "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown", "BSpace", "DC", "Tab", "Space" };
     for (keys) |name| {
         try std.testing.expect(tmuxKeyLookup(name) != null);
+    }
+}
+
+// ==========================================================================
+// percentDecode tests
+// ==========================================================================
+
+test "percentDecode decodes fully encoded format string" {
+    const result = percentDecode("%23%7Bpane_id%7D", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("#{pane_id}", result);
+}
+
+test "percentDecode passes through plain strings" {
+    const result = percentDecode("hello", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "percentDecode decodes spaces" {
+    const result = percentDecode("hello%20world", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "percentDecode handles mixed encoded and literal" {
+    const result = percentDecode("%23{pane_id}", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("#{pane_id}", result);
+}
+
+test "percentDecode passes through invalid hex" {
+    const result = percentDecode("abc%ZZdef", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("abc%ZZdef", result);
+}
+
+test "percentDecode handles truncated percent at end" {
+    const result = percentDecode("abc%2", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("abc%2", result);
+}
+
+test "percentDecode handles empty string" {
+    const result = percentDecode("", std.testing.allocator).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+// ==========================================================================
+// hexDigit tests
+// ==========================================================================
+
+test "hexDigit resolves decimal digits" {
+    try std.testing.expectEqual(@as(?u8, 0), hexDigit('0'));
+    try std.testing.expectEqual(@as(?u8, 9), hexDigit('9'));
+    try std.testing.expectEqual(@as(?u8, 5), hexDigit('5'));
+}
+
+test "hexDigit resolves lowercase hex" {
+    try std.testing.expectEqual(@as(?u8, 10), hexDigit('a'));
+    try std.testing.expectEqual(@as(?u8, 15), hexDigit('f'));
+}
+
+test "hexDigit resolves uppercase hex" {
+    try std.testing.expectEqual(@as(?u8, 10), hexDigit('A'));
+    try std.testing.expectEqual(@as(?u8, 15), hexDigit('F'));
+}
+
+test "hexDigit returns null for non-hex chars" {
+    try std.testing.expect(hexDigit('g') == null);
+    try std.testing.expect(hexDigit('G') == null);
+    try std.testing.expect(hexDigit(' ') == null);
+    try std.testing.expect(hexDigit('%') == null);
+}
+
+// ==========================================================================
+// JSON parsing edge cases
+// ==========================================================================
+
+test "jsonGetString with empty value" {
+    try std.testing.expectEqualStrings("", jsonGetString("{\"cmd\":\"\"}", "cmd").?);
+}
+
+test "jsonGetString with spaces in value" {
+    try std.testing.expectEqualStrings("echo hello world", jsonGetString("{\"command\":\"echo hello world\"}", "command").?);
+}
+
+test "jsonGetInt with zero" {
+    try std.testing.expectEqual(@as(?u32, 0), jsonGetInt("{\"pane\":0}", "pane"));
+}
+
+test "jsonGetInt at end of object" {
+    try std.testing.expectEqual(@as(?u32, 42), jsonGetInt("{\"id\":42}", "id"));
+}
+
+test "jsonGetArray with empty array" {
+    try std.testing.expectEqualStrings("", jsonGetArray("{\"args\":[]}", "args").?);
+}
+
+test "jsonGetArray with single element" {
+    try std.testing.expectEqualStrings("\"ls\"", jsonGetArray("{\"args\":[\"ls\"]}", "args").?);
+}
+
+// ==========================================================================
+// handleTmuxPost routing (JSON extraction tests)
+// ==========================================================================
+
+test "JSON extraction for split-window body" {
+    const body = "{\"cmd\":\"split-window\",\"pane\":2,\"dir\":\"h\",\"command\":\"vim\"}";
+    try std.testing.expectEqualStrings("split-window", jsonGetString(body, "cmd").?);
+    try std.testing.expectEqual(@as(?u32, 2), jsonGetInt(body, "pane"));
+    try std.testing.expectEqualStrings("h", jsonGetString(body, "dir").?);
+    try std.testing.expectEqualStrings("vim", jsonGetString(body, "command").?);
+}
+
+test "JSON extraction for new-window body" {
+    const body = "{\"cmd\":\"new-window\",\"command\":\"top\",\"name\":\"monitor\"}";
+    try std.testing.expectEqualStrings("new-window", jsonGetString(body, "cmd").?);
+    try std.testing.expectEqualStrings("top", jsonGetString(body, "command").?);
+    try std.testing.expectEqualStrings("monitor", jsonGetString(body, "name").?);
+}
+
+test "JSON extraction for send-keys body" {
+    const body = "{\"cmd\":\"send-keys\",\"target\":3,\"args\":[\"ls -la\",\"Enter\"]}";
+    try std.testing.expectEqualStrings("send-keys", jsonGetString(body, "cmd").?);
+    try std.testing.expectEqual(@as(?u32, 3), jsonGetInt(body, "target"));
+    const arr = jsonGetArray(body, "args").?;
+    var iter = JsonArrayIterator.init(arr);
+    try std.testing.expectEqualStrings("ls -la", iter.next().?);
+    try std.testing.expectEqualStrings("Enter", iter.next().?);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "JSON extraction returns null for missing cmd" {
+    try std.testing.expect(jsonGetString("{\"target\":1}", "cmd") == null);
+}
+
+test "JSON extraction returns null for unknown fields" {
+    const body = "{\"cmd\":\"unknown-cmd\"}";
+    try std.testing.expectEqualStrings("unknown-cmd", jsonGetString(body, "cmd").?);
+    try std.testing.expect(jsonGetString(body, "target") == null);
+}
+
+// ==========================================================================
+// Send-keys args building
+// ==========================================================================
+
+test "JsonArrayIterator parses send-keys args" {
+    var iter = JsonArrayIterator.init("\"ls -la\",\"Enter\"");
+    const first = iter.next().?;
+    try std.testing.expectEqualStrings("ls -la", first);
+    const second = iter.next().?;
+    try std.testing.expectEqualStrings("Enter", second);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "key lookup integration: Enter resolves, literal text does not" {
+    try std.testing.expect(tmuxKeyLookup("Enter") != null);
+    try std.testing.expect(tmuxKeyLookup("hello") == null);
+    try std.testing.expect(tmuxKeyLookup("ls -la") == null);
+}
+
+// ==========================================================================
+// All ctrl keys C-a through C-z
+// ==========================================================================
+
+test "tmuxKeyLookup resolves all C-a through C-z" {
+    var letter: u8 = 'a';
+    while (letter <= 'z') : (letter += 1) {
+        const name = [_]u8{ 'C', '-', letter };
+        const key = tmuxKeyLookup(&name);
+        try std.testing.expect(key != null);
+        const k = key.?;
+        // Verify correct control byte
+        const expected_byte: u8 = letter - 'a' + 1;
+        try std.testing.expectEqual(expected_byte, k.text.?[0]);
+        // Verify CTRL modifier is set
+        try std.testing.expectEqual(c.GHOSTTY_MODS_CTRL, k.mods);
     }
 }
