@@ -7113,6 +7113,21 @@ fn hexDigit(char: u8) ?u8 {
     return null;
 }
 
+/// Tmux format variable types for interpolation dispatch.
+const FmtVar = enum { pane_id, pane_index, pane_active, pane_width, pane_height, pane_current_path, pane_title };
+
+/// Comptime map from variable name to FmtVar for O(1) lookup.
+const fmt_var_map = std.StaticStringMap(FmtVar).initComptime(.{
+    .{ "pane_id", .pane_id },
+    .{ "pane_index", .pane_index },
+    .{ "pane_active", .pane_active },
+    .{ "pane_width", .pane_width },
+    .{ "pane_height", .pane_height },
+    .{ "pane_current_path", .pane_current_path },
+    .{ "pane_title", .pane_title },
+    .{ "pane_current_command", .pane_title },
+});
+
 /// Interpolate tmux format variables (e.g., #{pane_id} → %1) into buf.
 fn interpolateTmuxFormat(
     buf: *std.ArrayListUnmanaged(u8),
@@ -7125,6 +7140,7 @@ fn interpolateTmuxFormat(
     title: []const u8,
     allocator: std.mem.Allocator,
 ) void {
+    const writer = buf.writer(allocator);
     var i: usize = 0;
     while (i < format.len) {
         if (i + 1 < format.len and format[i] == '#' and format[i + 1] == '{') {
@@ -7133,22 +7149,15 @@ fn interpolateTmuxFormat(
                 i += 1;
                 continue;
             };
-            const var_name = format[i + 2 .. close];
-            if (std.mem.eql(u8, var_name, "pane_id")) {
-                std.fmt.format(buf.writer(allocator), "%{d}", .{panel_id}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_index")) {
-                std.fmt.format(buf.writer(allocator), "{d}", .{panel_id}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_active")) {
-                std.fmt.format(buf.writer(allocator), "{d}", .{active}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_width")) {
-                std.fmt.format(buf.writer(allocator), "{d}", .{width}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_height")) {
-                std.fmt.format(buf.writer(allocator), "{d}", .{height}) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_current_path")) {
-                buf.appendSlice(allocator, pwd) catch {};
-            } else if (std.mem.eql(u8, var_name, "pane_title") or std.mem.eql(u8, var_name, "pane_current_command")) {
-                buf.appendSlice(allocator, title) catch {};
-            }
+            if (fmt_var_map.get(format[i + 2 .. close])) |v| switch (v) {
+                .pane_id => std.fmt.format(writer, "%{d}", .{panel_id}) catch {},
+                .pane_index => std.fmt.format(writer, "{d}", .{panel_id}) catch {},
+                .pane_active => std.fmt.format(writer, "{d}", .{active}) catch {},
+                .pane_width => std.fmt.format(writer, "{d}", .{width}) catch {},
+                .pane_height => std.fmt.format(writer, "{d}", .{height}) catch {},
+                .pane_current_path => buf.appendSlice(allocator, pwd) catch {},
+                .pane_title => buf.appendSlice(allocator, title) catch {},
+            };
             i = close + 1;
         } else {
             buf.append(allocator, format[i]) catch break;
@@ -7169,9 +7178,8 @@ fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.A
         const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == panel.id) @as(u8, 1) else @as(u8, 0)) else 0;
 
         if (format.len > 0) {
-            var line: std.ArrayListUnmanaged(u8) = .{};
             interpolateTmuxFormat(
-                &line,
+                &buf,
                 format,
                 panel.id,
                 panel.width,
@@ -7181,9 +7189,7 @@ fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.A
                 if (panel.title.len > 0) panel.title else "shell",
                 allocator,
             );
-            line.append(allocator, '\n') catch {};
-            buf.appendSlice(allocator, line.items) catch {};
-            line.deinit(allocator);
+            buf.append(allocator, '\n') catch {};
         } else {
             // Default format: %N: [WxH] [active]
             std.fmt.format(buf.writer(allocator), "%{d}: [{d}x{d}] [{s}]\n", .{
@@ -7199,14 +7205,12 @@ fn handleTmuxListPanes(server: *Server, format: []const u8, allocator: std.mem.A
 
 fn handleTmuxDisplayMessage(server: *Server, pane_id: u32, format: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     server.mutex.lock();
-    const panel = server.panels.get(pane_id);
+    const p = server.panels.get(pane_id) orelse {
+        server.mutex.unlock();
+        return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
+    };
     const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == pane_id) @as(u8, 1) else @as(u8, 0)) else 0;
     server.mutex.unlock();
-
-    if (panel == null) {
-        return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
-    }
-    const p = panel.?;
 
     if (format.len == 0) {
         return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
@@ -8336,94 +8340,44 @@ test "tmuxKeyLookup resolves all C-a through C-z" {
 // interpolateTmuxFormat tests
 // ==========================================================================
 
-test "interpolateTmuxFormat resolves pane_id" {
+/// Test helper: run interpolateTmuxFormat and return result for comparison.
+fn testFmt(format: []const u8, id: u32, w: u32, h: u32, active: u8, pwd: []const u8, title: []const u8) std.ArrayListUnmanaged(u8) {
     var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "#{pane_id}", 5, 800, 600, 1, "/home", "shell", std.testing.allocator);
-    try std.testing.expectEqualStrings("%5", buf.items);
+    interpolateTmuxFormat(&buf, format, id, w, h, active, pwd, title, std.testing.allocator);
+    return buf;
 }
 
-test "interpolateTmuxFormat resolves width and height" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "#{pane_width}x#{pane_height}", 1, 800, 600, 0, "/home", "shell", std.testing.allocator);
-    try std.testing.expectEqualStrings("800x600", buf.items);
+test "interpolateTmuxFormat resolves all variable types" {
+    const cases = .{
+        .{ "#{pane_id}", 5, 800, 600, @as(u8, 1), "/home", "shell", "%5" },
+        .{ "#{pane_index}", 5, 80, 24, @as(u8, 0), "/", "sh", "5" },
+        .{ "#{pane_active}", 1, 80, 24, @as(u8, 1), "/", "sh", "1" },
+        .{ "#{pane_active}", 1, 80, 24, @as(u8, 0), "/", "sh", "0" },
+        .{ "#{pane_width}x#{pane_height}", 1, 800, 600, @as(u8, 0), "/home", "shell", "800x600" },
+        .{ "#{pane_current_path}", 1, 80, 24, @as(u8, 0), "/home/user", "sh", "/home/user" },
+        .{ "#{pane_title}", 1, 80, 24, @as(u8, 0), "/", "vim", "vim" },
+        .{ "#{pane_current_command}", 1, 80, 24, @as(u8, 0), "/", "vim", "vim" },
+    };
+    inline for (cases) |tc| {
+        var buf = testFmt(tc[0], tc[1], tc[2], tc[3], tc[4], tc[5], tc[6]);
+        defer buf.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(tc[7], buf.items);
+    }
 }
 
-test "interpolateTmuxFormat resolves pane_active" {
-    var buf1: std.ArrayListUnmanaged(u8) = .{};
-    defer buf1.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf1, "#{pane_active}", 1, 80, 24, 1, "/", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("1", buf1.items);
-
-    var buf0: std.ArrayListUnmanaged(u8) = .{};
-    defer buf0.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf0, "#{pane_active}", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("0", buf0.items);
-}
-
-test "interpolateTmuxFormat resolves pane_current_path" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "#{pane_current_path}", 1, 80, 24, 0, "/home/user", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("/home/user", buf.items);
-}
-
-test "interpolateTmuxFormat resolves pane_title" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "#{pane_title}", 1, 80, 24, 0, "/", "vim", std.testing.allocator);
-    try std.testing.expectEqualStrings("vim", buf.items);
-}
-
-test "interpolateTmuxFormat resolves pane_current_command same as title" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "#{pane_current_command}", 1, 80, 24, 0, "/", "vim", std.testing.allocator);
-    try std.testing.expectEqualStrings("vim", buf.items);
-}
-
-test "interpolateTmuxFormat resolves pane_index without percent prefix" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "#{pane_index}", 5, 80, 24, 0, "/", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("5", buf.items);
-}
-
-test "interpolateTmuxFormat skips unknown variables" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "a#{foo}b", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("ab", buf.items);
-}
-
-test "interpolateTmuxFormat handles unclosed brace" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "#{pane_id", 5, 80, 24, 0, "/", "sh", std.testing.allocator);
-    // Unclosed brace: '#' is passed through literally, then remaining chars
-    try std.testing.expectEqualStrings("#{pane_id", buf.items);
-}
-
-test "interpolateTmuxFormat mixed literals and variables" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "id=#{pane_id} w=#{pane_width}", 5, 800, 600, 1, "/", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("id=%5 w=800", buf.items);
-}
-
-test "interpolateTmuxFormat empty format" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("", buf.items);
-}
-
-test "interpolateTmuxFormat plain text passthrough" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-    interpolateTmuxFormat(&buf, "hello world", 1, 80, 24, 0, "/", "sh", std.testing.allocator);
-    try std.testing.expectEqualStrings("hello world", buf.items);
+test "interpolateTmuxFormat edge cases" {
+    const cases = .{
+        .{ "a#{foo}b", 1, 80, 24, @as(u8, 0), "/", "sh", "ab" }, // unknown var skipped
+        .{ "#{pane_id", 5, 80, 24, @as(u8, 0), "/", "sh", "#{pane_id" }, // unclosed brace
+        .{ "id=#{pane_id} w=#{pane_width}", 5, 800, 600, @as(u8, 1), "/", "sh", "id=%5 w=800" }, // mixed
+        .{ "", 1, 80, 24, @as(u8, 0), "/", "sh", "" }, // empty
+        .{ "hello world", 1, 80, 24, @as(u8, 0), "/", "sh", "hello world" }, // plain text
+    };
+    inline for (cases) |tc| {
+        var buf = testFmt(tc[0], tc[1], tc[2], tc[3], tc[4], tc[5], tc[6]);
+        defer buf.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(tc[7], buf.items);
+    }
 }
 
 // ==========================================================================
