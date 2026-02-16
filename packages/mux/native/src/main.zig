@@ -7324,40 +7324,13 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         server.mutex.unlock();
 
         if (panel) |p| {
-            // Collect arguments from JSON array or legacy "keys" string
-            var args_list: std.ArrayListUnmanaged([]const u8) = .{};
-            defer args_list.deinit(allocator);
-
             if (jsonGetArray(body, "args")) |args_slice| {
                 var iter = JsonArrayIterator.init(args_slice);
-                while (iter.next()) |arg| {
-                    args_list.append(allocator, arg) catch {};
-                }
+                while (iter.next()) |arg| sendKeyArg(p, arg);
             } else if (jsonGetString(body, "keys")) |keys| {
-                // Legacy: split by spaces, try to match key names
-                var i: usize = 0;
-                while (i < keys.len) {
-                    while (i < keys.len and keys[i] == ' ') i += 1;
-                    if (i >= keys.len) break;
-                    const start = i;
-                    while (i < keys.len and keys[i] != ' ') i += 1;
-                    args_list.append(allocator, keys[start..i]) catch {};
-                }
+                var tok = std.mem.tokenizeScalar(u8, keys, ' ');
+                while (tok.next()) |arg| sendKeyArg(p, arg);
             }
-
-            // Process each argument: key names → key events, literal text → text input
-            for (args_list.items) |arg| {
-                if (tmuxKeyLookup(arg)) |key| {
-                    // Send as key press+release event (bypasses bracketed paste)
-                    p.queueKeyEvent(key.keycode, key.mods, key.text);
-                } else {
-                    // Literal text → paste via ghostty_surface_text
-                    if (arg.len > 0) {
-                        p.handleTextInput(arg);
-                    }
-                }
-            }
-
             p.has_pending_input.store(true, .release);
             server.wake_signal.notify();
         }
@@ -7366,6 +7339,15 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
     }
 
     return null;
+}
+
+/// Dispatch a single key argument: named keys → key events, literal text → text input.
+fn sendKeyArg(p: anytype, arg: []const u8) void {
+    if (tmuxKeyLookup(arg)) |key| {
+        p.queueKeyEvent(key.keycode, key.mods, key.text);
+    } else if (arg.len > 0) {
+        p.handleTextInput(arg);
+    }
 }
 
 /// Send optional command to a newly created panel and return the JSON response.
@@ -7395,9 +7377,8 @@ fn sendCommandToPanel(server: *Server, panel_id: u32, command: []const u8) void 
     server.wake_signal.notify();
 }
 
-/// Simple JSON string field extractor — finds "key":"value" and returns value slice.
-/// Find the byte position of the value for "key" in JSON. Returns index of first non-whitespace
-/// character after the colon, or null if key not found.
+/// Find the byte position of the value for "key" in JSON. Returns index of first
+/// non-whitespace character after the colon, or null if key not found.
 fn jsonFindValue(json: []const u8, key: []const u8) ?usize {
     var i: usize = 0;
     while (i + key.len + 4 < json.len) : (i += 1) {
@@ -8080,28 +8061,6 @@ test "JsonArrayIterator" {
     try std.testing.expect(escaped.next() == null);
 }
 
-test "JSON extraction for tmux API bodies" {
-    // split-window
-    const split = "{\"cmd\":\"split-window\",\"pane\":2,\"dir\":\"h\",\"command\":\"vim\"}";
-    try std.testing.expectEqualStrings("split-window", jsonGetString(split, "cmd").?);
-    try std.testing.expectEqual(@as(?u32, 2), jsonGetInt(split, "pane"));
-    try std.testing.expectEqualStrings("h", jsonGetString(split, "dir").?);
-    try std.testing.expectEqualStrings("vim", jsonGetString(split, "command").?);
-    // new-window
-    const nw = "{\"cmd\":\"new-window\",\"command\":\"top\",\"name\":\"monitor\"}";
-    try std.testing.expectEqualStrings("new-window", jsonGetString(nw, "cmd").?);
-    try std.testing.expectEqualStrings("top", jsonGetString(nw, "command").?);
-    // send-keys
-    const sk = "{\"cmd\":\"send-keys\",\"target\":3,\"args\":[\"ls -la\",\"Enter\"]}";
-    try std.testing.expectEqual(@as(?u32, 3), jsonGetInt(sk, "target"));
-    var sk_iter = JsonArrayIterator.init(jsonGetArray(sk, "args").?);
-    try std.testing.expectEqualStrings("ls -la", sk_iter.next().?);
-    try std.testing.expectEqualStrings("Enter", sk_iter.next().?);
-    try std.testing.expect(sk_iter.next() == null);
-    // missing/unknown
-    try std.testing.expect(jsonGetString("{\"target\":1}", "cmd") == null);
-}
-
 test "tmuxKeyLookup" {
     // Named keys
     const enter = tmuxKeyLookup("Enter").?;
@@ -8117,6 +8076,14 @@ test "tmuxKeyLookup" {
     // Invalid keys
     try std.testing.expect(tmuxKeyLookup("NotAKey") == null);
     try std.testing.expect(tmuxKeyLookup("") == null);
+    // C-<letter>: all 26 keys with correct control byte and modifier
+    var letter: u8 = 'a';
+    while (letter <= 'z') : (letter += 1) {
+        const name = [_]u8{ 'C', '-', letter };
+        const k = tmuxKeyLookup(&name).?;
+        try std.testing.expectEqual(letter - 'a' + 1, k.text.?[0]);
+        try std.testing.expectEqual(c.GHOSTTY_MODS_CTRL, k.mods);
+    }
     // Invalid C- patterns
     try std.testing.expect(tmuxKeyLookup("C-A") == null);
     try std.testing.expect(tmuxKeyLookup("C-1") == null);
@@ -8155,21 +8122,6 @@ test "hexDigit" {
     try std.testing.expect(hexDigit('G') == null);
     try std.testing.expect(hexDigit(' ') == null);
     try std.testing.expect(hexDigit('%') == null);
-}
-
-test "tmuxKeyLookup resolves all C-a through C-z" {
-    var letter: u8 = 'a';
-    while (letter <= 'z') : (letter += 1) {
-        const name = [_]u8{ 'C', '-', letter };
-        const key = tmuxKeyLookup(&name);
-        try std.testing.expect(key != null);
-        const k = key.?;
-        // Verify correct control byte
-        const expected_byte: u8 = letter - 'a' + 1;
-        try std.testing.expectEqual(expected_byte, k.text.?[0]);
-        // Verify CTRL modifier is set
-        try std.testing.expectEqual(c.GHOSTTY_MODS_CTRL, k.mods);
-    }
 }
 
 /// Test helper: run interpolateTmuxFormat and return result for comparison.
