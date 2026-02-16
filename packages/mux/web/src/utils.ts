@@ -447,5 +447,102 @@ export class CircularBuffer<T> {
 }
 
 // ============================================================================
+// CRC32 / ZIP utilities
+// ============================================================================
+
+const CRC32_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+  let c = i;
+  for (let j = 0; j < 8; j++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+  CRC32_TABLE[i] = c;
+}
+
+export function crc32(data: Uint8Array): number {
+  let crc = ~0;
+  for (let i = 0; i < data.length; i++) {
+    crc = CRC32_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return ~crc >>> 0;
+}
+
+/** Create a ZIP file from a map of path → data entries (stored, no compression). */
+export function createZip(files: Map<string, Uint8Array>): Uint8Array {
+  const encoder = new TextEncoder();
+  const entries: Array<{ name: Uint8Array; data: Uint8Array; crc: number; offset: number }> = [];
+
+  // Calculate total size
+  let totalSize = 22; // end of central directory
+  for (const [name, data] of files) {
+    const nameBytes = encoder.encode(name);
+    totalSize += 30 + nameBytes.length + data.length; // local header + data
+    totalSize += 46 + nameBytes.length; // central directory entry
+  }
+
+  const zip = new Uint8Array(totalSize);
+  const view = new DataView(zip.buffer);
+  let pos = 0;
+
+  // Write local file headers + data
+  for (const [name, data] of files) {
+    const nameBytes = encoder.encode(name);
+    const fileCrc = crc32(data);
+    const localOffset = pos;
+
+    // Local file header signature
+    view.setUint32(pos, 0x04034b50, true); pos += 4;
+    view.setUint16(pos, 20, true); pos += 2;   // version needed
+    view.setUint16(pos, 0, true); pos += 2;    // flags
+    view.setUint16(pos, 0, true); pos += 2;    // compression: stored
+    view.setUint16(pos, 0, true); pos += 2;    // mod time
+    view.setUint16(pos, 0, true); pos += 2;    // mod date
+    view.setUint32(pos, fileCrc, true); pos += 4;
+    view.setUint32(pos, data.length, true); pos += 4; // compressed size
+    view.setUint32(pos, data.length, true); pos += 4; // uncompressed size
+    view.setUint16(pos, nameBytes.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;    // extra field length
+    zip.set(nameBytes, pos); pos += nameBytes.length;
+    zip.set(data, pos); pos += data.length;
+
+    entries.push({ name: nameBytes, data, crc: fileCrc, offset: localOffset });
+  }
+
+  // Write central directory
+  const centralDirOffset = pos;
+  for (const entry of entries) {
+    view.setUint32(pos, 0x02014b50, true); pos += 4; // signature
+    view.setUint16(pos, 20, true); pos += 2;   // version made by
+    view.setUint16(pos, 20, true); pos += 2;   // version needed
+    view.setUint16(pos, 0, true); pos += 2;    // flags
+    view.setUint16(pos, 0, true); pos += 2;    // compression
+    view.setUint16(pos, 0, true); pos += 2;    // mod time
+    view.setUint16(pos, 0, true); pos += 2;    // mod date
+    view.setUint32(pos, entry.crc, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint16(pos, entry.name.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;    // extra field length
+    view.setUint16(pos, 0, true); pos += 2;    // file comment length
+    view.setUint16(pos, 0, true); pos += 2;    // disk number
+    view.setUint16(pos, 0, true); pos += 2;    // internal attrs
+    view.setUint32(pos, 0, true); pos += 4;    // external attrs
+    view.setUint32(pos, entry.offset, true); pos += 4;
+    zip.set(entry.name, pos); pos += entry.name.length;
+  }
+  const centralDirSize = pos - centralDirOffset;
+
+  // End of central directory
+  view.setUint32(pos, 0x06054b50, true); pos += 4;
+  view.setUint16(pos, 0, true); pos += 2;      // disk number
+  view.setUint16(pos, 0, true); pos += 2;      // central dir disk
+  view.setUint16(pos, entries.length, true); pos += 2;
+  view.setUint16(pos, entries.length, true); pos += 2;
+  view.setUint32(pos, centralDirSize, true); pos += 4;
+  view.setUint32(pos, centralDirOffset, true); pos += 4;
+  view.setUint16(pos, 0, true); pos += 2;      // comment length
+
+  return zip.slice(0, pos);
+}
+
+// ============================================================================
 // Stream utilities
 // ============================================================================

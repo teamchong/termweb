@@ -1551,3 +1551,107 @@ test "JWT: constantTimeEql" {
     try std.testing.expect(constantTimeEql(&a, &b));
     try std.testing.expect(!constantTimeEql(&a, &c));
 }
+
+test "extractTokenFromQuery: token at start" {
+    try std.testing.expectEqualStrings("abc123", extractTokenFromQuery("/path?token=abc123").?);
+}
+
+test "extractTokenFromQuery: token in middle" {
+    try std.testing.expectEqualStrings("xyz", extractTokenFromQuery("/path?foo=bar&token=xyz&other=1").?);
+}
+
+test "extractTokenFromQuery: no token" {
+    try std.testing.expect(extractTokenFromQuery("/path?foo=bar") == null);
+}
+
+test "extractTokenFromQuery: empty token" {
+    try std.testing.expect(extractTokenFromQuery("/path?token=&foo=bar") == null);
+}
+
+test "decodeToken: no encoding needed" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("plain-token_123", decodeToken(&buf, "plain-token_123"));
+}
+
+test "decodeToken: percent-encoded special chars" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("a/b+c=d", decodeToken(&buf, "a%2Fb%2Bc%3Dd"));
+}
+
+test "decodeToken: encoded spaces" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("hello world", decodeToken(&buf, "hello%20world"));
+}
+
+test "percentEncodeToken: unreserved chars unchanged" {
+    var buf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings("abc-XYZ_123.~", percentEncodeToken(&buf, "abc-XYZ_123.~"));
+}
+
+test "percentEncodeToken: special chars encoded" {
+    var buf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings("a%2Bb%2Fc%3Dd", percentEncodeToken(&buf, "a+b/c=d"));
+}
+
+test "percentEncodeToken: space encoded" {
+    var buf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings("hello%20world", percentEncodeToken(&buf, "hello world"));
+}
+
+test "hexVal: digits" {
+    try std.testing.expectEqual(@as(u4, 0), hexVal('0').?);
+    try std.testing.expectEqual(@as(u4, 9), hexVal('9').?);
+}
+
+test "hexVal: lowercase hex" {
+    try std.testing.expectEqual(@as(u4, 10), hexVal('a').?);
+    try std.testing.expectEqual(@as(u4, 15), hexVal('f').?);
+}
+
+test "hexVal: uppercase hex" {
+    try std.testing.expectEqual(@as(u4, 10), hexVal('A').?);
+    try std.testing.expectEqual(@as(u4, 15), hexVal('F').?);
+}
+
+test "hexVal: invalid char" {
+    try std.testing.expect(hexVal('g') == null);
+    try std.testing.expect(hexVal('z') == null);
+    try std.testing.expect(hexVal(' ') == null);
+}
+
+test "hexEncodeToken: all zeros" {
+    var out: [token_hex_len]u8 = undefined;
+    var token = [_]u8{0} ** token_len;
+    hexEncodeToken(&out, &token);
+    for (out) |c| try std.testing.expectEqual(@as(u8, '0'), c);
+}
+
+test "hexEncodeToken: all 0xFF" {
+    var out: [token_hex_len]u8 = undefined;
+    var token = [_]u8{0xff} ** token_len;
+    hexEncodeToken(&out, &token);
+    for (out) |c| try std.testing.expectEqual(@as(u8, 'f'), c);
+}
+
+test "hexEncodeToken: known pattern" {
+    var out: [token_hex_len]u8 = undefined;
+    var token = [_]u8{0} ** token_len;
+    token[0] = 0x12;
+    token[1] = 0xAB;
+    hexEncodeToken(&out, &token);
+    try std.testing.expectEqualStrings("12ab", out[0..4]);
+}
+
+test "parseJwtClaims: valid payload" {
+    const claims = parseJwtClaims("{\"s\":\"session\",\"exp\":1234567890}");
+    try std.testing.expect(claims != null);
+    try std.testing.expectEqual(@as(i64, 1234567890), claims.?.exp);
+}
+
+test "parseJwtClaims: missing exp" {
+    try std.testing.expect(parseJwtClaims("{\"s\":\"session\"}") == null);
+}
+
+test "parseJwtClaims: non-numeric exp" {
+    try std.testing.expect(parseJwtClaims("{\"exp\":\"notanumber\"}") == null);
+}

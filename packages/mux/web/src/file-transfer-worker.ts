@@ -2,6 +2,8 @@
 // - zstd decompression/compression via WASM (off main thread)
 // - OPFS synchronous file access for cached storage
 
+import { crc32, createZip } from './utils';
+
 interface ZstdExports {
   memory: WebAssembly.Memory;
   zstd_alloc(size: number): number;
@@ -331,7 +333,7 @@ async function createZipFromTemp(transferId: number, folderName?: string): Promi
   console.log(`[Worker] Collected ${files.size} files from OPFS temp`);
 
   // Create zip from collected files
-  const zipData = createZipInWorker(files);
+  const zipData = createZip(files);
   console.log(`[Worker] Created zip: ${zipData.length} bytes`);
 
   // Use provided folder name or extract from first file path
@@ -352,101 +354,6 @@ async function cleanupTempFiles(transferId: number): Promise<void> {
   }
 }
 
-// CRC32 table for ZIP checksums
-const CRC32_TABLE = new Uint32Array(256);
-for (let i = 0; i < 256; i++) {
-  let c = i;
-  for (let k = 0; k < 8; k++) {
-    c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  }
-  CRC32_TABLE[i] = c;
-}
-
-function crc32(data: Uint8Array): number {
-  let crc = ~0;
-  for (let i = 0; i < data.length; i++) {
-    crc = CRC32_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
-  }
-  return ~crc >>> 0;
-}
-
-/** Create a ZIP file from a map of path → data entries (stored, no compression). */
-function createZipInWorker(files: Map<string, Uint8Array>): Uint8Array {
-  const encoder = new TextEncoder();
-  const entries: Array<{ name: Uint8Array; data: Uint8Array; crc: number; offset: number }> = [];
-
-  // Calculate total size
-  let totalSize = 22; // end of central directory
-  for (const [name, data] of files) {
-    const nameBytes = encoder.encode(name);
-    totalSize += 30 + nameBytes.length + data.length; // local header + data
-    totalSize += 46 + nameBytes.length; // central directory entry
-  }
-
-  const zip = new Uint8Array(totalSize);
-  const view = new DataView(zip.buffer);
-  let pos = 0;
-
-  // Write local file headers + data
-  for (const [name, data] of files) {
-    const nameBytes = encoder.encode(name);
-    const fileCrc = crc32(data);
-    const localOffset = pos;
-
-    // Local file header signature
-    view.setUint32(pos, 0x04034b50, true); pos += 4;
-    view.setUint16(pos, 20, true); pos += 2;   // version needed
-    view.setUint16(pos, 0, true); pos += 2;    // flags
-    view.setUint16(pos, 0, true); pos += 2;    // compression: stored
-    view.setUint16(pos, 0, true); pos += 2;    // mod time
-    view.setUint16(pos, 0, true); pos += 2;    // mod date
-    view.setUint32(pos, fileCrc, true); pos += 4;
-    view.setUint32(pos, data.length, true); pos += 4; // compressed size
-    view.setUint32(pos, data.length, true); pos += 4; // uncompressed size
-    view.setUint16(pos, nameBytes.length, true); pos += 2;
-    view.setUint16(pos, 0, true); pos += 2;    // extra field length
-    zip.set(nameBytes, pos); pos += nameBytes.length;
-    zip.set(data, pos); pos += data.length;
-
-    entries.push({ name: nameBytes, data, crc: fileCrc, offset: localOffset });
-  }
-
-  // Write central directory
-  const centralDirOffset = pos;
-  for (const entry of entries) {
-    view.setUint32(pos, 0x02014b50, true); pos += 4; // signature
-    view.setUint16(pos, 20, true); pos += 2;   // version made by
-    view.setUint16(pos, 20, true); pos += 2;   // version needed
-    view.setUint16(pos, 0, true); pos += 2;    // flags
-    view.setUint16(pos, 0, true); pos += 2;    // compression
-    view.setUint16(pos, 0, true); pos += 2;    // mod time
-    view.setUint16(pos, 0, true); pos += 2;    // mod date
-    view.setUint32(pos, entry.crc, true); pos += 4;
-    view.setUint32(pos, entry.data.length, true); pos += 4; // compressed size
-    view.setUint32(pos, entry.data.length, true); pos += 4; // uncompressed size
-    view.setUint16(pos, entry.name.length, true); pos += 2;
-    view.setUint16(pos, 0, true); pos += 2;    // extra field length
-    view.setUint16(pos, 0, true); pos += 2;    // file comment length
-    view.setUint16(pos, 0, true); pos += 2;    // disk number
-    view.setUint16(pos, 0, true); pos += 2;    // internal file attributes
-    view.setUint32(pos, 0, true); pos += 4;    // external file attributes
-    view.setUint32(pos, entry.offset, true); pos += 4; // local header offset
-    zip.set(entry.name, pos); pos += entry.name.length;
-  }
-
-  // Write end of central directory
-  const centralDirSize = pos - centralDirOffset;
-  view.setUint32(pos, 0x06054b50, true); pos += 4; // signature
-  view.setUint16(pos, 0, true); pos += 2;    // disk number
-  view.setUint16(pos, 0, true); pos += 2;    // disk with central dir
-  view.setUint16(pos, entries.length, true); pos += 2; // entries on this disk
-  view.setUint16(pos, entries.length, true); pos += 2; // total entries
-  view.setUint32(pos, centralDirSize, true); pos += 4;
-  view.setUint32(pos, centralDirOffset, true); pos += 4;
-  view.setUint16(pos, 0, true); // comment length
-
-  return zip;
-}
 
 // ── OPFS Cache (persistent storage for delta sync) ──
 
@@ -955,7 +862,7 @@ self.onmessage = async (e: MessageEvent) => {
           break;
         }
         console.log(`[Worker] Creating zip from ${store.size} in-memory files`);
-        const zipData = createZipInWorker(store);
+        const zipData = createZip(store);
         const folderName = msg.folderName || 'download';
         const filename = `${folderName}.zip`;
         console.log(`[Worker] Zip created: ${zipData.length} bytes, filename: ${filename}`);

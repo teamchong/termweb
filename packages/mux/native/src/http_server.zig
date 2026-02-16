@@ -1087,3 +1087,22 @@ test "extractJsonValue: parses numeric values" {
     try std.testing.expectEqualStrings("12345", extractJsonValue(json, "\"id\":").?);
     try std.testing.expectEqualStrings("99", extractJsonValue(json, "\"count\":").?);
 }
+
+test "getContentType: common web file types" {
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", HttpServer.getContentType("index.html"));
+    try std.testing.expectEqualStrings("application/javascript", HttpServer.getContentType("app.js"));
+    try std.testing.expectEqualStrings("text/css", HttpServer.getContentType("style.css"));
+    try std.testing.expectEqualStrings("application/json", HttpServer.getContentType("data.json"));
+}
+
+test "getContentType: image types" {
+    try std.testing.expectEqualStrings("image/png", HttpServer.getContentType("icon.png"));
+    try std.testing.expectEqualStrings("image/svg+xml", HttpServer.getContentType("logo.svg"));
+    try std.testing.expectEqualStrings("image/x-icon", HttpServer.getContentType("favicon.ico"));
+}
+
+test "getContentType: wasm and unknown" {
+    try std.testing.expectEqualStrings("application/wasm", HttpServer.getContentType("module.wasm"));
+    try std.testing.expectEqualStrings("application/octet-stream", HttpServer.getContentType("file.xyz"));
+    try std.testing.expectEqualStrings("application/octet-stream", HttpServer.getContentType("noextension"));
+}
