@@ -626,27 +626,30 @@
     }
   }
 
+  /** Resolve panel dimensions from _initialSize, panelEl, or defaults.
+   *  Returns null if the element exists but has zero size (caller should retry). */
+  function getPanelDimensions(): { width: number; height: number } | null {
+    if (_initialSize) {
+      const size = _initialSize;
+      _initialSize = null;
+      return size;
+    }
+    if (panelEl) {
+      const rect = panelEl.getBoundingClientRect();
+      const width = Math.floor(rect.width);
+      const height = Math.floor(rect.height);
+      if (width === 0 || height === 0) return null;
+      return { width, height };
+    }
+    return { width: PANEL.DEFAULT_WIDTH, height: PANEL.DEFAULT_HEIGHT };
+  }
+
   function sendCreatePanel(): void {
     if (!canSendInput()) return;
 
-    let width: number, height: number;
-    if (_initialSize) {
-      width = _initialSize.width;
-      height = _initialSize.height;
-      _initialSize = null;
-    } else if (panelEl) {
-      const rect = panelEl.getBoundingClientRect();
-      width = Math.floor(rect.width);
-      height = Math.floor(rect.height);
-      if (width === 0 || height === 0) {
-        // Element not laid out yet (parent may have display:none) — retry after layout
-        requestAnimationFrame(() => sendCreatePanel());
-        return;
-      }
-    } else {
-      width = PANEL.DEFAULT_WIDTH;
-      height = PANEL.DEFAULT_HEIGHT;
-    }
+    const dims = getPanelDimensions();
+    if (!dims) { requestAnimationFrame(() => sendCreatePanel()); return; }
+    const { width, height } = dims;
     const scale = window.devicePixelRatio || 1;
 
     lastReportedWidth = width;
@@ -666,24 +669,9 @@
   function sendSplitPanel(): void {
     if (!canSendInput() || !_splitInfo) return;
 
-    let width: number, height: number;
-    if (_initialSize) {
-      width = _initialSize.width;
-      height = _initialSize.height;
-      _initialSize = null;
-    } else if (panelEl) {
-      const rect = panelEl.getBoundingClientRect();
-      width = Math.floor(rect.width);
-      height = Math.floor(rect.height);
-      if (width === 0 || height === 0) {
-        // Element not laid out yet (parent may have display:none) — retry after layout
-        requestAnimationFrame(() => sendSplitPanel());
-        return;
-      }
-    } else {
-      width = PANEL.DEFAULT_WIDTH;
-      height = PANEL.DEFAULT_HEIGHT;
-    }
+    const dims = getPanelDimensions();
+    if (!dims) { requestAnimationFrame(() => sendSplitPanel()); return; }
+    const { width, height } = dims;
     const scale = window.devicePixelRatio || 1;
 
     lastReportedWidth = width;
@@ -760,15 +748,19 @@
     sendMouseButton(e, false);
   }
 
-  function handleMouseMove(e: MouseEvent): void {
-    if (!canSendInput() || !canvasEl) return;
-
+  /** Get coordinates relative to canvasEl from client coordinates. */
+  function canvasPos(clientX: number, clientY: number): { x: number; y: number } | null {
+    if (!canvasEl) return null;
     const rect = canvasEl.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const mods = getModifiers(e);
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }
 
-    throttledSendMouseMove?.(x, y, mods);
+  function handleMouseMove(e: MouseEvent): void {
+    if (!canSendInput()) return;
+    const pos = canvasPos(e.clientX, e.clientY);
+    if (!pos) return;
+
+    throttledSendMouseMove?.(pos.x, pos.y, getModifiers(e));
   }
 
   function sendMouseMoveInternal(x: number, y: number, mods: number): void {
@@ -782,15 +774,13 @@
   }
 
   function sendMouseButton(e: MouseEvent, pressed: boolean): void {
-    if (!canSendInput() || !canvasEl) return;
-
-    const rect = canvasEl.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    if (!canSendInput()) return;
+    const pos = canvasPos(e.clientX, e.clientY);
+    if (!pos) return;
 
     mouseButtonView.setUint8(0, ClientMsg.MOUSE_INPUT);
-    mouseButtonView.setFloat64(1, x, true);
-    mouseButtonView.setFloat64(9, y, true);
+    mouseButtonView.setFloat64(1, pos.x, true);
+    mouseButtonView.setFloat64(9, pos.y, true);
     mouseButtonView.setUint8(17, e.button);
     mouseButtonView.setUint8(18, pressed ? 1 : 0);
     mouseButtonView.setUint8(19, getModifiers(e));
@@ -801,9 +791,8 @@
     e.preventDefault();
     if (!canSendInput() || !canvasEl) return;
 
-    const rect = canvasEl.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const pos = canvasPos(e.clientX, e.clientY);
+    if (!pos) return;
 
     // Negate: browser deltaY positive = down, ghostty expects positive = up
     let dx = -e.deltaX;
@@ -812,15 +801,15 @@
       dx *= PANEL.LINE_SCROLL_MULTIPLIER;
       dy *= PANEL.LINE_SCROLL_MULTIPLIER;
     } else if (e.deltaMode === WHEEL_MODE.PAGE) {
-      dx *= canvasEl.clientWidth;
-      dy *= canvasEl.clientHeight;
+      dx *= canvasEl!.clientWidth;
+      dy *= canvasEl!.clientHeight;
     }
 
     // deltaMode 0 (PIXEL) = precision scroll (trackpad/smooth), 1/2 = discrete wheel
     const precision = e.deltaMode === WHEEL_MODE.PIXEL ? 1 : 0;
     wheelView.setUint8(0, ClientMsg.MOUSE_SCROLL);
-    wheelView.setFloat64(1, x, true);
-    wheelView.setFloat64(9, y, true);
+    wheelView.setFloat64(1, pos.x, true);
+    wheelView.setFloat64(9, pos.y, true);
     wheelView.setFloat64(17, dx, true);
     wheelView.setFloat64(25, dy, true);
     wheelView.setUint8(33, getModifiers(e));
@@ -1000,29 +989,25 @@
   }
 
   function handleTouchMove(e: TouchEvent): void {
-    if (e.touches.length === 1 && canSendInput() && canvasEl) {
+    if (e.touches.length === 1 && canSendInput()) {
       const t = e.touches[0];
-      const rect = canvasEl.getBoundingClientRect();
-      const x = t.clientX - rect.left;
-      const y = t.clientY - rect.top;
+      const pos = canvasPos(t.clientX, t.clientY);
+      if (!pos) return;
       lastTouchX = t.clientX;
       lastTouchY = t.clientY;
-      throttledSendMouseMove?.(x, y, 0);
-    } else if (e.touches.length === 2 && canSendInput() && canvasEl) {
+      throttledSendMouseMove?.(pos.x, pos.y, 0);
+    } else if (e.touches.length === 2 && canSendInput()) {
       // Two-finger scroll
       e.preventDefault();
       const t0 = e.touches[0];
       const t1 = e.touches[1];
-      const midX = (t0.clientX + t1.clientX) / 2;
-      const midY = (t0.clientY + t1.clientY) / 2;
-      const rect = canvasEl.getBoundingClientRect();
-      const x = midX - rect.left;
-      const y = midY - rect.top;
+      const pos = canvasPos((t0.clientX + t1.clientX) / 2, (t0.clientY + t1.clientY) / 2);
+      if (!pos) return;
       const dy = ((lastTouchY - t0.clientY) + (lastTouchY - t1.clientY)) / 2;
 
       wheelView.setUint8(0, ClientMsg.MOUSE_SCROLL);
-      wheelView.setFloat64(1, x, true);
-      wheelView.setFloat64(9, y, true);
+      wheelView.setFloat64(1, pos.x, true);
+      wheelView.setFloat64(9, pos.y, true);
       wheelView.setFloat64(17, 0, true);
       wheelView.setFloat64(25, dy * 2, true);
       wheelView.setUint8(33, 0);
@@ -1033,7 +1018,7 @@
   }
 
   function handleTouchEnd(e: TouchEvent): void {
-    if (e.changedTouches.length === 1 && canvasEl) {
+    if (e.changedTouches.length === 1) {
       const t = e.changedTouches[0];
       const elapsed = Date.now() - touchStartTime;
       const dx = Math.abs(t.clientX - touchStartX);
@@ -1041,17 +1026,14 @@
 
       // Tap detection: short duration, minimal movement
       if (elapsed < 300 && dx < 10 && dy < 10) {
-        // Prevent synthetic mousedown/mouseup from stealing focus
         e.preventDefault();
-
-        const rect = canvasEl.getBoundingClientRect();
-        const x = t.clientX - rect.left;
-        const y = t.clientY - rect.top;
+        const pos = canvasPos(t.clientX, t.clientY);
+        if (!pos) return;
 
         // Send mouse click (down + up)
         mouseButtonView.setUint8(0, ClientMsg.MOUSE_INPUT);
-        mouseButtonView.setFloat64(1, x, true);
-        mouseButtonView.setFloat64(9, y, true);
+        mouseButtonView.setFloat64(1, pos.x, true);
+        mouseButtonView.setFloat64(9, pos.y, true);
         mouseButtonView.setUint8(17, 0); // left button
         mouseButtonView.setUint8(18, 1); // pressed
         mouseButtonView.setUint8(19, 0);
