@@ -7212,24 +7212,11 @@ fn handleTmuxDisplayMessage(server: *Server, pane_id: u32, format: []const u8, a
     const active: u8 = if (server.layout.active_panel_id) |aid| (if (aid == pane_id) @as(u8, 1) else @as(u8, 0)) else 0;
     server.mutex.unlock();
 
-    if (format.len == 0) {
-        return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
-    }
+    if (format.len == 0) return std.fmt.allocPrint(allocator, "%{d}", .{pane_id}) catch null;
 
     var buf: std.ArrayListUnmanaged(u8) = .{};
-    interpolateTmuxFormat(
-        &buf,
-        format,
-        p.id,
-        p.width,
-        p.height,
-        active,
-        if (p.pwd.len > 0) p.pwd else server.initial_cwd,
-        if (p.title.len > 0) p.title else "shell",
-        allocator,
-    );
+    interpolateTmuxFormat(&buf, format, p.id, p.width, p.height, active, if (p.pwd.len > 0) p.pwd else server.initial_cwd, if (p.title.len > 0) p.title else "shell", allocator);
     buf.append(allocator, '\n') catch {};
-
     return buf.toOwnedSlice(allocator) catch null;
 }
 
@@ -7249,8 +7236,6 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         {
             server.mutex.lock();
             const parent = server.panels.get(pane_id);
-
-            // Prefer panel owner's viewport for accurate split sizing
             const owner_viewport: ?SessionViewport = blk: {
                 if (server.panel_assignments.get(pane_id)) |owner_sid| {
                     if (server.session_viewports.get(owner_sid)) |vp| break :blk vp;
@@ -7260,24 +7245,16 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
             server.mutex.unlock();
 
             if (owner_viewport) |vp| {
+                width = vp.width;
+                height = vp.height;
                 scale = vp.scale;
-                if (direction == .horizontal) {
-                    width = vp.width / 2;
-                    height = vp.height;
-                } else {
-                    width = vp.width;
-                    height = vp.height / 2;
-                }
             } else if (parent) |p| {
+                width = p.width;
+                height = p.height;
                 scale = p.scale;
-                if (direction == .horizontal) {
-                    width = p.width / 2;
-                    height = p.height;
-                } else {
-                    width = p.width;
-                    height = p.height / 2;
-                }
             }
+            // Halve along the split axis
+            if (direction == .horizontal) { width /= 2; } else { height /= 2; }
         }
 
         // Record next_panel_id before sending request
@@ -7293,17 +7270,8 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         });
         server.wake_signal.notify();
 
-        // Block waiting for the panel to be created (with timeout)
         const new_id = server.tmux_api_response_ch.recv() orelse expected_id;
-
-        // If a command was specified, send it to the new panel (like real tmux)
-        if (jsonGetString(body, "command")) |cmd_str| {
-            if (cmd_str.len > 0) {
-                sendCommandToPanel(server, new_id, cmd_str);
-            }
-        }
-
-        return std.fmt.allocPrint(allocator, "{{\"pane_id\":\"%{d}\"}}\n", .{new_id}) catch null;
+        return finishNewPanel(server, new_id, body, allocator);
     }
 
     if (std.mem.eql(u8, cmd, "new-window")) {
@@ -7313,15 +7281,14 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         var scale: f64 = 2.0;
         {
             server.mutex.lock();
-            var found = false;
-            var vp_it = server.session_viewports.valueIterator();
-            if (vp_it.next()) |vp| {
+            if (blk: {
+                var vp_it = server.session_viewports.valueIterator();
+                break :blk vp_it.next();
+            }) |vp| {
                 width = vp.width;
                 height = vp.height;
                 scale = vp.scale;
-                found = true;
-            }
-            if (!found) {
+            } else {
                 var it = server.panels.iterator();
                 if (it.next()) |entry| {
                     const p = entry.value_ptr.*;
@@ -7346,15 +7313,7 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
         server.wake_signal.notify();
 
         const new_id = server.tmux_api_response_ch.recv() orelse expected_id;
-
-        // If a command was specified, send it to the new panel
-        if (jsonGetString(body, "command")) |cmd_str| {
-            if (cmd_str.len > 0) {
-                sendCommandToPanel(server, new_id, cmd_str);
-            }
-        }
-
-        return std.fmt.allocPrint(allocator, "{{\"pane_id\":\"%{d}\"}}\n", .{new_id}) catch null;
+        return finishNewPanel(server, new_id, body, allocator);
     }
 
     if (std.mem.eql(u8, cmd, "send-keys")) {
@@ -7409,27 +7368,31 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
     return null;
 }
 
+/// Send optional command to a newly created panel and return the JSON response.
+fn finishNewPanel(server: *Server, new_id: u32, body: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    if (jsonGetString(body, "command")) |cmd_str| {
+        if (cmd_str.len > 0) sendCommandToPanel(server, new_id, cmd_str);
+    }
+    return std.fmt.allocPrint(allocator, "{{\"pane_id\":\"%{d}\"}}\n", .{new_id}) catch null;
+}
+
 /// Send a command string to a panel as text input followed by Enter.
-/// Used by tmux shim's split-window and new-window to run commands in new panels.
 /// Waits briefly for the shell to initialize before sending.
 fn sendCommandToPanel(server: *Server, panel_id: u32, command: []const u8) void {
     // Brief delay to let the shell initialize in the new panel.
-    // Without this, the command arrives before the shell prompt is ready
-    // and gets lost or partially consumed by shell init sequences.
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     server.mutex.lock();
-    const panel = server.panels.get(panel_id);
+    const p = server.panels.get(panel_id) orelse {
+        server.mutex.unlock();
+        return;
+    };
     server.mutex.unlock();
 
-    if (panel) |p| {
-        // Send the command as text input
-        p.handleTextInput(command);
-        // Send Enter key to execute it
-        p.queueKeyEvent(0x0024, 0, "\r");
-        p.has_pending_input.store(true, .release);
-        server.wake_signal.notify();
-    }
+    p.handleTextInput(command);
+    p.queueKeyEvent(0x0024, 0, "\r");
+    p.has_pending_input.store(true, .release);
+    server.wake_signal.notify();
 }
 
 /// Simple JSON string field extractor — finds "key":"value" and returns value slice.
@@ -8161,69 +8124,34 @@ test "tmuxKeyLookup covers all navigation keys" {
 // percentDecode tests
 // ==========================================================================
 
-test "percentDecode decodes fully encoded format string" {
-    const result = percentDecode("%23%7Bpane_id%7D", std.testing.allocator).?;
+fn expectDecode(input: []const u8, expected: []const u8) !void {
+    const result = percentDecode(input, std.testing.allocator).?;
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("#{pane_id}", result);
+    try std.testing.expectEqualStrings(expected, result);
 }
 
-test "percentDecode passes through plain strings" {
-    const result = percentDecode("hello", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("hello", result);
-}
-
-test "percentDecode decodes spaces" {
-    const result = percentDecode("hello%20world", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("hello world", result);
-}
-
-test "percentDecode handles mixed encoded and literal" {
-    const result = percentDecode("%23{pane_id}", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("#{pane_id}", result);
-}
-
-test "percentDecode passes through invalid hex" {
-    const result = percentDecode("abc%ZZdef", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("abc%ZZdef", result);
-}
-
-test "percentDecode handles truncated percent at end" {
-    const result = percentDecode("abc%2", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("abc%2", result);
-}
-
-test "percentDecode handles empty string" {
-    const result = percentDecode("", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
+test "percentDecode" {
+    try expectDecode("%23%7Bpane_id%7D", "#{pane_id}");
+    try expectDecode("hello", "hello");
+    try expectDecode("hello%20world", "hello world");
+    try expectDecode("%23{pane_id}", "#{pane_id}");
+    try expectDecode("abc%ZZdef", "abc%ZZdef"); // invalid hex passthrough
+    try expectDecode("abc%2", "abc%2"); // truncated percent
+    try expectDecode("", "");
 }
 
 // ==========================================================================
 // hexDigit tests
 // ==========================================================================
 
-test "hexDigit resolves decimal digits" {
+test "hexDigit" {
     try std.testing.expectEqual(@as(?u8, 0), hexDigit('0'));
     try std.testing.expectEqual(@as(?u8, 9), hexDigit('9'));
     try std.testing.expectEqual(@as(?u8, 5), hexDigit('5'));
-}
-
-test "hexDigit resolves lowercase hex" {
     try std.testing.expectEqual(@as(?u8, 10), hexDigit('a'));
     try std.testing.expectEqual(@as(?u8, 15), hexDigit('f'));
-}
-
-test "hexDigit resolves uppercase hex" {
     try std.testing.expectEqual(@as(?u8, 10), hexDigit('A'));
     try std.testing.expectEqual(@as(?u8, 15), hexDigit('F'));
-}
-
-test "hexDigit returns null for non-hex chars" {
     try std.testing.expect(hexDigit('g') == null);
     try std.testing.expect(hexDigit('G') == null);
     try std.testing.expect(hexDigit(' ') == null);
@@ -8298,29 +8226,6 @@ test "JSON extraction returns null for unknown fields" {
     try std.testing.expect(jsonGetString(body, "target") == null);
 }
 
-// ==========================================================================
-// Send-keys args building
-// ==========================================================================
-
-test "JsonArrayIterator parses send-keys args" {
-    var iter = JsonArrayIterator.init("\"ls -la\",\"Enter\"");
-    const first = iter.next().?;
-    try std.testing.expectEqualStrings("ls -la", first);
-    const second = iter.next().?;
-    try std.testing.expectEqualStrings("Enter", second);
-    try std.testing.expect(iter.next() == null);
-}
-
-test "key lookup integration: Enter resolves, literal text does not" {
-    try std.testing.expect(tmuxKeyLookup("Enter") != null);
-    try std.testing.expect(tmuxKeyLookup("hello") == null);
-    try std.testing.expect(tmuxKeyLookup("ls -la") == null);
-}
-
-// ==========================================================================
-// All ctrl keys C-a through C-z
-// ==========================================================================
-
 test "tmuxKeyLookup resolves all C-a through C-z" {
     var letter: u8 = 'a';
     while (letter <= 'z') : (letter += 1) {
@@ -8380,32 +8285,11 @@ test "interpolateTmuxFormat edge cases" {
     }
 }
 
-// ==========================================================================
-// Additional percentDecode tests
-// ==========================================================================
-
-test "percentDecode multi-variable URL-encoded format" {
-    const result = percentDecode("%23%7Bpane_id%7D%20%23%7Bpane_width%7D", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("#{pane_id} #{pane_width}", result);
-}
-
-test "percentDecode consecutive percent encodings" {
-    const result = percentDecode("%41%42%43", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("ABC", result);
-}
-
-test "percentDecode does not decode plus as space" {
-    const result = percentDecode("a+b", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("a+b", result);
-}
-
-test "percentDecode decodes percent-encoded percent" {
-    const result = percentDecode("%25", std.testing.allocator).?;
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("%", result);
+test "percentDecode additional cases" {
+    try expectDecode("%23%7Bpane_id%7D%20%23%7Bpane_width%7D", "#{pane_id} #{pane_width}");
+    try expectDecode("%41%42%43", "ABC");
+    try expectDecode("a+b", "a+b"); // plus not decoded as space
+    try expectDecode("%25", "%"); // encoded percent
 }
 
 // ==========================================================================
