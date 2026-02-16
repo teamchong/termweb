@@ -7371,8 +7371,9 @@ fn sendCommandToPanel(server: *Server, panel_id: u32, command: []const u8) void 
     };
     server.mutex.unlock();
 
+    const enter_key = tmux_key_map.get("Enter").?;
     p.handleTextInput(command);
-    p.queueKeyEvent(0x0024, 0, "\r");
+    p.queueKeyEvent(enter_key.keycode, enter_key.mods, enter_key.text);
     p.has_pending_input.store(true, .release);
     server.wake_signal.notify();
 }
@@ -7386,8 +7387,14 @@ fn jsonFindValue(json: []const u8, key: []const u8) ?usize {
             std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
             json[i + 1 + key.len] == '"')
         {
-            var j = i + 1 + key.len + 1; // past closing quote of key
-            while (j < json.len and (json[j] == ':' or json[j] == ' ')) : (j += 1) {}
+            // Skip whitespace/colon after closing quote, but require a colon
+            // to distinguish keys from string values that happen to match.
+            var j = i + 1 + key.len + 1;
+            var found_colon = false;
+            while (j < json.len and (json[j] == ':' or json[j] == ' ')) : (j += 1) {
+                if (json[j] == ':') found_colon = true;
+            }
+            if (!found_colon) continue;
             return j;
         }
     }
@@ -8022,6 +8029,8 @@ test "jsonGetString" {
     // Exact key match, not substring
     try std.testing.expectEqualStrings("y", jsonGetString("{\"cmd_extra\":\"x\",\"cmd\":\"y\"}", "cmd").?);
     try std.testing.expectEqualStrings("first", jsonGetString("{\"k\":\"first\",\"k\":\"second\"}", "k").?); // first wins
+    // Key name appearing as a value must not shadow the real key
+    try std.testing.expectEqualStrings("real", jsonGetString("{\"val\":\"cmd\",\"cmd\":\"real\"}", "cmd").?);
 }
 
 test "jsonGetInt" {
