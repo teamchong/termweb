@@ -2897,12 +2897,9 @@ const Server = struct {
     }
 
 
-    fn sendInspectorStateToPanel(self: *Server, panel: *Panel, conn: *ws.Connection) void {
-        // Note: mutex must already be held by caller
-        _ = self;
+    /// Build the 15-byte inspector state message for a panel.
+    fn buildInspectorStateBuf(panel: *Panel) [15]u8 {
         const size = c.ghostty_surface_size(panel.surface);
-
-        // Binary: [type:u8][panel_id:u32][cols:u16][rows:u16][sw:u16][sh:u16][cw:u8][ch:u8] = 15 bytes
         var buf: [15]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state);
         std.mem.writeInt(u32, buf[1..5], panel.id, .little);
@@ -2912,22 +2909,16 @@ const Server = struct {
         std.mem.writeInt(u16, buf[11..13], @intCast(size.height_px), .little);
         buf[13] = @intCast(size.cell_width_px);
         buf[14] = @intCast(size.cell_height_px);
+        return buf;
+    }
 
+    fn sendInspectorStateToPanel(_: *Server, panel: *Panel, conn: *ws.Connection) void {
+        const buf = buildInspectorStateBuf(panel);
         conn.sendBinary(&buf) catch {};
     }
 
-    // Broadcast inspector state to all control connections (mutex must be held)
     fn broadcastInspectorStateToAll(self: *Server, panel: *Panel) void {
-        const size = c.ghostty_surface_size(panel.surface);
-        var buf: [15]u8 = undefined;
-        buf[0] = @intFromEnum(BinaryCtrlMsg.inspector_state);
-        std.mem.writeInt(u32, buf[1..5], panel.id, .little);
-        std.mem.writeInt(u16, buf[5..7], @intCast(size.columns), .little);
-        std.mem.writeInt(u16, buf[7..9], @intCast(size.rows), .little);
-        std.mem.writeInt(u16, buf[9..11], @intCast(size.width_px), .little);
-        std.mem.writeInt(u16, buf[11..13], @intCast(size.height_px), .little);
-        buf[13] = @intCast(size.cell_width_px);
-        buf[14] = @intCast(size.cell_height_px);
+        const buf = buildInspectorStateBuf(panel);
         for (self.control_connections.items) |ctrl_conn| {
             ctrl_conn.sendBinary(&buf) catch {};
         }
@@ -3760,6 +3751,27 @@ const Server = struct {
         return buf;
     }
 
+    /// Compute cursor pixel coordinates from grid position and surface metrics.
+    /// Y offset +2 accounts for visual baseline alignment with text.
+    const CursorPixelCoords = struct { x: u16, y: u16, w: u16, h: u16, surf_w: u16, surf_h: u16, cell_w: u16, cell_h: u16 };
+    fn computeCursorPixelCoords(surface: ?*anyopaque, col: u16, row: u16) CursorPixelCoords {
+        const size = c.ghostty_surface_size(surface);
+        const cell_w: u16 = @intCast(size.cell_width_px);
+        const cell_h: u16 = @intCast(size.cell_height_px);
+        const padding_x: u16 = @intCast(size.padding_left_px);
+        const padding_y: u16 = @intCast(size.padding_top_px);
+        return .{
+            .x = padding_x + col * cell_w,
+            .y = padding_y + row * cell_h + 2,
+            .w = cell_w -| 1,
+            .h = cell_h -| 2,
+            .surf_w = @intCast(size.width_px),
+            .surf_h = @intCast(size.height_px),
+            .cell_w = cell_w,
+            .cell_h = cell_h,
+        };
+    }
+
     /// Send current cursor state for all panels to a single connection.
     /// Called when a new control client connects so it gets immediate cursor/surface state.
     fn sendCursorStateToConn(self: *Server, conn: *ws.Connection) void {
@@ -3770,23 +3782,12 @@ const Server = struct {
         while (pit.next()) |panel_ptr| {
             const panel = panel_ptr.*;
             if (panel.surface == null) continue;
-            const size = c.ghostty_surface_size(panel.surface);
-            const cell_w: u16 = @intCast(size.cell_width_px);
-            const cell_h: u16 = @intCast(size.cell_height_px);
-            const padding_x: u16 = @intCast(size.padding_left_px);
-            const padding_y: u16 = @intCast(size.padding_top_px);
-            const surf_x = padding_x + panel.last_cursor_col * cell_w;
-            const surf_y = padding_y + panel.last_cursor_row * cell_h + 2;
-            const surf_w: u16 = cell_w -| 1;
-            const surf_h: u16 = cell_h -| 2;
-            const surf_total_w: u16 = @intCast(size.width_px);
-            const surf_total_h: u16 = @intCast(size.height_px);
+            const cp = computeCursorPixelCoords(panel.surface, panel.last_cursor_col, panel.last_cursor_row);
 
-            // Send surface dims first so client knows coordinate space
-            const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
+            const dims_buf = buildSurfaceDimsBuf(panel.id, cp.surf_w, cp.surf_h);
             conn.sendBinary(&dims_buf) catch {};
 
-            const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, panel.last_cursor_style, panel.last_cursor_visible, panel.last_cursor_color_r, panel.last_cursor_color_g, panel.last_cursor_color_b);
+            const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, panel.last_cursor_style, panel.last_cursor_visible, panel.last_cursor_color_r, panel.last_cursor_color_g, panel.last_cursor_color_b);
             conn.sendBinary(&cursor_buf) catch {};
         }
     }
@@ -5707,6 +5708,30 @@ const Server = struct {
         }
     }
 
+    /// Write a formatted debug message to a log file (no-op when log is null).
+    fn logToFile(file: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+        const f = file orelse return;
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        _ = f.write(line) catch {};
+    }
+
+    /// Snapshot panel pointers from the map into a stack buffer so callers
+    /// can iterate without holding the mutex.
+    fn collectPanels(self: *Server, buf: *[64]*Panel) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        var it = self.panels.valueIterator();
+        while (it.next()) |pp| {
+            if (count < buf.len) {
+                buf[count] = pp.*;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     // Main render loop
     fn runRenderLoop(self: *Server) void {
         // Adaptive frame timing: render immediately on input for snappy response,
@@ -5759,16 +5784,7 @@ const Server = struct {
             // Collect panels first, then release mutex before calling ghostty
             // (ghostty callbacks may need the mutex)
             var panels_buf: [64]*Panel = undefined;
-            var panels_count: usize = 0;
-            self.mutex.lock();
-            var panel_it = self.panels.valueIterator();
-            while (panel_it.next()) |panel_ptr| {
-                if (panels_count < panels_buf.len) {
-                    panels_buf[panels_count] = panel_ptr.*;
-                    panels_count += 1;
-                }
-            }
-            self.mutex.unlock();
+            const panels_count = self.collectPanels(&panels_buf);
 
             // Process input (fast - no rendering)
             crash_phase.store(3, .monotonic); // processInputQueue
@@ -5784,13 +5800,7 @@ const Server = struct {
                 // or pre-frame work (processPending*, input) taking too long
                 const gap_threshold_ns: u64 = 100 * std.time.ns_per_ms;
                 if (since_last_frame > gap_threshold_ns and last_frame > 0) {
-                    if (perf_log) |f| {
-                        var gap_buf: [128]u8 = undefined;
-                        const gap_line = std.fmt.bufPrint(&gap_buf, "GAP {d}ms between frames\n", .{
-                            since_last_frame / std.time.ns_per_ms,
-                        }) catch "";
-                        _ = f.write(gap_line) catch {};
-                    }
+                    logToFile(perf_log, "GAP {d}ms between frames\n", .{since_last_frame / std.time.ns_per_ms});
                 }
                 last_frame = now;
 
@@ -5831,7 +5841,7 @@ const Server = struct {
                     }
                 }
 
-                panel_it = self.panels.valueIterator();
+                var panel_it = self.panels.valueIterator();
                 while (panel_it.next()) |panel_ptr| {
                     const panel = panel_ptr.*;
                     const is_paused = !panel.streaming.load(.acquire);
@@ -5854,13 +5864,9 @@ const Server = struct {
 
                     // Debug: trace new panels (first 10 ticks)
                     if (panel.ticks_since_connect < 10) {
-                        if (dbg_log) |f| {
-                            var dbg_buf: [256]u8 = undefined;
-                            const dbg_line = std.fmt.bufPrint(&dbg_buf, "COLLECT panel={d} tick={d} in_active={} overview={} h264_clients={} force_kf={} consec_unch={d}\n", .{
-                                panel.id, panel.ticks_since_connect, in_active, is_overview, has_h264_clients, panel.force_keyframe, panel.consecutive_unchanged,
-                            }) catch "";
-                            _ = f.write(dbg_line) catch {};
-                        }
+                        logToFile(dbg_log, "COLLECT panel={d} tick={d} in_active={} overview={} h264_clients={} force_kf={} consec_unch={d}\n", .{
+                            panel.id, panel.ticks_since_connect, in_active, is_overview, has_h264_clients, panel.force_keyframe, panel.consecutive_unchanged,
+                        });
                     }
 
                     // Skip panels not in active tab (unless overview is open = need all panels)
@@ -6055,11 +6061,7 @@ const Server = struct {
 
                         if (panel.video_encoder == null or panel.bgra_buffer == null) {
                             if (panel.ticks_since_connect < 10) {
-                                if (dbg_log) |f| {
-                                    var dbg_buf: [128]u8 = undefined;
-                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "NO_ENCODER panel={d} tick={d} enc={} buf={}\n", .{ panel.id, panel.ticks_since_connect, panel.video_encoder != null, panel.bgra_buffer != null }) catch "";
-                                    _ = f.write(dbg_line) catch {};
-                                }
+                                logToFile(dbg_log, "NO_ENCODER panel={d} tick={d} enc={} buf={}\n", .{ panel.id, panel.ticks_since_connect, panel.video_encoder != null, panel.bgra_buffer != null });
                             }
                             continue;
                         }
@@ -6075,11 +6077,7 @@ const Server = struct {
 
                         // Wait a few frames for ghostty to render initial content
                         if (panel.ticks_since_connect < 3) {
-                            if (dbg_log) |f| {
-                                var dbg_buf: [128]u8 = undefined;
-                                const dbg_line = std.fmt.bufPrint(&dbg_buf, "SKIP_EARLY panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
-                                _ = f.write(dbg_line) catch {};
-                            }
+                            logToFile(dbg_log, "SKIP_EARLY panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
                             continue;
                         }
 
@@ -6106,25 +6104,21 @@ const Server = struct {
                             var cur_color_b: u8 = 0xc8;
                             c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible, &cur_color_r, &cur_color_g, &cur_color_b);
 
-                            const size = c.ghostty_surface_size(panel.surface);
-                            const surf_total_w: u16 = @intCast(size.width_px);
-                            const surf_total_h: u16 = @intCast(size.height_px);
+                            const cp = computeCursorPixelCoords(panel.surface, cur_col, cur_row);
 
                             // Broadcast surface dims only when they change (resize)
-                            const surface_changed = surf_total_w != panel.last_surf_w or surf_total_h != panel.last_surf_h;
+                            const surface_changed = cp.surf_w != panel.last_surf_w or cp.surf_h != panel.last_surf_h;
                             if (surface_changed) {
-                                panel.last_surf_w = surf_total_w;
-                                panel.last_surf_h = surf_total_h;
-                                const dims_buf = buildSurfaceDimsBuf(panel.id, surf_total_w, surf_total_h);
+                                panel.last_surf_w = cp.surf_w;
+                                panel.last_surf_h = cp.surf_h;
+                                const dims_buf = buildSurfaceDimsBuf(panel.id, cp.surf_w, cp.surf_h);
                                 self.broadcastControlData(&dims_buf);
                             }
 
                             // Cell dimensions change on zoom in/out/reset even when
                             // the surface pixel size stays the same. Track them so the
                             // cursor pixel position is recalculated and re-sent.
-                            const cell_w: u16 = @intCast(size.cell_width_px);
-                            const cell_h: u16 = @intCast(size.cell_height_px);
-                            const cell_dims_changed = cell_w != panel.last_cell_w or cell_h != panel.last_cell_h;
+                            const cell_dims_changed = cp.cell_w != panel.last_cell_w or cp.cell_h != panel.last_cell_h;
 
                             // Re-send cursor when surface/cell dims change, position/style/color changes
                             if (surface_changed or cell_dims_changed or
@@ -6143,20 +6137,10 @@ const Server = struct {
                                 panel.last_cursor_color_r = cur_color_r;
                                 panel.last_cursor_color_g = cur_color_g;
                                 panel.last_cursor_color_b = cur_color_b;
-                                panel.last_cell_w = cell_w;
-                                panel.last_cell_h = cell_h;
+                                panel.last_cell_w = cp.cell_w;
+                                panel.last_cell_h = cp.cell_h;
 
-                                // Compute cursor in surface-space pixel coordinates.
-                                // Always send cell-sized rectangle; CSS handles bar/underline visuals.
-                                // Y offset +2 accounts for visual baseline alignment with text.
-                                const padding_x: u16 = @intCast(size.padding_left_px);
-                                const padding_y: u16 = @intCast(size.padding_top_px);
-                                const surf_x = padding_x + cur_col * cell_w;
-                                const surf_y = padding_y + cur_row * cell_h + 2;
-                                const surf_w: u16 = cell_w -| 1;
-                                const surf_h: u16 = cell_h -| 2;
-
-                                const cursor_buf = buildCursorBuf(panel.id, surf_x, surf_y, surf_w, surf_h, cur_style, cur_visible, cur_color_r, cur_color_g, cur_color_b);
+                                const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, cur_style, cur_visible, cur_color_r, cur_color_g, cur_color_b);
                                 self.broadcastControlData(&cursor_buf);
                             }
                         }
@@ -6172,7 +6156,7 @@ const Server = struct {
                             // Debug: log frames after input to diagnose stale pixels
                             if (panel.dbg_input_countdown > 0) {
                                 panel.dbg_input_countdown -= 1;
-                                if (dbg_log) |f| {
+                                if (dbg_log != null) {
                                     // Get cursor info to correlate with pixel content
                                     var cur_col: u16 = 0;
                                     var cur_row: u16 = 0;
@@ -6183,8 +6167,7 @@ const Server = struct {
                                     var dbg_cb: u8 = 0;
                                     c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible, &dbg_cr, &dbg_cg, &dbg_cb);
 
-                                    // Sample a few pixels to see if content changes
-                                    // Check pixel at row 0, col 5 (likely near prompt text)
+                                    // Sample pixel at cursor position
                                     const row_bytes = pixel_width * 4;
                                     const sample_row: usize = @min(@as(usize, cur_row) * @as(usize, @intCast(c.ghostty_surface_size(panel.surface).cell_height_px)), pixel_height - 1);
                                     const sample_offset = sample_row * row_bytes + @min(@as(usize, cur_col) * @as(usize, @intCast(c.ghostty_surface_size(panel.surface).cell_width_px)) * 4, row_bytes - 4);
@@ -6193,7 +6176,7 @@ const Server = struct {
                                     const px_r = panel.bgra_buffer.?[sample_offset + 2];
                                     const px_a = panel.bgra_buffer.?[sample_offset + 3];
 
-                                    // Also check first non-black pixel in row 0
+                                    // First non-black pixel in row 0
                                     var first_nonblack: usize = 0;
                                     for (0..@min(pixel_width, 200)) |x| {
                                         const off = x * 4;
@@ -6203,24 +6186,17 @@ const Server = struct {
                                         }
                                     }
 
-                                    var dbg_buf2: [512]u8 = undefined;
-                                    const dbg_line2 = std.fmt.bufPrint(&dbg_buf2, "INPUT_FRAME panel={d} cd={d} hash={x} prev={x} match={} cursor=({d},{d}) px@cursor=({d},{d},{d},{d}) first_nonblack_x={d}\n", .{
+                                    logToFile(dbg_log, "INPUT_FRAME panel={d} cd={d} hash={x} prev={x} match={} cursor=({d},{d}) px@cursor=({d},{d},{d},{d}) first_nonblack_x={d}\n", .{
                                         panel.id, panel.dbg_input_countdown, frame_hash, panel.last_frame_hash, @intFromBool(frame_hash == panel.last_frame_hash),
                                         cur_col, cur_row, px_r, px_g, px_b, px_a, first_nonblack,
-                                    }) catch "";
-                                    _ = f.write(dbg_line2) catch {};
+                                    });
                                 }
                             }
 
                             if (frame_hash == panel.last_frame_hash and !panel.force_keyframe) {
                                 panel.consecutive_unchanged += 1;
-                                if (panel.ticks_since_connect < 10) {
-                                    if (dbg_log) |f| {
-                                        var dbg_buf: [128]u8 = undefined;
-                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "HASH_SKIP panel={d} tick={d} hash={x}\n", .{ panel.id, panel.ticks_since_connect, frame_hash }) catch "";
-                                        _ = f.write(dbg_line) catch {};
-                                    }
-                                }
+                                if (panel.ticks_since_connect < 10)
+                                    logToFile(dbg_log, "HASH_SKIP panel={d} tick={d} hash={x}\n", .{ panel.id, panel.ticks_since_connect, frame_hash });
                                 continue;
                             }
                             panel.consecutive_unchanged = 0;
@@ -6233,32 +6209,16 @@ const Server = struct {
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
                                 panel.force_keyframe = false;
-                                {
-                                    if (dbg_log) |f| {
-                                        var dbg_buf: [256]u8 = undefined;
-                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 }) catch "";
-                                        _ = f.write(dbg_line) catch {};
-                                    }
-                                }
+                                logToFile(dbg_log, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
                             } else {
-                                if (panel.ticks_since_connect < 10) {
-                                    if (dbg_log) |f| {
-                                        var dbg_buf: [128]u8 = undefined;
-                                        const dbg_line = std.fmt.bufPrint(&dbg_buf, "ENCODE_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
-                                        _ = f.write(dbg_line) catch {};
-                                    }
-                                }
+                                if (panel.ticks_since_connect < 10)
+                                    logToFile(dbg_log, "ENCODE_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
                             }
                             enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
                             perf_encode_ns += enc_elapsed;
                         } else {
-                            if (panel.ticks_since_connect < 10) {
-                                if (dbg_log) |f| {
-                                    var dbg_buf: [128]u8 = undefined;
-                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "READ_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect }) catch "";
-                                    _ = f.write(dbg_line) catch {};
-                                }
-                            }
+                            if (panel.ticks_since_connect < 10)
+                                logToFile(dbg_log, "READ_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
                         }
                     }
 
@@ -6267,13 +6227,8 @@ const Server = struct {
                         if (self.sendH264Frame(panel.id, data)) {
                             frames_sent += 1;
                             panel.last_frame_time = t_frame_start; // For per-panel adaptive FPS
-                            if (panel.ticks_since_connect < 10) {
-                                if (dbg_log) |f| {
-                                    var dbg_buf: [128]u8 = undefined;
-                                    const dbg_line = std.fmt.bufPrint(&dbg_buf, "SENT panel={d} tick={d} size={d}\n", .{ panel.id, panel.ticks_since_connect, data.len }) catch "";
-                                    _ = f.write(dbg_line) catch {};
-                                }
-                            }
+                            if (panel.ticks_since_connect < 10)
+                                logToFile(dbg_log, "SENT panel={d} tick={d} size={d}\n", .{ panel.id, panel.ticks_since_connect, data.len });
                         } else {
                             // All sends failed — force keyframe for recovery
                             panel.force_keyframe = true;
@@ -6296,19 +6251,15 @@ const Server = struct {
                     const frame_total_ns: u64 = @intCast(std.time.nanoTimestamp() - t_frame_start);
                     const spike_threshold_ns: u64 = 50 * std.time.ns_per_ms;
                     if (frame_total_ns > spike_threshold_ns) {
-                        if (perf_log) |f| {
-                            var spike_buf: [256]u8 = undefined;
-                            const spike_line = std.fmt.bufPrint(&spike_buf, "SPIKE panel={d} total={d}ms tick={d}ms read={d}ms enc={d}ms keyframe={} send_fail={}\n", .{
-                                panel.id,
-                                frame_total_ns / std.time.ns_per_ms,
-                                tick_elapsed / std.time.ns_per_ms,
-                                read_elapsed / std.time.ns_per_ms,
-                                enc_elapsed / std.time.ns_per_ms,
-                                was_keyframe,
-                                send_failed,
-                            }) catch "";
-                            _ = f.write(spike_line) catch {};
-                        }
+                        logToFile(perf_log, "SPIKE panel={d} total={d}ms tick={d}ms read={d}ms enc={d}ms keyframe={} send_fail={}\n", .{
+                            panel.id,
+                            frame_total_ns / std.time.ns_per_ms,
+                            tick_elapsed / std.time.ns_per_ms,
+                            read_elapsed / std.time.ns_per_ms,
+                            enc_elapsed / std.time.ns_per_ms,
+                            was_keyframe,
+                            send_failed,
+                        });
                     }
 
                 }
@@ -6354,18 +6305,10 @@ const Server = struct {
                                 const bw_vt = self.bw_vt_bytes.load(.monotonic);
                                 const bw_now2: i64 = @truncate(std.time.nanoTimestamp());
                                 const elapsed_s: u64 = @intCast(@divFloor(bw_now2 - self.bw_start_time.load(.monotonic), std.time.ns_per_s));
-                                var bw_buf: [512]u8 = undefined;
-                                const bw_line = std.fmt.bufPrint(&bw_buf, "BW t={d}s h264={d}KB/{d}frames ctrl_out={d}KB ctrl_in={d}KB raw_px={d}MB vt={d}KB total_ws={d}KB\n", .{
-                                    elapsed_s,
-                                    bw_h264 / 1024,
-                                    bw_h264_frames,
-                                    bw_ctrl_sent / 1024,
-                                    bw_ctrl_recv / 1024,
-                                    bw_raw_px / (1024 * 1024),
-                                    bw_vt / 1024,
-                                    (bw_h264 + bw_ctrl_sent) / 1024,
-                                }) catch "";
-                                _ = f.write(bw_line) catch {};
+                                logToFile(perf_log, "BW t={d}s h264={d}KB/{d}frames ctrl_out={d}KB ctrl_in={d}KB raw_px={d}MB vt={d}KB total_ws={d}KB\n", .{
+                                    elapsed_s, bw_h264 / 1024, bw_h264_frames, bw_ctrl_sent / 1024,
+                                    bw_ctrl_recv / 1024, bw_raw_px / (1024 * 1024), bw_vt / 1024, (bw_h264 + bw_ctrl_sent) / 1024,
+                                });
                             }
                         }
                     }
