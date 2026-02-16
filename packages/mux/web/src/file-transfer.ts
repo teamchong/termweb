@@ -39,6 +39,22 @@ export interface TransferFile {
   file?: File;
 }
 
+/** Parse a file list from binary data at the given offset. Returns files and new offset. */
+function parseFileList(view: DataView, bytes: Uint8Array, startOffset: number, fileCount: number): { files: TransferFile[]; offset: number } {
+  let offset = startOffset;
+  const files: TransferFile[] = [];
+  for (let i = 0; i < fileCount; i++) {
+    const pathLen = view.getUint16(offset, true); offset += PROTO_SIZE.UINT16;
+    const path = sharedTextDecoder.decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
+    const size = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
+    const mtime = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
+    const hash = view.getBigUint64(offset, true); offset += PROTO_SIZE.UINT64;
+    const isDir = bytes[offset] !== 0; offset += PROTO_SIZE.UINT8;
+    files.push({ path, size, mtime, hash, isDir });
+  }
+  return { files, offset };
+}
+
 export interface TransferState {
   id: number;
   direction: 'upload' | 'download' | 'sync';
@@ -572,24 +588,11 @@ export class FileTransferHandler {
     const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
     const fileCount = view.getUint32(PROTO_FILE_LIST.FILE_COUNT, true);
     const totalBytes = Number(view.getBigUint64(PROTO_FILE_LIST.TOTAL_BYTES, true));
-    let offset = PROTO_FILE_LIST.PAYLOAD;
 
     console.log(`[FT] FILE_LIST: transferId=${transferId}, fileCount=${fileCount}, totalBytes=${totalBytes}`);
 
-    const files: TransferFile[] = [];
-    let dirCount = 0;
-    for (let i = 0; i < fileCount; i++) {
-      const pathLen = view.getUint16(offset, true); offset += PROTO_SIZE.UINT16;
-      const path = sharedTextDecoder.decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
-      const size = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
-      const mtime = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
-      const hash = view.getBigUint64(offset, true); offset += PROTO_SIZE.UINT64;
-      const isDir = bytes[offset] !== 0; offset += PROTO_SIZE.UINT8;
-
-      if (isDir) dirCount++;
-      files.push({ path, size, mtime, hash, isDir });
-    }
-
+    const { files } = parseFileList(view, bytes, PROTO_FILE_LIST.PAYLOAD, fileCount);
+    const dirCount = files.filter(f => f.isDir).length;
     const nonDirCount = fileCount - dirCount;
     console.log(`[FT] FILE_LIST parsed: ${fileCount} total entries (${nonDirCount} files, ${dirCount} dirs)`);
 
@@ -1437,20 +1440,8 @@ export class FileTransferHandler {
     const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
     const fileCount = view.getUint32(PROTO_SYNC_FILE_LIST.FILE_COUNT, true);
     const totalBytes = Number(view.getBigUint64(PROTO_SYNC_FILE_LIST.TOTAL_BYTES, true));
-    let offset = PROTO_SYNC_FILE_LIST.PAYLOAD;
 
-    // Parse the server's file list (same format as FILE_LIST)
-    const serverFiles: TransferFile[] = [];
-    for (let i = 0; i < fileCount; i++) {
-      const pathLen = view.getUint16(offset, true); offset += PROTO_SIZE.UINT16;
-      const path = sharedTextDecoder.decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
-      const size = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
-      const mtime = Number(view.getBigUint64(offset, true)); offset += PROTO_SIZE.UINT64;
-      const hash = view.getBigUint64(offset, true); offset += PROTO_SIZE.UINT64;
-      const isDir = bytes[offset] !== 0; offset += PROTO_SIZE.UINT8;
-
-      serverFiles.push({ path, size, mtime, hash, isDir });
-    }
+    const { files: serverFiles } = parseFileList(view, bytes, PROTO_SYNC_FILE_LIST.PAYLOAD, fileCount);
 
     // Activate the transfer if it's pending
     if (this.pendingTransfer) {
