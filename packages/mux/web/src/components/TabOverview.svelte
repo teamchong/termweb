@@ -104,24 +104,26 @@
     }
   }
 
-  function parseNalUnits(data: Uint8Array): Uint8Array[] {
-    const units: Uint8Array[] = [];
-    let start = 0;
-
+  /** Find positions of Annex-B start codes (00 00 00 01) in H.264 data. */
+  function findNalStartPositions(data: Uint8Array): number[] {
+    const positions: number[] = [];
     for (let i = 0; i < data.length - 3; i++) {
       if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
-        if (i > start) {
-          units.push(data.slice(start, i));
-        }
-        start = i + 4;
+        positions.push(i);
         i += 3;
       }
     }
+    return positions;
+  }
 
-    if (start < data.length) {
-      units.push(data.slice(start));
+  function parseNalUnits(data: Uint8Array): Uint8Array[] {
+    const positions = findNalStartPositions(data);
+    const units: Uint8Array[] = [];
+    for (let k = 0; k < positions.length; k++) {
+      const start = positions[k] + 4;
+      const end = k + 1 < positions.length ? positions[k + 1] : data.length;
+      if (end > start) units.push(data.slice(start, end));
     }
-
     return units;
   }
 
@@ -134,13 +136,7 @@
   }
 
   function convertAnnexBToAvcc(data: Uint8Array): void {
-    const positions: number[] = [];
-    for (let i = 0; i < data.length - 3; i++) {
-      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
-        positions.push(i);
-        i += 3;
-      }
-    }
+    const positions = findNalStartPositions(data);
     for (let k = 0; k < positions.length; k++) {
       const pos = positions[k];
       const end = k + 1 < positions.length ? positions[k + 1] : data.length;
