@@ -628,6 +628,15 @@ pub const AuthState = struct {
     // Persistence
     
 
+    /// Write bytes as hex string to a file.
+    fn writeHex(file: fs.File, bytes: []const u8) !void {
+        var hex_buf: [2]u8 = undefined;
+        for (bytes) |b| {
+            _ = std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{b}) catch continue;
+            try file.writeAll(&hex_buf);
+        }
+    }
+
     pub fn save(self: *AuthState) !void {
         var file = try fs.createFileAbsolute(self.config_path, .{ .mode = 0o600 });
         defer file.close();
@@ -643,11 +652,7 @@ pub const AuthState = struct {
         // admin_password_hash
         if (self.admin_password_hash) |hash| {
             try file.writeAll("  \"admin_password_hash\": \"");
-            var hex_buf: [2]u8 = undefined;
-            for (hash) |b| {
-                _ = std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{b}) catch continue;
-                try file.writeAll(&hex_buf);
-            }
+            try writeHex(file, &hash);
             try file.writeAll("\",\n");
         }
 
@@ -666,13 +671,7 @@ pub const AuthState = struct {
             try file.writeAll(session.name);
             const created_str = std.fmt.bufPrint(&buf, "\", \"created_at\": {}, \"token\": \"", .{session.created_at}) catch continue;
             try file.writeAll(created_str);
-            {
-                var hex_buf3: [2]u8 = undefined;
-                for (session.token) |b| {
-                    _ = std.fmt.bufPrint(&hex_buf3, "{x:0>2}", .{b}) catch continue;
-                    try file.writeAll(&hex_buf3);
-                }
-            }
+            try writeHex(file, &session.token);
             const role_str = std.fmt.bufPrint(&buf, "\", \"role\": {}", .{@intFromEnum(session.role)}) catch continue;
             try file.writeAll(role_str);
             if (session.provider) |prov| {
@@ -697,13 +696,7 @@ pub const AuthState = struct {
             first = false;
 
             try file.writeAll("    {\"token\": \"");
-            {
-                var hex_buf4: [2]u8 = undefined;
-                for (link.token) |b| {
-                    _ = std.fmt.bufPrint(&hex_buf4, "{x:0>2}", .{b}) catch continue;
-                    try file.writeAll(&hex_buf4);
-                }
-            }
+            try writeHex(file, &link.token);
             const link_str = std.fmt.bufPrint(&buf, "\", \"role\": {}, \"created_at\": {}, \"use_count\": {}", .{
                 @intFromEnum(link.role),
                 link.created_at,
@@ -730,19 +723,14 @@ pub const AuthState = struct {
 
         // oauth_providers
         try file.writeAll("  \"oauth\": {\n");
-        if (self.github_oauth) |gh| {
-            try file.writeAll("    \"github\": {\"client_id\": \"");
-            try file.writeAll(gh.client_id);
-            try file.writeAll("\", \"client_secret\": \"");
-            try file.writeAll(gh.client_secret);
-            try file.writeAll("\"},\n");
-        }
-        if (self.google_oauth) |gg| {
-            try file.writeAll("    \"google\": {\"client_id\": \"");
-            try file.writeAll(gg.client_id);
-            try file.writeAll("\", \"client_secret\": \"");
-            try file.writeAll(gg.client_secret);
-            try file.writeAll("\"},\n");
+        inline for (.{ .{ "github", self.github_oauth }, .{ "google", self.google_oauth } }) |pair| {
+            if (pair[1]) |oauth| {
+                try file.writeAll("    \"" ++ pair[0] ++ "\": {\"client_id\": \"");
+                try file.writeAll(oauth.client_id);
+                try file.writeAll("\", \"client_secret\": \"");
+                try file.writeAll(oauth.client_secret);
+                try file.writeAll("\"},\n");
+            }
         }
         const role_str2 = std.fmt.bufPrint(&buf, "    \"default_role\": {}\n", .{@intFromEnum(self.oauth_default_role)}) catch "    \"default_role\": 1\n";
         try file.writeAll(role_str2);
@@ -756,16 +744,9 @@ pub const AuthState = struct {
             first = false;
 
             try file.writeAll("    {\"id\": \"");
-            var hex_buf2: [2]u8 = undefined;
-            for (cred.id) |b| {
-                _ = std.fmt.bufPrint(&hex_buf2, "{x:0>2}", .{b}) catch continue;
-                try file.writeAll(&hex_buf2);
-            }
+            try writeHex(file, cred.id);
             try file.writeAll("\", \"public_key\": \"");
-            for (cred.public_key) |b| {
-                _ = std.fmt.bufPrint(&hex_buf2, "{x:0>2}", .{b}) catch continue;
-                try file.writeAll(&hex_buf2);
-            }
+            try writeHex(file, cred.public_key);
             try file.writeAll("\"");
             if (cred.name) |n| {
                 try file.writeAll(", \"name\": \"");
