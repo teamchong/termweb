@@ -1838,7 +1838,7 @@ pub const TransferSession = struct {
         const saved_id = std.mem.readInt(u32, header_buf[0..4], .little);
         if (saved_id != id) return error.InvalidStateFile;
 
-        const direction: TransferDirection = @enumFromInt(header_buf[4]);
+        const direction: TransferDirection = std.meta.intToEnum(TransferDirection, header_buf[4]) catch return error.InvalidStateFile;
         const flags: TransferFlags = @bitCast(header_buf[5]);
         const current_file_index = std.mem.readInt(u32, header_buf[6..10], .little);
         const current_file_offset = std.mem.readInt(u64, header_buf[10..18], .little);

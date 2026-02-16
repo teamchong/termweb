@@ -564,7 +564,7 @@
     view.setUint8(0, ClientMsg.BUFFER_STATS);
     view.setUint8(1, Math.round(health));
     view.setUint8(2, Math.round(fps));
-    view.setUint16(3, pendingDecode * PANEL.APPROX_FRAME_DURATION_MS, true);
+    view.setUint16(3, Math.min(pendingDecode * PANEL.APPROX_FRAME_DURATION_MS, 0xFFFF), true);
     sendInput(buf);
   }
 

@@ -1527,7 +1527,7 @@ const Panel = struct {
     fn handleMessage(self: *Panel, data: []const u8) void {
         if (data.len == 0) return;
 
-        const msg_type: ClientMsg = @enumFromInt(data[0]);
+        const msg_type: ClientMsg = std.meta.intToEnum(ClientMsg, data[0]) catch return;
         const payload = data[1..];
 
         switch (msg_type) {
@@ -3204,7 +3204,7 @@ const Server = struct {
                 if (data.len < 6) return;
                 const id_len = std.mem.readInt(u16, data[1..3], .little);
                 const name_len = std.mem.readInt(u16, data[3..5], .little);
-                const session_role: auth.Role = @enumFromInt(data[5]);
+                const session_role: auth.Role = std.meta.intToEnum(auth.Role, data[5]) catch return;
                 if (data.len < 6 + id_len + name_len) return;
                 const session_id = data[6..][0..id_len];
                 const session_name = data[6 + id_len ..][0..name_len];
@@ -3244,7 +3244,7 @@ const Server = struct {
                     return;
                 }
                 if (data.len < 2) return;
-                const link_role: auth.Role = @enumFromInt(data[1]);
+                const link_role: auth.Role = std.meta.intToEnum(auth.Role, data[1]) catch return;
                 _ = self.auth_state.createShareLink(link_role, null, null, null) catch {
                     self.sendAuthError(conn, "Failed to create share link");
                     return;
