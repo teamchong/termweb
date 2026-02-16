@@ -16,6 +16,24 @@ interface ZstdExports {
 let wasm: ZstdExports | null = null;
 let initPromise: Promise<void> | null = null;
 
+// Reusable WASM memory buffers — avoids per-call malloc/free overhead.
+// Buffers grow exponentially and are reused across calls.
+const MIN_BUF_SIZE = 65536; // 64KB minimum allocation
+let srcBuf = { ptr: 0, cap: 0 };
+let dstBuf = { ptr: 0, cap: 0 };
+
+function ensureBuf(buf: { ptr: number; cap: number }, needed: number): void {
+  if (needed <= buf.cap) return;
+  if (buf.ptr !== 0) wasm!.zstd_free(buf.ptr, buf.cap);
+  const newCap = Math.max(needed, buf.cap * 2, MIN_BUF_SIZE);
+  buf.ptr = wasm!.zstd_alloc(newCap);
+  if (buf.ptr === 0) {
+    buf.cap = 0;
+    throw new Error('zstd WASM alloc failed');
+  }
+  buf.cap = newCap;
+}
+
 /**
  * Initialize the zstd WASM module.
  * Loads zstd.wasm from the server and instantiates it.
@@ -80,7 +98,9 @@ export async function initZstd(wasmPath = '/zstd.wasm'): Promise<void> {
 }
 
 /**
- * Compress data using zstd WASM
+ * Compress data using zstd WASM.
+ * Uses reusable buffers — 0 WASM allocs in steady state.
+ * Returns a copy (.slice()) since callers may hold references.
  */
 export function compressZstd(data: Uint8Array, level = 3): Uint8Array {
   if (!wasm) throw new Error('zstd WASM not initialized. Call initZstd() first.');
@@ -88,57 +108,38 @@ export function compressZstd(data: Uint8Array, level = 3): Uint8Array {
   const srcSize = data.length;
   const dstCap = wasm.zstd_compress_bound(srcSize);
 
-  const srcPtr = wasm.zstd_alloc(srcSize);
-  const dstPtr = wasm.zstd_alloc(dstCap);
-  if (srcPtr === 0 || dstPtr === 0) {
-    if (srcPtr) wasm.zstd_free(srcPtr, srcSize);
-    if (dstPtr) wasm.zstd_free(dstPtr, dstCap);
-    throw new Error('zstd WASM alloc failed');
-  }
+  ensureBuf(srcBuf, srcSize);
+  ensureBuf(dstBuf, dstCap);
 
-  try {
-    new Uint8Array(wasm.memory.buffer, srcPtr, srcSize).set(data);
-    const compressedSize = wasm.zstd_compress(dstPtr, dstCap, srcPtr, srcSize, level);
-    if (compressedSize === 0) throw new Error('zstd compression failed');
-    return new Uint8Array(wasm.memory.buffer.slice(dstPtr, dstPtr + compressedSize));
-  } finally {
-    wasm.zstd_free(srcPtr, srcSize);
-    wasm.zstd_free(dstPtr, dstCap);
-  }
+  new Uint8Array(wasm.memory.buffer, srcBuf.ptr, srcSize).set(data);
+  const compressedSize = wasm.zstd_compress(dstBuf.ptr, dstBuf.cap, srcBuf.ptr, srcSize, level);
+  if (compressedSize === 0) throw new Error('zstd compression failed');
+  return new Uint8Array(wasm.memory.buffer.slice(dstBuf.ptr, dstBuf.ptr + compressedSize));
 }
 
 /**
- * Decompress zstd-compressed data using WASM
+ * Decompress zstd-compressed data using WASM.
+ * Uses reusable buffers — 0 WASM allocs in steady state.
+ * Returns a copy (.slice()) since callers may hold references.
  */
 export function decompressZstd(data: Uint8Array, maxDecompressedSize = 16 * 1024 * 1024): Uint8Array {
   if (!wasm) throw new Error('zstd WASM not initialized. Call initZstd() first.');
 
   const srcSize = data.length;
 
+  ensureBuf(srcBuf, srcSize);
+  new Uint8Array(wasm.memory.buffer, srcBuf.ptr, srcSize).set(data);
+
   // Try to get frame content size for precise allocation
-  const srcPtr = wasm.zstd_alloc(srcSize);
-  if (srcPtr === 0) throw new Error('zstd WASM alloc failed');
-
-  new Uint8Array(wasm.memory.buffer, srcPtr, srcSize).set(data);
-
-  let dstCap = wasm.zstd_frame_content_size(srcPtr, srcSize);
+  let dstCap = wasm.zstd_frame_content_size(srcBuf.ptr, srcSize);
   if (dstCap === 0 || dstCap > maxDecompressedSize) {
     // Unknown size or too large - use conservative estimate
     dstCap = Math.min(srcSize * 8, maxDecompressedSize);
   }
 
-  const dstPtr = wasm.zstd_alloc(dstCap);
-  if (dstPtr === 0) {
-    wasm.zstd_free(srcPtr, srcSize);
-    throw new Error('zstd WASM alloc failed');
-  }
+  ensureBuf(dstBuf, dstCap);
 
-  try {
-    const decompressedSize = wasm.zstd_decompress(dstPtr, dstCap, srcPtr, srcSize);
-    if (decompressedSize === 0) throw new Error('zstd decompression failed');
-    return new Uint8Array(wasm.memory.buffer.slice(dstPtr, dstPtr + decompressedSize));
-  } finally {
-    wasm.zstd_free(srcPtr, srcSize);
-    wasm.zstd_free(dstPtr, dstCap);
-  }
+  const decompressedSize = wasm.zstd_decompress(dstBuf.ptr, dstBuf.cap, srcBuf.ptr, srcSize);
+  if (decompressedSize === 0) throw new Error('zstd decompression failed');
+  return new Uint8Array(wasm.memory.buffer.slice(dstBuf.ptr, dstBuf.ptr + decompressedSize));
 }

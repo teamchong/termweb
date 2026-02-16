@@ -814,7 +814,7 @@
     wheelView.setFloat64(25, dy, true);
     wheelView.setUint8(33, getModifiers(e));
     wheelView.setUint8(34, precision);
-    sendInput(wheelBuffer);
+    sendInputImmediate(wheelBuffer);
   }
 
   function handleContextMenu(e: Event): void {
@@ -1321,7 +1321,7 @@
   }
 
   export function decodePreviewFrame(frameData: Uint8Array): void {
-    handleFrame(frameData.buffer.slice(frameData.byteOffset, frameData.byteOffset + frameData.byteLength) as ArrayBuffer);
+    handleFrame(frameData.slice().buffer as ArrayBuffer);
   }
 
   export function handleInspectorState(state: unknown): void {
@@ -1419,7 +1419,7 @@
     // Initialize throttled mouse move
     throttledSendMouseMove = throttle((x: number, y: number, mods: number) => {
       sendMouseMoveInternal(x, y, mods);
-    }, PANEL.APPROX_FRAME_DURATION_MS);
+    }, 16); // ~60fps — match display refresh for responsive cursor tracking
 
     // Setup resize observer
     if (panelEl) {

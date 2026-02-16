@@ -74,6 +74,17 @@ export async function initWebGPURenderer(
           let configuredWidth = canvas.width;
           let configuredHeight = canvas.height;
 
+          // Pre-allocate render pass descriptor — only the view field changes per frame
+          const colorAttachment: GPURenderPassColorAttachment = {
+            view: null! as GPUTextureView, // updated per frame
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: 'clear' as GPULoadOp,
+            storeOp: 'store' as GPUStoreOp,
+          };
+          const renderPassDescriptor: GPURenderPassDescriptor = {
+            colorAttachments: [colorAttachment],
+          };
+
           function renderFrame(frame: VideoFrame): void {
             if (canvas.width !== configuredWidth || canvas.height !== configuredHeight) {
               gpuCtx!.configure({ device, format, alphaMode: 'opaque' });
@@ -92,18 +103,9 @@ export async function initWebGPURenderer(
             });
 
             const commandEncoder = device.createCommandEncoder();
-            const textureView = gpuCtx!.getCurrentTexture().createView();
+            colorAttachment.view = gpuCtx!.getCurrentTexture().createView();
 
-            const passEncoder = commandEncoder.beginRenderPass({
-              colorAttachments: [
-                {
-                  view: textureView,
-                  clearValue: { r: 0, g: 0, b: 0, a: 1 },
-                  loadOp: 'clear' as GPULoadOp,
-                  storeOp: 'store' as GPUStoreOp,
-                },
-              ],
-            });
+            const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
 
             passEncoder.setPipeline(pipeline);
             passEncoder.setBindGroup(0, bindGroup);

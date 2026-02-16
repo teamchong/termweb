@@ -378,13 +378,13 @@ export class MuxClient {
   private controlOutQueue: Uint8Array[] = [];
   private controlFlushScheduled = false;
 
-  /** Queue binary data for the next batch flush (once per rAF) */
+  /** Queue binary data for the next batch flush (once per microtask) */
   private sendControlBinary(data: Uint8Array): void {
     if (!this.isControlWsOpen()) return;
     this.controlOutQueue.push(data);
     if (!this.controlFlushScheduled) {
       this.controlFlushScheduled = true;
-      requestAnimationFrame(() => this.flushControlBatch());
+      queueMicrotask(() => this.flushControlBatch());
     }
   }
 
