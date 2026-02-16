@@ -68,22 +68,12 @@ fn setSocketOptions(fd: posix.socket_t) void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1))) catch {};
 }
 
-// Set socket read timeout for blocking I/O with periodic wakeup
-fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
+fn setSocketTimeout(fd: posix.socket_t, opt: u32, timeout_ms: u32) void {
     const tv = posix.timeval{
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-}
-
-// Set socket write timeout to prevent blocking on slow/unresponsive clients
-fn setWriteTimeout(fd: posix.socket_t, timeout_ms: u32) void {
-    const tv = posix.timeval{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv)) catch {};
 }
 
 // Find HTTP header value case-insensitively (proxies may lowercase headers)
@@ -697,8 +687,8 @@ pub const Server = struct {
 
         // Configure socket for low-latency interactive use
         setSocketOptions(accepted.stream.handle);
-        setReadTimeout(accepted.stream.handle, 100); // 100ms wakeup for shutdown check
-        setWriteTimeout(accepted.stream.handle, self.send_timeout_ms);
+        setSocketTimeout(accepted.stream.handle, posix.SO.RCVTIMEO, 100); // 100ms wakeup for shutdown check
+        setSocketTimeout(accepted.stream.handle, posix.SO.SNDTIMEO, self.send_timeout_ms);
 
         // Perform handshake (with or without zstd based on server config)
         try conn.acceptHandshakeWithOptions(self.enable_zstd);
@@ -790,8 +780,8 @@ pub const Server = struct {
 
         // Configure socket for low-latency interactive use
         setSocketOptions(stream.handle);
-        setReadTimeout(stream.handle, 100); // 100ms wakeup for shutdown check
-        setWriteTimeout(stream.handle, self.send_timeout_ms);
+        setSocketTimeout(stream.handle, posix.SO.RCVTIMEO, 100); // 100ms wakeup for shutdown check
+        setSocketTimeout(stream.handle, posix.SO.SNDTIMEO, self.send_timeout_ms);
 
         // Complete WebSocket handshake with pre-read request
         conn.acceptHandshakeFromRequest(request, self.enable_zstd) catch {

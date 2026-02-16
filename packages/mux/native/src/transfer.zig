@@ -2036,8 +2036,11 @@ pub fn buildTransferReadyEx(
 // [0x31][transfer_id:u32][file_count:u32][total_bytes:u64][files...]
 // file: [path_len:u16][path][size:u64][mtime:u64][hash:u64][is_dir:u8]
 pub fn buildFileList(allocator: Allocator, session: *const TransferSession) ![]u8 {
-    // Calculate total size
-    var total_len: usize = 1 + 4 + 4 + 8; // header
+    return buildFileListImpl(allocator, session, .file_list);
+}
+
+fn buildFileListImpl(allocator: Allocator, session: *const TransferSession, msg_type: ServerMsgType) ![]u8 {
+    var total_len: usize = 1 + 4 + 4 + 8;
     for (session.files.items) |entry| {
         total_len += 2 + entry.path.len + 8 + 8 + 8 + 1;
     }
@@ -2045,34 +2048,27 @@ pub fn buildFileList(allocator: Allocator, session: *const TransferSession) ![]u
     var msg = try allocator.alloc(u8, total_len);
     var offset: usize = 0;
 
-    msg[offset] = @intFromEnum(ServerMsgType.file_list);
+    msg[offset] = @intFromEnum(msg_type);
     offset += 1;
 
     std.mem.writeInt(u32, msg[offset..][0..4], session.id, .little);
     offset += 4;
-
     std.mem.writeInt(u32, msg[offset..][0..4], @intCast(session.files.items.len), .little);
     offset += 4;
-
     std.mem.writeInt(u64, msg[offset..][0..8], session.total_bytes, .little);
     offset += 8;
 
     for (session.files.items) |entry| {
         std.mem.writeInt(u16, msg[offset..][0..2], @intCast(entry.path.len), .little);
         offset += 2;
-
         @memcpy(msg[offset..][0..entry.path.len], entry.path);
         offset += entry.path.len;
-
         std.mem.writeInt(u64, msg[offset..][0..8], entry.size, .little);
         offset += 8;
-
         std.mem.writeInt(u64, msg[offset..][0..8], entry.mtime, .little);
         offset += 8;
-
         std.mem.writeInt(u64, msg[offset..][0..8], entry.hash, .little);
         offset += 8;
-
         msg[offset] = if (entry.is_dir) 1 else 0;
         offset += 1;
     }
@@ -2911,41 +2907,7 @@ pub fn parseBlockChecksums(allocator: Allocator, data: []const u8) !BlockChecksu
 /// [0x38][transfer_id:u32][file_count:u32][total_bytes:u64][entries...]
 /// entry: [path_len:u16][path][size:u64][mtime:u64][hash:u64][is_dir:u8]
 pub fn buildSyncFileList(allocator: Allocator, session: *const TransferSession) ![]u8 {
-    // Same format as FILE_LIST but with sync_file_list type
-    var total_len: usize = 1 + 4 + 4 + 8;
-    for (session.files.items) |entry| {
-        total_len += 2 + entry.path.len + 8 + 8 + 8 + 1;
-    }
-
-    var msg = try allocator.alloc(u8, total_len);
-    var offset: usize = 0;
-
-    msg[offset] = @intFromEnum(ServerMsgType.sync_file_list);
-    offset += 1;
-
-    std.mem.writeInt(u32, msg[offset..][0..4], session.id, .little);
-    offset += 4;
-    std.mem.writeInt(u32, msg[offset..][0..4], @intCast(session.files.items.len), .little);
-    offset += 4;
-    std.mem.writeInt(u64, msg[offset..][0..8], session.total_bytes, .little);
-    offset += 8;
-
-    for (session.files.items) |entry| {
-        std.mem.writeInt(u16, msg[offset..][0..2], @intCast(entry.path.len), .little);
-        offset += 2;
-        @memcpy(msg[offset..][0..entry.path.len], entry.path);
-        offset += entry.path.len;
-        std.mem.writeInt(u64, msg[offset..][0..8], entry.size, .little);
-        offset += 8;
-        std.mem.writeInt(u64, msg[offset..][0..8], entry.mtime, .little);
-        offset += 8;
-        std.mem.writeInt(u64, msg[offset..][0..8], entry.hash, .little);
-        offset += 8;
-        msg[offset] = if (entry.is_dir) 1 else 0;
-        offset += 1;
-    }
-
-    return msg;
+    return buildFileListImpl(allocator, session, .sync_file_list);
 }
 
 /// Build DELTA_DATA message for a file.

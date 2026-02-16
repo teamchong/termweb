@@ -915,11 +915,21 @@ pub const VideoEncoder = struct {
     /// Resize encoder for pixel budget / quality tier change (same source dims, different resolution cap).
     /// Unlike resize(), this doesn't check source_width/source_height equality.
     fn resizeForTier(self: *VideoEncoder) ResizeError!void {
-        const scaled = calcAlignedDimensions(self.source_width, self.source_height, self.active_max_pixels);
+        return self.resizeInternal(self.source_width, self.source_height, false);
+    }
+
+    pub fn resize(self: *VideoEncoder, width: u32, height: u32) ResizeError!void {
+        return self.resizeInternal(width, height, true);
+    }
+
+    fn resizeInternal(self: *VideoEncoder, source_w: u32, source_h: u32, update_source: bool) ResizeError!void {
+        if (update_source and self.source_width == source_w and self.source_height == source_h) return;
+
+        const scaled = calcAlignedDimensions(source_w, source_h, self.active_max_pixels);
         const encode_width = scaled.w;
         const encode_height = scaled.h;
 
-        if (encode_width == self.width and encode_height == self.height) return;
+        if (!update_source and encode_width == self.width and encode_height == self.height) return;
 
         const va_display = self.shared.va_display;
 
@@ -988,111 +998,12 @@ pub const VideoEncoder = struct {
         self.width = encode_width;
         self.height = encode_height;
         self.frame_count = 0;
+        if (update_source) {
+            self.source_width = source_w;
+            self.source_height = source_h;
+        }
 
         // Recreate VPP resources at new encode resolution
-        if (self.shared.has_vpp) vpp_blk: {
-            var rgba_attribs = [_]c.VASurfaceAttrib{
-                .{
-                    .type = c.VASurfaceAttribPixelFormat,
-                    .flags = c.VA_SURFACE_ATTRIB_SETTABLE,
-                    .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = @as(c_int, @bitCast(@as(u32, c.VA_FOURCC_BGRX))) } },
-                },
-            };
-            status = c.vaCreateSurfaces(va_display, c.VA_RT_FORMAT_RGB32, encode_width, encode_height, @ptrCast(&self.rgba_surface), 1, &rgba_attribs, 1);
-            if (status != c.VA_STATUS_SUCCESS) break :vpp_blk;
-            status = c.vaCreateContext(va_display, self.shared.vpp_config, @intCast(encode_width), @intCast(encode_height), c.VA_PROGRESSIVE, @ptrCast(&self.rgba_surface), 1, &self.vpp_context);
-            if (status != c.VA_STATUS_SUCCESS) {
-                _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
-                break :vpp_blk;
-            }
-            self.rgba_width = encode_width;
-            self.rgba_height = encode_height;
-            self.has_vpp = true;
-        }
-
-        // Regenerate SPS/PPS for new dimensions
-        self.generateSPS();
-        self.generatePPS();
-    }
-
-    pub fn resize(self: *VideoEncoder, width: u32, height: u32) ResizeError!void {
-        if (self.source_width == width and self.source_height == height) return;
-
-        const scaled = calcAlignedDimensions(width, height, self.active_max_pixels);
-        const encode_width = scaled.w;
-        const encode_height = scaled.h;
-
-        const va_display = self.shared.va_display;
-
-        // Destroy old VPP resources
-        if (self.has_vpp) {
-            _ = c.vaDestroyContext(va_display, self.vpp_context);
-            _ = c.vaDestroySurfaces(va_display, @ptrCast(&self.rgba_surface), 1);
-            self.has_vpp = false;
-        }
-
-        // Destroy old resources
-        var old_surfaces = [_]c.VASurfaceID{ self.src_surface, self.ref_surface, self.recon_surface };
-        _ = vaDestroyBuffer(va_display, self.coded_buf);
-        _ = c.vaDestroyContext(va_display, self.va_context);
-        _ = c.vaDestroySurfaces(va_display, &old_surfaces, 3);
-
-        // Create new surfaces
-        var surfaces: [3]c.VASurfaceID = undefined;
-        var status = c.vaCreateSurfaces(
-            va_display,
-            c.VA_RT_FORMAT_YUV420,
-            encode_width,
-            encode_height,
-            &surfaces,
-            3,
-            null,
-            0,
-        );
-        if (status != c.VA_STATUS_SUCCESS) return error.VaSurfacesFailed;
-
-        // Create new context
-        status = c.vaCreateContext(
-            va_display,
-            self.shared.va_config,
-            @intCast(encode_width),
-            @intCast(encode_height),
-            c.VA_PROGRESSIVE,
-            &surfaces,
-            3,
-            &self.va_context,
-        );
-        if (status != c.VA_STATUS_SUCCESS) {
-            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
-            return error.VaContextFailed;
-        }
-
-        // Create new double-buffered coded buffers
-        status = vaCreateBuffer(
-            va_display,
-            self.va_context,
-            VAEncCodedBufferType,
-            MAX_OUTPUT_SIZE,
-            1,
-            null,
-            &self.coded_buf,
-        );
-        if (status != c.VA_STATUS_SUCCESS) {
-            _ = c.vaDestroyContext(va_display, self.va_context);
-            _ = c.vaDestroySurfaces(va_display, &surfaces, 3);
-            return error.VaBufferFailed;
-        }
-
-        self.src_surface = surfaces[0];
-        self.ref_surface = surfaces[1];
-        self.recon_surface = surfaces[2];
-        self.width = encode_width;
-        self.height = encode_height;
-        self.source_width = width;
-        self.source_height = height;
-        self.frame_count = 0;
-
-        // Recreate VPP resources at encode resolution
         if (self.shared.has_vpp) vpp_blk: {
             var rgba_attribs = [_]c.VASurfaceAttrib{
                 .{
