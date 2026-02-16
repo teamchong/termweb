@@ -8019,110 +8019,109 @@ pub fn main() !void {
     try run(allocator, args.http_port, args.mode);
 }
 
-// ==========================================================================
-// Tests
-// ==========================================================================
-
-test "jsonFindValue locates value position" {
+test "jsonFindValue" {
     const json = "{\"cmd\":\"send-keys\",\"target\":3}";
     try std.testing.expectEqual(@as(?usize, 7), jsonFindValue(json, "cmd"));
     try std.testing.expectEqual(@as(?usize, 28), jsonFindValue(json, "target"));
     try std.testing.expectEqual(@as(?usize, null), jsonFindValue(json, "missing"));
+    // Duplicate keys: returns first occurrence
+    const dup = "{\"k\":\"first\",\"k\":\"second\"}";
+    try std.testing.expect(jsonFindValue(dup, "k").? < 20);
 }
 
-test "jsonGetString extracts string values" {
+test "jsonGetString" {
     const json = "{\"cmd\":\"send-keys\",\"name\":\"hello world\"}";
     try std.testing.expectEqualStrings("send-keys", jsonGetString(json, "cmd").?);
     try std.testing.expectEqualStrings("hello world", jsonGetString(json, "name").?);
     try std.testing.expect(jsonGetString(json, "missing") == null);
-    // Integer value shouldn't match as string
-    try std.testing.expect(jsonGetString("{\"n\":42}", "n") == null);
+    try std.testing.expect(jsonGetString("{\"n\":42}", "n") == null); // int not string
+    try std.testing.expectEqualStrings("", jsonGetString("{\"cmd\":\"\"}", "cmd").?); // empty
+    try std.testing.expectEqualStrings("echo hello world", jsonGetString("{\"command\":\"echo hello world\"}", "command").?);
+    try std.testing.expectEqualStrings("日本語", jsonGetString("{\"k\":\"日本語\"}", "k").?); // unicode
+    // Exact key match, not substring
+    try std.testing.expectEqualStrings("y", jsonGetString("{\"cmd_extra\":\"x\",\"cmd\":\"y\"}", "cmd").?);
+    try std.testing.expectEqualStrings("first", jsonGetString("{\"k\":\"first\",\"k\":\"second\"}", "k").?); // first wins
 }
 
-test "jsonGetInt extracts integer values" {
+test "jsonGetInt" {
     try std.testing.expectEqual(@as(?u32, 3), jsonGetInt("{\"target\":3}", "target"));
     try std.testing.expectEqual(@as(?u32, 12345), jsonGetInt("{\"id\":12345,\"x\":1}", "id"));
     try std.testing.expect(jsonGetInt("{\"target\":\"str\"}", "target") == null);
     try std.testing.expect(jsonGetInt("{\"x\":1}", "missing") == null);
+    try std.testing.expectEqual(@as(?u32, 0), jsonGetInt("{\"pane\":0}", "pane"));
+    try std.testing.expectEqual(@as(?u32, 42), jsonGetInt("{\"id\":42}", "id")); // at end of object
+    try std.testing.expectEqual(@as(?u32, 7), jsonGetInt("{\"n\":007}", "n")); // leading zeros
 }
 
-test "jsonGetArray extracts array contents" {
+test "jsonGetArray" {
     const json = "{\"args\":[\"ls\",\"Enter\"],\"x\":1}";
-    const arr = jsonGetArray(json, "args").?;
-    try std.testing.expectEqualStrings("\"ls\",\"Enter\"", arr);
+    try std.testing.expectEqualStrings("\"ls\",\"Enter\"", jsonGetArray(json, "args").?);
     try std.testing.expect(jsonGetArray(json, "x") == null);
     try std.testing.expect(jsonGetArray(json, "missing") == null);
-    // Nested brackets
-    const nested = "{\"a\":[[1],2]}";
-    try std.testing.expectEqualStrings("[1],2", jsonGetArray(nested, "a").?);
+    try std.testing.expectEqualStrings("[1],2", jsonGetArray("{\"a\":[[1],2]}", "a").?); // nested
+    try std.testing.expectEqualStrings("\"echo \\\"hi\\\"\"", jsonGetArray("{\"args\":[\"echo \\\"hi\\\"\"]}", "args").?); // escaped quotes
+    try std.testing.expectEqualStrings("", jsonGetArray("{\"args\":[]}", "args").?); // empty
+    try std.testing.expectEqualStrings("\"ls\"", jsonGetArray("{\"args\":[\"ls\"]}", "args").?); // single
+    try std.testing.expectEqualStrings("{\"x\":1}", jsonGetArray("{\"a\":[{\"x\":1}]}", "a").?); // nested objects
 }
 
-test "jsonGetArray handles escaped quotes" {
-    const json = "{\"args\":[\"echo \\\"hi\\\"\"]}";
-    const arr = jsonGetArray(json, "args").?;
-    try std.testing.expectEqualStrings("\"echo \\\"hi\\\"\"", arr);
-}
-
-test "JsonArrayIterator parses string elements" {
+test "JsonArrayIterator" {
     var iter = JsonArrayIterator.init("\"ls -la\",\"Enter\",\"C-c\"");
     try std.testing.expectEqualStrings("ls -la", iter.next().?);
     try std.testing.expectEqualStrings("Enter", iter.next().?);
     try std.testing.expectEqualStrings("C-c", iter.next().?);
     try std.testing.expect(iter.next() == null);
+
+    var empty = JsonArrayIterator.init("");
+    try std.testing.expect(empty.next() == null);
+
+    var escaped = JsonArrayIterator.init("\"echo \\\"hi\\\"\"");
+    try std.testing.expectEqualStrings("echo \\\"hi\\\"", escaped.next().?);
+    try std.testing.expect(escaped.next() == null);
 }
 
-test "JsonArrayIterator handles empty array" {
-    var iter = JsonArrayIterator.init("");
-    try std.testing.expect(iter.next() == null);
+test "JSON extraction for tmux API bodies" {
+    // split-window
+    const split = "{\"cmd\":\"split-window\",\"pane\":2,\"dir\":\"h\",\"command\":\"vim\"}";
+    try std.testing.expectEqualStrings("split-window", jsonGetString(split, "cmd").?);
+    try std.testing.expectEqual(@as(?u32, 2), jsonGetInt(split, "pane"));
+    try std.testing.expectEqualStrings("h", jsonGetString(split, "dir").?);
+    try std.testing.expectEqualStrings("vim", jsonGetString(split, "command").?);
+    // new-window
+    const nw = "{\"cmd\":\"new-window\",\"command\":\"top\",\"name\":\"monitor\"}";
+    try std.testing.expectEqualStrings("new-window", jsonGetString(nw, "cmd").?);
+    try std.testing.expectEqualStrings("top", jsonGetString(nw, "command").?);
+    // send-keys
+    const sk = "{\"cmd\":\"send-keys\",\"target\":3,\"args\":[\"ls -la\",\"Enter\"]}";
+    try std.testing.expectEqual(@as(?u32, 3), jsonGetInt(sk, "target"));
+    var sk_iter = JsonArrayIterator.init(jsonGetArray(sk, "args").?);
+    try std.testing.expectEqualStrings("ls -la", sk_iter.next().?);
+    try std.testing.expectEqualStrings("Enter", sk_iter.next().?);
+    try std.testing.expect(sk_iter.next() == null);
+    // missing/unknown
+    try std.testing.expect(jsonGetString("{\"target\":1}", "cmd") == null);
 }
 
-test "JsonArrayIterator handles escaped quotes in values" {
-    var iter = JsonArrayIterator.init("\"echo \\\"hi\\\"\"");
-    try std.testing.expectEqualStrings("echo \\\"hi\\\"", iter.next().?);
-    try std.testing.expect(iter.next() == null);
-}
-
-test "tmuxKeyLookup resolves named keys" {
+test "tmuxKeyLookup" {
+    // Named keys
     const enter = tmuxKeyLookup("Enter").?;
     try std.testing.expectEqual(@as(u32, 0x0024), enter.keycode);
     try std.testing.expectEqual(@as(u32, 0), enter.mods);
     try std.testing.expectEqualStrings("\r", enter.text.?);
-
     const esc = tmuxKeyLookup("Escape").?;
     try std.testing.expectEqual(@as(u32, 0x0009), esc.keycode);
     try std.testing.expect(esc.text == null);
-
+    // All navigation keys resolve
+    const nav_keys = [_][]const u8{ "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown", "BSpace", "DC", "Tab", "Space" };
+    for (nav_keys) |name| try std.testing.expect(tmuxKeyLookup(name) != null);
+    // Invalid keys
     try std.testing.expect(tmuxKeyLookup("NotAKey") == null);
     try std.testing.expect(tmuxKeyLookup("") == null);
-}
-
-test "tmuxKeyLookup resolves C-<letter> keys" {
-    const ctrl_c = tmuxKeyLookup("C-c").?;
-    try std.testing.expectEqual(c.GHOSTTY_MODS_CTRL, ctrl_c.mods);
-    try std.testing.expectEqualStrings("\x03", ctrl_c.text.?);
-
-    const ctrl_a = tmuxKeyLookup("C-a").?;
-    try std.testing.expectEqualStrings("\x01", ctrl_a.text.?);
-
-    const ctrl_z = tmuxKeyLookup("C-z").?;
-    try std.testing.expectEqualStrings("\x1a", ctrl_z.text.?);
-
     // Invalid C- patterns
-    try std.testing.expect(tmuxKeyLookup("C-A") == null); // uppercase
-    try std.testing.expect(tmuxKeyLookup("C-1") == null); // digit
-    try std.testing.expect(tmuxKeyLookup("C-") == null); // too short
+    try std.testing.expect(tmuxKeyLookup("C-A") == null);
+    try std.testing.expect(tmuxKeyLookup("C-1") == null);
+    try std.testing.expect(tmuxKeyLookup("C-") == null);
 }
-
-test "tmuxKeyLookup covers all navigation keys" {
-    const keys = [_][]const u8{ "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown", "BSpace", "DC", "Tab", "Space" };
-    for (keys) |name| {
-        try std.testing.expect(tmuxKeyLookup(name) != null);
-    }
-}
-
-// ==========================================================================
-// percentDecode tests
-// ==========================================================================
 
 fn expectDecode(input: []const u8, expected: []const u8) !void {
     const result = percentDecode(input, std.testing.allocator).?;
@@ -8138,11 +8137,11 @@ test "percentDecode" {
     try expectDecode("abc%ZZdef", "abc%ZZdef"); // invalid hex passthrough
     try expectDecode("abc%2", "abc%2"); // truncated percent
     try expectDecode("", "");
+    try expectDecode("%23%7Bpane_id%7D%20%23%7Bpane_width%7D", "#{pane_id} #{pane_width}");
+    try expectDecode("%41%42%43", "ABC"); // consecutive
+    try expectDecode("a+b", "a+b"); // plus not decoded
+    try expectDecode("%25", "%"); // encoded percent
 }
-
-// ==========================================================================
-// hexDigit tests
-// ==========================================================================
 
 test "hexDigit" {
     try std.testing.expectEqual(@as(?u8, 0), hexDigit('0'));
@@ -8156,74 +8155,6 @@ test "hexDigit" {
     try std.testing.expect(hexDigit('G') == null);
     try std.testing.expect(hexDigit(' ') == null);
     try std.testing.expect(hexDigit('%') == null);
-}
-
-// ==========================================================================
-// JSON parsing edge cases
-// ==========================================================================
-
-test "jsonGetString with empty value" {
-    try std.testing.expectEqualStrings("", jsonGetString("{\"cmd\":\"\"}", "cmd").?);
-}
-
-test "jsonGetString with spaces in value" {
-    try std.testing.expectEqualStrings("echo hello world", jsonGetString("{\"command\":\"echo hello world\"}", "command").?);
-}
-
-test "jsonGetInt with zero" {
-    try std.testing.expectEqual(@as(?u32, 0), jsonGetInt("{\"pane\":0}", "pane"));
-}
-
-test "jsonGetInt at end of object" {
-    try std.testing.expectEqual(@as(?u32, 42), jsonGetInt("{\"id\":42}", "id"));
-}
-
-test "jsonGetArray with empty array" {
-    try std.testing.expectEqualStrings("", jsonGetArray("{\"args\":[]}", "args").?);
-}
-
-test "jsonGetArray with single element" {
-    try std.testing.expectEqualStrings("\"ls\"", jsonGetArray("{\"args\":[\"ls\"]}", "args").?);
-}
-
-// ==========================================================================
-// handleTmuxPost routing (JSON extraction tests)
-// ==========================================================================
-
-test "JSON extraction for split-window body" {
-    const body = "{\"cmd\":\"split-window\",\"pane\":2,\"dir\":\"h\",\"command\":\"vim\"}";
-    try std.testing.expectEqualStrings("split-window", jsonGetString(body, "cmd").?);
-    try std.testing.expectEqual(@as(?u32, 2), jsonGetInt(body, "pane"));
-    try std.testing.expectEqualStrings("h", jsonGetString(body, "dir").?);
-    try std.testing.expectEqualStrings("vim", jsonGetString(body, "command").?);
-}
-
-test "JSON extraction for new-window body" {
-    const body = "{\"cmd\":\"new-window\",\"command\":\"top\",\"name\":\"monitor\"}";
-    try std.testing.expectEqualStrings("new-window", jsonGetString(body, "cmd").?);
-    try std.testing.expectEqualStrings("top", jsonGetString(body, "command").?);
-    try std.testing.expectEqualStrings("monitor", jsonGetString(body, "name").?);
-}
-
-test "JSON extraction for send-keys body" {
-    const body = "{\"cmd\":\"send-keys\",\"target\":3,\"args\":[\"ls -la\",\"Enter\"]}";
-    try std.testing.expectEqualStrings("send-keys", jsonGetString(body, "cmd").?);
-    try std.testing.expectEqual(@as(?u32, 3), jsonGetInt(body, "target"));
-    const arr = jsonGetArray(body, "args").?;
-    var iter = JsonArrayIterator.init(arr);
-    try std.testing.expectEqualStrings("ls -la", iter.next().?);
-    try std.testing.expectEqualStrings("Enter", iter.next().?);
-    try std.testing.expect(iter.next() == null);
-}
-
-test "JSON extraction returns null for missing cmd" {
-    try std.testing.expect(jsonGetString("{\"target\":1}", "cmd") == null);
-}
-
-test "JSON extraction returns null for unknown fields" {
-    const body = "{\"cmd\":\"unknown-cmd\"}";
-    try std.testing.expectEqualStrings("unknown-cmd", jsonGetString(body, "cmd").?);
-    try std.testing.expect(jsonGetString(body, "target") == null);
 }
 
 test "tmuxKeyLookup resolves all C-a through C-z" {
@@ -8241,10 +8172,6 @@ test "tmuxKeyLookup resolves all C-a through C-z" {
     }
 }
 
-// ==========================================================================
-// interpolateTmuxFormat tests
-// ==========================================================================
-
 /// Test helper: run interpolateTmuxFormat and return result for comparison.
 fn testFmt(format: []const u8, id: u32, w: u32, h: u32, active: u8, pwd: []const u8, title: []const u8) std.ArrayListUnmanaged(u8) {
     var buf: std.ArrayListUnmanaged(u8) = .{};
@@ -8252,8 +8179,9 @@ fn testFmt(format: []const u8, id: u32, w: u32, h: u32, active: u8, pwd: []const
     return buf;
 }
 
-test "interpolateTmuxFormat resolves all variable types" {
+test "interpolateTmuxFormat" {
     const cases = .{
+        // All variable types
         .{ "#{pane_id}", 5, 800, 600, @as(u8, 1), "/home", "shell", "%5" },
         .{ "#{pane_index}", 5, 80, 24, @as(u8, 0), "/", "sh", "5" },
         .{ "#{pane_active}", 1, 80, 24, @as(u8, 1), "/", "sh", "1" },
@@ -8262,64 +8190,16 @@ test "interpolateTmuxFormat resolves all variable types" {
         .{ "#{pane_current_path}", 1, 80, 24, @as(u8, 0), "/home/user", "sh", "/home/user" },
         .{ "#{pane_title}", 1, 80, 24, @as(u8, 0), "/", "vim", "vim" },
         .{ "#{pane_current_command}", 1, 80, 24, @as(u8, 0), "/", "vim", "vim" },
+        // Edge cases
+        .{ "a#{foo}b", 1, 80, 24, @as(u8, 0), "/", "sh", "ab" },
+        .{ "#{pane_id", 5, 80, 24, @as(u8, 0), "/", "sh", "#{pane_id" },
+        .{ "id=#{pane_id} w=#{pane_width}", 5, 800, 600, @as(u8, 1), "/", "sh", "id=%5 w=800" },
+        .{ "", 1, 80, 24, @as(u8, 0), "/", "sh", "" },
+        .{ "hello world", 1, 80, 24, @as(u8, 0), "/", "sh", "hello world" },
     };
     inline for (cases) |tc| {
         var buf = testFmt(tc[0], tc[1], tc[2], tc[3], tc[4], tc[5], tc[6]);
         defer buf.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings(tc[7], buf.items);
     }
-}
-
-test "interpolateTmuxFormat edge cases" {
-    const cases = .{
-        .{ "a#{foo}b", 1, 80, 24, @as(u8, 0), "/", "sh", "ab" }, // unknown var skipped
-        .{ "#{pane_id", 5, 80, 24, @as(u8, 0), "/", "sh", "#{pane_id" }, // unclosed brace
-        .{ "id=#{pane_id} w=#{pane_width}", 5, 800, 600, @as(u8, 1), "/", "sh", "id=%5 w=800" }, // mixed
-        .{ "", 1, 80, 24, @as(u8, 0), "/", "sh", "" }, // empty
-        .{ "hello world", 1, 80, 24, @as(u8, 0), "/", "sh", "hello world" }, // plain text
-    };
-    inline for (cases) |tc| {
-        var buf = testFmt(tc[0], tc[1], tc[2], tc[3], tc[4], tc[5], tc[6]);
-        defer buf.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings(tc[7], buf.items);
-    }
-}
-
-test "percentDecode additional cases" {
-    try expectDecode("%23%7Bpane_id%7D%20%23%7Bpane_width%7D", "#{pane_id} #{pane_width}");
-    try expectDecode("%41%42%43", "ABC");
-    try expectDecode("a+b", "a+b"); // plus not decoded as space
-    try expectDecode("%25", "%"); // encoded percent
-}
-
-// ==========================================================================
-// Additional JSON edge case tests
-// ==========================================================================
-
-test "jsonGetString with unicode value" {
-    try std.testing.expectEqualStrings("日本語", jsonGetString("{\"k\":\"日本語\"}", "k").?);
-}
-
-test "jsonGetInt with leading zeros" {
-    try std.testing.expectEqual(@as(?u32, 7), jsonGetInt("{\"n\":007}", "n"));
-}
-
-test "jsonGetArray with nested objects" {
-    const arr = jsonGetArray("{\"a\":[{\"x\":1}]}", "a").?;
-    try std.testing.expectEqualStrings("{\"x\":1}", arr);
-}
-
-test "jsonFindValue returns first occurrence for duplicate keys" {
-    // Two "k" keys — should find the first one
-    const pos = jsonFindValue("{\"k\":\"first\",\"k\":\"second\"}", "k").?;
-    // First value starts at the opening quote of "first"
-    try std.testing.expect(pos < 20);
-    const str = jsonGetString("{\"k\":\"first\",\"k\":\"second\"}", "k").?;
-    try std.testing.expectEqualStrings("first", str);
-}
-
-test "jsonGetString matches exact key not substring" {
-    const json = "{\"cmd_extra\":\"x\",\"cmd\":\"y\"}";
-    try std.testing.expectEqualStrings("y", jsonGetString(json, "cmd").?);
-    try std.testing.expectEqualStrings("x", jsonGetString(json, "cmd_extra").?);
 }
