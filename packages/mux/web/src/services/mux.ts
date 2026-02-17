@@ -11,7 +11,7 @@ import { FileTransferHandler } from '../file-transfer';
 import type { DryRunReport, TransferOptions } from '../file-transfer';
 import type { AppConfig, LayoutData, LayoutNode, LayoutTab } from '../types';
 import type { PanelStatus } from '../stores/types';
-import { applyColors, generateId, getWsUrl, sharedTextEncoder, sharedTextDecoder } from '../utils';
+import { applyColors, generateId, getWsUrl, setAuthToken, sharedTextEncoder, sharedTextDecoder } from '../utils';
 import { TIMING, WS_PATHS, SERVER_MSG, UI } from '../constants';
 import { BinaryCtrlMsg, Role } from '../protocol';
 import { initZstd, compressZstd, decompressZstd } from '../zstd-wasm';
@@ -596,11 +596,15 @@ export class MuxClient {
     if (config.keybindings) keybindings.set(config.keybindings);
   }
 
+  private authenticated = false;
+  private authFailCount = 0;
+
   private connectControl(): void {
     if (this.destroyed) return;
     const wsUrl = getWsUrl(WS_PATHS.CONTROL);
     this.controlWs = new WebSocket(wsUrl);
     this.controlWs.binaryType = 'arraybuffer';
+    let receivedMessage = false;
 
     this.controlWs.onopen = () => {
       console.log('Control channel connected');
@@ -610,6 +614,7 @@ export class MuxClient {
 
     this.controlWs.onmessage = (event) => {
       if (this.destroyed) return;
+      receivedMessage = true;
       if (typeof event.data === 'string') {
         try {
           this.handleJsonMessage(JSON.parse(event.data));
@@ -639,6 +644,17 @@ export class MuxClient {
     this.controlWs.onclose = () => {
       console.log('[MUX] Control channel disconnected');
       connectionStatus.set('disconnected');
+
+      // If closed without receiving any message, auth failed (invalid/expired JWT)
+      if (!receivedMessage && !this.authenticated) {
+        this.authFailCount++;
+        if (this.authFailCount >= 2) {
+          // Redirect to login after repeated auth failures
+          window.location.href = window.location.pathname + '?error=session_expired';
+          return;
+        }
+      }
+
       if (!this.destroyed) {
         const jitter = Math.random() * 0.3 * this.reconnectDelay;
         const delay = Math.min(this.reconnectDelay + jitter, TIMING.WS_RECONNECT_MAX);
@@ -778,6 +794,13 @@ export class MuxClient {
             githubConfigured: data.byteLength > 5 ? view.getUint8(5) === 1 : false,
             googleConfigured: data.byteLength > 6 ? view.getUint8(6) === 1 : false,
           });
+          // Invalid/expired token: redirect to login
+          if (role === Role.NONE) {
+            window.location.href = window.location.pathname + '?error=access_denied';
+            return;
+          }
+          this.authenticated = true;
+          this.authFailCount = 0;
           // Update UI isAdmin flag
           const isAdmin = role === Role.ADMIN;
           ui.update(s => ({ ...s, isAdmin }));
@@ -797,10 +820,14 @@ export class MuxClient {
             const jwtLen = view.getUint16(1, true);
             if (jwtLen > 0 && data.byteLength >= 3 + jwtLen) {
               const jwt = new TextDecoder().decode(bytes.slice(3, 3 + jwtLen));
-              // Update URL without reload so future requests/reconnects use the new JWT
-              const url = new URL(window.location.href);
-              url.searchParams.set('token', jwt);
-              window.history.replaceState({}, '', url.toString());
+              // Store the new JWT for future WebSocket reconnections
+              setAuthToken(jwt);
+              // Also try to update URL (may not work in VSCode Simple Browser)
+              try {
+                const url = new URL(window.location.href);
+                url.searchParams.set('token', jwt);
+                window.history.replaceState({}, '', url.toString());
+              } catch { /* ignore in restricted webviews */ }
             }
           }
           break;

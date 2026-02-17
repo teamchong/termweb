@@ -731,11 +731,21 @@
     return mods;
   }
 
+  // Map special key names to their terminal text equivalents.
+  // These keys produce text but e.key is a multi-char name (e.g. "Enter"),
+  // so the default (e.key.length === 1) check misses them.
+  const SPECIAL_KEY_TEXT: Record<string, string> = {
+    'Enter': '\r',
+    'Tab': '\t',
+    'Backspace': '\x7f',
+    'Escape': '\x1b',
+  };
+
   export function sendKeyInput(e: KeyboardEvent, action: number): void {
     if (!canSendInput()) return;
 
     const codeBytes = sharedTextEncoder.encode(e.code);
-    const text = (e.key.length === 1) ? e.key : '';
+    const text = (e.key.length === 1) ? e.key : (SPECIAL_KEY_TEXT[e.key] ?? '');
     const textBytes = sharedTextEncoder.encode(text);
 
     const buf = new ArrayBuffer(5 + codeBytes.length + textBytes.length);

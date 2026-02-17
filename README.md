@@ -103,18 +103,53 @@ sudo apt-get install intel-media-va-driver
 
 ## Keyboard Shortcuts
 
+Uses `Cmd` on macOS, `Super`/`Meta` on Linux/Windows. Shortcuts are customizable via Ghostty config.
+
+### Tabs & Panes
+
 | Shortcut | Action |
 |----------|--------|
 | `Cmd+/` | New Tab |
-| `Cmd+.` | Close Tab |
+| `Cmd+.` | Close Pane |
+| `Cmd+Alt+.` | Close Tab |
+| `Cmd+Shift+.` | Close Window |
 | `Cmd+D` | Split Right |
 | `Cmd+Shift+D` | Split Down |
-| `Cmd+[` / `Cmd+]` | Select Previous/Next Split |
+| `Cmd+[` / `Cmd+]` | Previous/Next Split |
+| `Cmd+Shift+Arrow` | Select Split by Direction |
 | `Cmd+Shift+Enter` | Zoom Split (maximize) |
 | `Cmd+1-9` | Switch to Tab 1-9 |
+| `Cmd+Shift+[` / `Cmd+Shift+]` | Previous/Next Tab |
+| `Cmd+Shift+A` | Show All Tabs |
 | `Cmd+Shift+F` | Toggle Full Screen |
+| `Cmd+Alt+\` | Quick Terminal |
+
+### Edit
+
+| Shortcut | Action |
+|----------|--------|
+| `Cmd+C` | Copy |
+| `Cmd+V` | Paste |
+| `Cmd+Shift+V` | Paste Selection |
+| `Cmd+A` | Select All |
+
+### View
+
+| Shortcut | Action |
+|----------|--------|
+| `Cmd+=` | Increase Font Size |
+| `Cmd+-` | Decrease Font Size |
+| `Cmd+0` | Reset Font Size |
+
+### Tools
+
+| Shortcut | Action |
+|----------|--------|
 | `Cmd+U` | Upload Files |
 | `Cmd+Shift+S` | Download Files |
+| `Cmd+Shift+K` | Command Palette |
+| `Cmd+Alt+I` | Toggle Inspector |
+| `Cmd+Shift+,` | Reload Config |
 
 ## Other Commands
 

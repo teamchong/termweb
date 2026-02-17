@@ -1068,6 +1068,22 @@ const Panel = struct {
                     if (key_event.text_len > 0) {
                         key_event.input.text = @ptrCast(&key_event.text_buf);
                     }
+                    // Workaround: the pre-built ghostty generates modifyOtherKeys
+                    // escape sequences for Shift+Enter etc. even with consumed_mods.
+                    // For Shift+non-printable keys, send the CSI u sequence via
+                    // ghostty's binding action system (csi: prefix sends ESC[...
+                    // directly to the PTY), so apps using the kitty keyboard
+                    // protocol can distinguish Shift+Enter from plain Enter.
+                    const mods_val: c_uint = @intCast(key_event.input.mods);
+                    const has_shift = (mods_val & c.GHOSTTY_MODS_SHIFT) != 0;
+                    const only_shift = has_shift and (mods_val & ~@as(c_uint, c.GHOSTTY_MODS_SHIFT)) == 0;
+                    if (only_shift and key_event.input.action == c.GHOSTTY_ACTION_PRESS) {
+                        if (csiUForKey(key_event.input.keycode)) |csi_action| {
+                            _ = c.ghostty_surface_binding_action(self.surface, csi_action.ptr, csi_action.len);
+                            self.had_input = true;
+                            continue;
+                        }
+                    }
                     _ = c.ghostty_surface_key(self.surface, key_event.input);
                     self.had_input = true;
                 },
@@ -1391,6 +1407,18 @@ const Panel = struct {
         return false;
     }
 
+    /// Return a ghostty binding action string for Shift+key, or null if not applicable.
+    /// Uses "csi:" prefix which sends ESC[... directly to the PTY, bypassing
+    /// ghostty's key encoding that generates modifyOtherKeys format.
+    fn csiUForKey(keycode: u32) ?[]const u8 {
+        // Use comptime platform-specific keycode maps (same as mapKeyCode)
+        const enter_keycode = comptime mapKeyCode("Enter");
+        const tab_keycode = comptime mapKeyCode("Tab");
+        if (keycode == enter_keycode) return "csi:13;2u"; // Shift+Enter → ESC[13;2u
+        if (keycode == tab_keycode) return "csi:9;2u"; // Shift+Tab → ESC[9;2u
+        return null;
+    }
+
     // Handle keyboard input from client (queues event for main thread)
     // Format: [action:u8][mods:u8][code_len:u8][code:...][text_len:u8][text:...]
     fn handleKeyInput(self: *Panel, data: []const u8) void {
@@ -1429,12 +1457,7 @@ const Panel = struct {
                 },
                 .keycode = keycode,
                 .mods = convertMods(mods),
-                // Consume Shift when:
-                // 1. Text was produced (Shift generated the uppercase char), OR
-                // 2. Key is a non-printable control key (Enter, Tab, Backspace, Escape, etc.)
-                //    where Shift doesn't produce different text — prevents ghostty from
-                //    generating modifyOtherKeys escape sequences for Shift+Enter etc.
-                .consumed_mods = if ((text_len > 0 or isNonPrintableKey(code)) and (mods & 0x01) != 0)
+                .consumed_mods = if (text_len > 0 and (mods & 0x01) != 0)
                     @intCast(c.GHOSTTY_MODS_SHIFT)
                 else
                     0,
@@ -2807,15 +2830,18 @@ const Server = struct {
                     conns_buf[conns_count] = conn;
                     conns_count += 1;
                 } else if (assigned_session) |target_sid| {
-                    // Non-admin: only send if connection's session matches assignment
+                    // Assigned panel: only send if connection's session matches
                     if (self.connection_sessions.get(conn)) |conn_sid| {
                         if (std.mem.eql(u8, conn_sid, target_sid)) {
                             conns_buf[conns_count] = conn;
                             conns_count += 1;
                         }
                     }
+                } else if (role != .none) {
+                    // Unassigned panel: visible to all authenticated users
+                    conns_buf[conns_count] = conn;
+                    conns_count += 1;
                 }
-                // Unassigned panels: skip for non-admins (no else branch)
             }
         }
         if (conns_count == 0) return false;
@@ -3419,13 +3445,15 @@ const Server = struct {
     }
 
     /// Check if a connection is authorized to interact with a panel.
-    /// Admins always have access. Non-admins can only access panels explicitly
-    /// assigned to their session. Unassigned panels are denied for non-admins.
+    /// Admins always have access. Non-admins can access unassigned panels
+    /// (default) or panels explicitly assigned to their session.
     /// Must be called with self.mutex held.
     fn isPanelAuthorized(self: *Server, conn: *ws.Connection, panel_id: u32) bool {
         const role = self.connection_roles.get(conn) orelse .none;
         if (role == .admin) return true;
-        const assigned_session = self.panel_assignments.get(panel_id) orelse return false;
+        if (role == .none) return false;
+        // Unassigned panels are accessible to all authenticated users
+        const assigned_session = self.panel_assignments.get(panel_id) orelse return true;
         const sender_session = self.connection_sessions.get(conn) orelse return false;
         return std.mem.eql(u8, sender_session, assigned_session);
     }
@@ -3497,10 +3525,22 @@ const Server = struct {
         }
 
         // Check token from connection URI query param (percent-decode for URL-encoded tokens)
+        // Only JWTs are accepted for endpoint access — permanent tokens must be
+        // exchanged for a JWT via the HTTP redirect flow first.
         if (conn.request_uri) |uri| {
             if (auth.extractTokenFromQuery(uri)) |raw_token| {
                 var token_buf: [256]u8 = undefined;
                 const token = auth.decodeToken(&token_buf, raw_token);
+
+                // Reject permanent (hex) tokens — they are only for JWT exchange
+                if (auth.isPermanentToken(token)) {
+                    if (ip) |ip_str| self.rate_limiter.recordFailure(ip_str);
+                    self.mutex.lock();
+                    self.connection_roles.put(conn, .none) catch {};
+                    self.mutex.unlock();
+                    return .none;
+                }
+
                 const result = self.auth_state.validateToken(token);
                 if (result.role == .none) {
                     if (ip) |ip_str| self.rate_limiter.recordFailure(ip_str);
@@ -4379,16 +4419,21 @@ const Server = struct {
         const sender_session = self.connection_sessions.get(conn);
         const assigned_session = self.panel_assignments.get(panel_id);
 
-        // Admin can always send input; editors must be assigned
+        // Admin can always send input; editors can access unassigned panels
+        // or panels assigned to their session
         if (role != .admin) {
-            if (sender_session == null or assigned_session == null) {
-                self.mutex.unlock();
-                return;
+            if (assigned_session) |target_sid| {
+                // Panel is assigned — editor must match
+                const sid = sender_session orelse {
+                    self.mutex.unlock();
+                    return;
+                };
+                if (!std.mem.eql(u8, sid, target_sid)) {
+                    self.mutex.unlock();
+                    return;
+                }
             }
-            if (!std.mem.eql(u8, sender_session.?, assigned_session.?)) {
-                self.mutex.unlock();
-                return;
-            }
+            // Unassigned panel: any authenticated editor can send input
         }
 
         // Route input to the panel

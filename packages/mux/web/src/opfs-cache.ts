@@ -65,6 +65,25 @@ export class OPFSCache {
     return this.request('apply-delta', { serverPath, filePath, deltaPayload }, [deltaPayload]) as Promise<ArrayBuffer>;
   }
 
+  /** Compute block checksums from raw file data (no OPFS path needed) */
+  computeBlockChecksumsRaw(
+    data: ArrayBuffer,
+    blockSize: number,
+  ): Promise<{ rolling: Uint32Array; strong: BigUint64Array }> {
+    return this.request('compute-checksums-raw', { data, blockSize }, [data]) as Promise<{
+      rolling: Uint32Array;
+      strong: BigUint64Array;
+    }>;
+  }
+
+  /** Apply delta commands to raw base data (no OPFS path needed) */
+  applyDeltaRaw(
+    baseData: ArrayBuffer,
+    deltaPayload: ArrayBuffer,
+  ): Promise<ArrayBuffer> {
+    return this.request('apply-delta-raw', { baseData, deltaPayload }, [baseData, deltaPayload]) as Promise<ArrayBuffer>;
+  }
+
   /** Delete the entire cache directory */
   clearAll(): Promise<void> {
     if (!this._available) return Promise.resolve();

@@ -310,7 +310,7 @@
 
         <label class="checkbox-label">
           <input type="checkbox" bind:checked={useGitignore} />
-          Use .gitignore
+          Use remote .gitignore
         </label>
 
         {#if mode === 'upload' || (mode === 'download' && destDirHandle)}

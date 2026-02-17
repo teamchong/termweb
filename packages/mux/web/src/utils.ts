@@ -9,11 +9,17 @@ import {
 // WebSocket utilities
 // ============================================================================
 
-/** Get the auth token query string (?token=xxx) from the current page URL */
+/** Current auth token — initialized from URL, updated by JWT renewal */
+let currentToken: string | null = new URLSearchParams(window.location.search).get('token');
+
+/** Update the stored auth token (called on JWT renewal) */
+export function setAuthToken(token: string): void {
+  currentToken = token;
+}
+
+/** Get the auth token query string (?token=xxx) */
 function getAuthQuery(): string {
-  const params = new URLSearchParams(window.location.search);
-  const token = params.get('token');
-  return token ? `?token=${encodeURIComponent(token)}` : '';
+  return currentToken ? `?token=${encodeURIComponent(currentToken)}` : '';
 }
 
 /**

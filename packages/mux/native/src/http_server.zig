@@ -338,15 +338,27 @@ pub const HttpServer = struct {
                     const result = auth_st.validateToken(t);
                     if (result.role == .none) {
                         if (self.rate_limiter) |rl| rl.recordFailure(ip_str);
+                        // Invalid/expired token on page request → show login with error
+                        if (is_get and (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html"))) {
+                            self.sendLoginRedirectWithError(stream, "Invalid or expired token");
+                            stream.close();
+                            return;
+                        }
                         self.sendError(stream, 401, "Unauthorized");
                         stream.close();
                         return;
                     }
                     if (self.rate_limiter) |rl| rl.recordSuccess(ip_str);
 
-                    // Permanent token on non-WebSocket request → exchange for JWT and redirect
-                    if (auth.isPermanentToken(t) and !self.isWebSocketUpgrade(request)) {
-                        // For share links (no session_id), find a session matching the link's role
+                    // Permanent tokens are only for JWT exchange — never grant direct access
+                    if (auth.isPermanentToken(t)) {
+                        if (self.isWebSocketUpgrade(request)) {
+                            // Reject WS upgrade with permanent token
+                            self.sendError(stream, 401, "Unauthorized");
+                            stream.close();
+                            return;
+                        }
+                        // Exchange permanent token for JWT and redirect
                         const session = if (result.session_id) |sid|
                             auth_st.getSession(sid)
                         else
@@ -355,9 +367,11 @@ pub const HttpServer = struct {
                             var jwt_buf: [256]u8 = undefined;
                             const jwt = auth_st.createJwt(s, &jwt_buf);
                             self.sendRedirectPage(stream, jwt);
-                            stream.close();
-                            return;
+                        } else {
+                            self.sendError(stream, 401, "Session not found");
                         }
+                        stream.close();
+                        return;
                     }
                 } else {
                     // No token — serve login page on GET / instead of 401
@@ -513,19 +527,10 @@ pub const HttpServer = struct {
     /// Send a minimal HTML page with a spinner that redirects to the JWT URL.
     /// Used to exchange static tokens for JWTs without the static token entering browser history.
     fn sendRedirectPage(_: *HttpServer, stream: net.Stream, jwt: []const u8) void {
-        const header = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n";
-        const prefix =
-            \\<!DOCTYPE html><html><head><style>
-            \\body{display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e}
-            \\.s{width:40px;height:40px;border:3px solid #333;border-top-color:#7c3aed;border-radius:50%;animation:r .6s linear infinite}
-            \\@keyframes r{to{transform:rotate(360deg)}}
-            \\</style></head><body><div class="s"></div><script>location.replace(location.pathname+'?token=
-        ;
-        const suffix = "')</script></body></html>";
+        // Use HTTP 302 redirect — works in all webviews including VSCode Simple Browser
+        var header_buf: [1024]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 302 Found\r\nLocation: /?token={s}\r\nCache-Control: no-store\r\nContent-Length: 0\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{jwt}) catch return;
         _ = stream.write(header) catch return;
-        _ = stream.write(prefix) catch return;
-        _ = stream.write(jwt) catch return;
-        _ = stream.write(suffix) catch return;
     }
 
     fn sendError(self: *HttpServer, stream: net.Stream, code: u16, message: []const u8) void {

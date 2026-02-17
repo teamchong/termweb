@@ -627,9 +627,10 @@ export class FileTransferHandler {
       }
 
       if (transfer.direction === 'download') {
-        // Enable zip mode for multi-file downloads (stream to OPFS temp)
+        // Enable zip mode for multi-file downloads WITHOUT a dest folder.
+        // When dirHandle is set, files are written directly as they arrive.
         const nonDirFiles = files.filter(f => !f.isDir && f.size > 0).length;
-        if (nonDirFiles > 1) {
+        if (nonDirFiles > 1 && !transfer.dirHandle) {
           transfer.useZipMode = true;
           transfer.filesCompleted = 0;
         }
@@ -947,7 +948,15 @@ export class FileTransferHandler {
         return; // Don't delete transfer yet — handleCompletedFile will finish it
       }
     } else {
-      console.log('[FT] Not in zip mode (single file download)');
+      console.log('[FT] Not in zip mode');
+    }
+
+    // For dirHandle downloads, run delete-not-in-source if requested
+    if (transfer.dirHandle && transfer.options?.deleteNotInSource && transfer.files) {
+      const serverPaths = new Set(transfer.files.filter(f => !f.isDir).map(f => f.path));
+      this.deleteNotInSet(transfer.dirHandle, '', serverPaths).catch(err => {
+        console.error('[FT] Failed to delete files not in source:', err);
+      });
     }
 
     this.activeTransfers.delete(transferId);
@@ -1146,7 +1155,15 @@ export class FileTransferHandler {
       return;
     }
 
-    const { dryRun = false, excludes = [], useGitignore = false, deleteNotInSource = false, destDirHandle } = options;
+    const { destDirHandle } = options;
+
+    // When a dest folder is selected, use the sync protocol for rsync-like
+    // delta transfer — only changed blocks are sent over the wire.
+    if (destDirHandle) {
+      return this.startFolderSync(serverPath, options);
+    }
+
+    const { dryRun = false, excludes = [], useGitignore = false, deleteNotInSource = false } = options;
     const flagsByte = (dryRun ? 1 : 0) | (useGitignore ? 2 : 0) | (deleteNotInSource ? 4 : 0);
 
     const pathBytes = sharedTextEncoder.encode(serverPath);
@@ -1181,10 +1198,52 @@ export class FileTransferHandler {
       direction: 'download',
       serverPath,
       options,
+      state: 'pending',
+      bytesTransferred: 0,
+      currentFileIndex: 0,
+    };
+  }
+
+  /** Start a folder download using the sync (rsync) protocol.
+   *  Reads existing files from the dest folder for delta computation. */
+  private async startFolderSync(serverPath: string, options: TransferOptions): Promise<void> {
+    const { excludes = [], useGitignore = false, destDirHandle } = options;
+
+    const pathBytes = sharedTextEncoder.encode(serverPath);
+    const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
+    const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
+
+    // SYNC_REQUEST: [msg_type:1][flags:1][path_len:2][path][exclude_count:1][excludes...]
+    const flagsByte = useGitignore ? 2 : 0;
+    const msgLen = 1 + 1 + 2 + pathBytes.length + 1 + excludeTotalLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, TransferMsgType.SYNC_REQUEST); offset += 1;
+    view.setUint8(offset, flagsByte); offset += 1;
+    view.setUint16(offset, pathBytes.length, true); offset += 2;
+    bytes.set(pathBytes, offset); offset += pathBytes.length;
+    view.setUint8(offset, excludes.length); offset += 1;
+
+    for (const exclude of excludeBytes) {
+      view.setUint8(offset, exclude.length); offset += 1;
+      bytes.set(exclude, offset); offset += exclude.length;
+    }
+
+    this.send(msg);
+
+    this.pendingTransfer = {
+      id: 0,
+      direction: 'sync',
+      serverPath,
+      options,
       dirHandle: destDirHandle,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
+      syncFilesProcessed: 0,
     };
   }
 
@@ -1443,7 +1502,7 @@ export class FileTransferHandler {
     };
   }
 
-  /** Handle SYNC_FILE_LIST from server: compare with OPFS cache, send checksums for changed files */
+  /** Handle SYNC_FILE_LIST from server: compare with local files, send checksums for changed files */
   private async handleSyncFileList(data: ArrayBuffer): Promise<void> {
     const view = new DataView(data);
     const bytes = new Uint8Array(data);
@@ -1468,7 +1527,31 @@ export class FileTransferHandler {
     transfer.totalBytes = totalBytes;
     transfer.state = 'transferring';
 
-    // Compare with OPFS cache and send block checksums for changed files
+    // Notify UI that sync transfer has started
+    const nonDirFiles = serverFiles.filter(f => !f.isDir);
+    const dir = transfer.direction === 'sync' ? 'download' : transfer.direction;
+    this.onTransferStart?.(transferId, transfer.serverPath ?? '', dir as 'upload' | 'download', nonDirFiles.length, totalBytes);
+
+    // Upload sync: compare local files with server files, then upload changed ones
+    if (transfer.sourceFiles && transfer.files && transfer.dirHandle) {
+      await this.handleUploadSyncFileList(transferId, transfer, serverFiles);
+      return;
+    }
+
+    // Download sync: use dest folder for comparison when available, otherwise OPFS cache
+    if (transfer.dirHandle) {
+      await this.syncFileListFromFolder(transferId, transfer, serverFiles);
+    } else {
+      await this.syncFileListFromCache(transferId, transfer, serverFiles);
+    }
+  }
+
+  /** Compare server files against OPFS cache and send checksums */
+  private async syncFileListFromCache(
+    transferId: number,
+    transfer: TransferState,
+    serverFiles: TransferFile[],
+  ): Promise<void> {
     const cachedMeta: Record<string, CachedFileMeta> = await this.cache!.listFiles(transfer.serverPath!).catch(() => ({}));
 
     for (let i = 0; i < serverFiles.length; i++) {
@@ -1483,7 +1566,6 @@ export class FileTransferHandler {
       }
 
       if (cached) {
-        // File changed — compute block checksums of our cached copy and send to server
         const blockSize = this.computeBlockSize(cached.size);
         try {
           const { rolling, strong } = await this.cache!.computeBlockChecksums(
@@ -1491,16 +1573,190 @@ export class FileTransferHandler {
             file.path,
             blockSize,
           );
-
           this.sendBlockChecksums(transferId, i, blockSize, rolling, strong);
         } catch {
-          // Checksum computation failed — server will send full file as literal-only delta
           this.sendBlockChecksums(transferId, i, blockSize, new Uint32Array(0), new BigUint64Array(0));
         }
       } else {
-        // New file — send empty checksums so server sends full content as literal
         this.sendBlockChecksums(transferId, i, 0, new Uint32Array(0), new BigUint64Array(0));
       }
+    }
+  }
+
+  /** Compare server files against local dest folder and send checksums */
+  private async syncFileListFromFolder(
+    transferId: number,
+    transfer: TransferState,
+    serverFiles: TransferFile[],
+  ): Promise<void> {
+    const dirHandle = transfer.dirHandle!;
+
+    for (let i = 0; i < serverFiles.length; i++) {
+      const file = serverFiles[i];
+      if (file.isDir) continue;
+
+      try {
+        // Try to read existing local file
+        const localFile = await this.readFileFromFolder(dirHandle, file.path);
+        if (!localFile) {
+          // New file — send empty checksums
+          this.sendBlockChecksums(transferId, i, 0, new Uint32Array(0), new BigUint64Array(0));
+          continue;
+        }
+
+        // Check if file matches (same size — mtime not available from File System Access API)
+        if (localFile.byteLength === file.size) {
+          // Same size — skip (assume unchanged; we don't have mtime from server to compare)
+          // To be safe we still send checksums for same-size files so server can verify
+        }
+
+        // File exists locally — compute block checksums for delta transfer
+        const blockSize = this.computeBlockSize(localFile.byteLength);
+        try {
+          const { rolling, strong } = await this.cache!.computeBlockChecksumsRaw(
+            localFile,
+            blockSize,
+          );
+          this.sendBlockChecksums(transferId, i, blockSize, rolling, strong);
+        } catch {
+          this.sendBlockChecksums(transferId, i, blockSize, new Uint32Array(0), new BigUint64Array(0));
+        }
+      } catch {
+        // File doesn't exist or read error — send empty checksums
+        this.sendBlockChecksums(transferId, i, 0, new Uint32Array(0), new BigUint64Array(0));
+      }
+    }
+  }
+
+  /** Handle upload sync: compare local files with server's file list.
+   *  - Files that exist on server with same size → skip
+   *  - New/changed files → start upload
+   *  - Files on server not in local → send SYNC_DELETE_LIST
+   *  After comparison, switches from sync to upload mode. */
+  private async handleUploadSyncFileList(
+    transferId: number,
+    transfer: TransferState,
+    serverFiles: TransferFile[],
+  ): Promise<void> {
+    const localFiles = transfer.files!;
+    const dirHandle = transfer.dirHandle!;
+    const options = transfer.options ?? {};
+    const serverPath = transfer.serverPath!;
+
+    // Build a map of server files: path → { size, hash }
+    const serverFileMap = new Map<string, TransferFile>();
+    for (const sf of serverFiles) {
+      if (!sf.isDir) serverFileMap.set(sf.path, sf);
+    }
+
+    // Compare: filter local files to only changed/new ones
+    const filesToUpload: TransferFile[] = [];
+    for (const localFile of localFiles) {
+      if (localFile.isDir) {
+        filesToUpload.push(localFile); // Keep directory entries
+        continue;
+      }
+      const serverFile = serverFileMap.get(localFile.path);
+      if (serverFile && serverFile.size === localFile.size) {
+        // Same size on server → skip (unchanged)
+        continue;
+      }
+      // New or changed → include in upload
+      filesToUpload.push(localFile);
+    }
+
+    const skippedCount = localFiles.filter(f => !f.isDir).length - filesToUpload.filter(f => !f.isDir).length;
+    console.log(`[FT] Upload sync: ${filesToUpload.filter(f => !f.isDir).length} files to upload, ${skippedCount} unchanged (skipped)`);
+
+    // Delete files on server not in local source
+    if (options.deleteNotInSource) {
+      const localPaths = new Set(localFiles.filter(f => !f.isDir).map(f => f.path));
+      const pathsToDelete = serverFiles
+        .filter(f => !f.isDir && !localPaths.has(f.path))
+        .map(f => f.path);
+
+      if (pathsToDelete.length > 0) {
+        this.sendSyncDeleteList(transferId, pathsToDelete);
+      }
+    }
+
+    // If nothing to upload, complete immediately
+    const nonDirToUpload = filesToUpload.filter(f => !f.isDir);
+    if (nonDirToUpload.length === 0) {
+      console.log('[FT] Upload sync: nothing to upload, completing');
+      this.activeTransfers.delete(transferId);
+      this.onTransferComplete?.(transferId, 0);
+      if (this.activeTransfers.size === 0) {
+        this.onConnectionShouldClose?.();
+      }
+      return;
+    }
+
+    // Switch from sync to upload: send TRANSFER_INIT for the filtered file list
+    const { dryRun = false, excludes = [], useGitignore = false, deleteNotInSource = false } = options;
+    const flagsByte = (dryRun ? 1 : 0) | (useGitignore ? 2 : 0) | (deleteNotInSource ? 4 : 0);
+
+    const pathBytes = sharedTextEncoder.encode(serverPath);
+    const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
+    const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
+
+    const msgLen = 1 + 1 + 1 + 1 + 2 + pathBytes.length + excludeTotalLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
+    view.setUint8(offset, 0); offset += 1; // direction: upload
+    view.setUint8(offset, flagsByte); offset += 1;
+    view.setUint8(offset, excludes.length); offset += 1;
+    view.setUint16(offset, pathBytes.length, true); offset += 2;
+    bytes.set(pathBytes, offset); offset += pathBytes.length;
+
+    for (const exclude of excludeBytes) {
+      view.setUint8(offset, exclude.length); offset += 1;
+      bytes.set(exclude, offset); offset += exclude.length;
+    }
+
+    // Remove current transfer from active (it was registered as sync)
+    this.activeTransfers.delete(transferId);
+
+    this.send(msg);
+
+    // Re-register as pending upload with only the filtered files
+    this.pendingTransfer = {
+      id: 0,
+      direction: 'upload',
+      files: filesToUpload,
+      dirHandle,
+      options,
+      serverPath,
+      state: 'pending',
+      bytesTransferred: 0,
+      currentFileIndex: 0,
+    };
+  }
+
+  /** Read a file from a directory handle by relative path (e.g. "src/index.ts") */
+  private async readFileFromFolder(
+    dirHandle: FileSystemDirectoryHandle,
+    relativePath: string,
+  ): Promise<ArrayBuffer | null> {
+    const parts = relativePath.split('/');
+    let current = dirHandle;
+    for (let i = 0; i < parts.length - 1; i++) {
+      try {
+        current = await current.getDirectoryHandle(parts[i]);
+      } catch {
+        return null; // Directory doesn't exist
+      }
+    }
+    try {
+      const fileHandle = await current.getFileHandle(parts[parts.length - 1]);
+      const file = await fileHandle.getFile();
+      return await file.arrayBuffer();
+    } catch {
+      return null; // File doesn't exist
     }
   }
 
@@ -1535,7 +1791,7 @@ export class FileTransferHandler {
     this.send(msg);
   }
 
-  /** Handle DELTA_DATA from server: apply delta to cached file or save new file */
+  /** Handle DELTA_DATA from server: apply delta to local file (folder or OPFS cache) */
   private async handleDeltaData(data: ArrayBuffer): Promise<void> {
     const view = new DataView(data);
     const bytes = new Uint8Array(data);
@@ -1556,36 +1812,85 @@ export class FileTransferHandler {
     try {
       decompressedDelta = await this.decompress(compressedPayload);
     } catch {
-      // If decompression fails, the payload may be uncompressed
       decompressedDelta = compressedPayload;
     }
 
+    const deltaBuffer = decompressedDelta.buffer.slice(
+      decompressedDelta.byteOffset,
+      decompressedDelta.byteOffset + decompressedDelta.byteLength,
+    ) as ArrayBuffer;
+
+    if (transfer.dirHandle) {
+      // Apply delta against local folder file and write result back
+      await this.applyDeltaToFolder(transferId, transfer, fileIndex, file, deltaBuffer);
+    } else {
+      // Apply delta against OPFS cache (original flow)
+      await this.applyDeltaToCache(transferId, transfer, fileIndex, file, deltaBuffer);
+    }
+  }
+
+  /** Apply delta against OPFS cached file */
+  private async applyDeltaToCache(
+    transferId: number,
+    transfer: TransferState,
+    fileIndex: number,
+    file: TransferFile,
+    deltaBuffer: ArrayBuffer,
+  ): Promise<void> {
     try {
-      // Try to apply delta against cached copy
       const resultBuf = await this.cache!.applyDelta(
         transfer.serverPath!,
         file.path,
-        decompressedDelta.buffer.slice(
-          decompressedDelta.byteOffset,
-          decompressedDelta.byteOffset + decompressedDelta.byteLength,
-        ) as ArrayBuffer,
+        deltaBuffer,
       );
       const resultData = new Uint8Array(resultBuf);
 
       transfer.bytesTransferred += resultData.length;
       transfer.syncFilesProcessed = (transfer.syncFilesProcessed ?? 0) + 1;
 
-      // Update the OPFS cache with the new version
       this.cache!.putFile(transfer.serverPath!, file.path, resultBuf, {
         size: resultData.length,
         mtime: file.mtime ?? 0,
         hash: file.hash?.toString() ?? '0',
       }).catch(() => { /* best-effort */ });
 
-      // Send SYNC_ACK for this file
       this.sendSyncAck(transferId, fileIndex, resultData.length);
     } catch {
-      // Delta application failed (no cached copy or corrupt) — treat as error
+      transfer.syncFilesProcessed = (transfer.syncFilesProcessed ?? 0) + 1;
+      this.sendSyncAck(transferId, fileIndex, 0);
+    }
+  }
+
+  /** Apply delta against a file in the dest folder and write result back */
+  private async applyDeltaToFolder(
+    transferId: number,
+    transfer: TransferState,
+    fileIndex: number,
+    file: TransferFile,
+    deltaBuffer: ArrayBuffer,
+  ): Promise<void> {
+    const dirHandle = transfer.dirHandle!;
+    try {
+      // Read existing local file (may not exist for new files)
+      const localData = await this.readFileFromFolder(dirHandle, file.path);
+      const baseData = localData ?? new ArrayBuffer(0);
+
+      // Apply delta via worker
+      const resultBuf = await this.cache!.applyDeltaRaw(baseData, deltaBuffer);
+      const resultData = new Uint8Array(resultBuf);
+
+      // Write result to dest folder
+      await this.writeFileToDestFolder(dirHandle, file.path, resultData);
+
+      transfer.bytesTransferred += resultData.length;
+      transfer.syncFilesProcessed = (transfer.syncFilesProcessed ?? 0) + 1;
+
+      const totalFiles = transfer.files?.filter(f => !f.isDir).length ?? 0;
+      this.onDownloadProgress?.(transferId, transfer.syncFilesProcessed, totalFiles, transfer.bytesTransferred, transfer.totalBytes ?? 0);
+
+      this.sendSyncAck(transferId, fileIndex, resultData.length);
+    } catch (err) {
+      console.error(`[FT] Failed to apply delta for ${file.path}:`, err);
       transfer.syncFilesProcessed = (transfer.syncFilesProcessed ?? 0) + 1;
       this.sendSyncAck(transferId, fileIndex, 0);
     }
@@ -1650,7 +1955,7 @@ export class FileTransferHandler {
   }
 
   /** Handle SYNC_COMPLETE from server */
-  private handleSyncComplete(data: ArrayBuffer): void {
+  private async handleSyncComplete(data: ArrayBuffer): Promise<void> {
     const view = new DataView(data);
     const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
     const filesSynced = view.getUint32(PROTO_SYNC_COMPLETE.FILES_SYNCED, true);
@@ -1661,9 +1966,23 @@ export class FileTransferHandler {
     const transfer = this.activeTransfers.get(transferId);
     if (transfer) {
       transfer.state = 'complete';
+
+      // Delete files not in source (rsync --delete) for folder syncs
+      if (transfer.dirHandle && transfer.options?.deleteNotInSource && transfer.files) {
+        const serverPaths = new Set(transfer.files.filter(f => !f.isDir).map(f => f.path));
+        try {
+          await this.deleteNotInSet(transfer.dirHandle, '', serverPaths);
+        } catch (err) {
+          console.error('[FT] Failed to delete files not in source:', err);
+        }
+      }
     }
     this.activeTransfers.delete(transferId);
     this.onTransferComplete?.(transferId, bytesTransferred);
+
+    if (this.activeTransfers.size === 0) {
+      this.onConnectionShouldClose?.();
+    }
   }
 
   /** Compute adaptive block size: sqrt(file_size) clamped to [512, 65536] */
@@ -1732,8 +2051,12 @@ export class FileTransferHandler {
       }
       return true;
     }
-    // Single file download: write to dest folder if available, otherwise browser download
+    // Write to dest folder if available (multi-file or single-file)
     if (transfer?.dirHandle) {
+      transfer.filesCompleted = (transfer.filesCompleted ?? 0) + 1;
+      transfer.bytesTransferred += data.length;
+      const totalFiles = transfer.files?.filter(f => !f.isDir && f.size > 0).length ?? 0;
+      this.onDownloadProgress?.(transferId, transfer.filesCompleted, totalFiles, transfer.bytesTransferred, transfer.totalBytes ?? 0);
       this.writeFileToDestFolder(transfer.dirHandle, path, data).catch(err => {
         console.error(`[FT] Failed to write ${path} to dest folder:`, err);
       });

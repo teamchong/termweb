@@ -25,6 +25,25 @@
   // Loading state
   let showLoading = $state(true);
 
+  // Access error from URL (e.g. redirected after invalid/expired token)
+  let accessError = $state('');
+  {
+    const params = new URLSearchParams(window.location.search);
+    const err = params.get('error');
+    if (err) {
+      // Map known codes to messages, otherwise use the error string directly
+      if (err === 'access_denied') {
+        accessError = 'Access denied: invalid or expired share link.';
+      } else if (err === 'session_expired') {
+        accessError = 'Session expired. Please log in again.';
+      } else {
+        accessError = decodeURIComponent(err);
+      }
+      // Clean up URL without reloading
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }
+
   // Mobile menu state
   let mobileMenuOpen = $state(false);
 
@@ -737,8 +756,17 @@
 
     const key = e.key.toLowerCase();
 
-    // Special case: Cmd+V (native paste) — must not preventDefault
-    if (e.metaKey && key === 'v' && !e.shiftKey && !e.altKey) {
+    // Special case: Cmd+V / Ctrl+V — paste from clipboard
+    // Use Clipboard API directly instead of relying on native paste event,
+    // because VSCode Simple Browser intercepts Cmd+V before it reaches the webview.
+    if ((e.metaKey || e.ctrlKey) && key === 'v' && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      navigator.clipboard.readText().then(text => {
+        if (text && muxClient) {
+          muxClient.sendClipboard(text);
+          muxClient.sendViewAction('paste_from_clipboard');
+        }
+      }).catch(() => {});
       return;
     }
 
@@ -802,6 +830,13 @@
 <svelte:window onkeydown={handleKeydown} onkeyup={handleKeyup} />
 
 <div class="app-container">
+  {#if accessError}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="access-error" onclick={() => accessError = ''}>
+      {accessError}
+    </div>
+  {/if}
   <!-- Titlebar -->
   <div id="titlebar" class:hidden={isFullscreen}>
     <div id="title-left">
@@ -981,6 +1016,14 @@
 </div>
 
 <style>
+  .access-error {
+    background: #b91c1c;
+    color: #fff;
+    text-align: center;
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
   .app-container {
     display: flex;
     flex-direction: column;

@@ -636,9 +636,14 @@ interface TransferMetadata {
 
 async function saveTransferMetadata(meta: TransferMetadata): Promise<void> {
   if (!opfsRoot) return;
+  // Bail if this transfer was cancelled/completed — prevents in-flight saves
+  // from re-creating metadata after delete-transfer-metadata ran
+  if (cancelledTransfers.has(meta.transferId)) return;
   try {
     const transfersDir = await opfsRoot.getDirectoryHandle('transfers', { create: true });
     const transferDir = await transfersDir.getDirectoryHandle(`${meta.transferId}`, { create: true });
+    // Re-check after awaits — delete-transfer-metadata may have interleaved
+    if (cancelledTransfers.has(meta.transferId)) return;
     const metaFile = await transferDir.getFileHandle('metadata.json', { create: true });
     const writable = await metaFile.createWritable();
     await writable.write(JSON.stringify(meta));
@@ -967,6 +972,50 @@ self.onmessage = async (e: MessageEvent) => {
         try {
           const cachedData = new Uint8Array(await cacheGet(serverPath, filePath));
           const result = applyDelta(cachedData, new Uint8Array(deltaPayload));
+          const buffer = result.buffer as ArrayBuffer;
+          (self as unknown as Worker).postMessage(
+            { type: 'delta-applied', id, data: buffer },
+            [buffer]
+          );
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : 'Delta application failed';
+          (self as unknown as Worker).postMessage({ type: 'delta-error', id, message });
+        }
+        break;
+      }
+
+      // Raw-data variants: compute checksums / apply delta from ArrayBuffer (no OPFS)
+      case 'compute-checksums-raw': {
+        const { id, data: rawData, blockSize: bs } = msg;
+        try {
+          const fileData = new Uint8Array(rawData);
+          const blockCount = Math.ceil(fileData.length / bs);
+          const rolling = new Uint32Array(blockCount);
+          const strong = new BigUint64Array(blockCount);
+          for (let i = 0; i < blockCount; i++) {
+            const start = i * bs;
+            const end = Math.min(start + bs, fileData.length);
+            const block = fileData.subarray(start, end);
+            rolling[i] = rollingChecksum(block);
+            strong[i] = strongChecksum(block);
+          }
+          const rollingBuf = rolling.buffer as ArrayBuffer;
+          const strongBuf = strong.buffer as ArrayBuffer;
+          (self as unknown as Worker).postMessage(
+            { type: 'checksums-computed', id, rolling: rollingBuf, strong: strongBuf },
+            [rollingBuf, strongBuf]
+          );
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : 'Checksum computation failed';
+          (self as unknown as Worker).postMessage({ type: 'checksums-error', id, message });
+        }
+        break;
+      }
+
+      case 'apply-delta-raw': {
+        const { id, baseData, deltaPayload: dp } = msg;
+        try {
+          const result = applyDelta(new Uint8Array(baseData), new Uint8Array(dp));
           const buffer = result.buffer as ArrayBuffer;
           (self as unknown as Worker).postMessage(
             { type: 'delta-applied', id, data: buffer },
