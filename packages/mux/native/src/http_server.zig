@@ -111,7 +111,7 @@ const login_page_html =
     \\</div>
     \\<hr class="divider">
     \\<form method="POST" action="/auth/login">
-    \\<input type="text" name="token" placeholder="Paste access token..." autocomplete="off" autofocus>
+    \\<input type="text" name="token" placeholder="Paste token or URL..." autocomplete="off" autofocus>
     \\<button type="submit" class="btn btn-primary">Sign in with Token</button>
     \\</form>
     \\</div>
@@ -120,6 +120,9 @@ const login_page_html =
     \\if(p.get('error')){var e=document.getElementById('error');e.textContent=p.get('error');e.classList.remove('hidden')}
     \\if(document.body.dataset.github==='1')document.getElementById('gh-btn').classList.remove('hidden');
     \\if(document.body.dataset.google==='1')document.getElementById('gg-btn').classList.remove('hidden');
+    \\var f=document.querySelector('form'),ti=f.querySelector('input[name=token]');
+    \\f.addEventListener('submit',function(ev){var v=ti.value.trim();
+    \\try{var u=new URL(v);var t=u.searchParams.get('token');if(t){ti.value=t}}catch(e){}});
     \\</script></body></html>
 ;
 

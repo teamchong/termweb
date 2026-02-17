@@ -967,9 +967,6 @@
       downloadProgressOpen = false;
       // Reset title when dialog is closed
       const activeCount = Array.from(activeDownloads.values()).filter(d => d.status === 'active').length;
-      if (activeCount === 0) {
-        document.title = 'termweb';
-      }
     }}
     onCancel={async (id) => {
       const transfer = activeDownloads.get(id);
