@@ -6288,8 +6288,10 @@ const Server = struct {
                             const sentinels_match = std.mem.eql(u32, &sentinels, &panel.last_sentinels);
                             panel.last_sentinels = sentinels;
 
-                            // Full hash only when sentinels differ or keyframe forced
-                            const frame_hash = if (sentinels_match and !panel.force_keyframe)
+                            // Full hash when sentinels differ, keyframe forced, or input pending.
+                            // Input always needs a full hash because typed characters may not
+                            // land on any sentinel position, causing false "unchanged" skips.
+                            const frame_hash = if (sentinels_match and !panel.force_keyframe and !had_input)
                                 panel.last_frame_hash // Reuse previous hash (sentinels say unchanged)
                             else
                                 std.hash.XxHash64.hash(0, buf);
