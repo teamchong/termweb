@@ -6256,7 +6256,7 @@ const Server = struct {
                         }
 
                         was_keyframe = panel.force_keyframe;
-                        const had_input = panel.has_pending_input.load(.acquire);
+                        const had_input = panel.had_input;
 
                         // Read pixels from OpenGL framebuffer
                         crash_phase.store(6, .monotonic); // ghostty_surface_read_pixels
