@@ -636,6 +636,7 @@ const Panel = struct {
     consecutive_unchanged: u32, // Consecutive frames with no pixel change (for adaptive frame rate)
     idle_keyframe_sent: bool, // One-shot: sent a quality keyframe during this idle period
     had_input: bool, // Set by processInputQueue on key/scroll events, cleared by render loop
+    last_encode_exceeded_budget: bool, // Previous frame's encode exceeded 16ms budget (for frame skip)
 
     // Cursor state tracking (for frontend CSS blink overlay)
     last_cursor_col: u16 = 0,
@@ -804,6 +805,7 @@ const Panel = struct {
             .consecutive_unchanged = 0,
             .idle_keyframe_sent = false,
             .had_input = false,
+            .last_encode_exceeded_budget = false,
         };
 
         return panel;
@@ -1743,7 +1745,8 @@ const Server = struct {
     quick_terminal_open: bool,  // Whether quick terminal is open
     inspector_open: bool,  // Whether inspector is open
     shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
-    dma_buf_failed: if (is_linux) bool else void,  // Sticky flag: DMA-BUF export failed, use fallback path
+    dma_buf_fail_count: if (is_linux) u32 else void,  // Consecutive DMA-BUF failures (0 = working, >=10 = permanent fallback)
+    dma_buf_frame_counter: if (is_linux) u32 else void,  // Frame counter for periodic DMA-BUF retry
     wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
     goroutine_rt: *goroutine_runtime.Runtime, // M:N goroutine scheduler for file transfer pipeline
 
@@ -1869,7 +1872,8 @@ const Server = struct {
                     break :blk null;
                 };
             } else {},
-            .dma_buf_failed = if (is_linux) false else {},
+            .dma_buf_fail_count = if (is_linux) 0 else {},
+            .dma_buf_frame_counter = if (is_linux) 0 else {},
             .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
             .goroutine_rt = gor_rt,
             .bw_h264_bytes = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
@@ -6364,6 +6368,19 @@ const Server = struct {
                     const tick_elapsed: u64 = @intCast(std.time.nanoTimestamp() - t_tick);
                     perf_tick_ns += tick_elapsed;
 
+                    // Frame skip during rapid input: if previous encode exceeded budget
+                    // and there's pending input, skip capture+encode for this frame.
+                    // Ghostty already rendered internally (tick above), so the next frame
+                    // we encode will have the latest state including all skipped inputs.
+                    if (panel.last_encode_exceeded_budget and
+                        panel.has_pending_input.load(.acquire) and
+                        !panel.force_keyframe)
+                    {
+                        panel.last_encode_exceeded_budget = false;
+                        logToFile(dbg_log, "FRAME_SKIP panel={d} (prev encode slow + pending input)\n", .{panel.id});
+                        continue;
+                    }
+
                     // Platform-specific frame capture
                     var frame_data: ?[]const u8 = null;
                     var read_elapsed: u64 = 0;
@@ -6398,8 +6415,8 @@ const Server = struct {
                                 video.VideoEncoder.initWithShared(panel.allocator, ctx, pixel_width, pixel_height) catch null
                             else
                                 null;
-                            // Only allocate BGRA buffer if DMA-BUF already known to fail
-                            if (panel.video_encoder != null and self.dma_buf_failed) {
+                            // Only allocate BGRA buffer if DMA-BUF already known to fail permanently
+                            if (panel.video_encoder != null and self.dma_buf_fail_count >= 10) {
                                 panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch {
                                     panel.video_encoder.?.deinit();
                                     panel.video_encoder = null;
@@ -6440,7 +6457,10 @@ const Server = struct {
                         // Try exporting the GL texture as a DMA-BUF fd and importing directly
                         // into VA-API. Eliminates glReadPixels (GPU→CPU) and vaMapBuffer (CPU→GPU).
                         var used_dma_buf = false;
-                        if (!self.dma_buf_failed and panel.video_encoder.?.has_vpp) {
+                        self.dma_buf_frame_counter +%= 1;
+                        const dma_buf_should_try = self.dma_buf_fail_count < 10 or
+                            (self.dma_buf_frame_counter % 60 == 0); // Retry once/sec even after permanent fallback
+                        if (dma_buf_should_try and panel.video_encoder.?.has_vpp) {
                             var dma_fd: c_int = -1;
                             var dma_stride: c_int = 0;
                             var dma_offset: c_int = 0;
@@ -6484,23 +6504,36 @@ const Server = struct {
                                     frame_data = result.data;
                                     panel.force_keyframe = false;
                                     used_dma_buf = true;
+                                    if (self.dma_buf_fail_count > 0) {
+                                        logToFile(dbg_log, "DMA_BUF_RECOVERED after {d} failures\n", .{self.dma_buf_fail_count});
+                                        self.dma_buf_fail_count = 0;
+                                    }
                                     logToFile(dbg_log, "DMA_ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
                                 } else {
-                                    // DMA-BUF encode failed — fall back to CPU path permanently
-                                    std.debug.print("DMA-BUF encode failed, falling back to CPU path\n", .{});
-                                    self.dma_buf_failed = true;
+                                    // DMA-BUF encode failed — increment failure counter
+                                    self.dma_buf_fail_count +|= 1;
+                                    if (self.dma_buf_fail_count == 1) {
+                                        std.debug.print("DMA-BUF encode failed (attempt 1), will retry\n", .{});
+                                        logToFile(dbg_log, "DMA_BUF_ENCODE_FAIL panel={d} count={d}\n", .{ panel.id, self.dma_buf_fail_count });
+                                    } else if (self.dma_buf_fail_count == 10) {
+                                        std.debug.print("DMA-BUF encode failed 10x, falling back to CPU path (periodic retry enabled)\n", .{});
+                                        logToFile(dbg_log, "DMA_BUF_PERMANENT_FALLBACK panel={d}\n", .{ panel.id });
+                                    }
                                 }
                                 enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
                                 perf_encode_ns += enc_elapsed;
 
                                 // Close the DMA-BUF fd (VA-API import duplicates it internally)
-                                _ = std.posix.close(@intCast(dma_fd));
+                                std.posix.close(@intCast(dma_fd));
                             } else {
-                                // DMA-BUF export not available — use CPU path permanently
-                                if (panel.ticks_since_connect < 5) {
-                                    std.debug.print("DMA-BUF export unavailable, using CPU readback path\n", .{});
+                                // DMA-BUF export not available — increment failure counter
+                                self.dma_buf_fail_count +|= 1;
+                                if (self.dma_buf_fail_count == 1) {
+                                    std.debug.print("DMA-BUF export unavailable (attempt 1), will retry\n", .{});
+                                    logToFile(dbg_log, "DMA_BUF_EXPORT_FAIL panel={d} count={d}\n", .{ panel.id, self.dma_buf_fail_count });
+                                } else if (self.dma_buf_fail_count == 10) {
+                                    std.debug.print("DMA-BUF export failed 10x, using CPU readback (periodic retry enabled)\n", .{});
                                 }
-                                self.dma_buf_failed = true;
                             }
                         }
 
@@ -6593,6 +6626,10 @@ const Server = struct {
                             send_failed,
                         });
                     }
+
+                    // Track whether this frame exceeded budget for next-frame skip decision
+                    const budget_ns: u64 = Panel.FRAME_INTERVAL_MS * std.time.ns_per_ms;
+                    panel.last_encode_exceeded_budget = (frame_total_ns > budget_ns);
 
                 }
 

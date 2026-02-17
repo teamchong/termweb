@@ -64,10 +64,10 @@ index 3d3973084..f4215821c 100644
  void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..84546dbe8
+index 000000000..658ef9b81
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,782 @@
+@@ -0,0 +1,785 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
@@ -690,23 +690,29 @@ index 000000000..84546dbe8
 +/// Export an OpenGL texture as a DMA-BUF file descriptor.
 +/// The caller must close the returned fd after VA-API import.
 +pub fn exportDmaBuf(texture_id: c_uint, width: u32, height: u32) ?DmaBufExport {
-+    const ctx = global_egl_context orelse return null;
++    const ctx = global_egl_context orelse {
++        log.warn("exportDmaBuf: no global EGL context", .{});
++        return null;
++    };
 +
-+    if (!hasDmaBufExport()) return null;
++    if (!hasDmaBufExport()) {
++        log.warn("exportDmaBuf: DMA-BUF extensions not loaded", .{});
++        return null;
++    }
 +
 +    // Ensure GL context is current
 +    if (!makeCurrentOnThread()) return null;
 +
-+    // Create EGLImage from the GL texture
-+    const attribs = [_]c.EGLint{
-+        c.EGL_IMAGE_PRESERVED_KHR, c.EGL_TRUE,
-+        c.EGL_NONE,
-+    };
++    // Create EGLImage from the GL texture.
++    // Use EGL_NONE attribs — EGL_IMAGE_PRESERVED_KHR is not universally supported
++    // and can cause eglCreateImageKHR to fail on some drivers.
++    const attribs = [_]c.EGLint{c.EGL_NONE};
 +    // EGL expects the texture ID as an EGLClientBuffer (pointer-sized opaque handle)
 +    const client_buffer: ?*anyopaque = @ptrFromInt(@as(usize, texture_id));
 +    const image = c.eglCreateImageKHR.?(ctx.display, ctx.context, c.EGL_GL_TEXTURE_2D_KHR, client_buffer, &attribs);
 +    if (image == c.EGL_NO_IMAGE_KHR) {
-+        log.warn("exportDmaBuf: eglCreateImageKHR failed", .{});
++        const err = c.eglGetError();
++        log.warn("exportDmaBuf: eglCreateImageKHR failed (tex={d}, err=0x{x})", .{ texture_id, err });
 +        return null;
 +    }
 +    defer _ = c.eglDestroyImageKHR.?(ctx.display, image);
@@ -776,10 +782,7 @@ index 000000000..84546dbe8
 +    // GL pipeline guarantees command execution order within the same context.
 +    // glReadPixels will execute after all preceding rendering commands complete.
 +    // No explicit glFinish needed — PBO double-buffering handles synchronization
-+    // (we read the previous frame which had 33ms+ to complete).
-+    if (gl.glad.context.Finish) |glFinish| {
-+        glFinish();
-+    }
++    // (we read the previous frame which had 16ms+ to complete).
 +
 +    // Bind the FBO for reading
 +    if (gl.glad.context.BindFramebuffer) |bindFbo| {

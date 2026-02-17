@@ -1789,10 +1789,10 @@ pub const VideoEncoder = struct {
         self.src_surface = tmp;
         self.frame_count += 1;
 
-        // Log timing — upload time should be ~0ms (zero-copy)
+        // Log timing — vpp time should be ~0-2ms (zero-copy, no CPU upload)
         if (@mod(self.frame_count, 30) == 0) {
             const ns = std.time.ns_per_ms;
-            logEncTiming(0, @divFloor(t1 - t0, ns), @divFloor(t2 - t1, ns), self.width, self.height);
+            logEncTimingPath("dma", 0, @divFloor(t1 - t0, ns), @divFloor(t2 - t1, ns), self.width, self.height);
         }
 
         if (self.output_len > 0) {
@@ -1805,13 +1805,17 @@ pub const VideoEncoder = struct {
     }
 
     fn logEncTiming(sync_ms: i128, upload_ms: i128, submit_ms: i128, w: u32, h: u32) void {
+        logEncTimingPath("cpu", sync_ms, upload_ms, submit_ms, w, h);
+    }
+
+    fn logEncTimingPath(path: []const u8, sync_ms: i128, upload_ms: i128, submit_ms: i128, w: u32, h: u32) void {
         const f = std.fs.openFileAbsolute("/tmp/termweb-enc.log", .{ .mode = .write_only }) catch
             std.fs.createFileAbsolute("/tmp/termweb-enc.log", .{}) catch return;
         defer f.close();
         f.seekFromEnd(0) catch return;
         var buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "sync={d}ms upload={d}ms submit={d}ms total={d}ms {d}x{d}\n", .{
-            sync_ms, upload_ms, submit_ms, sync_ms + upload_ms + submit_ms, w, h,
+        const line = std.fmt.bufPrint(&buf, "[{s}] sync={d}ms vpp={d}ms enc={d}ms total={d}ms {d}x{d}\n", .{
+            path, sync_ms, upload_ms, submit_ms, sync_ms + upload_ms + submit_ms, w, h,
         }) catch return;
         _ = f.write(line) catch {};
     }
