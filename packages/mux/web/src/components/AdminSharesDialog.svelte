@@ -104,8 +104,7 @@
           {#each $sessions as session (session.id)}
             <div class="session-row">
               <div class="session-info">
-                <div class="session-name">{session.name || session.id}</div>
-                <div class="session-id">{session.id}</div>
+                <div class="session-name">{session.name || session.id} <span class="role-badge">{session.role === 0 ? 'admin' : session.role === 1 ? 'editor' : 'viewer'}</span></div>
               </div>
               <div class="session-actions">
                 <button type="button" class="action-btn" onclick={() => handleShare(session)} title="Show QR & URL">QR</button>
@@ -262,13 +261,13 @@
     text-overflow: ellipsis;
   }
 
-  .session-id {
-    font-size: 11px;
+  .role-badge {
+    font-size: 10px;
     color: var(--text-dim);
-    font-family: monospace;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    background: rgba(128, 128, 128, 0.15);
+    padding: 1px 5px;
+    border-radius: 3px;
+    vertical-align: middle;
   }
 
   .session-actions {

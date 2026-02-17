@@ -3647,18 +3647,23 @@ const Server = struct {
 
         const sessions = self.auth_state.sessions;
 
-        // Count sessions to include
-        const count: u16 = if (is_admin)
-            @intCast(sessions.count())
-        else if (own_session_id) |sid|
-            if (sessions.get(sid) != null) 1 else 0
-        else
-            0;
+        // Count sessions to include (admins skip the "default" internal session)
+        var count: u16 = 0;
+        if (is_admin) {
+            var count_iter = sessions.valueIterator();
+            while (count_iter.next()) |s| {
+                if (!std.mem.eql(u8, s.id, "default")) count += 1;
+            }
+        } else if (own_session_id) |sid| {
+            count = if (sessions.get(sid) != null) 1 else 0;
+        }
 
         buf.writer(self.allocator).writeInt(u16, count, .little) catch return;
 
         var iter = sessions.valueIterator();
         while (iter.next()) |session| {
+            // Admins: skip the "default" internal session (it's the admin's own, not a share)
+            if (is_admin and std.mem.eql(u8, session.id, "default")) continue;
             // Non-admins: only include their own session
             if (own_session_id) |sid| {
                 if (!std.mem.eql(u8, session.id, sid)) continue;
