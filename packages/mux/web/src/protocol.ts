@@ -80,6 +80,7 @@ export const TransferMsgType = {
   SYNC_REQUEST: 0x26,
   BLOCK_CHECKSUMS: 0x27,
   SYNC_ACK: 0x28,
+  SYNC_DELETE_LIST: 0x29,
   // Server -> Client
   TRANSFER_READY: 0x30,
   FILE_LIST: 0x31,
@@ -93,6 +94,7 @@ export const TransferMsgType = {
   SYNC_FILE_LIST: 0x38,
   DELTA_DATA: 0x39,
   SYNC_COMPLETE: 0x3A,
+  DELETE_REPORT: 0x3B,
 } as const;
 
 // Role constants

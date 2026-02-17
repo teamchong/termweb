@@ -6,8 +6,10 @@
     serverPath: string;
     excludes: string[];
     useGitignore: boolean;
+    deleteNotInSource: boolean;
     dirHandle?: FileSystemDirectoryHandle;
     files?: File[];
+    destDirHandle?: FileSystemDirectoryHandle;
   }
 
   interface Props {
@@ -36,9 +38,14 @@
   let serverPath = $state('');
   let excludesText = $state('');
   let useGitignore = $state(true);
+  let deleteNotInSource = $state(false);
   let previewReport: DryRunReport | null = $state(null);
   let isLoading = $state(false);
   let errorMsg = $state('');
+
+  // Download destination folder
+  let destDirHandle: FileSystemDirectoryHandle | undefined = $state();
+  let destFolderName = $state('');
 
   // Upload source state
   let dirHandle: FileSystemDirectoryHandle | undefined = $state();
@@ -54,10 +61,13 @@
       serverPath = defaultPath || '';
       excludesText = '';
       useGitignore = true;
+      deleteNotInSource = false;
       previewReport = null;
       isLoading = false;
       errorMsg = '';
       isSubmitting = false; // Reset submit guard
+      destDirHandle = undefined;
+      destFolderName = '';
       // Initialize upload source from props
       dirHandle = initialDirHandle;
       uploadFiles = initialFiles;
@@ -86,7 +96,7 @@
       .split(',')
       .map(s => s.trim())
       .filter(s => s.length > 0);
-    return { serverPath: path, excludes, useGitignore, dirHandle, files: uploadFiles };
+    return { serverPath: path, excludes, useGitignore, deleteNotInSource, dirHandle, files: uploadFiles, destDirHandle };
   }
 
   let canSubmit = $derived(
@@ -182,6 +192,25 @@
     }
   }
 
+  async function selectDestFolder() {
+    if (!('showDirectoryPicker' in window)) return;
+    try {
+      const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
+      destDirHandle = handle;
+      destFolderName = handle.name + '/';
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        console.error('Destination folder picker failed:', err);
+      }
+    }
+  }
+
+  function clearDestFolder() {
+    destDirHandle = undefined;
+    destFolderName = '';
+    deleteNotInSource = false;
+  }
+
   async function selectFiles() {
     if (!('showOpenFilePicker' in window)) return;
     try {
@@ -264,10 +293,32 @@
           />
         </div>
 
+        {#if mode === 'download'}
+          <div class="form-group">
+            <span class="form-label">Save to:</span>
+            <div class="source-row">
+              <button type="button" class="btn btn-secondary btn-sm" onclick={selectDestFolder}>Select Folder</button>
+              {#if destFolderName}
+                <span class="source-name">{destFolderName}</span>
+                <button type="button" class="btn btn-secondary btn-sm" onclick={clearDestFolder}>Clear</button>
+              {:else}
+                <span class="source-hint">Optional — defaults to zip download</span>
+              {/if}
+            </div>
+          </div>
+        {/if}
+
         <label class="checkbox-label">
           <input type="checkbox" bind:checked={useGitignore} />
           Use .gitignore
         </label>
+
+        {#if mode === 'upload' || (mode === 'download' && destDirHandle)}
+          <label class="checkbox-label">
+            <input type="checkbox" bind:checked={deleteNotInSource} />
+            Delete files not in source
+          </label>
+        {/if}
 
         {#if errorMsg}
           <div class="error-msg">{errorMsg}</div>

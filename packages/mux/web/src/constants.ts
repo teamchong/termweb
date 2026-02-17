@@ -212,6 +212,22 @@ export const PROTO_SYNC_COMPLETE = {
   BYTES_TRANSFERRED: 9,
 } as const;
 
+/** SYNC_DELETE_LIST message offsets (0x29) */
+export const PROTO_SYNC_DELETE_LIST = {
+  /** Number of paths to delete */
+  COUNT: 5,
+  /** Start of path entries */
+  ENTRIES: 9,
+} as const;
+
+/** DELETE_REPORT message offsets (0x3B) */
+export const PROTO_DELETE_REPORT = {
+  /** Number of deleted paths */
+  COUNT: 5,
+  /** Start of path entries */
+  ENTRIES: 9,
+} as const;
+
 /** Action codes for dry run entries */
 export const DRY_RUN_ACTION = ['create', 'update', 'delete'] as const;
 

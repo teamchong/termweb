@@ -1023,6 +1023,7 @@ pub const ClientMsgType = enum(u8) {
     sync_request = 0x26,      // Start incremental sync
     block_checksums = 0x27,   // Client sends block checksums of cached copy
     sync_ack = 0x28,          // Client confirms delta applied
+    sync_delete_list = 0x29,  // Client sends list of server files to delete
 };
 
 // Message types from server (0x30-0x3F)
@@ -1039,6 +1040,7 @@ pub const ServerMsgType = enum(u8) {
     sync_file_list = 0x38,    // File list for sync (with mtime comparison)
     delta_data = 0x39,        // Delta commands (COPY + LITERAL)
     sync_complete = 0x3A,     // Sync finished
+    delete_report = 0x3B,     // Report of deleted files
 };
 
 // Transfer direction
@@ -1051,7 +1053,8 @@ pub const TransferDirection = enum(u8) {
 pub const TransferFlags = packed struct {
     dry_run: bool = false, // Preview only, don't transfer
     use_gitignore: bool = false, // Apply .gitignore patterns from base directory
-    _reserved: u6 = 0,
+    delete_not_in_source: bool = false, // Delete files on dest not present in source
+    _reserved: u5 = 0,
 };
 
 // File entry in file list
@@ -2832,6 +2835,74 @@ pub fn buildSyncComplete(allocator: Allocator, transfer_id: u32, files_synced: u
     std.mem.writeInt(u32, msg[1..5], transfer_id, .little);
     std.mem.writeInt(u32, msg[5..9], files_synced, .little);
     std.mem.writeInt(u64, msg[9..17], bytes_transferred, .little);
+    return msg;
+}
+
+/// Parsed SYNC_DELETE_LIST message from client.
+pub const SyncDeleteListData = struct {
+    transfer_id: u32,
+    paths: [][]const u8,
+
+    pub fn deinit(self: *SyncDeleteListData, allocator: Allocator) void {
+        for (self.paths) |path| {
+            allocator.free(path);
+        }
+        allocator.free(self.paths);
+    }
+};
+
+/// Parse SYNC_DELETE_LIST message.
+/// Format: [0x29][transfer_id:u32][count:u32][entries: (path_len:u16, path)...]
+pub fn parseSyncDeleteList(allocator: Allocator, data: []const u8) !SyncDeleteListData {
+    if (data.len < 9) return error.InvalidArgs;
+
+    const transfer_id = std.mem.readInt(u32, data[1..5], .little);
+    const count = std.mem.readInt(u32, data[5..9], .little);
+
+    var paths = try allocator.alloc([]const u8, count);
+    var parsed: u32 = 0;
+    errdefer {
+        for (paths[0..parsed]) |path| {
+            allocator.free(path);
+        }
+        allocator.free(paths);
+    }
+
+    var offset: usize = 9;
+    for (0..count) |i| {
+        if (offset + 2 > data.len) return error.InvalidArgs;
+        const path_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+        offset += 2;
+        if (offset + path_len > data.len) return error.InvalidArgs;
+        paths[i] = try allocator.dupe(u8, data[offset .. offset + path_len]);
+        parsed += 1;
+        offset += path_len;
+    }
+
+    return .{ .transfer_id = transfer_id, .paths = paths };
+}
+
+/// Build DELETE_REPORT message.
+/// Format: [0x3B][transfer_id:u32][count:u32][entries: (path_len:u16, path)...]
+pub fn buildDeleteReport(allocator: Allocator, transfer_id: u32, deleted_paths: []const []const u8) ![]u8 {
+    var total_len: usize = 1 + 4 + 4; // type + transfer_id + count
+    for (deleted_paths) |path| {
+        total_len += 2 + path.len; // path_len + path
+    }
+
+    var msg = try allocator.alloc(u8, total_len);
+    msg[0] = @intFromEnum(ServerMsgType.delete_report);
+    std.mem.writeInt(u32, msg[1..5], transfer_id, .little);
+    std.mem.writeInt(u32, msg[5..9], @intCast(deleted_paths.len), .little);
+
+    var offset: usize = 9;
+    for (deleted_paths) |path| {
+        std.mem.writeInt(u16, msg[offset..][0..2], @intCast(path.len), .little);
+        offset += 2;
+        @memcpy(msg[offset .. offset + path.len], path);
+        offset += path.len;
+    }
+
     return msg;
 }
 

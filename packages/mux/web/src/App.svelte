@@ -272,7 +272,12 @@
   async function handleTransferExecute(config: TransferConfig) {
     if (!muxClient) return;
     const ft = muxClient.getFileTransfer();
-    const options = { excludes: config.excludes, useGitignore: config.useGitignore };
+    const options = {
+      excludes: config.excludes,
+      useGitignore: config.useGitignore,
+      deleteNotInSource: config.deleteNotInSource,
+      destDirHandle: config.destDirHandle,
+    };
 
     console.log('[App] handleTransferExecute START:', {
       mode: transferDialogMode,
@@ -311,7 +316,7 @@
 
   async function handleTransferPreview(config: TransferConfig) {
     if (!muxClient) return null;
-    const options = { excludes: config.excludes, useGitignore: config.useGitignore };
+    const options = { excludes: config.excludes, useGitignore: config.useGitignore, deleteNotInSource: config.deleteNotInSource };
     return muxClient.requestDryRun(
       transferDialogMode,
       config.serverPath,

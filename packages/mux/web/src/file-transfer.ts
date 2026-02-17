@@ -21,6 +21,7 @@ import {
   PROTO_SYNC_FILE_LIST,
   PROTO_DELTA_DATA,
   PROTO_SYNC_COMPLETE,
+  PROTO_DELETE_REPORT,
   DRY_RUN_ACTION,
 } from './constants';
 import type { FileSystemDirectoryHandleIterator } from './types';
@@ -84,12 +85,16 @@ export interface TransferState {
   zipCreating?: boolean;
   /** Tracks file paths already marked complete (prevents duplicate completion counting) */
   completedPaths?: Set<string>;
+  /** Source file paths from client (for delete-not-in-source comparison during sync upload) */
+  sourceFiles?: Set<string>;
 }
 
 export interface TransferOptions {
   dryRun?: boolean;
   excludes?: string[];
   useGitignore?: boolean;
+  deleteNotInSource?: boolean;
+  destDirHandle?: FileSystemDirectoryHandle;
 }
 
 export interface DryRunReport {
@@ -524,6 +529,9 @@ export class FileTransferHandler {
         break;
       case TransferMsgType.SYNC_COMPLETE:
         this.handleSyncComplete(data);
+        break;
+      case TransferMsgType.DELETE_REPORT:
+        this.handleDeleteReport(data);
         break;
     }
   }
@@ -1013,7 +1021,7 @@ export class FileTransferHandler {
       return;
     }
 
-    const { dryRun = false, excludes = [], useGitignore = false } = options;
+    const { dryRun = false, excludes = [], useGitignore = false, deleteNotInSource = false } = options;
 
     let files: Awaited<ReturnType<typeof this.collectFilesFromHandle>>;
     try {
@@ -1039,7 +1047,7 @@ export class FileTransferHandler {
     let offset = 0;
     view.setUint8(offset, TransferMsgType.TRANSFER_INIT); offset += 1;
     view.setUint8(offset, 0); offset += 1; // direction: upload
-    view.setUint8(offset, (dryRun ? 1 : 0) | (useGitignore ? 2 : 0)); offset += 1;
+    view.setUint8(offset, (dryRun ? 1 : 0) | (useGitignore ? 2 : 0) | (deleteNotInSource ? 4 : 0)); offset += 1;
     view.setUint8(offset, excludes.length); offset += 1;
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;
@@ -1138,8 +1146,8 @@ export class FileTransferHandler {
       return;
     }
 
-    const { dryRun = false, excludes = [], useGitignore = false } = options;
-    const flagsByte = (dryRun ? 1 : 0) | (useGitignore ? 2 : 0);
+    const { dryRun = false, excludes = [], useGitignore = false, deleteNotInSource = false, destDirHandle } = options;
+    const flagsByte = (dryRun ? 1 : 0) | (useGitignore ? 2 : 0) | (deleteNotInSource ? 4 : 0);
 
     const pathBytes = sharedTextEncoder.encode(serverPath);
     const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
@@ -1167,13 +1175,13 @@ export class FileTransferHandler {
     this.send(msg);
     console.log(`[FT] TRANSFER_INIT sent, now creating pendingTransfer`);
 
-
     // Store as pending — server will assign the real ID in TRANSFER_READY
     this.pendingTransfer = {
       id: 0,
       direction: 'download',
       serverPath,
       options,
+      dirHandle: destDirHandle,
       state: 'pending',
       bytesTransferred: 0,
       currentFileIndex: 0,
@@ -1400,6 +1408,9 @@ export class FileTransferHandler {
     const excludeBytes = excludes.map(p => sharedTextEncoder.encode(p));
     const excludeTotalLen = excludeBytes.reduce((acc, b) => acc + 1 + b.length, 0);
 
+    const { deleteNotInSource = false } = options;
+    const flagsByte = (deleteNotInSource ? 4 : 0);
+
     // SYNC_REQUEST: [msg_type:1][flags:1][path_len:2][path][exclude_count:1][excludes...]
     const msgLen = 1 + 1 + 2 + pathBytes.length + 1 + excludeTotalLen;
     const msg = new ArrayBuffer(msgLen);
@@ -1408,7 +1419,7 @@ export class FileTransferHandler {
 
     let offset = 0;
     view.setUint8(offset, TransferMsgType.SYNC_REQUEST); offset += 1;
-    view.setUint8(offset, 0); offset += 1; // flags: 0 = recursive
+    view.setUint8(offset, flagsByte); offset += 1; // flags
     view.setUint16(offset, pathBytes.length, true); offset += 2;
     bytes.set(pathBytes, offset); offset += pathBytes.length;
     view.setUint8(offset, excludes.length); offset += 1;
@@ -1592,6 +1603,52 @@ export class FileTransferHandler {
     this.send(msg);
   }
 
+  /** Send SYNC_DELETE_LIST to server: paths that exist on server but not in client source */
+  private sendSyncDeleteList(transferId: number, pathsToDelete: string[]): void {
+    if (pathsToDelete.length === 0) return;
+
+    const encodedPaths = pathsToDelete.map(p => sharedTextEncoder.encode(p));
+    const payloadLen = encodedPaths.reduce((sum, p) => sum + 2 + p.length, 0);
+    const msgLen = 1 + 4 + 4 + payloadLen;
+    const msg = new ArrayBuffer(msgLen);
+    const view = new DataView(msg);
+    const bytes = new Uint8Array(msg);
+
+    let offset = 0;
+    view.setUint8(offset, TransferMsgType.SYNC_DELETE_LIST); offset += 1;
+    view.setUint32(offset, transferId, true); offset += 4;
+    view.setUint32(offset, pathsToDelete.length, true); offset += 4;
+
+    for (const pathBytes of encodedPaths) {
+      view.setUint16(offset, pathBytes.length, true); offset += 2;
+      bytes.set(pathBytes, offset); offset += pathBytes.length;
+    }
+
+    this.send(msg);
+    console.log(`[FT] Sent SYNC_DELETE_LIST: ${pathsToDelete.length} paths to delete`);
+  }
+
+  /** Handle DELETE_REPORT from server */
+  private handleDeleteReport(data: ArrayBuffer): void {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+
+    const transferId = view.getUint32(PROTO_HEADER.TRANSFER_ID, true);
+    const count = view.getUint32(PROTO_DELETE_REPORT.COUNT, true);
+
+    let offset = PROTO_DELETE_REPORT.ENTRIES;
+    const deletedPaths: string[] = [];
+    for (let i = 0; i < count; i++) {
+      if (offset + 2 > data.byteLength) break;
+      const pathLen = view.getUint16(offset, true); offset += 2;
+      if (offset + pathLen > data.byteLength) break;
+      const path = sharedTextDecoder.decode(bytes.slice(offset, offset + pathLen)); offset += pathLen;
+      deletedPaths.push(path);
+    }
+
+    console.log(`[FT] DELETE_REPORT: transferId=${transferId}, deleted ${deletedPaths.length} files`);
+  }
+
   /** Handle SYNC_COMPLETE from server */
   private handleSyncComplete(data: ArrayBuffer): void {
     const view = new DataView(data);
@@ -1675,15 +1732,29 @@ export class FileTransferHandler {
       }
       return true;
     }
+    // Single file download: write to dest folder if available, otherwise browser download
+    if (transfer?.dirHandle) {
+      this.writeFileToDestFolder(transfer.dirHandle, path, data).catch(err => {
+        console.error(`[FT] Failed to write ${path} to dest folder:`, err);
+      });
+      return true;
+    }
     console.log(`File completed (not in zip mode): ${path}`);
     return this.saveFile(path, data);
   }
 
-  /** Create zip from OPFS temp files and trigger browser download. */
+  /** Create zip from OPFS temp files and trigger browser download,
+   *  or write files to dest folder if destDirHandle is set. */
   private async createZipFromOPFS(transferId: number): Promise<void> {
     const transfer = this.activeTransfers.get(transferId);
     if (!transfer) {
       console.error(`[FT] createZipFromOPFS: No transfer found for ID ${transferId}`);
+      return;
+    }
+
+    // If a dest folder handle is set, write files directly there instead of creating a zip
+    if (transfer.dirHandle) {
+      await this.writeFilesToDestFolder(transferId);
       return;
     }
 
@@ -1751,6 +1822,138 @@ export class FileTransferHandler {
     // Close the file WebSocket connection only if no more active transfers
     if (this.activeTransfers.size === 0) {
       this.onConnectionShouldClose?.();
+    }
+  }
+
+  /** Write downloaded files from OPFS temp to the user's selected dest folder.
+   *  After writing, optionally deletes local files not present on the server. */
+  private async writeFilesToDestFolder(transferId: number): Promise<void> {
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer || !transfer.dirHandle || !transfer.files) {
+      this.activeTransfers.delete(transferId);
+      this.onTransferError?.(transferId, 'No destination folder or file list');
+      return;
+    }
+
+    const destHandle = transfer.dirHandle;
+    console.log(`[FT] Writing ${transfer.files.length} files to dest folder: ${destHandle.name}`);
+
+    // Request each file from OPFS temp and write to dest folder
+    const nonDirFiles = transfer.files.filter(f => !f.isDir && f.size > 0);
+    let filesWritten = 0;
+
+    for (const file of nonDirFiles) {
+      try {
+        // Get file data from worker
+        const fileData = await this.getFileFromOPFS(transferId, file.path);
+        if (!fileData) continue;
+
+        // Create subdirectories as needed
+        const parts = file.path.split('/');
+        let dirHandle = destHandle;
+        for (let i = 0; i < parts.length - 1; i++) {
+          dirHandle = await dirHandle.getDirectoryHandle(parts[i], { create: true });
+        }
+
+        // Write the file
+        const fileName = parts[parts.length - 1];
+        const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(fileData);
+        await writable.close();
+        filesWritten++;
+      } catch (err) {
+        console.error(`[FT] Failed to write ${file.path} to dest folder:`, err);
+      }
+    }
+
+    console.log(`[FT] Wrote ${filesWritten}/${nonDirFiles.length} files to dest folder`);
+
+    // Delete files not in server's file list (if deleteNotInSource option is set)
+    if (transfer.options?.deleteNotInSource) {
+      const serverPaths = new Set(transfer.files.filter(f => !f.isDir).map(f => f.path));
+      await this.deleteNotInSet(destHandle, '', serverPaths);
+    }
+
+    // Clean up
+    this.activeTransfers.delete(transferId);
+    this.onTransferComplete?.(transferId, transfer.totalBytes ?? 0);
+    this.worker?.postMessage({ type: 'cleanup-temp', transferId });
+    this.worker?.postMessage({ type: 'delete-transfer-metadata', transferId });
+
+    if (transfer.serverPath) {
+      this.clearCacheForPath(transfer.serverPath);
+    }
+
+    if (this.activeTransfers.size === 0) {
+      this.onConnectionShouldClose?.();
+    }
+  }
+
+  /** Get file data from OPFS temp (returns ArrayBuffer via worker message) */
+  private getFileFromOPFS(transferId: number, filePath: string): Promise<Uint8Array | null> {
+    return new Promise((resolve) => {
+      if (!this.worker) { resolve(null); return; }
+
+      const handler = (e: MessageEvent) => {
+        if (e.data.type === 'file-data' && e.data.transferId === transferId && e.data.filePath === filePath) {
+          this.worker?.removeEventListener('message', handler);
+          resolve(new Uint8Array(e.data.data));
+        }
+      };
+      this.worker.addEventListener('message', handler);
+      this.worker.postMessage({ type: 'get-file', transferId, filePath });
+
+      // Timeout after 10s
+      setTimeout(() => {
+        this.worker?.removeEventListener('message', handler);
+        resolve(null);
+      }, 10000);
+    });
+  }
+
+  /** Write a single file to the dest folder, creating subdirectories as needed */
+  private async writeFileToDestFolder(
+    destHandle: FileSystemDirectoryHandle,
+    path: string,
+    data: Uint8Array,
+  ): Promise<void> {
+    const parts = path.split('/');
+    let dirHandle = destHandle;
+    for (let i = 0; i < parts.length - 1; i++) {
+      dirHandle = await dirHandle.getDirectoryHandle(parts[i], { create: true });
+    }
+    const fileName = parts[parts.length - 1];
+    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(data);
+    await writable.close();
+  }
+
+  /** Recursively delete files in destHandle that are not in the serverPaths set */
+  private async deleteNotInSet(
+    dirHandle: FileSystemDirectoryHandle,
+    prefix: string,
+    serverPaths: Set<string>,
+  ): Promise<void> {
+    try {
+      for await (const [name, handle] of (dirHandle as unknown as FileSystemDirectoryHandleIterator).entries()) {
+        const path = prefix ? `${prefix}/${name}` : name;
+        if (handle.kind === 'directory') {
+          await this.deleteNotInSet(handle as FileSystemDirectoryHandle, path, serverPaths);
+        } else {
+          if (!serverPaths.has(path)) {
+            try {
+              await dirHandle.removeEntry(name);
+              console.log(`[FT] Deleted local file not on server: ${path}`);
+            } catch (err) {
+              console.error(`[FT] Failed to delete ${path}:`, err);
+            }
+          }
+        }
+      }
+    } catch {
+      // Directory iteration failed — skip
     }
   }
 

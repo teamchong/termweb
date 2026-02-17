@@ -1376,6 +1376,21 @@ const Panel = struct {
         return map.get(code) orelse 0xFFFF; // Invalid keycode
     }
 
+    /// Returns true if the key code represents a non-printable control key
+    /// where Shift doesn't produce different text output.
+    fn isNonPrintableKey(code: []const u8) bool {
+        const non_printable = [_][]const u8{
+            "Enter", "Tab", "Backspace", "Escape",
+            "Delete", "Insert", "Home", "End",
+            "PageUp", "PageDown",
+            "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+        };
+        for (non_printable) |key| {
+            if (std.mem.eql(u8, code, key)) return true;
+        }
+        return false;
+    }
+
     // Handle keyboard input from client (queues event for main thread)
     // Format: [action:u8][mods:u8][code_len:u8][code:...][text_len:u8][text:...]
     fn handleKeyInput(self: *Panel, data: []const u8) void {
@@ -1414,11 +1429,12 @@ const Panel = struct {
                 },
                 .keycode = keycode,
                 .mods = convertMods(mods),
-                // When text is produced, Shift was "consumed" by the input method
-                // to generate the uppercase/shifted character (e.g., Shift+c → "C").
-                // Without this, ghostty's effectiveMods() still sees Shift as active,
-                // causing escape sequence encoding instead of plain text output.
-                .consumed_mods = if (text_len > 0 and (mods & 0x01) != 0)
+                // Consume Shift when:
+                // 1. Text was produced (Shift generated the uppercase char), OR
+                // 2. Key is a non-printable control key (Enter, Tab, Backspace, Escape, etc.)
+                //    where Shift doesn't produce different text — prevents ghostty from
+                //    generating modifyOtherKeys escape sequences for Shift+Enter etc.
+                .consumed_mods = if ((text_len > 0 or isNonPrintableKey(code)) and (mods & 0x01) != 0)
                     @intCast(c.GHOSTTY_MODS_SHIFT)
                 else
                     0,
@@ -4527,6 +4543,7 @@ const Server = struct {
             @intFromEnum(transfer.ClientMsgType.sync_request) => self.handleSyncRequest(conn, data),
             @intFromEnum(transfer.ClientMsgType.block_checksums) => self.handleBlockChecksums(conn, data),
             @intFromEnum(transfer.ClientMsgType.sync_ack) => {}, // Client confirms delta applied — no server action needed
+            @intFromEnum(transfer.ClientMsgType.sync_delete_list) => self.handleSyncDeleteList(conn, data),
             else => std.debug.print("Unknown file transfer message type: 0x{x:0>2}\n", .{msg_type}),
         }
     }
@@ -4740,6 +4757,11 @@ const Server = struct {
 
         // Check if transfer is complete
         if (session.bytes_transferred >= session.total_bytes) {
+            // If delete_not_in_source flag is set, delete server files not in the upload file list
+            if (session.flags.delete_not_in_source) {
+                self.deleteNotInUploadList(conn, session);
+            }
+
             const complete_msg = transfer.buildTransferComplete(self.allocator, session.id, session.bytes_transferred) catch return;
             defer self.allocator.free(complete_msg);
             conn.sendBinary(complete_msg) catch {};
@@ -4962,6 +4984,113 @@ const Server = struct {
             defer self.allocator.free(delta_msg);
             conn.sendBinary(delta_msg) catch {};
         }
+    }
+
+    /// Delete files on the server that are not in the upload file list.
+    /// Called when upload completes with `delete_not_in_source` flag set.
+    fn deleteNotInUploadList(self: *Server, conn: *ws.Connection, session: *transfer.TransferSession) void {
+        // Build a set of uploaded file paths
+        var uploaded_paths = std.StringHashMap(void).init(self.allocator);
+        defer uploaded_paths.deinit();
+        for (session.files.items) |entry| {
+            if (!entry.is_dir) {
+                uploaded_paths.put(entry.path, {}) catch {};
+            }
+        }
+
+        // Walk the server directory and find files to delete
+        var deleted = std.ArrayListUnmanaged([]const u8){};
+        defer {
+            for (deleted.items) |p| self.allocator.free(p);
+            deleted.deinit(self.allocator);
+        }
+
+        var dir = std.fs.openDirAbsolute(session.base_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var walker = dir.walk(self.allocator) catch return;
+        defer walker.deinit();
+
+        while (walker.next() catch null) |entry| {
+            if (entry.kind == .directory) continue;
+            const rel_path = entry.path;
+
+            // Skip if this file was uploaded
+            if (uploaded_paths.contains(rel_path)) continue;
+
+            // Skip excluded files
+            if (session.isExcluded(rel_path)) continue;
+
+            // Build full path and delete
+            const full_path = std.fs.path.join(self.allocator, &.{ session.base_path, rel_path }) catch continue;
+            defer self.allocator.free(full_path);
+
+            if (session.flags.dry_run) {
+                const dup = self.allocator.dupe(u8, rel_path) catch continue;
+                deleted.append(self.allocator, dup) catch self.allocator.free(dup);
+                continue;
+            }
+
+            std.fs.cwd().deleteFile(full_path) catch |err| {
+                std.debug.print("delete_not_in_source: failed to delete {s}: {}\n", .{ full_path, err });
+                continue;
+            };
+            const dup = self.allocator.dupe(u8, rel_path) catch continue;
+            deleted.append(self.allocator, dup) catch self.allocator.free(dup);
+            std.debug.print("delete_not_in_source: deleted {s}\n", .{full_path});
+        }
+
+        if (deleted.items.len > 0) {
+            const report_msg = transfer.buildDeleteReport(self.allocator, session.id, deleted.items) catch return;
+            defer self.allocator.free(report_msg);
+            conn.sendBinary(report_msg) catch {};
+        }
+    }
+
+    /// Handle SYNC_DELETE_LIST message — client sends list of server files to delete
+    fn handleSyncDeleteList(self: *Server, conn: *ws.Connection, data: []u8) void {
+        var delete_data = transfer.parseSyncDeleteList(self.allocator, data) catch |err| {
+            std.debug.print("Failed to parse SYNC_DELETE_LIST: {}\n", .{err});
+            return;
+        };
+        defer delete_data.deinit(self.allocator);
+
+        const session = self.transfer_manager.getSession(delete_data.transfer_id) orelse return;
+        const base_path = session.base_path;
+
+        var deleted = std.ArrayListUnmanaged([]const u8){};
+        defer deleted.deinit(self.allocator);
+
+        for (delete_data.paths) |rel_path| {
+            // Security: validate path doesn't escape base_path (no ".." traversal)
+            if (std.mem.indexOf(u8, rel_path, "..") != null) {
+                std.debug.print("SYNC_DELETE_LIST: rejecting path with '..': {s}\n", .{rel_path});
+                continue;
+            }
+
+            // Build full path: base_path/rel_path
+            const full_path = std.fs.path.join(self.allocator, &.{ base_path, rel_path }) catch continue;
+            defer self.allocator.free(full_path);
+
+            // Check dry_run flag
+            if (session.flags.dry_run) {
+                deleted.append(self.allocator, rel_path) catch {};
+                continue;
+            }
+
+            // Delete the file
+            std.fs.cwd().deleteFile(full_path) catch |err| {
+                std.debug.print("SYNC_DELETE_LIST: failed to delete {s}: {}\n", .{ full_path, err });
+                continue;
+            };
+            deleted.append(self.allocator, rel_path) catch {};
+            std.debug.print("SYNC_DELETE_LIST: deleted {s}\n", .{full_path});
+        }
+
+        // Send DELETE_REPORT
+        const report_msg = transfer.buildDeleteReport(self.allocator, delete_data.transfer_id, deleted.items) catch return;
+        defer self.allocator.free(report_msg);
+        conn.sendBinary(report_msg) catch {};
     }
 
     /// Send full file content as a DELTA_DATA with a single LITERAL command
