@@ -413,6 +413,34 @@ pub const Layout = struct {
         }
     }
 
+    /// Apply even layout to a tab containing the given panel.
+    /// Sets split ratios so all leaf panes get equal space, using the formula:
+    /// ratio = left_leaf_count / total_leaf_count at each split node.
+    pub fn applyEvenLayout(self: *Layout, panel_id: u32) void {
+        const tab = self.findTabByPanel(panel_id) orelse return;
+        applyEvenRatios(tab.root);
+    }
+
+    fn countLeaves(node: *const SplitNode) u32 {
+        if (node.panel_id != null) return 1;
+        var count: u32 = 0;
+        if (node.first) |first| count += countLeaves(first);
+        if (node.second) |second| count += countLeaves(second);
+        return count;
+    }
+
+    fn applyEvenRatios(node: *SplitNode) void {
+        if (node.panel_id != null) return; // leaf
+        const left_count = if (node.first) |f| countLeaves(f) else 0;
+        const right_count = if (node.second) |s| countLeaves(s) else 0;
+        const total = left_count + right_count;
+        if (total > 0) {
+            node.ratio = @as(f32, @floatFromInt(left_count)) / @as(f32, @floatFromInt(total));
+        }
+        if (node.first) |first| applyEvenRatios(first);
+        if (node.second) |second| applyEvenRatios(second);
+    }
+
     // Remove a panel from the layout, collapsing splits as needed
     pub fn removePanel(self: *Layout, panel_id: u32) void {
         for (self.tabs.items, 0..) |tab, i| {
@@ -1606,6 +1634,7 @@ const PanelSplitRequest = struct {
     height: u32,
     scale: f64,
     from_api: bool = false, // If true, send new panel ID to tmux_api_response_ch
+    apply_even_layout: bool = false, // If true, apply even layout after split
 };
 
 /// JWT renewal tracking per connection
@@ -5765,11 +5794,18 @@ const Server = struct {
                 continue;
             };
 
+            // Apply even layout before broadcasting if requested (tmux API splits)
+            if (req.apply_even_layout) {
+                self.mutex.lock();
+                self.layout.applyEvenLayout(panel.id);
+                self.mutex.unlock();
+            }
+
             // Notify tmux API caller if this was an API-originated request
             if (req.from_api) _ = self.tmux_api_response_ch.send(panel.id);
 
             // Panel starts streaming immediately (H264 frames sent to all h264_connections)
-            // Initial dimensions are approximate (parent halved). Each client's
+            // Initial dimensions come from the parent panel's viewport. Each client's
             // ResizeObserver will send the correct viewport-based resize within
             // one animation frame (~16ms), which triggers a keyframe at the right size.
             self.broadcastPanelMsg(.panel_created, panel.id);
@@ -7003,6 +7039,20 @@ const tmux_shim_script =
     \\    fi
     \\    ;;
     \\
+    \\  select-layout)
+    \\    layout="tiled"
+    \\    while [ $# -gt 0 ]; do
+    \\      case "$1" in
+    \\        -t) shift 2 ;;
+    \\        -*) shift ;;
+    \\        *) layout="$1"; shift ;;
+    \\      esac
+    \\    done
+    \\    curl -sf --max-time 5 --unix-socket "$SOCK" -X POST "$API/api/tmux" \
+    \\      -H "Content-Type: application/json" \
+    \\      -d "{\"cmd\":\"select-layout\",\"pane\":$PANE,\"layout\":\"$layout\"}"
+    \\    ;;
+    \\
     \\  select-pane) exit 0 ;;
     \\  has-session|-has-session) exit 0 ;;
     \\  -V|--version) echo "tmux termweb-shim" ;;
@@ -7345,8 +7395,8 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
                 scale = parent.scale;
             }
         }
-        // Halve along the split axis (outside lock — only uses local copies)
-        if (direction == .horizontal) { width /= 2; } else { height /= 2; }
+        // Don't halve dimensions — the layout tree ratio (0.5) and CSS flex handle
+        // the visual split. ResizeObserver will report actual sizes back to the server.
 
         // Record next_panel_id before sending request
         const expected_id = @atomicLoad(u32, &server.next_panel_id, .acquire);
@@ -7358,11 +7408,28 @@ fn handleTmuxPost(server: *Server, body: []const u8, allocator: std.mem.Allocato
             .height = height,
             .scale = scale,
             .from_api = true,
+            .apply_even_layout = true, // Redistribute all panes evenly
         });
         server.wake_signal.notify();
 
         const new_id = server.tmux_api_response_ch.recv() orelse expected_id;
         return finishNewPanel(server, new_id, body, allocator);
+    }
+
+    if (std.mem.eql(u8, cmd, "select-layout")) {
+        const pane_id = jsonGetInt(body, "pane") orelse 1;
+        const layout_name = jsonGetString(body, "layout") orelse "tiled";
+        // Support even-horizontal, even-vertical, and tiled (all use even distribution)
+        if (std.mem.eql(u8, layout_name, "even-horizontal") or
+            std.mem.eql(u8, layout_name, "even-vertical") or
+            std.mem.eql(u8, layout_name, "tiled"))
+        {
+            server.mutex.lock();
+            server.layout.applyEvenLayout(pane_id);
+            server.mutex.unlock();
+            server.broadcastLayoutUpdate();
+        }
+        return null;
     }
 
     if (std.mem.eql(u8, cmd, "new-window")) {
