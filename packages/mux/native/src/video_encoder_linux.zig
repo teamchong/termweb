@@ -379,10 +379,10 @@ pub const VideoEncoder = struct {
     const QualityTier = struct { bitrate: u32, max_pixels: u64, fps: u32 };
     const QUALITY_TIERS = [_]QualityTier{
         .{ .bitrate = 1_000_000, .max_pixels = 1024 * 768, .fps = 15 },   // 0: Emergency
-        .{ .bitrate = 2_000_000, .max_pixels = 1280 * 1024, .fps = 24 },  // 1: Low
-        .{ .bitrate = 3_000_000, .max_pixels = 1920 * 1080, .fps = 30 },  // 2: Medium
-        .{ .bitrate = 5_000_000, .max_pixels = 2048 * 2048, .fps = 30 },  // 3: High (default)
-        .{ .bitrate = 8_000_000, .max_pixels = 3840 * 2160, .fps = 30 },  // 4: Max (4K)
+        .{ .bitrate = 2_000_000, .max_pixels = 1280 * 1024, .fps = 30 },  // 1: Low
+        .{ .bitrate = 3_000_000, .max_pixels = 1920 * 1080, .fps = 60 },  // 2: Medium
+        .{ .bitrate = 5_000_000, .max_pixels = 2048 * 2048, .fps = 60 },  // 3: High (default)
+        .{ .bitrate = 8_000_000, .max_pixels = 3840 * 2160, .fps = 60 },  // 4: Max (4K)
     };
     const DEFAULT_TIER: u8 = 3;
 
@@ -391,7 +391,7 @@ pub const VideoEncoder = struct {
     const HEALTH_GOOD: u8 = 70; // Above this: client is healthy
     const DOWNGRADE_STREAK: u8 = 2; // Consecutive bad reports before dropping (2s)
     const UPGRADE_STREAK: u8 = 3; // Consecutive good reports before upgrading (3s)
-    const MIN_STABLE_FRAMES: u32 = 150; // Frames at current tier before upgrade (~5s at 30fps)
+    const MIN_STABLE_FRAMES: u32 = 300; // Frames at current tier before upgrade (~5s at 60fps)
 
     fn calcAlignedDimensions(width: u32, height: u32, max_pixels: u64) struct { w: u32, h: u32 } {
         // VA-API hardware encoders require 16-pixel aligned surfaces.

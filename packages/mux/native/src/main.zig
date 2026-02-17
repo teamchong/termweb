@@ -651,15 +651,15 @@ const Panel = struct {
     last_cell_h: u16 = 0,
     dbg_input_countdown: u32 = 0, // Debug: log N frames after input
 
-    const TARGET_FPS: i64 = 30; // 30 FPS for video
+    const TARGET_FPS: i64 = 60; // 60 FPS for video
     /// After this many consecutive unchanged frames, reduce tick rate to save CPU/GPU.
-    /// At 30 FPS, 30 unchanged frames ≈ 1 second of idle.
-    const IDLE_THRESHOLD: u32 = 30;
+    /// At 60 FPS, 60 unchanged frames ≈ 1 second of idle.
+    const IDLE_THRESHOLD: u32 = 60;
     /// When idle, only tick every Nth cycle (effectively ~3 FPS for cursor/spinner checks)
-    const IDLE_DIVISOR: u32 = 10;
+    const IDLE_DIVISOR: u32 = 20;
     /// After this many consecutive unchanged frames, send a quality keyframe.
-    /// At 30 FPS, 15 frames ≈ 0.5 seconds of idle after activity stops.
-    const IDLE_KEYFRAME_THRESHOLD: u32 = 15;
+    /// At 60 FPS, 30 frames ≈ 0.5 seconds of idle after activity stops.
+    const IDLE_KEYFRAME_THRESHOLD: u32 = 30;
     const FRAME_INTERVAL_MS: i64 = 1000 / TARGET_FPS;
 
     fn init(allocator: std.mem.Allocator, app: c.ghostty_app_t, id: u32, width: u32, height: u32, scale: f64, working_directory: ?[]const u8, kind: PanelKind) !*Panel {
@@ -6081,9 +6081,9 @@ const Server = struct {
     // Main render loop
     fn runRenderLoop(self: *Server) void {
         // Adaptive frame timing: render immediately on input for snappy response,
-        // but keep steady 30fps otherwise. Burst mode not used because H.264
-        // encoding at ~15ms/panel/frame can't sustain 60fps with multiple panels.
-        const frame_time_ns: u64 = std.time.ns_per_s / 30; // 33.3ms
+        // steady 60fps otherwise. Adaptive quality tiers will reduce per-panel FPS
+        // if bandwidth is constrained.
+        const frame_time_ns: u64 = std.time.ns_per_s / 60; // 16.6ms
 
         var last_frame: i128 = 0;
 
@@ -6123,7 +6123,7 @@ const Server = struct {
             // Periodic cleanup of expired rate limit entries (self-throttles to once per minute)
             self.rate_limiter.cleanup();
 
-            // Periodic JWT renewal — check every ~10 seconds (300 frames at 30fps)
+            // Periodic JWT renewal — check every ~10 seconds (600 frames at 60fps)
             self.renewExpiredJwts();
 
             // Process input for all panels (more responsive than frame rate)
@@ -6310,11 +6310,11 @@ const Server = struct {
                     frames_attempted += 1;
                     const t_frame_start = std.time.nanoTimestamp();
 
-                    // Per-panel adaptive FPS: when encoder's quality tier has fps < 30,
+                    // Per-panel adaptive FPS: when encoder's quality tier has fps < 60,
                     // skip frames to match the tier's target rate. This saves encode
                     // bandwidth on degraded connections. Input and keyframe requests bypass.
                     if (panel.video_encoder) |encoder| {
-                        if (encoder.target_fps < 30 and
+                        if (encoder.target_fps < 60 and
                             !panel.force_keyframe and
                             !panel.has_pending_input.load(.acquire))
                         {
@@ -7118,6 +7118,29 @@ fn createTmuxShimDir(allocator: std.mem.Allocator) !TmuxShimResult {
     const file = try std.fs.cwd().createFile(script_path, .{ .mode = 0o755 });
     defer file.close();
     try file.writeAll(tmux_shim_script);
+
+    // Symlink termweb binary so it's accessible from spawned shells without PATH setup.
+    // On Linux, /proc/self/exe always points to the running binary.
+    // On macOS, use std.fs.selfExePath() to resolve the actual path.
+    const termweb_link_path = try std.fmt.allocPrint(allocator, "{s}/termweb", .{bin_dir});
+    defer allocator.free(termweb_link_path);
+
+    if (comptime @import("builtin").os.tag == .linux) {
+        std.posix.symlink("/proc/self/exe", termweb_link_path) catch |err| {
+            std.debug.print("Failed to create termweb symlink: {}\n", .{err});
+        };
+    } else {
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExePath(&exe_buf)) |exe_path| {
+            const exe_z = allocator.dupeZ(u8, exe_path) catch null;
+            defer if (exe_z) |z| allocator.free(z);
+            if (exe_z) |z| {
+                std.posix.symlink(z, termweb_link_path) catch |err| {
+                    std.debug.print("Failed to create termweb symlink: {}\n", .{err});
+                };
+            }
+        } else |_| {}
+    }
 
     std.debug.print("Tmux shim created at {s} (socket: {s})\n", .{ bin_dir, sock_path });
     return .{ .bin_dir = bin_dir, .sock_path = sock_path };
