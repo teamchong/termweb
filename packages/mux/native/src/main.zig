@@ -1743,6 +1743,7 @@ const Server = struct {
     quick_terminal_open: bool,  // Whether quick terminal is open
     inspector_open: bool,  // Whether inspector is open
     shared_va_ctx: if (is_linux) ?video.SharedVaContext else void,  // Shared VA-API context for fast encoder init
+    dma_buf_failed: if (is_linux) bool else void,  // Sticky flag: DMA-BUF export failed, use fallback path
     wake_signal: WakeSignal,  // Event-driven wakeup for render loop (replaces sleep polling)
     goroutine_rt: *goroutine_runtime.Runtime, // M:N goroutine scheduler for file transfer pipeline
 
@@ -1868,6 +1869,7 @@ const Server = struct {
                     break :blk null;
                 };
             } else {},
+            .dma_buf_failed = if (is_linux) false else {},
             .wake_signal = WakeSignal.init() catch return error.WakeSignalInit,
             .goroutine_rt = gor_rt,
             .bw_h264_bytes = if (enable_benchmark) std.atomic.Value(u64).init(0) else {},
@@ -6390,13 +6392,14 @@ const Server = struct {
                         const pixel_height = panel.getPixelHeight();
                         const buffer_size = @as(usize, pixel_width) * @as(usize, pixel_height) * 4;
 
-                        // Lazy init video encoder and BGRA buffer for Linux
+                        // Lazy init video encoder for Linux
                         if (panel.video_encoder == null) {
                             panel.video_encoder = if (self.shared_va_ctx) |*ctx|
                                 video.VideoEncoder.initWithShared(panel.allocator, ctx, pixel_width, pixel_height) catch null
                             else
                                 null;
-                            if (panel.video_encoder != null) {
+                            // Only allocate BGRA buffer if DMA-BUF already known to fail
+                            if (panel.video_encoder != null and self.dma_buf_failed) {
                                 panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch {
                                     panel.video_encoder.?.deinit();
                                     panel.video_encoder = null;
@@ -6405,9 +6408,9 @@ const Server = struct {
                             }
                         }
 
-                        if (panel.video_encoder == null or panel.bgra_buffer == null) {
+                        if (panel.video_encoder == null) {
                             if (panel.ticks_since_connect < 10) {
-                                logToFile(dbg_log, "NO_ENCODER panel={d} tick={d} enc={} buf={}\n", .{ panel.id, panel.ticks_since_connect, panel.video_encoder != null, panel.bgra_buffer != null });
+                                logToFile(dbg_log, "NO_ENCODER panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect, });
                             }
                             continue;
                         }
@@ -6415,9 +6418,11 @@ const Server = struct {
                         // Resize encoder if dimensions changed
                         if (pixel_width != panel.video_encoder.?.source_width or pixel_height != panel.video_encoder.?.source_height) {
                             panel.video_encoder.?.resize(pixel_width, pixel_height) catch continue;
-                            if (panel.bgra_buffer.?.len != buffer_size) {
-                                panel.allocator.free(panel.bgra_buffer.?);
-                                panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch continue;
+                            if (panel.bgra_buffer) |buf| {
+                                if (buf.len != buffer_size) {
+                                    panel.allocator.free(buf);
+                                    panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch continue;
+                                }
                             }
                         }
 
@@ -6429,97 +6434,126 @@ const Server = struct {
 
                         was_keyframe = panel.force_keyframe;
                         const had_input = panel.had_input;
+                        _ = had_input;
 
-                        // Read pixels from OpenGL framebuffer
-                        crash_phase.store(6, .monotonic); // ghostty_surface_read_pixels
-                        const t_read = std.time.nanoTimestamp();
-                        const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
-                        read_elapsed = @intCast(std.time.nanoTimestamp() - t_read);
-                        perf_read_ns += read_elapsed;
+                        // === Zero-copy DMA-BUF path (fast) ===
+                        // Try exporting the GL texture as a DMA-BUF fd and importing directly
+                        // into VA-API. Eliminates glReadPixels (GPU→CPU) and vaMapBuffer (CPU→GPU).
+                        var used_dma_buf = false;
+                        if (!self.dma_buf_failed and panel.video_encoder.?.has_vpp) {
+                            var dma_fd: c_int = -1;
+                            var dma_stride: c_int = 0;
+                            var dma_offset: c_int = 0;
+                            var dma_width: u32 = 0;
+                            var dma_height: u32 = 0;
+                            var dma_fourcc: c_int = 0;
 
-                        if (read_ok) {
-                            if (comptime enable_benchmark) {
-                                _ = self.bw_raw_pixels_bytes.fetchAdd(panel.bgra_buffer.?.len, .monotonic);
-                            }
+                            crash_phase.store(6, .monotonic);
+                            const t_export = std.time.nanoTimestamp();
 
-                            const buf = panel.bgra_buffer.?;
+                            if (c.ghostty_surface_export_dma_buf(
+                                panel.surface,
+                                &dma_fd,
+                                &dma_stride,
+                                &dma_offset,
+                                &dma_width,
+                                &dma_height,
+                                &dma_fourcc,
+                            )) {
+                                read_elapsed = @intCast(std.time.nanoTimestamp() - t_export);
+                                perf_read_ns += read_elapsed;
 
-                            // Frame skip: hash the pixel buffer and skip encoding if unchanged
-                            const frame_hash = std.hash.XxHash64.hash(0, buf);
+                                // No frame hashing with zero-copy — encode every frame.
+                                // At ~5-10ms per frame this stays well within 16ms budget.
+                                panel.consecutive_unchanged = 0;
+                                panel.idle_keyframe_sent = false;
 
-                            // Debug: log frames after input to diagnose stale pixels
-                            if (panel.dbg_input_countdown > 0) {
-                                panel.dbg_input_countdown -= 1;
-                                if (dbg_log != null) {
-                                    // Get cursor info to correlate with pixel content
-                                    var cur_col: u16 = 0;
-                                    var cur_row: u16 = 0;
-                                    var cur_style: u8 = 0;
-                                    var cur_visible: u8 = 0;
-                                    var dbg_cr: u8 = 0;
-                                    var dbg_cg: u8 = 0;
-                                    var dbg_cb: u8 = 0;
-                                    c.ghostty_surface_cursor_info(panel.surface, &cur_col, &cur_row, &cur_style, &cur_visible, &dbg_cr, &dbg_cg, &dbg_cb);
+                                self.queryCursorAndBroadcast(panel);
 
-                                    // Sample pixel at cursor position
-                                    const row_bytes = pixel_width * 4;
-                                    const sample_row: usize = @min(@as(usize, cur_row) * @as(usize, @intCast(c.ghostty_surface_size(panel.surface).cell_height_px)), pixel_height - 1);
-                                    const sample_offset = sample_row * row_bytes + @min(@as(usize, cur_col) * @as(usize, @intCast(c.ghostty_surface_size(panel.surface).cell_width_px)) * 4, row_bytes - 4);
-                                    const px_b = panel.bgra_buffer.?[sample_offset];
-                                    const px_g = panel.bgra_buffer.?[sample_offset + 1];
-                                    const px_r = panel.bgra_buffer.?[sample_offset + 2];
-                                    const px_a = panel.bgra_buffer.?[sample_offset + 3];
-
-                                    // First non-black pixel in row 0
-                                    var first_nonblack: usize = 0;
-                                    for (0..@min(pixel_width, 200)) |x| {
-                                        const off = x * 4;
-                                        if (panel.bgra_buffer.?[off] != 0 or panel.bgra_buffer.?[off + 1] != 0 or panel.bgra_buffer.?[off + 2] != 0) {
-                                            first_nonblack = x;
-                                            break;
-                                        }
-                                    }
-
-                                    logToFile(dbg_log, "INPUT_FRAME panel={d} cd={d} hash={x} prev={x} match={} cursor=({d},{d}) px@cursor=({d},{d},{d},{d}) first_nonblack_x={d}\n", .{
-                                        panel.id, panel.dbg_input_countdown, frame_hash, panel.last_frame_hash, @intFromBool(frame_hash == panel.last_frame_hash),
-                                        cur_col, cur_row, px_r, px_g, px_b, px_a, first_nonblack,
-                                    });
+                                crash_phase.store(7, .monotonic); // video encoder
+                                const t_enc = std.time.nanoTimestamp();
+                                if (panel.video_encoder.?.encodeFromDmaBuf(
+                                    dma_fd,
+                                    dma_width,
+                                    dma_height,
+                                    dma_stride,
+                                    dma_offset,
+                                    dma_fourcc,
+                                    panel.force_keyframe,
+                                ) catch null) |result| {
+                                    frame_data = result.data;
+                                    panel.force_keyframe = false;
+                                    used_dma_buf = true;
+                                    logToFile(dbg_log, "DMA_ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
+                                } else {
+                                    // DMA-BUF encode failed — fall back to CPU path permanently
+                                    std.debug.print("DMA-BUF encode failed, falling back to CPU path\n", .{});
+                                    self.dma_buf_failed = true;
                                 }
+                                enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
+                                perf_encode_ns += enc_elapsed;
+
+                                // Close the DMA-BUF fd (VA-API import duplicates it internally)
+                                _ = std.posix.close(@intCast(dma_fd));
+                            } else {
+                                // DMA-BUF export not available — use CPU path permanently
+                                if (panel.ticks_since_connect < 5) {
+                                    std.debug.print("DMA-BUF export unavailable, using CPU readback path\n", .{});
+                                }
+                                self.dma_buf_failed = true;
+                            }
+                        }
+
+                        // === Fallback: glReadPixels + CPU upload path ===
+                        if (!used_dma_buf) {
+                            // Ensure BGRA buffer is allocated for CPU path
+                            if (panel.bgra_buffer == null) {
+                                panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch continue;
                             }
 
-                            if (frame_hash == panel.last_frame_hash and !panel.force_keyframe) {
-                                panel.consecutive_unchanged += 1;
-                                if (panel.ticks_since_connect < 10)
-                                    logToFile(dbg_log, "HASH_SKIP panel={d} tick={d} hash={x}\n", .{ panel.id, panel.ticks_since_connect, frame_hash });
-                                // Cursor may have moved even though pixels didn't change
-                                // (e.g., typing spaces). Only query when there was input.
-                                if (had_input) self.queryCursorAndBroadcast(panel);
-                                continue;
-                            }
-                            panel.consecutive_unchanged = 0;
-                            panel.idle_keyframe_sent = false;
-                            panel.last_frame_hash = frame_hash;
+                            crash_phase.store(6, .monotonic); // ghostty_surface_read_pixels
+                            const t_read = std.time.nanoTimestamp();
+                            const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
+                            read_elapsed = @intCast(std.time.nanoTimestamp() - t_read);
+                            perf_read_ns += read_elapsed;
 
-                            // Cursor query: frame changed, always update cursor
-                            self.queryCursorAndBroadcast(panel);
+                            if (read_ok) {
+                                if (comptime enable_benchmark) {
+                                    _ = self.bw_raw_pixels_bytes.fetchAdd(panel.bgra_buffer.?.len, .monotonic);
+                                }
 
-                            // Pass explicit dimensions to ensure encoder matches frame size
-                            crash_phase.store(7, .monotonic); // video encoder
-                            const t_enc = std.time.nanoTimestamp();
-                            if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
-                                frame_data = result.data;
-                                panel.force_keyframe = false;
-                                logToFile(dbg_log, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
+                                const buf = panel.bgra_buffer.?;
+
+                                // Frame skip: hash the pixel buffer and skip encoding if unchanged
+                                const frame_hash = std.hash.XxHash64.hash(0, buf);
+
+                                if (frame_hash == panel.last_frame_hash and !panel.force_keyframe) {
+                                    panel.consecutive_unchanged += 1;
+                                    continue;
+                                }
+                                panel.consecutive_unchanged = 0;
+                                panel.idle_keyframe_sent = false;
+                                panel.last_frame_hash = frame_hash;
+
+                                self.queryCursorAndBroadcast(panel);
+
+                                crash_phase.store(7, .monotonic); // video encoder
+                                const t_enc = std.time.nanoTimestamp();
+                                if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
+                                    frame_data = result.data;
+                                    panel.force_keyframe = false;
+                                    logToFile(dbg_log, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
+                                } else {
+                                    if (panel.ticks_since_connect < 10)
+                                        logToFile(dbg_log, "ENCODE_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
+                                }
+                                enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
+                                perf_encode_ns += enc_elapsed;
                             } else {
                                 if (panel.ticks_since_connect < 10)
-                                    logToFile(dbg_log, "ENCODE_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
+                                    logToFile(dbg_log, "READ_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
                             }
-                            enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
-                            perf_encode_ns += enc_elapsed;
-                        } else {
-                            if (panel.ticks_since_connect < 10)
-                                logToFile(dbg_log, "READ_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
-                        }
+                        } // if (!used_dma_buf)
                     }
 
                     // Send frame to all H264 clients (multiplexed by panel_id)

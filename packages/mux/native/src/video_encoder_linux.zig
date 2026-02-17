@@ -20,6 +20,7 @@ const c = @cImport({
     @cInclude("va/va.h");
     @cInclude("va/va_vpp.h");
     @cInclude("va/va_drm.h");
+    @cInclude("va/va_drmcommon.h");
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
 });
@@ -1073,21 +1074,35 @@ pub const VideoEncoder = struct {
 
         // Fast path: no downscale needed (common case)
         if (src_width == dst_width and src_height <= dst_height) {
-            var y: u32 = 0;
-            while (y < src_height) : (y += 1) {
-                const src_row = @as(usize, y) * src_stride_px;
-                const dst_row = @as(usize, y) * dst_stride_px;
-                // Direct copy — BGRA pixels to BGRX surface (alpha=X, ignored)
+            // Bulk copy when pitch == width (no row padding) — single memcpy
+            // to write-combined GPU memory is much faster than per-row copies.
+            if (dst_stride_px == dst_width) {
+                const total_bytes = @as(usize, src_height) * @as(usize, dst_width) * 4;
                 @memcpy(
-                    @as([*]u8, @ptrCast(&dst_pixels[dst_row]))[0 .. dst_width * 4],
-                    @as([*]const u8, @ptrCast(&src_pixels[src_row]))[0 .. dst_width * 4],
+                    @as([*]u8, @ptrCast(dst_pixels))[0..total_bytes],
+                    @as([*]const u8, @ptrCast(src_pixels))[0..total_bytes],
                 );
-            }
-            // Pad remaining rows (16-pixel alignment padding) with black
-            var y2: u32 = src_height;
-            while (y2 < dst_height) : (y2 += 1) {
-                const dst_row = @as(usize, y2) * dst_stride_px;
-                @memset(@as([*]u8, @ptrCast(&dst_pixels[dst_row]))[0 .. dst_width * 4], 0);
+                // Pad remaining rows with black (16-pixel alignment)
+                if (src_height < dst_height) {
+                    const pad_bytes = @as(usize, dst_height - src_height) * @as(usize, dst_width) * 4;
+                    @memset(@as([*]u8, @ptrCast(dst_pixels))[total_bytes..][0..pad_bytes], 0);
+                }
+            } else {
+                var y: u32 = 0;
+                while (y < src_height) : (y += 1) {
+                    const src_row = @as(usize, y) * src_stride_px;
+                    const dst_row = @as(usize, y) * dst_stride_px;
+                    @memcpy(
+                        @as([*]u8, @ptrCast(&dst_pixels[dst_row]))[0 .. dst_width * 4],
+                        @as([*]const u8, @ptrCast(&src_pixels[src_row]))[0 .. dst_width * 4],
+                    );
+                }
+                // Pad remaining rows (16-pixel alignment padding) with black
+                var y2: u32 = src_height;
+                while (y2 < dst_height) : (y2 += 1) {
+                    const dst_row = @as(usize, y2) * dst_stride_px;
+                    @memset(@as([*]u8, @ptrCast(&dst_pixels[dst_row]))[0 .. dst_width * 4], 0);
+                }
             }
         } else {
             // Downscale path with nearest-neighbor sampling
@@ -1496,6 +1511,297 @@ pub const VideoEncoder = struct {
         _ = iosurface_ptr;
         _ = force_keyframe;
         return error.NotSupported;
+    }
+
+    /// Import a DMA-BUF fd as a BGRX VASurface for VPP input.
+    /// Returns the imported VASurfaceID or error.
+    fn importDmaBufSurface(self: *VideoEncoder, fd: c_int, width: u32, height: u32, stride: c_int, offset: c_int, fourcc: c_int) VaError!c.VASurfaceID {
+        const va_display = self.shared.va_display;
+
+        // Use VASurfaceAttribExternalBuffers for DRM PRIME import
+        var ext_buf = std.mem.zeroes(c.VASurfaceAttribExternalBuffers);
+        ext_buf.pixel_format = @bitCast(@as(u32, @bitCast(fourcc)));
+        ext_buf.width = width;
+        ext_buf.height = height;
+        ext_buf.data_size = @as(c_uint, @intCast(stride)) * height;
+        ext_buf.num_planes = 1;
+        ext_buf.pitches[0] = @intCast(stride);
+        ext_buf.offsets[0] = @intCast(offset);
+        ext_buf.num_buffers = 1;
+        // The fd needs to be passed as a uintptr_t in the buffers array
+        var fd_as_handle: c_ulong = @intCast(@as(c_uint, @bitCast(fd)));
+        ext_buf.buffers = @ptrCast(&fd_as_handle);
+
+        var attribs = [_]c.VASurfaceAttrib{
+            .{
+                .type = c.VASurfaceAttribMemoryType,
+                .flags = c.VA_SURFACE_ATTRIB_SETTABLE,
+                .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = @as(c_int, @bitCast(@as(u32, c.VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME))) } },
+            },
+            .{
+                .type = c.VASurfaceAttribExternalBufferDescriptor,
+                .flags = c.VA_SURFACE_ATTRIB_SETTABLE,
+                .value = .{ .type = c.VAGenericValueTypePointer, .value = .{ .p = @ptrCast(&ext_buf) } },
+            },
+        };
+
+        var imported_surface: c.VASurfaceID = c.VA_INVALID_SURFACE;
+        const status = c.vaCreateSurfaces(
+            va_display,
+            c.VA_RT_FORMAT_RGB32,
+            width,
+            height,
+            @ptrCast(&imported_surface),
+            1,
+            &attribs,
+            2,
+        );
+        if (status != c.VA_STATUS_SUCCESS) {
+            std.debug.print("ENCODER: DMA-BUF import vaCreateSurfaces failed: {}\n", .{status});
+            return error.VaSurfacesFailed;
+        }
+
+        return imported_surface;
+    }
+
+    /// Zero-copy encode: import DMA-BUF as VASurface, VPP color convert, H.264 encode.
+    /// No CPU pixel copies. The DMA-BUF fd is NOT consumed (caller must close it).
+    pub fn encodeFromDmaBuf(self: *VideoEncoder, fd: c_int, width: u32, height: u32, stride: c_int, offset: c_int, fourcc: c_int, force_keyframe: bool) VaError!?EncodeResult {
+        if (!self.has_vpp) {
+            // VPP required for BGRX→NV12 conversion
+            return error.NotSupported;
+        }
+
+        const va_display = self.shared.va_display;
+        const t0 = std.time.nanoTimestamp();
+
+        // Auto-resize encode dimensions if source changed
+        if (width != self.source_width or height != self.source_height) {
+            self.resize(width, height) catch |err| {
+                std.debug.print("ENCODER: DMA-BUF auto-resize failed: {}\n", .{err});
+                return error.VaSurfacesFailed;
+            };
+        }
+
+        const is_keyframe = force_keyframe or (self.frame_count == 0) or
+            (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
+
+        if (is_keyframe) {
+            self.frame_count = 0;
+        }
+
+        // Import the DMA-BUF as a BGRX VASurface
+        const imported = self.importDmaBufSurface(fd, width, height, stride, offset, fourcc) catch |err| {
+            std.debug.print("ENCODER: DMA-BUF import failed: {}\n", .{err});
+            return err;
+        };
+        defer _ = c.vaDestroySurfaces(va_display, @constCast(@ptrCast(&imported)), 1);
+
+        // VPP: convert imported BGRX surface → NV12 src_surface (with scaling if needed)
+        var pipeline_param = std.mem.zeroes(c.VAProcPipelineParameterBuffer);
+        pipeline_param.surface = imported;
+        pipeline_param.surface_color_standard = c.VAProcColorStandardNone;
+        pipeline_param.output_color_standard = c.VAProcColorStandardBT601;
+
+        var pipeline_buf: c.VABufferID = 0;
+        var status = vaCreateBuffer(
+            va_display,
+            self.vpp_context,
+            c.VAProcPipelineParameterBufferType,
+            @sizeOf(c.VAProcPipelineParameterBuffer),
+            1,
+            &pipeline_param,
+            &pipeline_buf,
+        );
+        if (status != c.VA_STATUS_SUCCESS) {
+            std.debug.print("ENCODER: DMA-BUF VPP buffer failed: {}\n", .{status});
+            return error.VaBufferFailed;
+        }
+        defer _ = vaDestroyBuffer(va_display, pipeline_buf);
+
+        status = vaBeginPicture(va_display, self.vpp_context, self.src_surface);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaBeginPictureFailed;
+
+        var bufs = [_]c.VABufferID{pipeline_buf};
+        status = vaRenderPicture(va_display, self.vpp_context, &bufs, 1);
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = vaEndPicture(va_display, self.vpp_context);
+            return error.VaRenderFailed;
+        }
+
+        status = vaEndPicture(va_display, self.vpp_context);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaEndPictureFailed;
+
+        // Sync VPP output before encoding
+        status = c.vaSyncSurface(va_display, self.src_surface);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaSyncFailed;
+
+        const t1 = std.time.nanoTimestamp();
+
+        // Now encode (same as encodeWithDimensions from the vaBeginPicture step onwards)
+        status = vaBeginPicture(va_display, self.va_context, self.src_surface);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaBeginPictureFailed;
+
+        // Create sequence parameter buffer
+        var seq_param: [SEQ_PARAM_SIZE]u8 = std.mem.zeroes([SEQ_PARAM_SIZE]u8);
+        writeU8(&seq_param, SEQ_seq_parameter_set_id, 0);
+        writeU8(&seq_param, SEQ_level_idc, 52);
+        writeU32(&seq_param, SEQ_intra_period, self.keyframe_interval);
+        writeU32(&seq_param, SEQ_intra_idr_period, self.keyframe_interval);
+        writeU32(&seq_param, SEQ_ip_period, 1);
+        writeU32(&seq_param, SEQ_bits_per_second, self.current_bitrate);
+        writeU32(&seq_param, SEQ_max_num_ref_frames, 1);
+        writeU16(&seq_param, SEQ_picture_width_in_mbs, @intCast(self.width / 16));
+        writeU16(&seq_param, SEQ_picture_height_in_mbs, @intCast(self.height / 16));
+        writeU32(&seq_param, SEQ_seq_fields, 0x4025);
+        writeU32(&seq_param, SEQ_time_scale, 60);
+        writeU32(&seq_param, SEQ_num_units_in_tick, 1);
+
+        var seq_buf: c.VABufferID = 0;
+        status = vaCreateBuffer(va_display, self.va_context, VAEncSequenceParameterBufferType, SEQ_PARAM_SIZE, 1, &seq_param, &seq_buf);
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = vaEndPicture(va_display, self.va_context);
+            return error.VaSeqBufferFailed;
+        }
+        defer _ = vaDestroyBuffer(va_display, seq_buf);
+
+        // Create picture parameter buffer
+        var pic_param: [PIC_PARAM_SIZE]u8 = std.mem.zeroes([PIC_PARAM_SIZE]u8);
+        writeU32(&pic_param, PIC_CurrPic + PICH264_picture_id, self.src_surface);
+        writeI32(&pic_param, PIC_CurrPic + PICH264_TopFieldOrderCnt, @intCast(self.frame_count * 2));
+        writeU32(&pic_param, PIC_coded_buf, self.coded_buf);
+        writeU8(&pic_param, PIC_pic_parameter_set_id, 0);
+        writeU8(&pic_param, PIC_seq_parameter_set_id, 0);
+        writeU16(&pic_param, PIC_frame_num, if (is_keyframe) 0 else @intCast(@mod(self.frame_count, 16)));
+        writeU8(&pic_param, PIC_pic_init_qp, 20);
+        writeU8(&pic_param, PIC_num_ref_idx_l0_active_minus1, 0);
+        writeU32(&pic_param, PIC_pic_fields, if (is_keyframe) 0x03 else 0x02);
+
+        if (!is_keyframe) {
+            writeU32(&pic_param, PIC_ReferenceFrames + PICH264_picture_id, self.ref_surface);
+            writeU32(&pic_param, PIC_ReferenceFrames + PICH264_flags, VA_PICTURE_H264_SHORT_TERM_REFERENCE);
+        }
+        var i: usize = if (is_keyframe) 0 else 1;
+        while (i < 16) : (i += 1) {
+            const ref_offset = PIC_ReferenceFrames + i * PICTURE_H264_SIZE;
+            writeU32(&pic_param, ref_offset + PICH264_picture_id, c.VA_INVALID_SURFACE);
+            writeU32(&pic_param, ref_offset + PICH264_flags, VA_PICTURE_H264_INVALID);
+        }
+
+        var pic_buf: c.VABufferID = 0;
+        status = vaCreateBuffer(va_display, self.va_context, VAEncPictureParameterBufferType, PIC_PARAM_SIZE, 1, &pic_param, &pic_buf);
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = vaEndPicture(va_display, self.va_context);
+            return error.VaPicBufferFailed;
+        }
+        defer _ = vaDestroyBuffer(va_display, pic_buf);
+
+        // Create slice parameter buffer
+        var slice_param: [SLICE_PARAM_SIZE]u8 = std.mem.zeroes([SLICE_PARAM_SIZE]u8);
+        writeU32(&slice_param, SLICE_macroblock_address, 0);
+        writeU32(&slice_param, SLICE_num_macroblocks, (self.width / 16) * (self.height / 16));
+        writeU32(&slice_param, SLICE_macroblock_info, c.VA_INVALID_ID);
+        writeU8(&slice_param, SLICE_slice_type, if (is_keyframe) 2 else 0);
+        writeU8(&slice_param, SLICE_pic_parameter_set_id, 0);
+        writeU16(&slice_param, SLICE_idr_pic_id, if (is_keyframe) @intCast(@mod(self.frame_count, 256)) else 0);
+        writeU16(&slice_param, SLICE_pic_order_cnt_lsb, @intCast(@mod(self.frame_count * 2, 256)));
+        writeU8(&slice_param, SLICE_num_ref_idx_l0_active_minus1, 0);
+        writeU8(&slice_param, SLICE_num_ref_idx_l1_active_minus1, 0);
+
+        var j: usize = 0;
+        while (j < 32) : (j += 1) {
+            const ref0_offset = SLICE_RefPicList0 + j * PICTURE_H264_SIZE;
+            writeU32(&slice_param, ref0_offset + PICH264_picture_id, c.VA_INVALID_SURFACE);
+            writeU32(&slice_param, ref0_offset + PICH264_flags, VA_PICTURE_H264_INVALID);
+            const ref1_offset = SLICE_RefPicList1 + j * PICTURE_H264_SIZE;
+            writeU32(&slice_param, ref1_offset + PICH264_picture_id, c.VA_INVALID_SURFACE);
+            writeU32(&slice_param, ref1_offset + PICH264_flags, VA_PICTURE_H264_INVALID);
+        }
+
+        if (!is_keyframe) {
+            writeU32(&slice_param, SLICE_RefPicList0 + PICH264_picture_id, self.ref_surface);
+            writeU32(&slice_param, SLICE_RefPicList0 + PICH264_flags, VA_PICTURE_H264_SHORT_TERM_REFERENCE);
+        }
+
+        writeU8(&slice_param, SLICE_cabac_init_idc, 0);
+        writeI8(&slice_param, SLICE_slice_qp_delta, -4);
+        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 0);
+        writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 3);
+        writeI8(&slice_param, SLICE_slice_beta_offset_div2, 3);
+
+        var slice_buf: c.VABufferID = 0;
+        status = vaCreateBuffer(va_display, self.va_context, VAEncSliceParameterBufferType, SLICE_PARAM_SIZE, 1, &slice_param, &slice_buf);
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = vaEndPicture(va_display, self.va_context);
+            return error.VaSliceBufferFailed;
+        }
+        defer _ = vaDestroyBuffer(va_display, slice_buf);
+
+        var render_bufs = [_]c.VABufferID{ seq_buf, pic_buf, slice_buf };
+        status = vaRenderPicture(va_display, self.va_context, &render_bufs, 3);
+        if (status != c.VA_STATUS_SUCCESS) {
+            _ = vaEndPicture(va_display, self.va_context);
+            return error.VaRenderFailed;
+        }
+
+        status = vaEndPicture(va_display, self.va_context);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaEndPictureFailed;
+
+        // Sync GPU encode
+        status = c.vaSyncSurface(va_display, self.src_surface);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaSyncFailed;
+        const t2 = std.time.nanoTimestamp();
+
+        // Read encoded output
+        var coded_seg_ptr: ?*anyopaque = null;
+        status = c.vaMapBuffer(va_display, self.coded_buf, &coded_seg_ptr);
+        if (status != c.VA_STATUS_SUCCESS) return error.VaMapCodedFailed;
+
+        self.output_len = 0;
+        if (is_keyframe) {
+            @memcpy(self.output_buffer[0..self.sps_len], self.sps_data[0..self.sps_len]);
+            self.output_len = self.sps_len;
+            @memcpy(self.output_buffer[self.output_len..][0..self.pps_len], self.pps_data[0..self.pps_len]);
+            self.output_len += self.pps_len;
+        }
+
+        if (coded_seg_ptr) |ptr| {
+            const coded_seg: *VACodedBufferSegment = @ptrCast(@alignCast(ptr));
+            var current_seg: ?*VACodedBufferSegment = coded_seg;
+            while (current_seg) |seg| {
+                const seg_size = seg.size;
+                if (self.output_len + seg_size <= self.output_buffer.len) {
+                    if (seg.buf) |buf| {
+                        const src_data: [*]const u8 = @ptrCast(buf);
+                        @memcpy(self.output_buffer[self.output_len..][0..seg_size], src_data[0..seg_size]);
+                        self.output_len += seg_size;
+                    }
+                }
+                current_seg = seg.next;
+            }
+        }
+
+        _ = c.vaUnmapBuffer(va_display, self.coded_buf);
+
+        // Swap surfaces for reference frame tracking
+        const tmp = self.ref_surface;
+        self.ref_surface = self.src_surface;
+        self.src_surface = tmp;
+        self.frame_count += 1;
+
+        // Log timing — upload time should be ~0ms (zero-copy)
+        if (@mod(self.frame_count, 30) == 0) {
+            const ns = std.time.ns_per_ms;
+            logEncTiming(0, @divFloor(t1 - t0, ns), @divFloor(t2 - t1, ns), self.width, self.height);
+        }
+
+        if (self.output_len > 0) {
+            return EncodeResult{
+                .data = self.output_buffer[0..self.output_len],
+                .is_keyframe = is_keyframe,
+            };
+        }
+        return null;
     }
 
     fn logEncTiming(sync_ms: i128, upload_ms: i128, submit_ms: i128, w: u32, h: u32) void {

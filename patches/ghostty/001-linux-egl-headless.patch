@@ -1,5 +1,5 @@
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 3d3973084..1e073a122 100644
+index 3d3973084..f4215821c 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
 @@ -38,6 +38,7 @@ typedef enum {
@@ -46,13 +46,15 @@ index 3d3973084..1e073a122 100644
  void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
  void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
  ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
-@@ -1146,6 +1159,13 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
+@@ -1146,6 +1159,15 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
  bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
  #endif
  
 +#ifdef __linux__
 +// Read pixels from the OpenGL framebuffer (for video encoding)
 +bool ghostty_surface_read_pixels(ghostty_surface_t, uint8_t*, size_t);
++// Export FBO texture as DMA-BUF fd for zero-copy GPU encode
++bool ghostty_surface_export_dma_buf(ghostty_surface_t, int* fd, int* stride, int* offset, uint32_t* width, uint32_t* height, int* fourcc);
 +// Get cursor position, style, visibility, and color for frontend rendering
 +void ghostty_surface_cursor_info(ghostty_surface_t, uint16_t*, uint16_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*);
 +#endif
@@ -62,10 +64,10 @@ index 3d3973084..1e073a122 100644
  void ghostty_set_window_background_blur(ghostty_app_t, void*);
 diff --git a/src/apprt/egl_headless.zig b/src/apprt/egl_headless.zig
 new file mode 100644
-index 000000000..c68a974d3
+index 000000000..84546dbe8
 --- /dev/null
 +++ b/src/apprt/egl_headless.zig
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,782 @@
 +const std = @import("std");
 +const builtin = @import("builtin");
 +const posix = std.posix;
@@ -132,7 +134,13 @@ index 000000000..c68a974d3
 +    pub const EGLConfig = ?*anyopaque;
 +    pub const EGLContext = ?*anyopaque;
 +    pub const EGLSurface = ?*anyopaque;
++    pub const EGLImage = ?*anyopaque;
 +    pub const EGLint = c_int;
++
++    // EGL_KHR_image_base
++    pub const EGL_GL_TEXTURE_2D_KHR: c_int = 0x30B1;
++    pub const EGL_IMAGE_PRESERVED_KHR: c_int = 0x30D2;
++    pub const EGL_NO_IMAGE_KHR: EGLImage = null;
 +
 +    var lib: ?std.DynLib = null;
 +
@@ -152,6 +160,14 @@ index 000000000..c68a974d3
 +    // EGL_EXT_device_enumeration / EGL_EXT_platform_device
 +    pub var eglQueryDevicesEXT: ?*const fn (c_int, [*]?*anyopaque, *c_int) callconv(.c) c_int = null;
 +    pub var eglGetPlatformDisplayEXT: ?*const fn (c_int, ?*anyopaque, [*]const c_int) callconv(.c) EGLDisplay = null;
++
++    // EGL_KHR_image_base — for creating EGLImage from GL texture
++    pub var eglCreateImageKHR: ?*const fn (EGLDisplay, EGLContext, c_int, ?*anyopaque, ?[*]const EGLint) callconv(.c) EGLImage = null;
++    pub var eglDestroyImageKHR: ?*const fn (EGLDisplay, EGLImage) callconv(.c) c_int = null;
++
++    // EGL_MESA_image_dma_buf_export — for exporting EGLImage as DMA-BUF fd
++    pub var eglExportDMABUFImageQueryMESA: ?*const fn (EGLDisplay, EGLImage, *c_int, *c_int, ?*u64) callconv(.c) c_int = null;
++    pub var eglExportDMABUFImageMESA: ?*const fn (EGLDisplay, EGLImage, *c_int, *EGLint, *EGLint) callconv(.c) c_int = null;
 +
 +    pub fn loadEgl() !void {
 +        if (lib != null) return;
@@ -177,6 +193,22 @@ index 000000000..c68a974d3
 +        }
 +        if (eglGetProcAddress("eglGetPlatformDisplayEXT")) |ptr| {
 +            eglGetPlatformDisplayEXT = @ptrCast(ptr);
++        }
++
++        // EGL_KHR_image_base — for DMA-BUF zero-copy encode path
++        if (eglGetProcAddress("eglCreateImageKHR")) |ptr| {
++            eglCreateImageKHR = @ptrCast(ptr);
++        }
++        if (eglGetProcAddress("eglDestroyImageKHR")) |ptr| {
++            eglDestroyImageKHR = @ptrCast(ptr);
++        }
++
++        // EGL_MESA_image_dma_buf_export — for exporting texture as DMA-BUF fd
++        if (eglGetProcAddress("eglExportDMABUFImageQueryMESA")) |ptr| {
++            eglExportDMABUFImageQueryMESA = @ptrCast(ptr);
++        }
++        if (eglGetProcAddress("eglExportDMABUFImageMESA")) |ptr| {
++            eglExportDMABUFImageMESA = @ptrCast(ptr);
 +        }
 +    }
 +};
@@ -637,6 +669,85 @@ index 000000000..c68a974d3
 +    }
 +}
 +
++/// Result of a DMA-BUF export operation.
++pub const DmaBufExport = struct {
++    fd: c_int,
++    stride: c_int,
++    offset: c_int,
++    width: u32,
++    height: u32,
++    fourcc: c_int,
++};
++
++/// Check if DMA-BUF export is available (all required EGL extensions loaded).
++pub fn hasDmaBufExport() bool {
++    return c.eglCreateImageKHR != null and
++        c.eglDestroyImageKHR != null and
++        c.eglExportDMABUFImageQueryMESA != null and
++        c.eglExportDMABUFImageMESA != null;
++}
++
++/// Export an OpenGL texture as a DMA-BUF file descriptor.
++/// The caller must close the returned fd after VA-API import.
++pub fn exportDmaBuf(texture_id: c_uint, width: u32, height: u32) ?DmaBufExport {
++    const ctx = global_egl_context orelse return null;
++
++    if (!hasDmaBufExport()) return null;
++
++    // Ensure GL context is current
++    if (!makeCurrentOnThread()) return null;
++
++    // Create EGLImage from the GL texture
++    const attribs = [_]c.EGLint{
++        c.EGL_IMAGE_PRESERVED_KHR, c.EGL_TRUE,
++        c.EGL_NONE,
++    };
++    // EGL expects the texture ID as an EGLClientBuffer (pointer-sized opaque handle)
++    const client_buffer: ?*anyopaque = @ptrFromInt(@as(usize, texture_id));
++    const image = c.eglCreateImageKHR.?(ctx.display, ctx.context, c.EGL_GL_TEXTURE_2D_KHR, client_buffer, &attribs);
++    if (image == c.EGL_NO_IMAGE_KHR) {
++        log.warn("exportDmaBuf: eglCreateImageKHR failed", .{});
++        return null;
++    }
++    defer _ = c.eglDestroyImageKHR.?(ctx.display, image);
++
++    // Query the DMA-BUF format
++    var fourcc: c_int = 0;
++    var num_planes: c_int = 0;
++    if (c.eglExportDMABUFImageQueryMESA.?(ctx.display, image, &fourcc, &num_planes, null) != c.EGL_TRUE) {
++        log.warn("exportDmaBuf: eglExportDMABUFImageQueryMESA failed", .{});
++        return null;
++    }
++
++    if (num_planes != 1) {
++        log.warn("exportDmaBuf: expected 1 plane, got {d}", .{num_planes});
++        return null;
++    }
++
++    // Export the DMA-BUF fd, stride, offset
++    var fd: c_int = -1;
++    var stride: c.EGLint = 0;
++    var offset: c.EGLint = 0;
++    if (c.eglExportDMABUFImageMESA.?(ctx.display, image, &fd, &stride, &offset) != c.EGL_TRUE) {
++        log.warn("exportDmaBuf: eglExportDMABUFImageMESA failed", .{});
++        return null;
++    }
++
++    if (fd < 0) {
++        log.warn("exportDmaBuf: invalid fd returned", .{});
++        return null;
++    }
++
++    return DmaBufExport{
++        .fd = fd,
++        .stride = stride,
++        .offset = offset,
++        .width = width,
++        .height = height,
++        .fourcc = fourcc,
++    };
++}
++
 +/// Set the OpenGL viewport size. Must be called when surface size changes.
 +pub fn setViewportSize(width: u32, height: u32) void {
 +    if (!makeCurrentOnThread()) {
@@ -740,7 +851,7 @@ index 000000000..c68a974d3
 +    return true;
 +}
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index dcf8a6357..654db8963 100644
+index dcf8a6357..7632ae310 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -26,6 +26,9 @@ const log = std.log.scoped(.embedded_window);
@@ -948,7 +1059,7 @@ index dcf8a6357..654db8963 100644
      /// Update the occlusion state of a surface.
      export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
          surface.occlusionCallback(visible);
-@@ -2204,4 +2318,83 @@ pub const CAPI = struct {
+@@ -2204,4 +2318,123 @@ pub const CAPI = struct {
              }
          }
      };
@@ -1022,6 +1133,46 @@ index dcf8a6357..654db8963 100644
 +                const surface_id = @intFromPtr(ptr);
 +
 +                return egl_headless.readPixels(buffer, buffer_len, width, height, fbo_id, surface_id);
++            }
++            return false;
++        }
++
++        /// Export the surface's FBO texture as a DMA-BUF for zero-copy GPU encode.
++        /// Returns true on success, filling out_fd/out_stride/out_offset/out_fourcc.
++        /// The caller must close the fd after use.
++        export fn ghostty_surface_export_dma_buf(
++            ptr: *Surface,
++            out_fd: *c_int,
++            out_stride: *c_int,
++            out_offset: *c_int,
++            out_width: *u32,
++            out_height: *u32,
++            out_fourcc: *c_int,
++        ) bool {
++            const width = ptr.size.width;
++            const height = ptr.size.height;
++
++            if (width == 0 or height == 0) return false;
++
++            if (comptime builtin.target.os.tag == .linux) {
++                const egl_headless = @import("egl_headless.zig");
++
++                // Get texture ID from the renderer's last_target
++                const texture_id: c_uint = blk: {
++                    const last_target = ptr.core_surface.renderer.api.last_target orelse {
++                        return false;
++                    };
++                    break :blk last_target.texture.id;
++                };
++
++                const result = egl_headless.exportDmaBuf(texture_id, width, height) orelse return false;
++                out_fd.* = result.fd;
++                out_stride.* = result.stride;
++                out_offset.* = result.offset;
++                out_width.* = result.width;
++                out_height.* = result.height;
++                out_fourcc.* = result.fourcc;
++                return true;
 +            }
 +            return false;
 +        }
@@ -1262,3 +1413,75 @@ index c8acebd0f..4f0ca6018 100644
                      const wide = state.cursor.cell.wide;
  
                      self.uniforms.cursor_pos = .{
+diff --git a/src/renderer/opengl/Target.zig b/src/renderer/opengl/Target.zig
+index 5c6d818f1..ebfcdcda3 100644
+--- a/src/renderer/opengl/Target.zig
++++ b/src/renderer/opengl/Target.zig
+@@ -1,6 +1,7 @@
+ //! Represents a render target.
+ //!
+-//! In this case, an OpenGL renderbuffer-backed framebuffer.
++//! Uses a texture-backed framebuffer to enable DMA-BUF export for
++//! zero-copy GPU encode (EGL_MESA_image_dma_buf_export requires a texture).
+ const Self = @This();
+ 
+ const std = @import("std");
+@@ -16,15 +17,15 @@ pub const Options = struct {
+     /// Desired height
+     height: usize,
+ 
+-    /// Internal format for the renderbuffer.
++    /// Internal format for the texture.
+     internal_format: gl.Texture.InternalFormat,
+ };
+ 
+ /// The underlying `gl.Framebuffer` instance.
+ framebuffer: gl.Framebuffer,
+ 
+-/// The underlying `gl.Renderbuffer` instance.
+-renderbuffer: gl.Renderbuffer,
++/// The underlying `gl.Texture` instance (used as color attachment for DMA-BUF export).
++texture: gl.Texture,
+ 
+ /// Current width of this target.
+ width: usize,
+@@ -32,23 +33,26 @@ width: usize,
+ height: usize,
+ 
+ pub fn init(opts: Options) !Self {
+-    const rbo = try gl.Renderbuffer.create();
+-    const bound_rbo = try rbo.bind();
+-    defer bound_rbo.unbind();
+-    try bound_rbo.storage(
++    const tex = try gl.Texture.create();
++    const bound_tex = try tex.bind(.@"2D");
++    try bound_tex.image2D(
++        0,
+         opts.internal_format,
+         @intCast(opts.width),
+         @intCast(opts.height),
++        .rgba,
++        .UnsignedByte,
++        null,
+     );
+ 
+     const fbo = try gl.Framebuffer.create();
+     const bound_fbo = try fbo.bind(.framebuffer);
+     defer bound_fbo.unbind();
+-    try bound_fbo.renderbuffer(.color0, rbo);
++    try bound_fbo.texture2D(.color0, .@"2D", tex, 0);
+ 
+     return .{
+         .framebuffer = fbo,
+-        .renderbuffer = rbo,
++        .texture = tex,
+         .width = opts.width,
+         .height = opts.height,
+     };
+@@ -56,5 +60,5 @@ pub fn init(opts: Options) !Self {
+ 
+ pub fn deinit(self: *Self) void {
+     self.framebuffer.destroy();
+-    self.renderbuffer.destroy();
++    self.texture.destroy();
+ }
