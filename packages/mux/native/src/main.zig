@@ -630,7 +630,6 @@ const Panel = struct {
     inspector_tab_len: u8,
     last_iosurface_seed: u32, // For detecting IOSurface/SharedMemory changes
     last_frame_hash: u64, // For detecting unchanged frames on Linux
-    last_sentinels: [8]u32, // Fast sentinel pixels for pre-hash skip check
     last_frame_time: i128, // For per-panel adaptive FPS control
     last_tick_time: i128, // For rate limiting panel.tick()
     ticks_since_connect: u32, // Track frames since connection (for initial render delay)
@@ -799,7 +798,6 @@ const Panel = struct {
             .inspector_tab_len = 0,
             .last_iosurface_seed = 0,
             .last_frame_hash = 0,
-            .last_sentinels = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .last_frame_time = 0,
             .last_tick_time = 0,
             .ticks_since_connect = 0,
@@ -6270,31 +6268,10 @@ const Server = struct {
                                 _ = self.bw_raw_pixels_bytes.fetchAdd(panel.bgra_buffer.?.len, .monotonic);
                             }
 
-                            // Fast sentinel check: sample 8 pixels at strategic positions.
-                            // If all match the previous frame's samples, skip the full hash (~1-2ms saved).
-                            // Catches ~95% of unchanged frames in <100ns.
                             const buf = panel.bgra_buffer.?;
-                            const quarter = buf.len / 4;
-                            const sentinels = [8]u32{
-                                std.mem.readInt(u32, buf[0..4], .little),                             // top-left
-                                std.mem.readInt(u32, buf[quarter..][0..4], .little),                   // 25%
-                                std.mem.readInt(u32, buf[quarter * 2 ..][0..4], .little),              // center
-                                std.mem.readInt(u32, buf[quarter * 3 ..][0..4], .little),              // 75%
-                                std.mem.readInt(u32, buf[buf.len - 4 ..][0..4], .little),              // bottom-right
-                                std.mem.readInt(u32, buf[buf.len / 3 ..][0..4], .little),              // 33%
-                                std.mem.readInt(u32, buf[buf.len * 2 / 3 ..][0..4], .little),          // 66%
-                                std.mem.readInt(u32, buf[buf.len / 7 ..][0..4], .little),              // 14%
-                            };
-                            const sentinels_match = std.mem.eql(u32, &sentinels, &panel.last_sentinels);
-                            panel.last_sentinels = sentinels;
 
-                            // Full hash when sentinels differ, keyframe forced, or input pending.
-                            // Input always needs a full hash because typed characters may not
-                            // land on any sentinel position, causing false "unchanged" skips.
-                            const frame_hash = if (sentinels_match and !panel.force_keyframe and !had_input)
-                                panel.last_frame_hash // Reuse previous hash (sentinels say unchanged)
-                            else
-                                std.hash.XxHash64.hash(0, buf);
+                            // Frame skip: hash the pixel buffer and skip encoding if unchanged
+                            const frame_hash = std.hash.XxHash64.hash(0, buf);
 
                             // Debug: log frames after input to diagnose stale pixels
                             if (panel.dbg_input_countdown > 0) {
