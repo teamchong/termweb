@@ -38,8 +38,8 @@
   let panelLastCodec = new Map<number, string>();
   let panelGotFirstKeyframe = new Map<number, boolean>();
 
-  // Tab → panel server IDs mapping
-  let tabPanelMap = $state(new Map<string, number[]>());
+  // Tab → panel server IDs with layout info
+  let tabPanelMap = $state(new Map<string, { serverId: number; left: number; top: number; width: number; height: number }[]>());
 
   // Snapshot fallbacks for initial display
   let snapshots = $state(new Map<string, string>());
@@ -380,10 +380,11 @@
               />
             {/if}
             {#if tabPanelMap.has(tab.id)}
-              {#each tabPanelMap.get(tab.id) ?? [] as serverId (serverId)}
+              {#each tabPanelMap.get(tab.id) ?? [] as panelInfo (panelInfo.serverId)}
                 <canvas
-                  bind:this={canvasRefs[serverId]}
+                  bind:this={canvasRefs[panelInfo.serverId]}
                   class="tab-preview-canvas"
+                  style="left:{panelInfo.left}%;top:{panelInfo.top}%;width:{panelInfo.width}%;height:{panelInfo.height}%"
                 ></canvas>
               {/each}
             {/if}
@@ -524,10 +525,6 @@
 
   .tab-preview-canvas {
     position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
     object-fit: contain;
     display: block;
   }

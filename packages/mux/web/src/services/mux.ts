@@ -2310,17 +2310,27 @@ export class MuxClient {
     return result;
   }
 
-  getTabPanelServerIds(): Map<string, number[]> {
-    const result = new Map<string, number[]>();
+  getTabPanelServerIds(): Map<string, { serverId: number; left: number; top: number; width: number; height: number }[]> {
+    const result = new Map<string, { serverId: number; left: number; top: number; width: number; height: number }[]>();
     for (const [tabId, tab] of this.tabInstances) {
       const allPanels = tab.root.getAllPanels() as PanelInstance[];
-      const serverIds: number[] = [];
+      const tabRect = tab.element.getBoundingClientRect();
+      const tabW = tabRect.width || 1;
+      const tabH = tabRect.height || 1;
+      const panels: { serverId: number; left: number; top: number; width: number; height: number }[] = [];
       for (const panel of allPanels) {
         if (panel.serverId != null) {
-          serverIds.push(panel.serverId);
+          const r = panel.element.getBoundingClientRect();
+          panels.push({
+            serverId: panel.serverId,
+            left: (r.left - tabRect.left) / tabW * 100,
+            top: (r.top - tabRect.top) / tabH * 100,
+            width: r.width / tabW * 100,
+            height: r.height / tabH * 100,
+          });
         }
       }
-      result.set(tabId, serverIds);
+      result.set(tabId, panels);
     }
     return result;
   }
