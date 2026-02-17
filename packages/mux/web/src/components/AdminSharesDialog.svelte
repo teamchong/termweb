@@ -98,7 +98,7 @@
       </div>
 
       {#if $sessions.length === 0}
-        <div class="empty">No shared sessions yet. Use Share menu to share a panel or tab.</div>
+        <div class="empty">No shares yet. Use the Share menu to share a tab.</div>
       {:else}
         <div class="session-list">
           {#each $sessions as session (session.id)}

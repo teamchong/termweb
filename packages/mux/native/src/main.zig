@@ -2690,6 +2690,22 @@ const Server = struct {
             return;
         }
 
+        // Resolve token → session_id and cache (same as onControlConnect)
+        if (conn.request_uri) |uri| {
+            if (auth.extractTokenFromQuery(uri)) |raw_token| {
+                var token_buf: [256]u8 = undefined;
+                const token = auth.decodeToken(&token_buf, raw_token);
+                if (auth.getSessionIdForToken(self.auth_state, token)) |session_id| {
+                    const duped = self.allocator.dupe(u8, session_id) catch null;
+                    if (duped) |s| {
+                        self.mutex.lock();
+                        self.connection_sessions.put(conn, s) catch {};
+                        self.mutex.unlock();
+                    }
+                }
+            }
+        }
+
         self.mutex.lock();
         self.h264_connections.append(self.allocator, conn) catch {};
 
@@ -2719,10 +2735,17 @@ const Server = struct {
                 break;
             }
         }
+
+        // Clean up role and session caches
+        _ = self.connection_roles.remove(conn);
+        if (self.connection_sessions.fetchRemove(conn)) |entry| {
+            self.allocator.free(entry.value);
+        }
         self.mutex.unlock();
     }
 
-    // Send H264 frame to all H264 clients with [panel_id:u32][frame_data...] prefix.
+    // Send H264 frame to authorized H264 clients with [panel_id:u32][frame_data...] prefix.
+    // Non-admin connections only receive frames for panels assigned to their session.
     // Returns true if sent to at least one client, false if all sends failed.
     fn sendH264Frame(self: *Server, panel_id: u32, frame_data: []const u8) bool {
         var conns_buf: [max_broadcast_conns]*ws.Connection = undefined;
@@ -2730,11 +2753,24 @@ const Server = struct {
         {
             self.mutex.lock();
             defer self.mutex.unlock();
+            const assigned_session = self.panel_assignments.get(panel_id);
             for (self.h264_connections.items) |conn| {
-                if (conns_count < conns_buf.len) {
+                if (conns_count >= conns_buf.len) break;
+                const role = self.connection_roles.get(conn) orelse .none;
+                if (role == .admin) {
+                    // Admins always receive all frames
                     conns_buf[conns_count] = conn;
                     conns_count += 1;
+                } else if (assigned_session) |target_sid| {
+                    // Non-admin: only send if connection's session matches assignment
+                    if (self.connection_sessions.get(conn)) |conn_sid| {
+                        if (std.mem.eql(u8, conn_sid, target_sid)) {
+                            conns_buf[conns_count] = conn;
+                            conns_count += 1;
+                        }
+                    }
                 }
+                // Unassigned panels: skip for non-admins (no else branch)
             }
         }
         if (conns_count == 0) return false;
@@ -2765,7 +2801,11 @@ const Server = struct {
         const inner_type = inner[0];
 
         // Handle create_panel and split_panel (no existing panel needed)
+        // Only admins and editors can create new panels/splits
         if (inner_type == @intFromEnum(ClientMsg.create_panel)) {
+            const role = self.connection_roles.get(conn) orelse .none;
+            if (role != .admin and role != .editor) return;
+
             // Create new panel: [inner_type:u8][width:u16][height:u16][scale:f32][inherit_panel_id:u32][flags:u8]?
             var width: u32 = 800;
             var height: u32 = 600;
@@ -2798,6 +2838,9 @@ const Server = struct {
         }
 
         if (inner_type == @intFromEnum(ClientMsg.split_panel)) {
+            const role = self.connection_roles.get(conn) orelse .none;
+            if (role != .admin and role != .editor) return;
+
             // Split existing panel: [inner_type:u8][parent_id:u32][dir_byte:u8][width:u16][height:u16][scale_x100:u16]
             if (inner.len < 12) return;
             const parent_id = std.mem.readInt(u32, inner[1..5], .little);
@@ -2871,25 +2914,29 @@ const Server = struct {
             return;
         }
 
-        // Gate resize messages by panel ownership
-        if (inner_type == @intFromEnum(ClientMsg.resize)) {
+        // Auth-check all panel messages (key, mouse, text, resize, etc.)
+        // Non-admins can only interact with panels assigned to their session.
+        {
             self.mutex.lock();
-            // Always record per-session viewport from resize dimensions
-            if (self.connection_sessions.get(conn)) |session_id| {
-                if (inner.len >= 5) {
-                    const w: u32 = std.mem.readInt(u16, inner[1..3], .little);
-                    const h: u32 = std.mem.readInt(u16, inner[3..5], .little);
-                    const current_scale = if (self.panels.get(panel_id)) |pp| pp.scale else 2.0;
-                    self.putSessionViewport(session_id, .{
-                        .width = w,
-                        .height = h,
-                        .scale = current_scale,
-                    });
+            const authorized = self.isPanelAuthorized(conn, panel_id);
+
+            // Always record per-session viewport from resize dimensions (even if not authorized to resize)
+            if (inner_type == @intFromEnum(ClientMsg.resize)) {
+                if (self.connection_sessions.get(conn)) |session_id| {
+                    if (inner.len >= 5) {
+                        const w: u32 = std.mem.readInt(u16, inner[1..3], .little);
+                        const h: u32 = std.mem.readInt(u16, inner[3..5], .little);
+                        const current_scale = if (self.panels.get(panel_id)) |pp| pp.scale else 2.0;
+                        self.putSessionViewport(session_id, .{
+                            .width = w,
+                            .height = h,
+                            .scale = current_scale,
+                        });
+                    }
                 }
             }
-            const should_apply = self.isResizeAuthorized(conn, panel_id);
             self.mutex.unlock();
-            if (!should_apply) return;
+            if (!authorized) return;
         }
 
         // General panel input (key, mouse, text, resize, etc.)
@@ -2969,8 +3016,8 @@ const Server = struct {
                     .scale = effective_scale,
                 });
             }
-            // Only apply PTY resize if authorized (owner or unassigned)
-            const should_apply = self.isResizeAuthorized(conn, panel_id);
+            // Only apply PTY resize if authorized
+            const should_apply = self.isPanelAuthorized(conn, panel_id);
             self.mutex.unlock();
 
             if (should_apply) {
@@ -3326,12 +3373,14 @@ const Server = struct {
         }
     }
 
-    /// Check if a connection is authorized to resize a panel's PTY.
+    /// Check if a connection is authorized to interact with a panel.
+    /// Admins always have access. Non-admins can only access panels explicitly
+    /// assigned to their session. Unassigned panels are denied for non-admins.
     /// Must be called with self.mutex held.
-    fn isResizeAuthorized(self: *Server, conn: *ws.Connection, panel_id: u32) bool {
+    fn isPanelAuthorized(self: *Server, conn: *ws.Connection, panel_id: u32) bool {
         const role = self.connection_roles.get(conn) orelse .none;
         if (role == .admin) return true;
-        const assigned_session = self.panel_assignments.get(panel_id) orelse return true;
+        const assigned_session = self.panel_assignments.get(panel_id) orelse return false;
         const sender_session = self.connection_sessions.get(conn) orelse return false;
         return std.mem.eql(u8, sender_session, assigned_session);
     }
