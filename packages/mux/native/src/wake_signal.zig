@@ -58,17 +58,34 @@ pub const WakeSignal = struct {
             .revents = 0,
         }};
 
-        const timeout_ms: i32 = if (timeout_ns >= std.time.ns_per_s * 60)
-            std.math.maxInt(i32) // cap at ~24 days
-        else
-            @intCast(timeout_ns / std.time.ns_per_ms);
+        if (comptime is_linux) {
+            // ppoll: nanosecond precision avoids poll()'s ms truncation
+            // which loses up to 999us per wait — critical for sub-5ms input latency
+            var ts = std.os.linux.timespec{
+                .sec = @intCast(timeout_ns / std.time.ns_per_s),
+                .nsec = @intCast(timeout_ns % std.time.ns_per_s),
+            };
+            const rc = std.os.linux.ppoll(@ptrCast(&fds), 1, &ts, null);
+            // ppoll returns number of ready fds, 0 on timeout, or
+            // negative (wrapped to large usize) on error
+            if (rc > 0 and rc < 0x8000_0000_0000_0000) {
+                self.drain();
+                return true;
+            }
+            return false;
+        } else {
+            const timeout_ms: i32 = if (timeout_ns >= std.time.ns_per_s * 60)
+                std.math.maxInt(i32) // cap at ~24 days
+            else
+                @intCast(timeout_ns / std.time.ns_per_ms);
 
-        const ready = posix.poll(&fds, timeout_ms) catch return false;
-        if (ready > 0) {
-            self.drain();
-            return true;
+            const ready = posix.poll(&fds, timeout_ms) catch return false;
+            if (ready > 0) {
+                self.drain();
+                return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// Drain all pending notifications without blocking.

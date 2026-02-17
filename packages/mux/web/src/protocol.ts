@@ -57,14 +57,6 @@ export const BinaryCtrlMsg = {
   REMOVE_OAUTH_CONFIG: 0x9F,
 } as const;
 
-// Server -> client auth response types
-export const AuthResponseType = {
-  AUTH_STATE: 0x0A,
-  SESSION_LIST: 0x0B,
-  SHARE_LINKS: 0x0C,
-  OAUTH_CONFIG: 0x1A,
-} as const;
-
 // Server -> client control message types
 export const ServerCtrlMsg = {
   JWT_RENEWAL: 0x0D,  // JWT renewal: [type:u8][jwt_len:u16_le][jwt...]

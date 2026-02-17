@@ -3,8 +3,6 @@
 import {
   BYTES,
   COLORS,
-  ID_GENERATION,
-  WS_PATHS,
 } from './constants';
 
 // ============================================================================
@@ -45,16 +43,6 @@ export const sharedTextEncoder = new TextEncoder();
 
 /** Shared TextDecoder instance - reuse to avoid allocation */
 export const sharedTextDecoder = new TextDecoder();
-
-// ============================================================================
-// Platform detection (computed once)
-// ============================================================================
-
-/** Whether the current platform is macOS/iOS */
-export const isMac = typeof navigator !== 'undefined' && (
-  (navigator as { userAgentData?: { platform?: string } }).userAgentData?.platform === 'macOS'
-  || /Mac|iPhone|iPad|iPod/.test(navigator.userAgent)
-);
 
 // ============================================================================
 // Color utilities
@@ -109,15 +97,6 @@ export function shadowColor(hex: string, level: number): string {
   return rgbToHex(r, g, b);
 }
 
-export function blendWithBlack(hex: string, alpha: number): string {
-  const rgb = hexToRgb(hex);
-  if (!rgb) return hex;
-  const r = rgb.r * (1 - alpha);
-  const g = rgb.g * (1 - alpha);
-  const b = rgb.b * (1 - alpha);
-  return rgbToHex(r, g, b);
-}
-
 // ============================================================================
 // Byte utilities
 // ============================================================================
@@ -136,7 +115,7 @@ export function formatBytes(bytes: number): string {
  * Generate a unique ID
  */
 export function generateId(): string {
-  return Math.random().toString(ID_GENERATION.RADIX).substring(ID_GENERATION.START, ID_GENERATION.START + ID_GENERATION.LENGTH);
+  return Math.random().toString(36).substring(2, 9);
 }
 
 /**
@@ -220,75 +199,6 @@ export function applyColors(colors: Record<string, string>): void {
       root.style.setProperty(`--palette-${i}`, colors[key]);
     }
   }
-}
-
-/**
- * Parse query string parameters using modern URLSearchParams API
- */
-export function parseQueryParams(): Record<string, string> {
-  const params: Record<string, string> = {};
-  const searchParams = new URLSearchParams(window.location.search);
-  searchParams.forEach((value, key) => {
-    params[key] = value;
-  });
-  return params;
-}
-
-/**
- * Create a binary message buffer
- */
-export function createBinaryMessage(type: number, ...parts: (number | Uint8Array)[]): ArrayBuffer {
-  // Calculate total size
-  let size = 1; // type byte
-  for (const part of parts) {
-    size += typeof part === 'number' ? 1 : part.length;
-  }
-
-  const buffer = new ArrayBuffer(size);
-  const view = new DataView(buffer);
-  const bytes = new Uint8Array(buffer);
-
-  let offset = 0;
-  view.setUint8(offset++, type);
-
-  for (const part of parts) {
-    if (typeof part === 'number') {
-      view.setUint8(offset++, part);
-    } else {
-      bytes.set(part, offset);
-      offset += part.length;
-    }
-  }
-
-  return buffer;
-}
-
-/**
- * Read a little-endian u16 from a DataView
- */
-export function readU16LE(view: DataView, offset: number): number {
-  return view.getUint16(offset, true);
-}
-
-/**
- * Read a little-endian u32 from a DataView
- */
-export function readU32LE(view: DataView, offset: number): number {
-  return view.getUint32(offset, true);
-}
-
-/**
- * Write a little-endian u16 to a DataView
- */
-export function writeU16LE(view: DataView, offset: number, value: number): void {
-  view.setUint16(offset, value, true);
-}
-
-/**
- * Write a little-endian u32 to a DataView
- */
-export function writeU32LE(view: DataView, offset: number, value: number): void {
-  view.setUint32(offset, value, true);
 }
 
 // ============================================================================

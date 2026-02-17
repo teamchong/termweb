@@ -230,16 +230,10 @@ export const BYTES = {
 // ============================================================================
 
 export const COLORS = {
-  /** Default background color */
-  DEFAULT_BACKGROUND: '#282c34',
-  /** Default foreground color */
-  DEFAULT_FOREGROUND: '#ffffff',
   /** Luminance threshold for light color detection */
   LUMINANCE_LIGHT_THRESHOLD: 0.5,
   /** Luminance threshold for very dark color detection */
   LUMINANCE_VERY_DARK_THRESHOLD: 0.05,
-  /** Number of palette colors */
-  PALETTE_COUNT: 16,
 } as const;
 
 // ============================================================================
@@ -253,19 +247,6 @@ export const UI = {
   LOADING_TEXT: 'Connecting...',
   /** Default inspector tab */
   DEFAULT_INSPECTOR_TAB: 'screen',
-} as const;
-
-// ============================================================================
-// ID Generation
-// ============================================================================
-
-export const ID_GENERATION = {
-  /** Radix for random ID (base 36 = alphanumeric) */
-  RADIX: 36,
-  /** Start index for substring */
-  START: 2,
-  /** Length of generated ID */
-  LENGTH: 7,
 } as const;
 
 // ============================================================================
