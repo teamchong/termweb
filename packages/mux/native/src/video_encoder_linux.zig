@@ -1287,8 +1287,10 @@ pub const VideoEncoder = struct {
             }
         }
 
-        const is_keyframe = force_keyframe or (self.frame_count == 0) or
-            (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
+        // No periodic keyframe interval — TCP guarantees delivery, and explicit
+        // keyframes (connect, resize, tab switch, reconnect, client request) cover
+        // all recovery cases. Periodic keyframes waste bandwidth and cause stutter.
+        const is_keyframe = force_keyframe or (self.frame_count == 0);
 
         // IDR resets the H.264 frame numbering sequence. Without this,
         // frame_num has gaps after forced keyframes (e.g., IDR frame_num=0
@@ -1313,8 +1315,8 @@ pub const VideoEncoder = struct {
         var seq_param: [SEQ_PARAM_SIZE]u8 = std.mem.zeroes([SEQ_PARAM_SIZE]u8);
         writeU8(&seq_param, SEQ_seq_parameter_set_id, 0);
         writeU8(&seq_param, SEQ_level_idc, 52);
-        writeU32(&seq_param, SEQ_intra_period, self.keyframe_interval);
-        writeU32(&seq_param, SEQ_intra_idr_period, self.keyframe_interval);
+        writeU32(&seq_param, SEQ_intra_period, 0);  // no periodic keyframes — explicit only
+        writeU32(&seq_param, SEQ_intra_idr_period, 0);
         writeU32(&seq_param, SEQ_ip_period, 1);
         writeU32(&seq_param, SEQ_bits_per_second, self.current_bitrate);
         writeU32(&seq_param, SEQ_max_num_ref_frames, 1);
@@ -1583,8 +1585,7 @@ pub const VideoEncoder = struct {
             };
         }
 
-        const is_keyframe = force_keyframe or (self.frame_count == 0) or
-            (@mod(self.frame_count, @as(i64, self.keyframe_interval)) == 0);
+        const is_keyframe = force_keyframe or (self.frame_count == 0);
 
         if (is_keyframe) {
             self.frame_count = 0;
@@ -1646,8 +1647,8 @@ pub const VideoEncoder = struct {
         var seq_param: [SEQ_PARAM_SIZE]u8 = std.mem.zeroes([SEQ_PARAM_SIZE]u8);
         writeU8(&seq_param, SEQ_seq_parameter_set_id, 0);
         writeU8(&seq_param, SEQ_level_idc, 52);
-        writeU32(&seq_param, SEQ_intra_period, self.keyframe_interval);
-        writeU32(&seq_param, SEQ_intra_idr_period, self.keyframe_interval);
+        writeU32(&seq_param, SEQ_intra_period, 0);  // no periodic keyframes — explicit only
+        writeU32(&seq_param, SEQ_intra_idr_period, 0);
         writeU32(&seq_param, SEQ_ip_period, 1);
         writeU32(&seq_param, SEQ_bits_per_second, self.current_bitrate);
         writeU32(&seq_param, SEQ_max_num_ref_frames, 1);
