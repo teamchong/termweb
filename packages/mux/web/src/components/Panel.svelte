@@ -153,17 +153,26 @@
   // ============================================================================
 
   // A prediction: a character overlay at a grid cell, or a blank (' ') for backspace erasure.
-  type Prediction = { char: string; col: number; row: number; tick: number; bg?: string };
+  type Prediction = { char: string; col: number; row: number; bg?: string; time: number };
 
   // Prediction state — $state for values read in $derived, plain let for the rest.
   let predTentative = false;
-  let predCol = 0;
-  let predRow = 0;
+  let predCol = $state(0);
+  let predRow = $state(0);
   let predBaseCol = 0;
   let predBaseRow = 0;
   let predPadX = 0;
   let predPadY = 0;
+  // Video-confirmed cursor: only updated when a video frame renders with
+  // a flushed cursor, so it reflects what's actually visible in the video.
+  let predVideoCol = 0;
+  let predVideoRow = 0;
   let predList = $state<Prediction[]>([]);
+  // Minimum display time: predictions stay visible for at least this long.
+  // Tracks the last observed confirm delay (prediction creation → video confirm)
+  // with a floor so predictions never flash too fast during rapid typing.
+  const PRED_MIN_DISPLAY_MS = 100;  // floor: ~6 frames at 60fps
+  let predMinDisplayMs = PRED_MIN_DISPLAY_MS;
 
   function predPredict(key: string, code: string, mods: number): void {
     if (mods & (MODIFIER.CTRL | MODIFIER.ALT | MODIFIER.META)) { predReset(); return; }
@@ -182,7 +191,7 @@
         // Sample background color from the canvas snapshot so it matches the video.
         predCol--;
         const bg = sampleCellBg(predCol, predRow);
-        predList = [{ char: ' ', col: predCol, row: predRow, tick: videoTick, bg }];
+        predList = [{ char: ' ', col: predCol, row: predRow, bg, time: performance.now() }];
       }
       return;
     }
@@ -193,7 +202,8 @@
 
     // Printable ASCII
     if (key.length === 1 && key.charCodeAt(0) >= 0x20 && key.charCodeAt(0) <= 0x7e) {
-      predList = [...predList, { char: key, col: predCol, row: predRow, tick: videoTick }];
+      const bg = sampleCellBg(predCol, predRow);
+      predList = [...predList, { char: key, col: predCol, row: predRow, bg, time: performance.now() }];
       predCol++;
       return;
     }
@@ -202,8 +212,10 @@
   /** Sync padding and base position from cursor pixel coords (called on every cursor update) */
   function predSyncCursor(pixelX: number, pixelY: number, cellW: number, cellH: number): void {
     if (cellW <= 0 || cellH <= 0) return;
-    const col = Math.round(pixelX / cellW);
-    const row = Math.round(pixelY / cellH);
+    // Use floor, not round: pixelX = padding + col * cellW, and if
+    // padding >= cellW/2, round() would give col+1 (off-by-one).
+    const col = Math.floor(pixelX / cellW);
+    const row = Math.floor(pixelY / cellH);
     predPadX = pixelX - col * cellW;
     predPadY = pixelY - row * cellH;
     predBaseCol = col;
@@ -215,16 +227,48 @@
     }
     // Tentative: clear if server moved to a new row (normal post-CR)
     if (predTentative && row !== predBaseRow) predTentative = false;
+    // Confirm predictions from cursor position — minimum display time
+    // prevents premature removal even if cursor update arrives before video.
+    if (predList.length > 0) {
+      predConfirmFrame(col, row);
+    }
   }
 
-  /** Confirm predictions when a video frame renders — predictions with tick < frameTick
-   *  have been rendered into the video and can be removed. Only called from renderFrame. */
-  function predConfirmFrame(frameTick: number): void {
+  /** Confirm predictions when a video frame renders. Uses the video-confirmed
+   *  cursor position and enforces a minimum display time so predictions don't
+   *  flash away during rapid typing. */
+  function predConfirmFrame(flushedCol: number, flushedRow: number): void {
+    predVideoCol = flushedCol;
+    predVideoRow = flushedRow;
+
     if (predList.length === 0) return;
-    const filtered = predList.filter(p => p.tick >= frameTick);
+
+    // If video cursor moved to a different row, all predictions on the old row are stale
+    if (predList[0].row !== flushedRow) {
+      predList = [];
+      predCol = predBaseCol;
+      predRow = predBaseRow;
+      return;
+    }
+
+    // Remove predictions that the video cursor has passed AND that have been
+    // displayed for at least the minimum display time.
+    const now = performance.now();
+    const minTime = predMinDisplayMs;
+    const filtered = predList.filter(p => {
+      if (p.col >= flushedCol) return true;  // video hasn't reached this column yet
+      if (now - p.time < minTime) return true;  // too young to remove
+      // Track the actual delay for adaptive minimum
+      const delay = now - p.time;
+      if (delay > predMinDisplayMs) {
+        predMinDisplayMs = Math.max(PRED_MIN_DISPLAY_MS, delay * 0.8);
+      }
+      return false;
+    });
     if (filtered.length !== predList.length) {
       predList = filtered;
     }
+
     if (predList.length === 0) {
       predCol = predBaseCol;
       predRow = predBaseRow;
@@ -330,6 +374,17 @@
     if (!cursorVisible || cursorW === 0 || paused) return null;
     if (pctW === 0 || pctH === 0) return null;
 
+    // When predictions are active, jump cursor to the predicted position
+    // instead of waiting for the video-synced server cursor.
+    if (predList.length > 0) {
+      return {
+        left: ((predPadX + predCol * cursorW) / pctW) * 100,
+        top: ((predPadY + predRow * cursorH) / pctH) * 100,
+        width: (cursorW / pctW) * 100,
+        height: (cursorH / pctH) * 100,
+      };
+    }
+
     return {
       left: (cursorX / pctW) * 100,
       top: (cursorY / pctH) * 100,
@@ -428,21 +483,29 @@
     gpuRenderer!.renderFrame(frame);
 
     // Flush the best matching cursor (highest tick <= videoTick), discard older
+    let flushedCursor: CursorUpdate | null = null;
     if (pendingCursors.size > 0) {
-      let best: CursorUpdate | null = null;
       let bestTick = 0;
       for (const [t, c] of pendingCursors) {
-        if (t <= videoTick && t > bestTick) { bestTick = t; best = c; }
+        if (t <= videoTick && t > bestTick) { bestTick = t; flushedCursor = c; }
       }
-      if (best) {
+      if (flushedCursor) {
         for (const t of pendingCursors.keys()) { if (t <= bestTick) pendingCursors.delete(t); }
-        applyCursor(best.x, best.y, best.w, best.h, best.style, best.visible, best.surfW, best.surfH, best.r, best.g, best.b);
+        applyCursor(flushedCursor.x, flushedCursor.y, flushedCursor.w, flushedCursor.h, flushedCursor.style, flushedCursor.visible, flushedCursor.surfW, flushedCursor.surfH, flushedCursor.r, flushedCursor.g, flushedCursor.b);
       }
     }
 
-    // Confirm predictions: video frame has rendered, so predictions at older ticks
-    // are now visible in the video and can be removed.
-    predConfirmFrame(videoTick);
+    // Confirm predictions using the video-synced cursor position.
+    // Only use the flushed cursor (synced to this video frame), not predBaseCol
+    // which may have advanced from cursor updates arriving before their video frame.
+    if (flushedCursor && flushedCursor.w > 0 && flushedCursor.h > 0) {
+      const col = Math.floor(flushedCursor.x / flushedCursor.w);
+      const row = Math.floor(flushedCursor.y / flushedCursor.h);
+      predConfirmFrame(col, row);
+    } else {
+      // No flushed cursor this frame — use last known video position
+      predConfirmFrame(predVideoCol, predVideoRow);
+    }
 
     // Update snapshot for tab overview (throttled, before frame.close())
     const now = performance.now();
