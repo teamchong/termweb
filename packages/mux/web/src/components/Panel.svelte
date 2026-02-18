@@ -149,154 +149,6 @@
   );
 
   // ============================================================================
-  // Predictive Echo (Mosh-style)
-  // ============================================================================
-
-  // A prediction: a character overlay at a grid cell, or a blank (' ') for backspace erasure.
-  type Prediction = { char: string; col: number; row: number; bg?: string; time: number };
-
-  // Prediction state — $state for values read in $derived, plain let for the rest.
-  let predTentative = false;
-  let predCol = $state(0);
-  let predRow = $state(0);
-  let predBaseCol = 0;
-  let predBaseRow = 0;
-  let predPadX = 0;
-  let predPadY = 0;
-  // Video-confirmed cursor: only updated when a video frame renders with
-  // a flushed cursor, so it reflects what's actually visible in the video.
-  let predVideoCol = 0;
-  let predVideoRow = 0;
-  let predList = $state<Prediction[]>([]);
-  // Minimum display time: predictions stay visible for at least this long.
-  // Tracks the last observed confirm delay (prediction creation → video confirm)
-  // with a floor so predictions never flash too fast during rapid typing.
-  const PRED_MIN_DISPLAY_MS = 100;  // floor: ~6 frames at 60fps
-  let predMinDisplayMs = PRED_MIN_DISPLAY_MS;
-
-  function predPredict(key: string, code: string, mods: number): void {
-    if (mods & (MODIFIER.CTRL | MODIFIER.ALT | MODIFIER.META)) { predReset(); return; }
-    if (predTentative) return;
-    if (code === 'Enter' || key === '\r') { predTentative = true; predList = []; return; }
-    if (code === 'Escape' || key === '\x1b') { predReset(); return; }
-    if (code === 'Tab' || key === '\t') { predReset(); return; }
-
-    if (code === 'Backspace' || key === '\x7f') {
-      if (predList.length > 0) {
-        // Remove last predicted character
-        predList = predList.slice(0, -1);
-        predCol = predList.length > 0 ? predList[predList.length - 1].col + 1 : predBaseCol;
-      } else if (predCol > 0) {
-        // Backspace on confirmed content — show blank overlay at the erased cell.
-        // Sample background color from the canvas snapshot so it matches the video.
-        predCol--;
-        const bg = sampleCellBg(predCol, predRow);
-        predList = [{ char: ' ', col: predCol, row: predRow, bg, time: performance.now() }];
-      }
-      return;
-    }
-
-    if (code === 'ArrowLeft') { if (predCol > 0) predCol--; predList = []; return; }
-    if (code === 'ArrowRight') { predCol++; predList = []; return; }
-    if (code === 'ArrowUp' || code === 'ArrowDown') { predReset(); return; }
-
-    // Printable ASCII
-    if (key.length === 1 && key.charCodeAt(0) >= 0x20 && key.charCodeAt(0) <= 0x7e) {
-      const bg = sampleCellBg(predCol, predRow);
-      predList = [...predList, { char: key, col: predCol, row: predRow, bg, time: performance.now() }];
-      predCol++;
-      return;
-    }
-  }
-
-  /** Sync padding and base position from cursor pixel coords (called on every cursor update) */
-  function predSyncCursor(pixelX: number, pixelY: number, cellW: number, cellH: number): void {
-    if (cellW <= 0 || cellH <= 0) return;
-    // Use floor, not round: pixelX = padding + col * cellW, and if
-    // padding >= cellW/2, round() would give col+1 (off-by-one).
-    const col = Math.floor(pixelX / cellW);
-    const row = Math.floor(pixelY / cellH);
-    predPadX = pixelX - col * cellW;
-    predPadY = pixelY - row * cellH;
-    predBaseCol = col;
-    predBaseRow = row;
-    // Keep predicted cursor synced when no predictions are active
-    if (predList.length === 0) {
-      predCol = col;
-      predRow = row;
-    }
-    // Tentative: clear if server moved to a new row (normal post-CR)
-    if (predTentative && row !== predBaseRow) predTentative = false;
-    // Confirm predictions from cursor position — minimum display time
-    // prevents premature removal even if cursor update arrives before video.
-    if (predList.length > 0) {
-      predConfirmFrame(col, row);
-    }
-  }
-
-  /** Confirm predictions when a video frame renders. Uses the video-confirmed
-   *  cursor position and enforces a minimum display time so predictions don't
-   *  flash away during rapid typing. */
-  function predConfirmFrame(flushedCol: number, flushedRow: number): void {
-    predVideoCol = flushedCol;
-    predVideoRow = flushedRow;
-
-    if (predList.length === 0) return;
-
-    // If video cursor moved to a different row, all predictions on the old row are stale
-    if (predList[0].row !== flushedRow) {
-      predList = [];
-      predCol = predBaseCol;
-      predRow = predBaseRow;
-      return;
-    }
-
-    // Remove predictions that the video cursor has passed AND that have been
-    // displayed for at least the minimum display time.
-    const now = performance.now();
-    const minTime = predMinDisplayMs;
-    const filtered = predList.filter(p => {
-      if (p.col >= flushedCol) return true;  // video hasn't reached this column yet
-      if (now - p.time < minTime) return true;  // too young to remove
-      // Track the actual delay for adaptive minimum
-      const delay = now - p.time;
-      if (delay > predMinDisplayMs) {
-        predMinDisplayMs = Math.max(PRED_MIN_DISPLAY_MS, delay * 0.8);
-      }
-      return false;
-    });
-    if (filtered.length !== predList.length) {
-      predList = filtered;
-    }
-
-    if (predList.length === 0) {
-      predCol = predBaseCol;
-      predRow = predBaseRow;
-    }
-  }
-
-  /** Sample the background color of a terminal cell from the snapshot canvas.
-   *  Returns an rgb() string matching the actual video content. */
-  function sampleCellBg(col: number, row: number): string {
-    if (snapshotCtx && snapshotCanvas && cursorW > 0 && cursorH > 0) {
-      // Cell center in video frame coordinates
-      const px = Math.round(predPadX + col * cursorW + cursorW / 2);
-      const py = Math.round(predPadY + row * cursorH + cursorH / 2);
-      if (px >= 0 && px < snapshotCanvas.width && py >= 0 && py < snapshotCanvas.height) {
-        const data = snapshotCtx.getImageData(px, py, 1, 1).data;
-        return `rgb(${data[0]},${data[1]},${data[2]})`;
-      }
-    }
-    // Fallback to CSS variable
-    return 'var(--bg, #1e1e1e)';
-  }
-
-  function predReset(): void {
-    predList = [];
-    predTentative = false;
-  }
-
-  // ============================================================================
   // Computed
   // ============================================================================
 
@@ -374,48 +226,12 @@
     if (!cursorVisible || cursorW === 0 || paused) return null;
     if (pctW === 0 || pctH === 0) return null;
 
-    // When predictions are active, jump cursor to the predicted position
-    // instead of waiting for the video-synced server cursor.
-    if (predList.length > 0) {
-      return {
-        left: ((predPadX + predCol * cursorW) / pctW) * 100,
-        top: ((predPadY + predRow * cursorH) / pctH) * 100,
-        width: (cursorW / pctW) * 100,
-        height: (cursorH / pctH) * 100,
-      };
-    }
-
     return {
       left: (cursorX / pctW) * 100,
       top: (cursorY / pctH) * 100,
       width: (cursorW / pctW) * 100,
       height: (cursorH / pctH) * 100,
     };
-  });
-
-  // Prediction overlay characters — derived from prediction state.
-  // Font-size uses CSS min() to match the viewport height (which depends on aspect ratio).
-  let predictionChars = $derived.by(() => {
-    if (predList.length === 0) return [];
-    if (pctW === 0 || pctH === 0 || cursorW === 0 || cursorH === 0) return [];
-    const cellWPct = (cursorW / pctW) * 100;
-    const cellHPct = (cursorH / pctH) * 100;
-    // Cell height fraction * 0.75 (font fills ~75% of cell) * viewport height in container units
-    const vw = viewportW;
-    const vh = viewportH;
-    const cellFrac = (cursorH / pctH) * 0.75;
-    const fontSize = vw > 0 && vh > 0
-      ? `calc(${cellFrac} * min(100cqb, ${100 * vh / vw}cqi))`
-      : '12px';
-    return predList.map(p => ({
-      char: p.char,
-      left: ((predPadX + p.col * cursorW) / pctW) * 100,
-      top: ((predPadY + p.row * cursorH) / pctH) * 100,
-      width: cellWPct,
-      height: cellHPct,
-      fontSize,
-      bg: p.bg ?? '',
-    }));
   });
 
   // ============================================================================
@@ -493,18 +309,6 @@
         for (const t of pendingCursors.keys()) { if (t <= bestTick) pendingCursors.delete(t); }
         applyCursor(flushedCursor.x, flushedCursor.y, flushedCursor.w, flushedCursor.h, flushedCursor.style, flushedCursor.visible, flushedCursor.surfW, flushedCursor.surfH, flushedCursor.r, flushedCursor.g, flushedCursor.b);
       }
-    }
-
-    // Confirm predictions using the video-synced cursor position.
-    // Only use the flushed cursor (synced to this video frame), not predBaseCol
-    // which may have advanced from cursor updates arriving before their video frame.
-    if (flushedCursor && flushedCursor.w > 0 && flushedCursor.h > 0) {
-      const col = Math.floor(flushedCursor.x / flushedCursor.w);
-      const row = Math.floor(flushedCursor.y / flushedCursor.h);
-      predConfirmFrame(col, row);
-    } else {
-      // No flushed cursor this frame — use last known video position
-      predConfirmFrame(predVideoCol, predVideoRow);
     }
 
     // Update snapshot for tab overview (throttled, before frame.close())
@@ -973,11 +777,6 @@
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
     sendInputImmediate(buf);
-
-    // Predictive echo: predict on key press only
-    if (action === 1) {
-      predPredict(text || e.key, e.code, getModifiers(e));
-    }
   }
 
   function handleMouseDown(e: MouseEvent): void {
@@ -1180,9 +979,6 @@
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
     sendInputImmediate(buf);
-
-    // Predictive echo for mobile/accessory key presses
-    predPredict(text || code, code, mods);
   }
 
   function handleMobileInput(e: Event): void {
@@ -1629,12 +1425,6 @@
     if (r !== undefined) cursorColorR = r;
     if (g !== undefined) cursorColorG = g;
     if (b !== undefined) cursorColorB = b;
-
-    // Sync prediction padding/base from cursor pixel position (no confirmation —
-    // predictions are only confirmed when a video frame actually renders).
-    if (w > 0 && h > 0) {
-      predSyncCursor(x, y, w, h);
-    }
   }
 
   // ============================================================================
@@ -1854,13 +1644,6 @@
                 style="left:{cursorPct.left}%;top:{cursorPct.top}%;width:{cursorPct.width}%;height:{cursorPct.height}%"
               ></div>
             {/key}
-          {/if}
-          {#if predictionChars.length > 0}
-            <div class="prediction-overlay">
-              {#each predictionChars as pred}
-                <span class="predicted-char" style="left:{pred.left}%;top:{pred.top}%;width:{pred.width}%;height:{pred.height}%;font-size:{pred.fontSize}{pred.bg ? ';background:' + pred.bg : ''}">{pred.char}</span>
-              {/each}
-            </div>
           {/if}
         </div>
       </div>
@@ -2185,27 +1968,6 @@
     0%, 49% { visibility: visible; }
     50%, 100% { visibility: hidden; }
   }
-
-  .prediction-overlay {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    z-index: 1;
-  }
-
-  .predicted-char {
-    position: absolute;
-    font-family: ui-monospace, monospace;
-    /* font-size set via inline style (computed from viewport + cell dimensions) */
-    color: var(--cursor-color, var(--text, #c8c8c8));
-    pointer-events: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-sizing: border-box;
-    line-height: 1;
-  }
-
 
   .panel-loading {
     position: absolute;
