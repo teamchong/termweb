@@ -149,6 +149,179 @@
   );
 
   // ============================================================================
+  // Predictive Echo (Mosh-style)
+  // ============================================================================
+
+  // A prediction is either a character ('char' set) or an empty placeholder
+  // from backspace ('char' is empty string → renders as underline-only).
+  type Prediction = { char: string; col: number; row: number; tick: number };
+
+  class PredictionEngine {
+    predictions: Prediction[] = [];
+    predictedCol = 0;
+    predictedRow = 0;
+    baseCursorCol = 0;
+    baseCursorRow = 0;
+    // Pixel offset from surface origin to first cell (terminal padding).
+    // Derived from server cursor position: paddingX = cursorX - col * cursorW.
+    paddingX = 0;
+    paddingY = 0;
+    tentative = false;   // suppress predictions after CR until confirmed
+    active = false;
+    lastConfirmTick = 0;
+
+    predict(key: string, code: string, mods: number): void {
+      // Don't predict when modifiers are held (except Shift for uppercase)
+      if (mods & (MODIFIER.CTRL | MODIFIER.ALT | MODIFIER.META)) {
+        this.reset();
+        return;
+      }
+
+      // Don't predict in tentative mode (password protection)
+      if (this.tentative) return;
+
+      // Enter/CR: mark tentative, clear predictions
+      if (code === 'Enter' || key === '\r') {
+        this.tentative = true;
+        this.predictions = [];
+        predictionVersion++;
+        return;
+      }
+
+      // Escape: reset everything (likely mode change)
+      if (code === 'Escape' || key === '\x1b') {
+        this.reset();
+        return;
+      }
+
+      // Tab: unpredictable (completion)
+      if (code === 'Tab' || key === '\t') {
+        this.reset();
+        return;
+      }
+
+      // Backspace: remove last predicted char, or predict blank at previous cell
+      if (code === 'Backspace' || key === '\x7f') {
+        this.active = true;
+        if (this.predictions.length > 0) {
+          // Remove the last character we predicted
+          this.predictions.pop();
+          this.predictedCol = this.predictions.length > 0
+            ? this.predictions[this.predictions.length - 1].col + 1
+            : this.baseCursorCol;
+        } else if (this.predictedCol > 0) {
+          // No predictions to pop — backspace erases confirmed content.
+          // Predict a blank (space) at the cell cursor moves to, shown as
+          // underline-only overlay so the user sees the erasure instantly.
+          this.predictedCol--;
+          this.predictions.push({
+            char: ' ',
+            col: this.predictedCol,
+            row: this.predictedRow,
+            tick: videoTick,
+          });
+        }
+        predictionVersion++;
+        return;
+      }
+
+      // Arrow keys: move predicted cursor
+      if (code === 'ArrowLeft') {
+        this.active = true;
+        if (this.predictedCol > 0) this.predictedCol--;
+        this.predictions = [];
+        predictionVersion++;
+        return;
+      }
+      if (code === 'ArrowRight') {
+        this.active = true;
+        this.predictedCol++;
+        this.predictions = [];
+        predictionVersion++;
+        return;
+      }
+
+      // ArrowUp/ArrowDown: unpredictable
+      if (code === 'ArrowUp' || code === 'ArrowDown') {
+        this.reset();
+        return;
+      }
+
+      // Printable single character (ASCII)
+      if (key.length === 1 && key.charCodeAt(0) >= 0x20 && key.charCodeAt(0) <= 0x7e) {
+        this.active = true;
+        this.predictions.push({
+          char: key,
+          col: this.predictedCol,
+          row: this.predictedRow,
+          tick: videoTick,
+        });
+        this.predictedCol++;
+        predictionVersion++;
+        return;
+      }
+
+      // Anything else: don't predict (non-ASCII, function keys, etc.)
+    }
+
+    /** Update padding and base position from server cursor pixel coords */
+    syncFromCursor(pixelX: number, pixelY: number, cellW: number, cellH: number): void {
+      if (cellW <= 0 || cellH <= 0) return;
+      const col = Math.round(pixelX / cellW);
+      const row = Math.round(pixelY / cellH);
+      this.paddingX = pixelX - col * cellW;
+      this.paddingY = pixelY - row * cellH;
+    }
+
+    confirm(serverCol: number, serverRow: number, tick: number): void {
+      this.lastConfirmTick = tick;
+
+      // Tentative mode: check if server confirms expected post-CR position
+      if (this.tentative) {
+        if (serverRow !== this.baseCursorRow) {
+          this.tentative = false;
+        }
+      }
+
+      // Update base cursor position from server
+      this.baseCursorCol = serverCol;
+      this.baseCursorRow = serverRow;
+
+      // Remove confirmed predictions (tick <= server tick)
+      if (this.predictions.length > 0) {
+        this.predictions = this.predictions.filter(p => p.tick > tick);
+        predictionVersion++;
+      }
+
+      // Rollback: if remaining predictions are on a different row than server,
+      // they're wrong — clear everything
+      if (this.active && this.predictions.length > 0) {
+        if (serverRow !== this.predictions[0].row) {
+          this.reset();
+          return;
+        }
+      }
+
+      // If no predictions remain, deactivate and sync predicted cursor to server
+      if (this.predictions.length === 0) {
+        this.active = false;
+        this.predictedCol = serverCol;
+        this.predictedRow = serverRow;
+      }
+    }
+
+    reset(): void {
+      this.predictions = [];
+      this.active = false;
+      this.tentative = false;
+      predictionVersion++;
+    }
+  }
+
+  const predEngine = new PredictionEngine();
+  let predictionVersion = $state(0);
+
+  // ============================================================================
   // Computed
   // ============================================================================
 
@@ -179,16 +352,11 @@
   let cursorColorB = $state(0xc8);
   let cursorColor = $derived(`rgb(${cursorColorR},${cursorColorG},${cursorColorB})`);
 
-  // Tick-based cursor-video sync: buffer cursor updates and apply when
-  // the matching video frame renders, so cursor and content move together.
+  // Tick-based cursor-video sync: buffer cursor updates keyed by tick
+  // and apply each when the matching video frame renders.
+  type CursorUpdate = { x: number; y: number; w: number; h: number; style: number; visible: boolean; surfW: number; surfH: number; r: number; g: number; b: number };
   let videoTick = 0;
-  let pendingCursor: {
-    x: number; y: number; w: number; h: number;
-    style: number; visible: boolean;
-    surfW: number; surfH: number;
-    r: number; g: number; b: number;
-    tick: number;
-  } | null = null;
+  const pendingCursors = new Map<number, CursorUpdate>();
 
   // Reactive canvas buffer dimensions (encoder-aligned) — updated from video frames.
   let frameWidth = $state(0);
@@ -237,6 +405,23 @@
       width: (cursorW / pctW) * 100,
       height: (cursorH / pctH) * 100,
     };
+  });
+
+  // Prediction overlay characters — derived from predEngine state.
+  // Uses padding offset from predEngine to align with the terminal grid.
+  let predictionChars = $derived.by(() => {
+    void predictionVersion;
+    if (!predEngine.active || predEngine.predictions.length === 0) return [];
+    if (pctW === 0 || pctH === 0 || cursorW === 0 || cursorH === 0) return [];
+    const padX = predEngine.paddingX;
+    const padY = predEngine.paddingY;
+    return predEngine.predictions.map(p => ({
+      char: p.char,
+      left: ((padX + p.col * cursorW) / pctW) * 100,
+      top: ((padY + p.row * cursorH) / pctH) * 100,
+      width: (cursorW / pctW) * 100,
+      height: (cursorH / pctH) * 100,
+    }));
   });
 
   // ============================================================================
@@ -303,11 +488,17 @@
 
     gpuRenderer!.renderFrame(frame);
 
-    // Flush buffered cursor update now that the matching video frame is on screen
-    if (pendingCursor && videoTick >= pendingCursor.tick) {
-      const c = pendingCursor;
-      pendingCursor = null;
-      applyCursor(c.x, c.y, c.w, c.h, c.style, c.visible, c.surfW, c.surfH, c.r, c.g, c.b);
+    // Flush the best matching cursor (highest tick <= videoTick), discard older
+    if (pendingCursors.size > 0) {
+      let best: CursorUpdate | null = null;
+      let bestTick = 0;
+      for (const [t, c] of pendingCursors) {
+        if (t <= videoTick && t > bestTick) { bestTick = t; best = c; }
+      }
+      if (best) {
+        for (const t of pendingCursors.keys()) { if (t <= bestTick) pendingCursors.delete(t); }
+        applyCursor(best.x, best.y, best.w, best.h, best.style, best.visible, best.surfW, best.surfH, best.r, best.g, best.b);
+      }
     }
 
     // Update snapshot for tab overview (throttled, before frame.close())
@@ -776,6 +967,11 @@
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
     sendInputImmediate(buf);
+
+    // Predictive echo: predict on key press only
+    if (action === 1) {
+      predEngine.predict(text || e.key, e.code, getModifiers(e));
+    }
   }
 
   function handleMouseDown(e: MouseEvent): void {
@@ -978,6 +1174,9 @@
     view[4 + codeBytes.length] = textBytes.length;
     view.set(textBytes, 5 + codeBytes.length);
     sendInputImmediate(buf);
+
+    // Predictive echo for mobile/accessory key presses
+    predEngine.predict(text || code, code, mods);
   }
 
   function handleMobileInput(e: Event): void {
@@ -1404,12 +1603,11 @@
   }
 
   export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number, tick?: number): void {
+    const update: CursorUpdate = { x, y, w, h, style, visible, surfW: totalW, surfH: totalH, r: r ?? cursorColorR, g: g ?? cursorColorG, b: b ?? cursorColorB };
     if (tick !== undefined && tick > videoTick) {
-      // Buffer cursor update until matching video frame renders
-      pendingCursor = { x, y, w, h, style, visible, surfW: totalW, surfH: totalH, r: r ?? cursorColorR, g: g ?? cursorColorG, b: b ?? cursorColorB, tick };
+      pendingCursors.set(tick, update);
       return;
     }
-    // No tick or video already caught up — apply immediately
     applyCursor(x, y, w, h, style, visible, totalW, totalH, r, g, b);
   }
 
@@ -1425,6 +1623,14 @@
     if (r !== undefined) cursorColorR = r;
     if (g !== undefined) cursorColorG = g;
     if (b !== undefined) cursorColorB = b;
+
+    // Sync padding offset and confirm predictions using grid position
+    if (w > 0 && h > 0) {
+      predEngine.syncFromCursor(x, y, w, h);
+      const col = Math.round(x / w);
+      const row = Math.round(y / h);
+      predEngine.confirm(col, row, videoTick);
+    }
   }
 
   // ============================================================================
@@ -1631,7 +1837,7 @@
       </div>
     {/if}
     {#if viewportW > 0 && viewportH > 0}
-      <div class="cursor-container" style="--fw:{viewportW};--fh:{viewportH};--cursor-color:{cursorColor}">
+      <div class="cursor-container" style="--fw:{viewportW};--fh:{viewportH};--cursor-color:{cursorColor};--cell-h:{pctH > 0 ? (cursorH / pctH) * 100 : 0}">
         <div class="cursor-viewport">
           {#if cursorPct}
             {#key cursorKey}
@@ -1644,6 +1850,13 @@
                 style="left:{cursorPct.left}%;top:{cursorPct.top}%;width:{cursorPct.width}%;height:{cursorPct.height}%"
               ></div>
             {/key}
+          {/if}
+          {#if predictionChars.length > 0}
+            <div class="prediction-overlay">
+              {#each predictionChars as pred}
+                <span class="predicted-char" class:predicted-erase={pred.char === ' '} style="left:{pred.left}%;top:{pred.top}%;width:{pred.width}%;height:{pred.height}%">{pred.char}</span>
+              {/each}
+            </div>
           {/if}
         </div>
       </div>
@@ -1967,6 +2180,33 @@
   @keyframes cursor-blink {
     0%, 49% { visibility: visible; }
     50%, 100% { visibility: hidden; }
+  }
+
+  .prediction-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .predicted-char {
+    position: absolute;
+    font-family: ui-monospace, monospace;
+    /* Scale font with cell height using container query units.
+       --cell-h is cell height as percentage of container block size.
+       0.75 factor: monospace glyphs fit ~75% of cell height. */
+    font-size: calc(var(--cell-h) * 0.75cqb / 100);
+    color: var(--cursor-color, var(--text, #c8c8c8));
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    line-height: 1;
+  }
+
+  .predicted-erase {
+    background: var(--bg, #1e1e1e);
   }
 
   .panel-loading {
