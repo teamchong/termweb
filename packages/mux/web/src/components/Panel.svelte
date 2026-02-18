@@ -183,6 +183,7 @@
   // and apply each when the matching video frame renders.
   type CursorUpdate = { x: number; y: number; w: number; h: number; style: number; visible: boolean; surfW: number; surfH: number; r: number; g: number; b: number };
   let videoTick = 0;
+  const videoTickQueue: number[] = [];  // FIFO: ticks pushed on H264 arrival, popped on frame render
   const pendingCursors = new Map<number, CursorUpdate>();
 
   // Reactive canvas buffer dimensions (encoder-aligned) — updated from video frames.
@@ -297,6 +298,12 @@
     }
 
     gpuRenderer!.renderFrame(frame);
+
+    // Pop this frame's tick from the FIFO queue — each decoded frame gets
+    // exactly the tick it was sent with, keeping cursor aligned with video
+    // even under rapid typing where multiple frames are in the decode pipeline.
+    const frameTick = videoTickQueue.shift();
+    if (frameTick !== undefined) videoTick = frameTick;
 
     // Flush the best matching cursor (highest tick <= videoTick), discard older
     let flushedCursor: CursorUpdate | null = null;
@@ -1367,7 +1374,9 @@
   }
 
   export function updateVideoTick(tick: number): void {
-    videoTick = tick;
+    // Queue the tick — frames decode in FIFO order, so each renderFrame
+    // pops the tick for that specific frame, keeping cursor and video aligned.
+    videoTickQueue.push(tick);
   }
 
   export function decodePreviewFrame(frameData: Uint8Array): void {
