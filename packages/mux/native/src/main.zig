@@ -41,6 +41,17 @@ fn debugLog(comptime fmt: []const u8, args: anytype) void {
 const is_macos = builtin.os.tag == .macos;
 const is_linux = builtin.os.tag == .linux;
 
+// DMA-BUF sync ioctl for CPU-coherent mmap reads (Linux only).
+// Used to hash DMA-BUF pixels before encoding to detect unchanged frames.
+const dma_buf = if (is_linux) struct {
+    const SYNC_READ: u64 = 1;
+    const SYNC_START: u64 = 0;
+    const SYNC_END: u64 = 4;
+    // DMA_BUF_IOCTL_SYNC = _IOW('b', 0, struct{u64}) = (1<<30) | (0x62<<8) | (8<<16)
+    const IOCTL_SYNC: u32 = 0x40086200;
+    const Sync = extern struct { flags: u64 };
+} else struct {};
+
 // Cross-platform video encoder (uses comptime to select implementation)
 const video = @import("video.zig");
 
@@ -651,6 +662,19 @@ const Panel = struct {
     last_cell_w: u16 = 0,
     last_cell_h: u16 = 0,
     dbg_input_countdown: u32 = 0, // Debug: log N frames after input
+
+    // Two-pass render: inter-pass state for batched GPU→encode pipeline
+    needs_encode: bool = false,
+    captured_dma_fd: c_int = -1,
+    captured_dma_width: u32 = 0,
+    captured_dma_height: u32 = 0,
+    captured_dma_stride: c_int = 0,
+    captured_dma_offset: c_int = 0,
+    captured_dma_fourcc: c_int = 0,
+    captured_was_keyframe: bool = false,
+
+    // Tick counter for cursor-vs-video divergence tracking
+    render_tick: u32 = 0,
 
     const TARGET_FPS: i64 = 60; // 60 FPS for video
     /// After this many consecutive unchanged frames, reduce tick rate to save CPU/GPU.
@@ -2821,7 +2845,7 @@ const Server = struct {
     // Send H264 frame to authorized H264 clients with [panel_id:u32][frame_data...] prefix.
     // Non-admin connections only receive frames for panels assigned to their session.
     // Returns true if sent to at least one client, false if all sends failed.
-    fn sendH264Frame(self: *Server, panel_id: u32, frame_data: []const u8) bool {
+    fn sendH264Frame(self: *Server, panel_id: u32, frame_data: []const u8, render_tick: u32) bool {
         var conns_buf: [max_broadcast_conns]*ws.Connection = undefined;
         var conns_count: usize = 0;
         {
@@ -2852,8 +2876,9 @@ const Server = struct {
         }
         if (conns_count == 0) return false;
 
-        var id_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &id_buf, panel_id, .little);
+        var id_buf: [8]u8 = undefined;
+        std.mem.writeInt(u32, id_buf[0..4], panel_id, .little);
+        std.mem.writeInt(u32, id_buf[4..8], render_tick, .little);
 
         var any_sent = false;
         for (conns_buf[0..conns_count]) |conn| {
@@ -2862,7 +2887,7 @@ const Server = struct {
         }
         if (comptime enable_benchmark) {
             if (any_sent) {
-                _ = self.bw_h264_bytes.fetchAdd(4 + frame_data.len, .monotonic);
+                _ = self.bw_h264_bytes.fetchAdd(8 + frame_data.len, .monotonic);
                 _ = self.bw_h264_frames.fetchAdd(1, .monotonic);
             }
         }
@@ -3896,8 +3921,10 @@ const Server = struct {
 
     /// Build 18-byte cursor state message in surface-space coordinates.
     /// [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8]
-    fn buildCursorBuf(panel_id: u32, x: u16, y: u16, w: u16, h: u16, style: u8, visible: u8, r: u8, g: u8, b: u8) [18]u8 {
-        var buf: [18]u8 = undefined;
+    /// Build 22-byte cursor state message in surface-space coordinates.
+    /// [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8][render_tick:u32]
+    fn buildCursorBuf(panel_id: u32, x: u16, y: u16, w: u16, h: u16, style: u8, visible: u8, r: u8, g: u8, b: u8, render_tick: u32) [22]u8 {
+        var buf: [22]u8 = undefined;
         buf[0] = @intFromEnum(BinaryCtrlMsg.cursor_state);
         std.mem.writeInt(u32, buf[1..5], panel_id, .little);
         std.mem.writeInt(u16, buf[5..7], x, .little);
@@ -3909,6 +3936,7 @@ const Server = struct {
         buf[15] = r;
         buf[16] = g;
         buf[17] = b;
+        std.mem.writeInt(u32, buf[18..22], render_tick, .little);
         return buf;
     }
 
@@ -3968,7 +3996,7 @@ const Server = struct {
             panel.last_cell_w = cp.cell_w;
             panel.last_cell_h = cp.cell_h;
 
-            const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, cur_style, cur_visible, cur_color_r, cur_color_g, cur_color_b);
+            const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, cur_style, cur_visible, cur_color_r, cur_color_g, cur_color_b, panel.render_tick);
             self.broadcastControlData(&cursor_buf);
         }
     }
@@ -4009,7 +4037,7 @@ const Server = struct {
             const dims_buf = buildSurfaceDimsBuf(panel.id, cp.surf_w, cp.surf_h);
             conn.sendBinary(&dims_buf) catch {};
 
-            const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, panel.last_cursor_style, panel.last_cursor_visible, panel.last_cursor_color_r, panel.last_cursor_color_g, panel.last_cursor_color_b);
+            const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, panel.last_cursor_style, panel.last_cursor_visible, panel.last_cursor_color_r, panel.last_cursor_color_g, panel.last_cursor_color_b, panel.render_tick);
             conn.sendBinary(&cursor_buf) catch {};
         }
     }
@@ -6305,16 +6333,22 @@ const Server = struct {
                     }
                 }
 
-                // Process each panel WITHOUT holding the server mutex
-                // This prevents mutex starvation when encoding takes 100+ms per panel
+                // Two-pass batched render loop:
+                // Pass 1 — GPU work (tick + cursor + capture) for all panels
+                // Pass 2 — Encode + send for panels that need it
+                // This keeps GPU and VA-API hardware units "hot" by batching similar work.
                 var perf_tick_ns: u64 = 0;
                 var perf_read_ns: u64 = 0;
                 var perf_encode_ns: u64 = 0;
                 var perf_input_latency_us: i64 = 0; // Latest input-to-frame-send latency
-                for (frame_panels_buf[0..frame_panels_count]) |panel| {
 
-                    frames_attempted += 1;
+                // ===== PASS 1: GPU work (tick + cursor + capture) =====
+                for (frame_panels_buf[0..frame_panels_count]) |panel| {
                     const t_frame_start = std.time.nanoTimestamp();
+
+                    // Reset inter-pass state
+                    panel.needs_encode = false;
+                    panel.captured_dma_fd = -1;
 
                     // Per-panel adaptive FPS: when encoder's quality tier has fps < 60,
                     // skip frames to match the tier's target rate. This saves encode
@@ -6365,6 +6399,7 @@ const Server = struct {
                     crash_phase.store(5, .monotonic); // ghostty_surface_draw
                     const t_tick = std.time.nanoTimestamp();
                     panel.tick();
+                    panel.render_tick +%= 1;
                     const tick_elapsed: u64 = @intCast(std.time.nanoTimestamp() - t_tick);
                     perf_tick_ns += tick_elapsed;
 
@@ -6381,13 +6416,7 @@ const Server = struct {
                         continue;
                     }
 
-                    // Platform-specific frame capture
-                    var frame_data: ?[]const u8 = null;
-                    var read_elapsed: u64 = 0;
-                    var enc_elapsed: u64 = 0;
-                    var was_keyframe = false;
-                    var send_failed = false;
-
+                    // Platform-specific frame capture (GPU work only — encode deferred to pass 2)
                     if (comptime is_macos) {
                         if (panel.getIOSurface()) |iosurface| {
                             // BGRA copy path - skip encode if surface unchanged
@@ -6398,10 +6427,8 @@ const Server = struct {
                             }
                             panel.consecutive_unchanged = 0;
                             panel.idle_keyframe_sent = false;
-
-                            if (panel.prepareFrame() catch null) |result| {
-                                frame_data = result.data;
-                            }
+                            panel.needs_encode = true;
+                            panel.captured_was_keyframe = panel.force_keyframe;
                         }
                     } else if (comptime is_linux) {
                         // Linux: Capture from OpenGL framebuffer via ghostty
@@ -6449,14 +6476,9 @@ const Server = struct {
                             continue;
                         }
 
-                        was_keyframe = panel.force_keyframe;
-                        const had_input = panel.had_input;
-                        _ = had_input;
+                        panel.captured_was_keyframe = panel.force_keyframe;
 
-                        // === Zero-copy DMA-BUF path (fast) ===
-                        // Try exporting the GL texture as a DMA-BUF fd and importing directly
-                        // into VA-API. Eliminates glReadPixels (GPU→CPU) and vaMapBuffer (CPU→GPU).
-                        var used_dma_buf = false;
+                        // === Zero-copy DMA-BUF path: capture fd only (encode in pass 2) ===
                         self.dma_buf_frame_counter +%= 1;
                         const dma_buf_should_try = self.dma_buf_fail_count < 10 or
                             (self.dma_buf_frame_counter % 60 == 0); // Retry once/sec even after permanent fallback
@@ -6480,51 +6502,53 @@ const Server = struct {
                                 &dma_height,
                                 &dma_fourcc,
                             )) {
-                                read_elapsed = @intCast(std.time.nanoTimestamp() - t_export);
+                                const read_elapsed: u64 = @intCast(std.time.nanoTimestamp() - t_export);
                                 perf_read_ns += read_elapsed;
 
-                                // No frame hashing with zero-copy — encode every frame.
-                                // At ~5-10ms per frame this stays well within 16ms budget.
-                                panel.consecutive_unchanged = 0;
-                                panel.idle_keyframe_sent = false;
+                                // Pre-encode change detection: mmap the DMA-BUF and hash pixels.
+                                // On Intel UMA this reads from shared memory (~0.8ms for 1080p)
+                                // vs ~5-10ms for a full VA-API encode. Skip encode if unchanged.
+                                const dma_map_size: usize = @intCast(@as(i64, dma_stride) * @as(i64, @intCast(dma_height)) + @as(i64, dma_offset));
+                                var dma_hash_matched = false;
+                                if (dma_map_size > 0 and !panel.force_keyframe) {
+                                    if (std.posix.mmap(null, dma_map_size, std.os.linux.PROT.READ, .{ .TYPE = .SHARED }, @intCast(dma_fd), 0)) |mapping| {
+                                        // Begin CPU read sync
+                                        var sync_start = dma_buf.Sync{ .flags = dma_buf.SYNC_START | dma_buf.SYNC_READ };
+                                        _ = std.os.linux.ioctl(@intCast(dma_fd), dma_buf.IOCTL_SYNC, @intFromPtr(&sync_start));
 
-                                self.queryCursorAndBroadcast(panel);
+                                        const pixel_data = mapping[@intCast(dma_offset)..dma_map_size];
+                                        const frame_hash = std.hash.XxHash64.hash(0, pixel_data);
 
-                                crash_phase.store(7, .monotonic); // video encoder
-                                const t_enc = std.time.nanoTimestamp();
-                                if (panel.video_encoder.?.encodeFromDmaBuf(
-                                    dma_fd,
-                                    dma_width,
-                                    dma_height,
-                                    dma_stride,
-                                    dma_offset,
-                                    dma_fourcc,
-                                    panel.force_keyframe,
-                                ) catch null) |result| {
-                                    frame_data = result.data;
-                                    panel.force_keyframe = false;
-                                    used_dma_buf = true;
-                                    if (self.dma_buf_fail_count > 0) {
-                                        logToFile(dbg_log, "DMA_BUF_RECOVERED after {d} failures\n", .{self.dma_buf_fail_count});
-                                        self.dma_buf_fail_count = 0;
-                                    }
-                                    logToFile(dbg_log, "DMA_ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
-                                } else {
-                                    // DMA-BUF encode failed — increment failure counter
-                                    self.dma_buf_fail_count +|= 1;
-                                    if (self.dma_buf_fail_count == 1) {
-                                        std.debug.print("DMA-BUF encode failed (attempt 1), will retry\n", .{});
-                                        logToFile(dbg_log, "DMA_BUF_ENCODE_FAIL panel={d} count={d}\n", .{ panel.id, self.dma_buf_fail_count });
-                                    } else if (self.dma_buf_fail_count == 10) {
-                                        std.debug.print("DMA-BUF encode failed 10x, falling back to CPU path (periodic retry enabled)\n", .{});
-                                        logToFile(dbg_log, "DMA_BUF_PERMANENT_FALLBACK panel={d}\n", .{ panel.id });
+                                        // End CPU read sync
+                                        var sync_end = dma_buf.Sync{ .flags = dma_buf.SYNC_END | dma_buf.SYNC_READ };
+                                        _ = std.os.linux.ioctl(@intCast(dma_fd), dma_buf.IOCTL_SYNC, @intFromPtr(&sync_end));
+
+                                        std.posix.munmap(mapping);
+
+                                        if (frame_hash == panel.last_frame_hash) {
+                                            panel.consecutive_unchanged += 1;
+                                            std.posix.close(@intCast(dma_fd));
+                                            dma_hash_matched = true;
+                                        } else {
+                                            panel.last_frame_hash = frame_hash;
+                                        }
+                                    } else |_| {
+                                        // mmap failed — fall through to encode path
                                     }
                                 }
-                                enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
-                                perf_encode_ns += enc_elapsed;
 
-                                // Close the DMA-BUF fd (VA-API import duplicates it internally)
-                                std.posix.close(@intCast(dma_fd));
+                                if (!dma_hash_matched) {
+                                    // Store DMA-BUF params for pass 2 encode
+                                    panel.captured_dma_fd = dma_fd;
+                                    panel.captured_dma_width = dma_width;
+                                    panel.captured_dma_height = dma_height;
+                                    panel.captured_dma_stride = dma_stride;
+                                    panel.captured_dma_offset = dma_offset;
+                                    panel.captured_dma_fourcc = dma_fourcc;
+                                    panel.consecutive_unchanged = 0;
+                                    panel.idle_keyframe_sent = false;
+                                    panel.needs_encode = true;
+                                }
                             } else {
                                 // DMA-BUF export not available — increment failure counter
                                 self.dma_buf_fail_count +|= 1;
@@ -6537,8 +6561,8 @@ const Server = struct {
                             }
                         }
 
-                        // === Fallback: glReadPixels + CPU upload path ===
-                        if (!used_dma_buf) {
+                        // === Fallback: glReadPixels capture (CPU path, encode in pass 2) ===
+                        if (panel.captured_dma_fd == -1) {
                             // Ensure BGRA buffer is allocated for CPU path
                             if (panel.bgra_buffer == null) {
                                 panel.bgra_buffer = panel.allocator.alloc(u8, buffer_size) catch continue;
@@ -6547,7 +6571,7 @@ const Server = struct {
                             crash_phase.store(6, .monotonic); // ghostty_surface_read_pixels
                             const t_read = std.time.nanoTimestamp();
                             const read_ok = c.ghostty_surface_read_pixels(panel.surface, panel.bgra_buffer.?.ptr, panel.bgra_buffer.?.len);
-                            read_elapsed = @intCast(std.time.nanoTimestamp() - t_read);
+                            const read_elapsed: u64 = @intCast(std.time.nanoTimestamp() - t_read);
                             perf_read_ns += read_elapsed;
 
                             if (read_ok) {
@@ -6555,43 +6579,106 @@ const Server = struct {
                                     _ = self.bw_raw_pixels_bytes.fetchAdd(panel.bgra_buffer.?.len, .monotonic);
                                 }
 
-                                const buf = panel.bgra_buffer.?;
-
                                 // Frame skip: hash the pixel buffer and skip encoding if unchanged
-                                const frame_hash = std.hash.XxHash64.hash(0, buf);
+                                const frame_hash = std.hash.XxHash64.hash(0, panel.bgra_buffer.?);
 
                                 if (frame_hash == panel.last_frame_hash and !panel.force_keyframe) {
                                     panel.consecutive_unchanged += 1;
                                     continue;
                                 }
-                                panel.consecutive_unchanged = 0;
-                                panel.idle_keyframe_sent = false;
                                 panel.last_frame_hash = frame_hash;
-
-                                self.queryCursorAndBroadcast(panel);
-
-                                crash_phase.store(7, .monotonic); // video encoder
-                                const t_enc = std.time.nanoTimestamp();
-                                if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
-                                    frame_data = result.data;
-                                    panel.force_keyframe = false;
-                                    logToFile(dbg_log, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
-                                } else {
-                                    if (panel.ticks_since_connect < 10)
-                                        logToFile(dbg_log, "ENCODE_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
-                                }
-                                enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
-                                perf_encode_ns += enc_elapsed;
+                                panel.needs_encode = true;
                             } else {
                                 if (panel.ticks_since_connect < 10)
                                     logToFile(dbg_log, "READ_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
                             }
-                        } // if (!used_dma_buf)
+                        }
+                    }
+                }
+
+                // ===== PASS 2: Encode + send (VA-API/VideoToolbox work) =====
+                for (frame_panels_buf[0..frame_panels_count]) |panel| {
+                    if (!panel.needs_encode) continue;
+
+                    frames_attempted += 1;
+                    const t_frame_start = std.time.nanoTimestamp();
+
+                    var frame_data: ?[]const u8 = null;
+                    var enc_elapsed: u64 = 0;
+                    var send_failed = false;
+                    const was_keyframe = panel.captured_was_keyframe;
+
+                    if (comptime is_macos) {
+                        if (panel.prepareFrame() catch null) |result| {
+                            frame_data = result.data;
+                        }
+                    } else if (comptime is_linux) {
+                        if (panel.captured_dma_fd != -1) {
+                            // DMA-BUF encode path (mmap hash already confirmed pixels changed)
+                            crash_phase.store(7, .monotonic); // video encoder
+                            const t_enc = std.time.nanoTimestamp();
+                            if (panel.video_encoder.?.encodeFromDmaBuf(
+                                panel.captured_dma_fd,
+                                panel.captured_dma_width,
+                                panel.captured_dma_height,
+                                panel.captured_dma_stride,
+                                panel.captured_dma_offset,
+                                panel.captured_dma_fourcc,
+                                panel.force_keyframe,
+                            ) catch null) |result| {
+                                frame_data = result.data;
+                                panel.force_keyframe = false;
+                                if (self.dma_buf_fail_count > 0) {
+                                    logToFile(dbg_log, "DMA_BUF_RECOVERED after {d} failures\n", .{self.dma_buf_fail_count});
+                                    self.dma_buf_fail_count = 0;
+                                }
+                                logToFile(dbg_log, "DMA_ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
+                            } else {
+                                // DMA-BUF encode failed — increment failure counter
+                                self.dma_buf_fail_count +|= 1;
+                                if (self.dma_buf_fail_count == 1) {
+                                    std.debug.print("DMA-BUF encode failed (attempt 1), will retry\n", .{});
+                                    logToFile(dbg_log, "DMA_BUF_ENCODE_FAIL panel={d} count={d}\n", .{ panel.id, self.dma_buf_fail_count });
+                                } else if (self.dma_buf_fail_count == 10) {
+                                    std.debug.print("DMA-BUF encode failed 10x, falling back to CPU path (periodic retry enabled)\n", .{});
+                                    logToFile(dbg_log, "DMA_BUF_PERMANENT_FALLBACK panel={d}\n", .{ panel.id });
+                                }
+                            }
+                            enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
+                            perf_encode_ns += enc_elapsed;
+
+                            // Close the DMA-BUF fd (VA-API import duplicates it internally)
+                            std.posix.close(@intCast(panel.captured_dma_fd));
+                            panel.captured_dma_fd = -1;
+                        } else {
+                            // CPU readback encode path
+                            panel.consecutive_unchanged = 0;
+                            panel.idle_keyframe_sent = false;
+
+                            const pixel_width = panel.getPixelWidth();
+                            const pixel_height = panel.getPixelHeight();
+
+                            crash_phase.store(7, .monotonic); // video encoder
+                            const t_enc = std.time.nanoTimestamp();
+                            if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
+                                frame_data = result.data;
+                                panel.force_keyframe = false;
+                                logToFile(dbg_log, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
+                            } else {
+                                if (panel.ticks_since_connect < 10)
+                                    logToFile(dbg_log, "ENCODE_FAIL panel={d} tick={d}\n", .{ panel.id, panel.ticks_since_connect });
+                            }
+                            enc_elapsed = @intCast(std.time.nanoTimestamp() - t_enc);
+                            perf_encode_ns += enc_elapsed;
+                        }
                     }
 
-                    // Send frame to all H264 clients (multiplexed by panel_id)
+                    // Send cursor + frame together so they arrive at the client in sync.
+                    // Cursor goes on control channel, frame on H264 channel — same server time.
+                    self.queryCursorAndBroadcast(panel);
+
                     if (frame_data) |data| {
-                        if (self.sendH264Frame(panel.id, data)) {
+                        if (self.sendH264Frame(panel.id, data, panel.render_tick)) {
                             frames_sent += 1;
                             panel.last_frame_time = t_frame_start; // For per-panel adaptive FPS
                             if (panel.ticks_since_connect < 10)
@@ -6616,11 +6703,9 @@ const Server = struct {
                     const frame_total_ns: u64 = @intCast(std.time.nanoTimestamp() - t_frame_start);
                     const spike_threshold_ns: u64 = 50 * std.time.ns_per_ms;
                     if (frame_total_ns > spike_threshold_ns) {
-                        logToFile(perf_log, "SPIKE panel={d} total={d}ms tick={d}ms read={d}ms enc={d}ms keyframe={} send_fail={}\n", .{
+                        logToFile(perf_log, "SPIKE panel={d} total={d}ms enc={d}ms keyframe={} send_fail={}\n", .{
                             panel.id,
                             frame_total_ns / std.time.ns_per_ms,
-                            tick_elapsed / std.time.ns_per_ms,
-                            read_elapsed / std.time.ns_per_ms,
                             enc_elapsed / std.time.ns_per_ms,
                             was_keyframe,
                             send_failed,

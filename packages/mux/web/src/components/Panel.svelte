@@ -179,6 +179,17 @@
   let cursorColorB = $state(0xc8);
   let cursorColor = $derived(`rgb(${cursorColorR},${cursorColorG},${cursorColorB})`);
 
+  // Tick-based cursor-video sync: buffer cursor updates and apply when
+  // the matching video frame renders, so cursor and content move together.
+  let videoTick = 0;
+  let pendingCursor: {
+    x: number; y: number; w: number; h: number;
+    style: number; visible: boolean;
+    surfW: number; surfH: number;
+    r: number; g: number; b: number;
+    tick: number;
+  } | null = null;
+
   // Reactive canvas buffer dimensions (encoder-aligned) — updated from video frames.
   let frameWidth = $state(0);
   let frameHeight = $state(0);
@@ -291,6 +302,13 @@
     }
 
     gpuRenderer!.renderFrame(frame);
+
+    // Flush buffered cursor update now that the matching video frame is on screen
+    if (pendingCursor && videoTick >= pendingCursor.tick) {
+      const c = pendingCursor;
+      pendingCursor = null;
+      applyCursor(c.x, c.y, c.w, c.h, c.style, c.visible, c.surfW, c.surfH, c.r, c.g, c.b);
+    }
 
     // Update snapshot for tab overview (throttled, before frame.close())
     const now = performance.now();
@@ -1347,6 +1365,10 @@
     }
   }
 
+  export function updateVideoTick(tick: number): void {
+    videoTick = tick;
+  }
+
   export function decodePreviewFrame(frameData: Uint8Array): void {
     handleFrame(frameData.slice().buffer as ArrayBuffer);
   }
@@ -1381,15 +1403,25 @@
     onPwdChange?.(newPwd);
   }
 
-  export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number): void {
+  export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number, tick?: number): void {
+    if (tick !== undefined && tick > videoTick) {
+      // Buffer cursor update until matching video frame renders
+      pendingCursor = { x, y, w, h, style, visible, surfW: totalW, surfH: totalH, r: r ?? cursorColorR, g: g ?? cursorColorG, b: b ?? cursorColorB, tick };
+      return;
+    }
+    // No tick or video already caught up — apply immediately
+    applyCursor(x, y, w, h, style, visible, totalW, totalH, r, g, b);
+  }
+
+  function applyCursor(x: number, y: number, w: number, h: number, style: number, visible: boolean, surfW: number, surfH: number, r?: number, g?: number, b?: number): void {
     cursorX = x;
     cursorY = y;
     cursorW = w;
     cursorH = h;
     cursorStyle = style;
     cursorVisible = visible;
-    cursorSurfW = totalW;
-    cursorSurfH = totalH;
+    cursorSurfW = surfW;
+    cursorSurfH = surfH;
     if (r !== undefined) cursorColorR = r;
     if (g !== undefined) cursorColorG = g;
     if (b !== undefined) cursorColorB = b;

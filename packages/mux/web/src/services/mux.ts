@@ -34,7 +34,8 @@ interface PanelInstance extends PanelLike {
   getPwd: () => string;
   setPwd: (pwd: string) => void;
   getSnapshotCanvas: () => HTMLCanvasElement | undefined;
-  updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number) => void;
+  updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number, tick?: number) => void;
+  updateVideoTick: (tick: number) => void;
 }
 
 // Type guard for validating LayoutData structure from server
@@ -950,7 +951,7 @@ export class MuxClient {
           break;
         }
         case SERVER_MSG.CURSOR_STATE: {
-          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8] = 18 bytes
+          // [0x14][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8][render_tick:u32] = 22 bytes (18 legacy)
           if (data.byteLength < 18) break;
           const panelId = view.getUint32(1, true);
           const x = view.getUint16(5, true);
@@ -962,13 +963,15 @@ export class MuxClient {
           const colorR = view.getUint8(15);
           const colorG = view.getUint8(16);
           const colorB = view.getUint8(17);
+          // Parse render_tick if present (22-byte message)
+          const cursorTick = data.byteLength >= 22 ? view.getUint32(18, true) : undefined;
           // Use cached surface dims from SURFACE_DIMS message
           const dims = this.surfaceDims.get(panelId);
           const totalW = dims?.w ?? 0;
           const totalH = dims?.h ?? 0;
           const panel = this.panelsByServerId.get(panelId);
           if (panel) {
-            panel.updateCursorState(x, y, w, h, style, visible, totalW, totalH, colorR, colorG, colorB);
+            panel.updateCursorState(x, y, w, h, style, visible, totalW, totalH, colorR, colorG, colorB, cursorTick);
           }
           break;
         }
@@ -1565,7 +1568,8 @@ export class MuxClient {
       setPwd: (pwd: string) => void;
       getCanvas: () => HTMLCanvasElement | undefined;
       getSnapshotCanvas: () => HTMLCanvasElement | undefined;
-      updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number) => void;
+      updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number, tick?: number) => void;
+      updateVideoTick: (tick: number) => void;
     };
 
     const panel: PanelInstance = {
@@ -1593,7 +1597,8 @@ export class MuxClient {
       getPwd: () => comp.getPwd(),
       setPwd: (p) => comp.setPwd(p),
       getSnapshotCanvas: () => comp.getSnapshotCanvas(),
-      updateCursorState: (x, y, w, h, s, v, tw, th) => comp.updateCursorState(x, y, w, h, s, v, tw, th),
+      updateCursorState: (x, y, w, h, s, v, tw, th, r?, g?, b?, tick?) => comp.updateCursorState(x, y, w, h, s, v, tw, th, r, g, b, tick),
+      updateVideoTick: (tick) => comp.updateVideoTick(tick),
     };
 
     this.panelInstances.set(panelId, panel);
@@ -2007,10 +2012,11 @@ export class MuxClient {
     this.h264Ws = new WebSocket(url);
     this.h264Ws.binaryType = 'arraybuffer';
     this.h264Ws.onmessage = (e: MessageEvent) => {
-      if (e.data instanceof ArrayBuffer && e.data.byteLength > 4) {
+      if (e.data instanceof ArrayBuffer && e.data.byteLength > 8) {
         const view = new DataView(e.data);
         const panelId = view.getUint32(0, true);
-        const frameData = new Uint8Array(e.data, 4);
+        const videoTick = view.getUint32(4, true);
+        const frameData = new Uint8Array(e.data, 8);
         // Route to override handler (overview) if set
         if (this.h264OverrideHandler) {
           this.h264OverrideHandler(panelId, frameData);
@@ -2018,6 +2024,7 @@ export class MuxClient {
         // Route to panel by server ID, cache if not ready yet
         const panel = this.panelsByServerId.get(panelId);
         if (panel) {
+          panel.updateVideoTick(videoTick);
           panel.decodePreviewFrame(frameData);
         } else {
           let pending = this.h264PendingFrames.get(panelId);
