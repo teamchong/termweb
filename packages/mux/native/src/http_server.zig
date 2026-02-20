@@ -32,6 +32,7 @@ fn setReadTimeout(fd: posix.socket_t, timeout_ms: u32) void {
 const web_assets = @import("web_assets");
 const embedded_file_worker_js = web_assets.file_worker_js;
 const embedded_zstd_wasm = web_assets.zstd_wasm;
+const embedded_terminal_wasm = web_assets.terminal_wasm;
 
 // Inlined HTML: JS is embedded directly so no sub-resource fetch is needed.
 // This avoids needing cookies or separate auth for static assets.
@@ -122,7 +123,7 @@ const login_page_html =
     \\if(document.body.dataset.google==='1')document.getElementById('gg-btn').classList.remove('hidden');
     \\var f=document.querySelector('form'),ti=f.querySelector('input[name=token]');
     \\f.addEventListener('submit',function(ev){var v=ti.value.trim();
-    \\try{var u=new URL(v);var t=u.searchParams.get('token');if(t){ti.value=t}}catch(e){}});
+    \\var m=v.match(/[?&]token=([^&]*)/);if(m)ti.value=decodeURIComponent(m[1])});
     \\</script></body></html>
 ;
 
@@ -489,6 +490,8 @@ pub const HttpServer = struct {
             embedded_file_worker_js
         else if (std.mem.eql(u8, clean_path, "/zstd.wasm"))
             embedded_zstd_wasm
+        else if (std.mem.eql(u8, clean_path, "/terminal.wasm"))
+            embedded_terminal_wasm
         else {
             self.sendError(stream, 404, "Not Found");
             return;
