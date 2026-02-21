@@ -484,7 +484,7 @@ pub const VideoEncoder = struct {
         }
     };
 
-    /// Generate SPS NAL unit for H264 Main profile (Annex B format)
+    /// Generate SPS NAL unit for H264 Baseline profile (AVCC format: 4-byte length prefix)
     fn generateSPS(self: *VideoEncoder) void {
         const width_mbs = self.width / 16;
         const height_mbs = self.height / 16;
@@ -492,11 +492,8 @@ pub const VideoEncoder = struct {
         // Clear buffer
         @memset(&self.sps_data, 0);
 
-        // Start code
-        self.sps_data[0] = 0;
-        self.sps_data[1] = 0;
-        self.sps_data[2] = 0;
-        self.sps_data[3] = 1;
+        // Reserve 4 bytes for AVCC length prefix (filled after NAL is complete)
+        // Bytes 0..3 = length (big-endian), byte 4 = NAL header
 
         // NAL header: nal_ref_idc=3, nal_unit_type=7 (SPS)
         self.sps_data[4] = 0x67;
@@ -584,18 +581,18 @@ pub const VideoEncoder = struct {
 
         bs.writeTrailingBits();
         self.sps_len = 5 + bs.getLength();
+        // Write AVCC 4-byte big-endian length prefix (NAL data length = total - 4 bytes prefix)
+        const sps_nal_len: u32 = @intCast(self.sps_len - 4);
+        std.mem.writeInt(u32, self.sps_data[0..4], sps_nal_len, .big);
     }
 
-    /// Generate PPS NAL unit for H264 Constrained Baseline profile (Annex B format)
+    /// Generate PPS NAL unit for H264 Constrained Baseline profile (AVCC format: 4-byte length prefix)
     fn generatePPS(self: *VideoEncoder) void {
         // Clear buffer
         @memset(&self.pps_data, 0);
 
-        // Start code
-        self.pps_data[0] = 0;
-        self.pps_data[1] = 0;
-        self.pps_data[2] = 0;
-        self.pps_data[3] = 1;
+        // Reserve 4 bytes for AVCC length prefix (filled after NAL is complete)
+        // Bytes 0..3 = length (big-endian), byte 4 = NAL header
 
         // NAL header: nal_ref_idc=3, nal_unit_type=8 (PPS)
         self.pps_data[4] = 0x68;
@@ -635,6 +632,9 @@ pub const VideoEncoder = struct {
 
         bs.writeTrailingBits();
         self.pps_len = 5 + bs.getLength();
+        // Write AVCC 4-byte big-endian length prefix (NAL data length = total - 4 bytes prefix)
+        const pps_nal_len: u32 = @intCast(self.pps_len - 4);
+        std.mem.writeInt(u32, self.pps_data[0..4], pps_nal_len, .big);
     }
 
     /// Initialize encoder using a shared VA context.
@@ -1412,9 +1412,12 @@ pub const VideoEncoder = struct {
 
         writeU8(&slice_param, SLICE_cabac_init_idc, 0);
         writeI8(&slice_param, SLICE_slice_qp_delta, -4);
-        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 0);
-        writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 3);
-        writeI8(&slice_param, SLICE_slice_beta_offset_div2, 3);
+        // Disable in-loop deblocking filter — saves ~20-30% decode time.
+        // Terminal text (sharp edges, solid colors) doesn't benefit from
+        // deblocking like natural video. idc=1 disables entirely.
+        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 1);
+        writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 0);
+        writeI8(&slice_param, SLICE_slice_beta_offset_div2, 0);
 
         var slice_buf: c.VABufferID = 0;
         status = vaCreateBuffer(
@@ -1457,12 +1460,15 @@ pub const VideoEncoder = struct {
 
         self.output_len = 0;
         if (is_keyframe) {
+            // SPS/PPS are already in AVCC format (4-byte length prefix)
             @memcpy(self.output_buffer[0..self.sps_len], self.sps_data[0..self.sps_len]);
             self.output_len = self.sps_len;
             @memcpy(self.output_buffer[self.output_len..][0..self.pps_len], self.pps_data[0..self.pps_len]);
             self.output_len += self.pps_len;
         }
 
+        // VA-API outputs Annex B format — copy segments then convert in-place to AVCC
+        const vaapi_data_start = self.output_len;
         if (coded_seg_ptr) |ptr| {
             const coded_seg: *VACodedBufferSegment = @ptrCast(@alignCast(ptr));
             var current_seg: ?*VACodedBufferSegment = coded_seg;
@@ -1480,6 +1486,11 @@ pub const VideoEncoder = struct {
         }
 
         _ = c.vaUnmapBuffer(va_display, self.coded_buf);
+
+        // Convert VA-API Annex B output to AVCC in-place (same 4-byte prefix swap)
+        if (self.output_len > vaapi_data_start) {
+            convertAnnexBToAvcc(self.output_buffer[vaapi_data_start..self.output_len]);
+        }
 
         // Swap surfaces for reference frame tracking
         const tmp = self.ref_surface;
@@ -1726,9 +1737,10 @@ pub const VideoEncoder = struct {
 
         writeU8(&slice_param, SLICE_cabac_init_idc, 0);
         writeI8(&slice_param, SLICE_slice_qp_delta, -4);
-        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 0);
-        writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 3);
-        writeI8(&slice_param, SLICE_slice_beta_offset_div2, 3);
+        // Disable in-loop deblocking filter (same as CPU path above)
+        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 1);
+        writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 0);
+        writeI8(&slice_param, SLICE_slice_beta_offset_div2, 0);
 
         var slice_buf: c.VABufferID = 0;
         status = vaCreateBuffer(va_display, self.va_context, VAEncSliceParameterBufferType, SLICE_PARAM_SIZE, 1, &slice_param, &slice_buf);
@@ -1760,12 +1772,15 @@ pub const VideoEncoder = struct {
 
         self.output_len = 0;
         if (is_keyframe) {
+            // SPS/PPS are already in AVCC format (4-byte length prefix)
             @memcpy(self.output_buffer[0..self.sps_len], self.sps_data[0..self.sps_len]);
             self.output_len = self.sps_len;
             @memcpy(self.output_buffer[self.output_len..][0..self.pps_len], self.pps_data[0..self.pps_len]);
             self.output_len += self.pps_len;
         }
 
+        // VA-API outputs Annex B format — copy segments then convert in-place to AVCC
+        const vaapi_data_start = self.output_len;
         if (coded_seg_ptr) |ptr| {
             const coded_seg: *VACodedBufferSegment = @ptrCast(@alignCast(ptr));
             var current_seg: ?*VACodedBufferSegment = coded_seg;
@@ -1783,6 +1798,11 @@ pub const VideoEncoder = struct {
         }
 
         _ = c.vaUnmapBuffer(va_display, self.coded_buf);
+
+        // Convert VA-API Annex B output to AVCC in-place (same 4-byte prefix swap)
+        if (self.output_len > vaapi_data_start) {
+            convertAnnexBToAvcc(self.output_buffer[vaapi_data_start..self.output_len]);
+        }
 
         // Swap surfaces for reference frame tracking
         const tmp = self.ref_surface;
@@ -1807,6 +1827,31 @@ pub const VideoEncoder = struct {
 
     fn logEncTiming(sync_ms: i128, upload_ms: i128, submit_ms: i128, w: u32, h: u32) void {
         logEncTimingPath("cpu", sync_ms, upload_ms, submit_ms, w, h);
+    }
+
+    /// Convert Annex B start codes (00 00 00 01) to AVCC length prefixes in-place.
+    /// Both use 4-byte prefixes, so this is a zero-allocation swap.
+    fn convertAnnexBToAvcc(data: []u8) void {
+        var i: usize = 0;
+        while (i + 3 < data.len) {
+            if (data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 1) {
+                // Found start code at position i — find next start code to determine NAL length
+                const nal_start = i + 4;
+                var next_start_code: usize = data.len;
+                var j: usize = nal_start;
+                while (j + 3 < data.len) : (j += 1) {
+                    if (data[j] == 0 and data[j + 1] == 0 and data[j + 2] == 0 and data[j + 3] == 1) {
+                        next_start_code = j;
+                        break;
+                    }
+                }
+                const nal_len: u32 = @intCast(next_start_code - nal_start);
+                std.mem.writeInt(u32, data[i..][0..4], nal_len, .big);
+                i = next_start_code;
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn logEncTimingPath(path: []const u8, sync_ms: i128, upload_ms: i128, submit_ms: i128, w: u32, h: u32) void {
@@ -1857,4 +1902,68 @@ test "calcAlignedDimensions: small dimensions stay small" {
     const dims = VideoEncoder.calcAlignedDimensions(320, 240, 1_000_000);
     try std.testing.expectEqual(@as(u32, 320), dims.w);
     try std.testing.expectEqual(@as(u32, 240), dims.h); // 240 is already 16-aligned
+}
+
+test "convertAnnexBToAvcc: single NAL unit" {
+    // [00 00 00 01] [NAL data: 3 bytes]
+    var data = [_]u8{ 0, 0, 0, 1, 0x65, 0xAA, 0xBB };
+    VideoEncoder.convertAnnexBToAvcc(&data);
+    // Length prefix should be 3 (big-endian)
+    try std.testing.expectEqual(@as(u8, 0), data[0]);
+    try std.testing.expectEqual(@as(u8, 0), data[1]);
+    try std.testing.expectEqual(@as(u8, 0), data[2]);
+    try std.testing.expectEqual(@as(u8, 3), data[3]);
+    // NAL data unchanged
+    try std.testing.expectEqual(@as(u8, 0x65), data[4]);
+    try std.testing.expectEqual(@as(u8, 0xAA), data[5]);
+    try std.testing.expectEqual(@as(u8, 0xBB), data[6]);
+}
+
+test "convertAnnexBToAvcc: multiple NAL units" {
+    // [00 00 00 01] [SPS: 2 bytes] [00 00 00 01] [PPS: 1 byte] [00 00 00 01] [IDR: 3 bytes]
+    var data = [_]u8{
+        0, 0, 0, 1, 0x67, 0x42, // SPS (2 bytes)
+        0, 0, 0, 1, 0x68, // PPS (1 byte)
+        0, 0, 0, 1, 0x65, 0xAA, 0xBB, // IDR (3 bytes)
+    };
+    VideoEncoder.convertAnnexBToAvcc(&data);
+
+    // First NAL: length = 2
+    try std.testing.expectEqual(@as(u8, 0), data[0]);
+    try std.testing.expectEqual(@as(u8, 0), data[1]);
+    try std.testing.expectEqual(@as(u8, 0), data[2]);
+    try std.testing.expectEqual(@as(u8, 2), data[3]);
+    try std.testing.expectEqual(@as(u8, 0x67), data[4]);
+    try std.testing.expectEqual(@as(u8, 0x42), data[5]);
+
+    // Second NAL: length = 1
+    try std.testing.expectEqual(@as(u8, 0), data[6]);
+    try std.testing.expectEqual(@as(u8, 0), data[7]);
+    try std.testing.expectEqual(@as(u8, 0), data[8]);
+    try std.testing.expectEqual(@as(u8, 1), data[9]);
+    try std.testing.expectEqual(@as(u8, 0x68), data[10]);
+
+    // Third NAL: length = 3
+    try std.testing.expectEqual(@as(u8, 0), data[11]);
+    try std.testing.expectEqual(@as(u8, 0), data[12]);
+    try std.testing.expectEqual(@as(u8, 0), data[13]);
+    try std.testing.expectEqual(@as(u8, 3), data[14]);
+    try std.testing.expectEqual(@as(u8, 0x65), data[15]);
+    try std.testing.expectEqual(@as(u8, 0xAA), data[16]);
+    try std.testing.expectEqual(@as(u8, 0xBB), data[17]);
+}
+
+test "convertAnnexBToAvcc: empty data" {
+    var data = [_]u8{};
+    VideoEncoder.convertAnnexBToAvcc(&data);
+    // Should not crash on empty input
+}
+
+test "convertAnnexBToAvcc: data too short for start code" {
+    var data = [_]u8{ 0, 0, 0 };
+    VideoEncoder.convertAnnexBToAvcc(&data);
+    // Should not modify anything
+    try std.testing.expectEqual(@as(u8, 0), data[0]);
+    try std.testing.expectEqual(@as(u8, 0), data[1]);
+    try std.testing.expectEqual(@as(u8, 0), data[2]);
 }

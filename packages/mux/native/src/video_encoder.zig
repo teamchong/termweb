@@ -369,14 +369,16 @@ pub const VideoEncoder = struct {
         // Prioritize speed over power efficiency
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_MaximizePowerEfficiency, c.kCFBooleanFalse);
 
-        // Prioritize quality over speed for sharp terminal text
-        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, c.kCFBooleanFalse);
+        // Prioritize encoding speed — produces simpler frames that decode faster.
+        // Terminal text quality is maintained by high bitrate and idle keyframes.
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, c.kCFBooleanTrue);
 
         // Disable B-frames (critical for zero latency)
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_AllowFrameReordering, c.kCFBooleanFalse);
 
-        // Set profile to Main for better quality (still no B-frames due to AllowFrameReordering=false)
-        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_ProfileLevel, c.kVTProfileLevel_H264_Main_AutoLevel);
+        // Set profile to Baseline for faster decoding (CAVLC instead of CABAC)
+        // Linux already uses Baseline (profile_idc=66). No B-frames due to AllowFrameReordering=false.
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_ProfileLevel, c.kVTProfileLevel_H264_Baseline_AutoLevel);
 
         // Color settings for accurate terminal rendering
         // BT.709 color primaries (standard for HD video)
@@ -781,13 +783,10 @@ pub const VideoEncoder = struct {
 };
 
 // Callback when encoded data is ready
-/// Append an Annex B NAL unit (start code + data) to the output buffer.
+/// Append an AVCC NAL unit (4-byte big-endian length prefix + data) to the output buffer.
 fn appendNalUnit(encoder: *VideoEncoder, nal_data: []const u8) void {
     if (encoder.output_len + 4 + nal_data.len > encoder.output_buffer.len) return;
-    encoder.output_buffer[encoder.output_len] = 0;
-    encoder.output_buffer[encoder.output_len + 1] = 0;
-    encoder.output_buffer[encoder.output_len + 2] = 0;
-    encoder.output_buffer[encoder.output_len + 3] = 1;
+    std.mem.writeInt(u32, encoder.output_buffer[encoder.output_len..][0..4], @intCast(nal_data.len), .big);
     @memcpy(encoder.output_buffer[encoder.output_len + 4 ..][0..nal_data.len], nal_data);
     encoder.output_len += 4 + nal_data.len;
 }
@@ -842,7 +841,8 @@ fn compressionOutputCallback(
         if (pps_size > 0) appendNalUnit(encoder, pps_ptr[0..pps_size]);
     }
 
-    // Get encoded data
+    // Get encoded data — CMBlockBuffer is already in AVCC format (4-byte length prefixed).
+    // Copy directly since we output AVCC.
     const data_buffer = c.CMSampleBufferGetDataBuffer(sample_buffer);
     if (data_buffer == null) return;
 
@@ -851,19 +851,8 @@ fn compressionOutputCallback(
     const data_status = c.CMBlockBufferGetDataPointer(data_buffer, 0, null, &length, &data_ptr);
     if (data_status != 0) return;
 
-    // Convert AVCC format to Annex B
-    var offset: usize = 0;
-    while (offset < length) {
-        if (offset + 4 > length) break;
-        const nal_length: u32 = (@as(u32, data_ptr[offset]) << 24) |
-            (@as(u32, data_ptr[offset + 1]) << 16) |
-            (@as(u32, data_ptr[offset + 2]) << 8) |
-            @as(u32, data_ptr[offset + 3]);
-        offset += 4;
-
-        if (offset + nal_length > length) break;
-        appendNalUnit(encoder, data_ptr[offset..][0..nal_length]);
-
-        offset += nal_length;
+    if (encoder.output_len + length <= encoder.output_buffer.len) {
+        @memcpy(encoder.output_buffer[encoder.output_len..][0..length], data_ptr[0..length]);
+        encoder.output_len += length;
     }
 }
