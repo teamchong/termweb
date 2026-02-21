@@ -331,8 +331,10 @@
     // Pop this frame's tick from the FIFO queue — each decoded frame gets
     // exactly the tick it was sent with, keeping cursor aligned with video
     // even under rapid typing where multiple frames are in the decode pipeline.
+    // Only advance forward — advanceVideoTick() from dropped frames may have
+    // already moved videoTick past this frame's tick.
     const frameTick = videoTickQueue.shift();
-    if (frameTick !== undefined) videoTick = frameTick;
+    if (frameTick !== undefined && frameTick > videoTick) videoTick = frameTick;
 
     // Flush the best matching cursor (highest tick <= videoTick), discard older.
     // applyCursor updates state vars only — commitCursorToGpu below reads them.
