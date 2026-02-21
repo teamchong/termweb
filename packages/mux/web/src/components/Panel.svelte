@@ -186,8 +186,29 @@
   // and apply each when the matching video frame renders.
   type CursorUpdate = { x: number; y: number; w: number; h: number; style: number; visible: boolean; surfW: number; surfH: number; r: number; g: number; b: number };
   let videoTick = 0;
-  const videoTickQueue: number[] = [];  // FIFO: ticks pushed on H264 arrival, popped on frame render
+  let pendingVideoTick: number | undefined;  // Set by updateVideoTick, consumed by handleFrame
+  const videoTickQueue: number[] = [];  // FIFO: ticks pushed when frame submitted to decoder, popped on render
   const pendingCursors = new Map<number, CursorUpdate>();
+
+  /** Advance videoTick and flush matching cursors — used when a frame is dropped
+   *  so cursor position stays current even without a rendered frame. */
+  function advanceVideoTick(tick: number): void {
+    if (tick > videoTick) videoTick = tick;
+    if (pendingCursors.size > 0) {
+      let best: CursorUpdate | null = null;
+      let bestTick = 0;
+      for (const [t, c] of pendingCursors) {
+        if (t <= videoTick && t > bestTick) { bestTick = t; best = c; }
+      }
+      if (best) {
+        for (const t of pendingCursors.keys()) { if (t <= bestTick) pendingCursors.delete(t); }
+        applyCursor(best.x, best.y, best.w, best.h, best.style, best.visible, best.surfW, best.surfH, best.r, best.g, best.b);
+        // Show updated cursor on persistent texture immediately
+        commitCursorToGpu();
+        if (gpuRenderer) gpuRenderer.renderCursorOnly();
+      }
+    }
+  }
 
   // Reactive canvas buffer dimensions (encoder-aligned) — updated from video frames.
   let frameWidth = $state(0);
@@ -425,6 +446,10 @@
   function handleFrame(frameData: Uint8Array, isKeyframe: boolean): void {
     if (destroyed) return;
 
+    // Consume the tick set by updateVideoTick() for this frame
+    const frameTick = pendingVideoTick;
+    pendingVideoTick = undefined;
+
     // Buffer raw frames until renderer is ready — prevents hardware decoder
     // surface exhaustion by not submitting frames before we can consume output.
     if (!gpuRenderer) {
@@ -435,7 +460,8 @@
       } else if (rawFrameBuffer.length > 0) {
         rawFrameBuffer.push({data: copy, isKeyframe}); // delta after keyframe — keep
       }
-      // deltas before any keyframe are discarded
+      // Advance tick so cursors arriving while buffered don't pile up
+      if (frameTick !== undefined) advanceVideoTick(frameTick);
       return;
     }
 
@@ -495,7 +521,10 @@
     }
 
     // Drop P-frames when decode queue is too deep (reduces pipeline latency).
+    // Advance videoTick so pending cursors for this tick still get flushed —
+    // cursor position stays current even when frame rendering is skipped.
     if (!isKeyframe && decoder && decoder.decodeQueueSize > PANEL.MAX_DECODE_QUEUE_SIZE) {
+      if (frameTick !== undefined) advanceVideoTick(frameTick);
       requestKeyframe(`queue_overflow_queueSize=${decoder.decodeQueueSize}`);
       return;
     }
@@ -503,6 +532,10 @@
     if (isKeyframe) {
       keyframeRequested = false;
     }
+
+    // Frame will be submitted to decoder — push tick to FIFO so renderFrame
+    // can pop it and advance videoTick when the decoded frame arrives.
+    if (frameTick !== undefined) videoTickQueue.push(frameTick);
 
     // Data is already in AVCC format — pass directly to decoder
     decodeFrame(frameData, isKeyframe);
@@ -1341,9 +1374,10 @@
   }
 
   export function updateVideoTick(tick: number): void {
-    // Queue the tick — frames decode in FIFO order, so each renderFrame
-    // pops the tick for that specific frame, keeping cursor and video aligned.
-    videoTickQueue.push(tick);
+    // Stash the tick — decodePreviewFrame will push it to the FIFO queue
+    // only if the frame is actually submitted to the decoder. Dropped frames
+    // advance videoTick directly so cursor updates don't get stuck.
+    pendingVideoTick = tick;
   }
 
   export function decodePreviewFrame(frameData: Uint8Array, isKeyframe: boolean): void {
