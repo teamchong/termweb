@@ -3,3 +3,4 @@ pub const index_html = @embedFile("index.html");
 pub const client_js = @embedFile("client.js");
 pub const file_worker_js = @embedFile("file-worker.js");
 pub const zstd_wasm = @embedFile("zstd.wasm");
+pub const terminal_wasm = @embedFile("terminal.wasm");

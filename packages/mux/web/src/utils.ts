@@ -10,7 +10,7 @@ import {
 // ============================================================================
 
 /** Current auth token — initialized from URL, updated by JWT renewal */
-let currentToken: string | null = new URLSearchParams(window.location.search).get('token');
+let currentToken: string | null = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('token') : null;
 
 /** Update the stored auth token (called on JWT renewal) */
 export function setAuthToken(token: string): void {

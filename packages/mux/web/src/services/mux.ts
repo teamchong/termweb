@@ -28,7 +28,7 @@ interface PanelInstance extends PanelLike {
   sendKeyInput: (e: KeyboardEvent, action: number) => void;
   sendTextInput: (text: string) => void;
   setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null, immediateFn?: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
-  decodePreviewFrame: (frameData: Uint8Array) => void;
+  decodePreviewFrame: (frameData: Uint8Array, isKeyframe: boolean) => void;
   handleInspectorState: (state: unknown) => void;
   getStatus: () => PanelStatus;
   getPwd: () => string;
@@ -36,6 +36,8 @@ interface PanelInstance extends PanelLike {
   getSnapshotCanvas: () => HTMLCanvasElement | undefined;
   updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number, tick?: number) => void;
   updateVideoTick: (tick: number) => void;
+  updatePromptState: (state: number, col: number, row: number, cursorCol?: number, paddingX?: number) => void;
+  updatePromptCells: (startRow: number, rowCount: number, colsPerRow: number, cellData: Uint8Array) => void;
 }
 
 // Type guard for validating LayoutData structure from server
@@ -113,7 +115,7 @@ export class MuxClient {
   private dpiMediaQuery: MediaQueryList | null = null;
   private dpiChangeHandler: (() => void) | null = null;
   private zstdReady = false;
-  private h264PendingFrames = new Map<number, Uint8Array[]>();
+  private h264PendingFrames = new Map<number, {data: Uint8Array, isKeyframe: boolean}[]>();
   private controlPendingByPanel = new Map<number, ArrayBuffer[]>();
 
   // Callbacks for transfer dialog UI (set by App.svelte)
@@ -710,7 +712,8 @@ export class MuxClient {
       msgType === SERVER_MSG.PANEL_PWD ||
       msgType === SERVER_MSG.PANEL_BELL ||
       msgType === SERVER_MSG.CURSOR_STATE ||
-      msgType === SERVER_MSG.INSPECTOR_STATE
+      msgType === SERVER_MSG.INSPECTOR_STATE ||
+      msgType === SERVER_MSG.PROMPT_STATE
     )) {
       const panelId = view.getUint32(1, true);
       if (!this.panelsByServerId.has(panelId)) {
@@ -1050,6 +1053,35 @@ export class MuxClient {
           URL.revokeObjectURL(url);
           break;
         }
+        case SERVER_MSG.PROMPT_STATE: {
+          // [0x17][panel_id:u32][state:u8][col:u16][row:u16][cursor_col:u16][padding_x:u16] = 14 bytes
+          if (data.byteLength < 10) break;
+          const panelId = view.getUint32(1, true);
+          const promptState = view.getUint8(5);
+          const promptCol = view.getUint16(6, true);
+          const promptRow = view.getUint16(8, true);
+          const cursorCol = data.byteLength >= 12 ? view.getUint16(10, true) : undefined;
+          const paddingX = data.byteLength >= 14 ? view.getUint16(12, true) : undefined;
+          const panel = this.panelsByServerId.get(panelId);
+          if (panel) {
+            panel.updatePromptState(promptState, promptCol, promptRow, cursorCol, paddingX);
+          }
+          break;
+        }
+        case SERVER_MSG.PTY_BYTES: {
+          // [0x18][panel_id:u32][start_row:u16][row_count:u16][cols_per_row:u16][cell_data...]
+          if (data.byteLength < 11) break;
+          const panelId = view.getUint32(1, true);
+          const startRow = view.getUint16(5, true);
+          const rowCount = view.getUint16(7, true);
+          const colsPerRow = view.getUint16(9, true);
+          const cellData = new Uint8Array(data, 11);
+          const panel = this.panelsByServerId.get(panelId);
+          if (panel) {
+            panel.updatePromptCells(startRow, rowCount, colsPerRow, cellData);
+          }
+          break;
+        }
         case SERVER_MSG.OAUTH_CONFIG: {
           // [0x1A][github:u8][google:u8][default_role:u8]
           if (data.byteLength >= 4) {
@@ -1314,7 +1346,7 @@ export class MuxClient {
     if (pendingFrames) {
       this.h264PendingFrames.delete(serverId);
       for (const frame of pendingFrames) {
-        panel.decodePreviewFrame(frame);
+        panel.decodePreviewFrame(frame.data, frame.isKeyframe);
       }
     }
   }
@@ -1368,7 +1400,7 @@ export class MuxClient {
         if (pendingFrames) {
           this.h264PendingFrames.delete(panelId);
           for (const frame of pendingFrames) {
-            panel.decodePreviewFrame(frame);
+            panel.decodePreviewFrame(frame.data, frame.isKeyframe);
           }
         }
         // Send resize now that the server has assigned an ID.
@@ -1561,7 +1593,7 @@ export class MuxClient {
       sendKeyInput: (e: KeyboardEvent, action: number) => void;
       sendTextInput: (text: string) => void;
       setControlWsSend: (fn: ((msg: ArrayBuffer | ArrayBufferView) => void) | null, immediateFn?: ((msg: ArrayBuffer | ArrayBufferView) => void) | null) => void;
-      decodePreviewFrame: (frameData: Uint8Array) => void;
+      decodePreviewFrame: (frameData: Uint8Array, isKeyframe: boolean) => void;
       handleInspectorState: (state: unknown) => void;
       getStatus: () => PanelStatus;
       getPwd: () => string;
@@ -1570,6 +1602,8 @@ export class MuxClient {
       getSnapshotCanvas: () => HTMLCanvasElement | undefined;
       updateCursorState: (x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number, tick?: number) => void;
       updateVideoTick: (tick: number) => void;
+      updatePromptState: (state: number, col: number, row: number, cursorCol?: number, paddingX?: number) => void;
+      updatePromptCells: (startRow: number, rowCount: number, colsPerRow: number, cellData: Uint8Array) => void;
     };
 
     const panel: PanelInstance = {
@@ -1591,7 +1625,7 @@ export class MuxClient {
       sendKeyInput: (e, a) => comp.sendKeyInput(e, a),
       sendTextInput: (t) => comp.sendTextInput(t),
       setControlWsSend: (fn, immFn) => comp.setControlWsSend(fn, immFn),
-      decodePreviewFrame: (f) => comp.decodePreviewFrame(f),
+      decodePreviewFrame: (f, k) => comp.decodePreviewFrame(f, k),
       handleInspectorState: (s) => comp.handleInspectorState(s),
       getStatus: () => comp.getStatus(),
       getPwd: () => comp.getPwd(),
@@ -1599,6 +1633,8 @@ export class MuxClient {
       getSnapshotCanvas: () => comp.getSnapshotCanvas(),
       updateCursorState: (x, y, w, h, s, v, tw, th, r?, g?, b?, tick?) => comp.updateCursorState(x, y, w, h, s, v, tw, th, r, g, b, tick),
       updateVideoTick: (tick) => comp.updateVideoTick(tick),
+      updatePromptState: (state, col, row, cursorCol?, paddingX?) => comp.updatePromptState(state, col, row, cursorCol, paddingX),
+      updatePromptCells: (startRow, rowCount, colsPerRow, cellData) => comp.updatePromptCells(startRow, rowCount, colsPerRow, cellData),
     };
 
     this.panelInstances.set(panelId, panel);
@@ -2012,11 +2048,13 @@ export class MuxClient {
     this.h264Ws = new WebSocket(url);
     this.h264Ws.binaryType = 'arraybuffer';
     this.h264Ws.onmessage = (e: MessageEvent) => {
-      if (e.data instanceof ArrayBuffer && e.data.byteLength > 8) {
+      if (e.data instanceof ArrayBuffer && e.data.byteLength > 9) {
         const view = new DataView(e.data);
         const panelId = view.getUint32(0, true);
         const videoTick = view.getUint32(4, true);
-        const frameData = new Uint8Array(e.data, 8);
+        const flags = view.getUint8(8);
+        const isKeyframe = (flags & 1) !== 0;
+        const frameData = new Uint8Array(e.data, 9);
         // Route to override handler (overview) if set
         if (this.h264OverrideHandler) {
           this.h264OverrideHandler(panelId, frameData);
@@ -2025,14 +2063,14 @@ export class MuxClient {
         const panel = this.panelsByServerId.get(panelId);
         if (panel) {
           panel.updateVideoTick(videoTick);
-          panel.decodePreviewFrame(frameData);
+          panel.decodePreviewFrame(frameData, isKeyframe);
         } else {
           let pending = this.h264PendingFrames.get(panelId);
           if (!pending) {
             pending = [];
             this.h264PendingFrames.set(panelId, pending);
           }
-          pending.push(frameData);
+          pending.push({data: frameData, isKeyframe});
         }
       }
     };

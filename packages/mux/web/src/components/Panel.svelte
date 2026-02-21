@@ -4,7 +4,10 @@
   import type { PanelStatus } from '../stores/types';
   import { sharedTextEncoder, CircularBuffer, throttle } from '../utils';
   import { PANEL, TIMING, UI, NAL, MODIFIER, WHEEL_MODE, STATS_THRESHOLD } from '../constants';
-  import { initWebGPURenderer, type WebGPUFrameRenderer } from '../webgpu-renderer';
+  import { initWebGPURenderer, type WebGPUFrameRenderer, type CursorParams } from '../webgpu-renderer';
+  import { PromptState } from '../prompt-buffer';
+  import { initTerminalWasm, WasmTerminal } from '../terminal-wasm';
+  import { createPromptRenderer, type PromptRenderer, type PromptCell } from '../prompt-renderer';
 
   // ============================================================================
   // Props
@@ -104,7 +107,7 @@
   // Buffer raw H264 frame data until gpuRenderer is ready — prevents hardware
   // decoder surface exhaustion by not submitting frames for decode before we
   // can consume VideoFrame output. Keeps latest keyframe + subsequent deltas.
-  let rawFrameBuffer: ArrayBuffer[] = [];
+  let rawFrameBuffer: {data: Uint8Array, isKeyframe: boolean}[] = [];
   let lastReportedWidth = 0;
   let lastReportedHeight = 0;
   let resizeObserver: ResizeObserver | null = null;
@@ -177,7 +180,7 @@
   let cursorColorR = $state(0xc8);
   let cursorColorG = $state(0xc8);
   let cursorColorB = $state(0xc8);
-  let cursorColor = $derived(`rgb(${cursorColorR},${cursorColorG},${cursorColorB})`);
+  // cursorColorR/G/B are pushed to GPU renderer via commitCursorToGpu()
 
   // Tick-based cursor-video sync: buffer cursor updates keyed by tick
   // and apply each when the matching video frame renders.
@@ -190,6 +193,41 @@
   let frameWidth = $state(0);
   let frameHeight = $state(0);
 
+  // Prompt overlay: local echo using ghostty VT WASM terminal
+  let wasmTerminal: WasmTerminal | null = null;
+  let wasmReady = false;
+  let promptState = $state(PromptState.NONE);
+  let promptSeq = $state(0); // reactive trigger
+  // VT overlay disabled while reworking the pipeline
+  let promptActive = $derived(false && promptState === PromptState.INPUT_START && promptSeq >= 0);
+  let promptAnchorX = 0;
+  let promptAnchorY = 0;
+  let promptInputCol = 0;
+  let promptInputRow = 0;
+  // Server-provided cell data for prompt rows (10 bytes per cell)
+  let promptRowCells: Uint8Array | null = null;
+  let promptRowCols = 0;
+  let promptRowCount = 0;
+  let promptStartRow = 0;
+
+  // Padding X: pixel offset of grid column 0 — captured once on first keystroke
+  let promptPadX = 0;
+  let promptPadXSet = false;
+  // Cursor's grid column — needed to compute padX correctly on reconnect
+  let cursorGridCol = 0;
+
+  // Prompt selection state (ghostty-style: click-drag, double-click word select)
+  let promptSelStart: { col: number; row: number } | null = null;
+  let promptSelEnd: { col: number; row: number } | null = null;
+  let promptSelecting = false;
+  let promptLastClickTime = 0;
+
+  // Initialize WASM terminal module
+  initTerminalWasm().then(() => {
+    wasmReady = true;
+    console.log('[PromptOverlay] WASM terminal ready');
+  }).catch(e => console.warn('terminal WASM init failed:', e));
+
   // Cursor overlay position: percentage-based within a CSS viewport div that
   // replicates the canvas's object-fit:contain area using container queries.
   // No JS objFitScale math — CSS handles the contain-fit sizing identically.
@@ -199,41 +237,14 @@
   // On Linux, VA-API requires 16-pixel aligned frames, so the frame is slightly
   // larger than the surface. Using surface dims would create an aspect ratio
   // mismatch causing cursor drift.
-  //
-  // Cursor PERCENTAGES depend on the encoder path:
-  // - Fast path (surfW == frameW): direct pixel copy with black padding at
-  //   bottom/right. Cursor position in frame == surface position → use frame dims.
-  // - Downscale path (surfW != frameW): source stretched to fill entire frame.
-  //   Cursor maps proportionally: surf_pos/surfDim == frame_pos/frameDim → use
-  //   surface dims (they give the same percentage as frame-space coords).
-  //
-  // Viewport aspect ratio: frame dims (matches canvas content)
-  // Fallback: surface dims when frame dims not yet available (before first frame)
-  // Key that changes on every cursor move — used by {#key} to restart CSS blink animation
-  let cursorKey = $derived(`${cursorX},${cursorY}`);
-
-  // Viewport uses frame dims (matches canvas object-fit:contain).
-  // Falls back to surface dims before the first video frame arrives.
+  // Viewport dims for prompt overlay aspect-ratio container
   let viewportW = $derived(frameWidth > 0 ? frameWidth : cursorSurfW);
   let viewportH = $derived(frameHeight > 0 ? frameHeight : cursorSurfH);
 
-  // Percentage denominators: frame dims for fast path (no stretching),
-  // surface dims for downscale path (stretched) or before first frame.
-  // Fast path detection: encoder copies pixels directly when surfW == frameW.
-  let pctW = $derived(frameWidth > 0 && cursorSurfW === frameWidth ? frameWidth : cursorSurfW);
-  let pctH = $derived(frameHeight > 0 && cursorSurfW === frameWidth ? frameHeight : cursorSurfH);
-
-  let cursorPct = $derived.by(() => {
-    if (!cursorVisible || cursorW === 0 || paused) return null;
-    if (pctW === 0 || pctH === 0) return null;
-
-    return {
-      left: (cursorX / pctW) * 100,
-      top: (cursorY / pctH) * 100,
-      width: (cursorW / pctW) * 100,
-      height: (cursorH / pctH) * 100,
-    };
-  });
+  // Cursor blink timer — re-renders from persistent GPU texture during idle
+  let cursorBlinkIntervalId: ReturnType<typeof setInterval> | null = null;
+  let lastFrameRenderTime = 0;
+  const CURSOR_BLINK_INTERVAL = 600; // ms — half of 1.2s blink cycle
 
   // ============================================================================
   // WebSocket Helpers
@@ -291,13 +302,10 @@
       canvasEl.width = frame.displayWidth;
       canvasEl.height = frame.displayHeight;
     }
-    // Update reactive frame dimensions so cursorPct recomputes
     if (frameWidth !== frame.displayWidth || frameHeight !== frame.displayHeight) {
       frameWidth = frame.displayWidth;
       frameHeight = frame.displayHeight;
     }
-
-    gpuRenderer!.renderFrame(frame);
 
     // Pop this frame's tick from the FIFO queue — each decoded frame gets
     // exactly the tick it was sent with, keeping cursor aligned with video
@@ -305,9 +313,10 @@
     const frameTick = videoTickQueue.shift();
     if (frameTick !== undefined) videoTick = frameTick;
 
-    // Flush the best matching cursor (highest tick <= videoTick), discard older
-    let flushedCursor: CursorUpdate | null = null;
+    // Flush the best matching cursor (highest tick <= videoTick), discard older.
+    // applyCursor updates state vars only — commitCursorToGpu below reads them.
     if (pendingCursors.size > 0) {
+      let flushedCursor: CursorUpdate | null = null;
       let bestTick = 0;
       for (const [t, c] of pendingCursors) {
         if (t <= videoTick && t > bestTick) { bestTick = t; flushedCursor = c; }
@@ -318,22 +327,33 @@
       }
     }
 
-    // Update snapshot for tab overview (throttled, before frame.close())
-    const now = performance.now();
-    if (now - lastSnapshotTime > SNAPSHOT_INTERVAL) {
+    // Commit cursor to GPU — cursor and text render in the same GPU pass.
+    commitCursorToGpu();
+
+    // Render video frame + cursor overlay in same GPU command buffer
+    gpuRenderer!.renderFrame(frame);
+
+    // Close immediately after GPU submit — frees decoder output surface so
+    // hardware decoder can continue without stalling on surface exhaustion.
+    frame.close();
+
+    lastFrameRenderTime = performance.now();
+
+    // Snapshot from the rendered canvas (not VideoFrame) — avoids GPU→CPU
+    // readback of decoder surfaces and doesn't hold the output surface.
+    const now = lastFrameRenderTime;
+    if (now - lastSnapshotTime > SNAPSHOT_INTERVAL && canvasEl) {
       lastSnapshotTime = now;
       if (!snapshotCanvas) {
         snapshotCanvas = document.createElement('canvas');
       }
-      if (snapshotCanvas.width !== frame.displayWidth || snapshotCanvas.height !== frame.displayHeight) {
-        snapshotCanvas.width = frame.displayWidth;
-        snapshotCanvas.height = frame.displayHeight;
+      if (snapshotCanvas.width !== canvasEl.width || snapshotCanvas.height !== canvasEl.height) {
+        snapshotCanvas.width = canvasEl.width;
+        snapshotCanvas.height = canvasEl.height;
         snapshotCtx = snapshotCanvas.getContext('2d');
       }
-      snapshotCtx?.drawImage(frame, 0, 0);
+      snapshotCtx?.drawImage(canvasEl, 0, 0);
     }
-
-    frame.close();
 
     // Hide loading
     if (loadingEl) {
@@ -374,68 +394,12 @@
     renderFrame(frame);
   }
 
-  // Reusable NAL unit index buffer — avoids per-frame allocations.
-  // Typical H.264 frames have 3-5 NAL units; 64 is generous headroom.
-  const MAX_NAL_UNITS = 64;
-  const nalStarts = new Uint32Array(MAX_NAL_UNITS);
-  const nalEnds = new Uint32Array(MAX_NAL_UNITS);
-  let nalCount = 0;
-
-  /** Scan frame for NAL unit boundaries, storing indices in reusable buffers. */
-  function scanNalUnits(data: Uint8Array): void {
-    nalCount = 0;
-    let start = 0;
-
-    for (let i = 0; i < data.length - 3; i++) {
-      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
-        if (i > start && nalCount < MAX_NAL_UNITS) {
-          nalStarts[nalCount] = start;
-          nalEnds[nalCount] = i;
-          nalCount++;
-        }
-        start = i + 4;
-        i += 3;
-      }
-    }
-
-    if (start < data.length && nalCount < MAX_NAL_UNITS) {
-      nalStarts[nalCount] = start;
-      nalEnds[nalCount] = data.length;
-      nalCount++;
-    }
-  }
-
   function getCodecFromSps(sps: Uint8Array): string {
     if (sps.length < 4) return PANEL.DEFAULT_H264_CODEC;
     const profile = sps[1];
     const constraints = sps[2];
     const level = sps[3];
     return `avc1.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
-  }
-
-  // Convert Annex B (start-code prefixed) to AVCC (length-prefixed) in-place.
-  // Both use 4-byte prefixes so this is a zero-allocation swap.
-  // Reusable position buffer for Annex B → AVCC conversion
-  const MAX_POSITIONS = 128;
-  const avccPositions = new Uint32Array(MAX_POSITIONS);
-
-  function convertAnnexBToAvcc(data: Uint8Array): void {
-    let posCount = 0;
-    for (let i = 0; i < data.length - 3; i++) {
-      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
-        if (posCount < MAX_POSITIONS) avccPositions[posCount++] = i;
-        i += 3;
-      }
-    }
-    for (let k = 0; k < posCount; k++) {
-      const pos = avccPositions[k];
-      const end = k + 1 < posCount ? avccPositions[k + 1] : data.length;
-      const nalLen = end - pos - 4;
-      data[pos]     = (nalLen >>> 24) & 0xFF;
-      data[pos + 1] = (nalLen >>> 16) & 0xFF;
-      data[pos + 2] = (nalLen >>> 8) & 0xFF;
-      data[pos + 3] = nalLen & 0xFF;
-    }
   }
 
   function buildAvcDescription(sps: Uint8Array, pps: Uint8Array): Uint8Array {
@@ -458,73 +422,67 @@
     return desc;
   }
 
-  function handleFrame(data: ArrayBuffer): void {
+  function handleFrame(frameData: Uint8Array, isKeyframe: boolean): void {
     if (destroyed) return;
 
     // Buffer raw frames until renderer is ready — prevents hardware decoder
     // surface exhaustion by not submitting frames before we can consume output.
     if (!gpuRenderer) {
-      const peek = new Uint8Array(data);
-      let isKey = false;
-      for (let i = 0; i < peek.length - 4; i++) {
-        if (peek[i] === 0 && peek[i + 1] === 0 && peek[i + 2] === 0 && peek[i + 3] === 1) {
-          if (((peek[i + 4] ?? 0) & NAL.TYPE_MASK) === NAL.TYPE_IDR) { isKey = true; break; }
-        }
-      }
-      if (isKey) {
-        rawFrameBuffer = [data]; // new keyframe — discard everything before
+      // Copy for buffer — original may be a view into a WS message
+      const copy = frameData.slice();
+      if (isKeyframe) {
+        rawFrameBuffer = [{data: copy, isKeyframe}]; // new keyframe — discard everything before
       } else if (rawFrameBuffer.length > 0) {
-        rawFrameBuffer.push(data); // delta after keyframe — keep
+        rawFrameBuffer.push({data: copy, isKeyframe}); // delta after keyframe — keep
       }
       // deltas before any keyframe are discarded
       return;
     }
 
     frameTimestamps.push(performance.now());
-    const frameData = new Uint8Array(data);
 
     if (!decoder) { console.debug('[Panel] handleFrame: no decoder'); return; }
 
-    // Scan NAL units to detect SPS/PPS/IDR (index-based, zero allocations)
-    scanNalUnits(frameData);
-    let isKeyframe = false;
-    let spsStart = -1, spsEnd = -1;
-    let ppsStart = -1, ppsEnd = -1;
+    // Parse AVCC format (4-byte big-endian length prefixed NAL units) to find SPS/PPS
+    if (isKeyframe) {
+      let sps: Uint8Array | null = null;
+      let pps: Uint8Array | null = null;
+      let offset = 0;
+      while (offset + 4 < frameData.length) {
+        const nalLen = (frameData[offset] << 24) | (frameData[offset + 1] << 16) |
+                       (frameData[offset + 2] << 8) | frameData[offset + 3];
+        offset += 4;
+        if (nalLen <= 0 || offset + nalLen > frameData.length) break;
+        const nalType = frameData[offset] & NAL.TYPE_MASK;
+        if (nalType === NAL.TYPE_SPS) sps = frameData.subarray(offset, offset + nalLen);
+        else if (nalType === NAL.TYPE_PPS) pps = frameData.subarray(offset, offset + nalLen);
+        offset += nalLen;
+      }
 
-    for (let n = 0; n < nalCount; n++) {
-      const s = nalStarts[n];
-      if (s >= frameData.length) continue;
-      const nalType = frameData[s] & NAL.TYPE_MASK;
-      if (nalType === NAL.TYPE_SPS) { spsStart = s; spsEnd = nalEnds[n]; }
-      else if (nalType === NAL.TYPE_PPS) { ppsStart = s; ppsEnd = nalEnds[n]; }
-      else if (nalType === NAL.TYPE_IDR) isKeyframe = true;
-    }
-
-    // Configure decoder with avc1 codec + AVCDecoderConfigurationRecord description.
-    if (spsStart >= 0 && ppsStart >= 0) {
-      const sps = frameData.subarray(spsStart, spsEnd);
-      const pps = frameData.subarray(ppsStart, ppsEnd);
-      const codec = getCodecFromSps(sps);
-      const needReconfigure = !decoderConfigured || codec !== lastCodec;
-      if (needReconfigure) {
-        try {
-          if (decoderConfigured) {
-            decoder.reset();
-            gotFirstKeyframe = false;
+      // Configure decoder with avc1 codec + AVCDecoderConfigurationRecord description.
+      if (sps && pps) {
+        const codec = getCodecFromSps(sps);
+        const needReconfigure = !decoderConfigured || codec !== lastCodec;
+        if (needReconfigure) {
+          try {
+            if (decoderConfigured) {
+              decoder.reset();
+              gotFirstKeyframe = false;
+            }
+            decoder.configure({
+              codec,
+              optimizeForLatency: true,
+              hardwareAcceleration: 'prefer-hardware',
+              description: buildAvcDescription(sps, pps),
+            });
+            decoderConfigured = true;
+            lastCodec = codec;
+            console.log(`[Panel] decoder configured: ${codec}`);
+          } catch (e) {
+            console.error('Failed to configure decoder:', e);
+            setStatus('error');
+            return;
           }
-          decoder.configure({
-            codec,
-            optimizeForLatency: true,
-            hardwareAcceleration: 'prefer-hardware',
-            description: buildAvcDescription(sps, pps),
-          });
-          decoderConfigured = true;
-          lastCodec = codec;
-          console.log(`[Panel] decoder configured: ${codec}`);
-        } catch (e) {
-          console.error('Failed to configure decoder:', e);
-          setStatus('error');
-          return;
         }
       }
     }
@@ -537,7 +495,7 @@
     }
 
     // Drop P-frames when decode queue is too deep (reduces pipeline latency).
-    if (!isKeyframe && decoder && decoder.decodeQueueSize > 2) {
+    if (!isKeyframe && decoder && decoder.decodeQueueSize > PANEL.MAX_DECODE_QUEUE_SIZE) {
       requestKeyframe(`queue_overflow_queueSize=${decoder.decodeQueueSize}`);
       return;
     }
@@ -546,7 +504,7 @@
       keyframeRequested = false;
     }
 
-    convertAnnexBToAvcc(frameData);
+    // Data is already in AVCC format — pass directly to decoder
     decodeFrame(frameData, isKeyframe);
     checkBufferHealth();
   }
@@ -626,7 +584,7 @@
       lastStatsUpdate = now;
 
       // Calculate average decode latency
-      const latencies = decodeLatencies.getAll();
+      const latencies = decodeLatencies.toArray();
       if (latencies.length > 0) {
         const sum = latencies.reduce((a, b) => a + b, 0);
         displayedLatency = Math.round(sum / latencies.length);
@@ -769,6 +727,15 @@
 
   export function sendKeyInput(e: KeyboardEvent, action: number): void {
     if (!canSendInput()) return;
+
+    // Feed key to WASM terminal for instant overlay (on key press only)
+    if (action === 1) {
+      if (promptState === PromptState.INPUT_START && wasmTerminal) {
+        feedPromptKey(e.key, e.code, e.ctrlKey);
+      } else {
+        console.log(`[PromptOverlay] sendKeyInput skip: promptState=${promptState}, wasmTerminal=${!!wasmTerminal}, key=${e.key}`);
+      }
+    }
 
     const codeBytes = sharedTextEncoder.encode(e.code);
     const text = (e.key.length === 1) ? e.key : (SPECIAL_KEY_TEXT[e.key] ?? '');
@@ -1379,8 +1346,8 @@
     videoTickQueue.push(tick);
   }
 
-  export function decodePreviewFrame(frameData: Uint8Array): void {
-    handleFrame(frameData.slice().buffer as ArrayBuffer);
+  export function decodePreviewFrame(frameData: Uint8Array, isKeyframe: boolean): void {
+    handleFrame(frameData, isKeyframe);
   }
 
   export function handleInspectorState(state: unknown): void {
@@ -1415,11 +1382,23 @@
 
   export function updateCursorState(x: number, y: number, w: number, h: number, style: number, visible: boolean, totalW: number, totalH: number, r?: number, g?: number, b?: number, tick?: number): void {
     const update: CursorUpdate = { x, y, w, h, style, visible, surfW: totalW, surfH: totalH, r: r ?? cursorColorR, g: g ?? cursorColorG, b: b ?? cursorColorB };
+    // When prompt is active, apply cursor immediately (bypass tick queue)
+    if (promptState === PromptState.INPUT_START) {
+      applyCursor(x, y, w, h, style, visible, totalW, totalH, r, g, b);
+      // Show on persistent texture immediately — no frame in flight
+      commitCursorToGpu();
+      if (gpuRenderer) gpuRenderer.renderCursorOnly();
+      return;
+    }
     if (tick !== undefined && tick > videoTick) {
       pendingCursors.set(tick, update);
       return;
     }
+    // Cursor for a tick that's already rendered — show immediately on the
+    // persistent texture so cursor catches up to the on-screen text.
     applyCursor(x, y, w, h, style, visible, totalW, totalH, r, g, b);
+    commitCursorToGpu();
+    if (gpuRenderer) gpuRenderer.renderCursorOnly();
   }
 
   function applyCursor(x: number, y: number, w: number, h: number, style: number, visible: boolean, surfW: number, surfH: number, r?: number, g?: number, b?: number): void {
@@ -1434,6 +1413,437 @@
     if (r !== undefined) cursorColorR = r;
     if (g !== undefined) cursorColorG = g;
     if (b !== undefined) cursorColorB = b;
+  }
+
+  // Last cursor params committed to GPU (in sync with the video frame).
+  // The blink timer re-uses this to toggle visibility without changing position.
+  let committedCursor: CursorParams | null = null;
+
+  /** Build CursorParams from current state, commit to GPU renderer */
+  function commitCursorToGpu(): void {
+    if (!gpuRenderer) return;
+    const focused = panelEl?.closest('.focused') ?? false;
+    const effectiveStyle = focused ? cursorStyle : 3; // hollow when unfocused
+
+    if (!cursorVisible || cursorW === 0 || paused) {
+      committedCursor = null;
+      gpuRenderer.setCursor(null);
+    } else {
+      committedCursor = {
+        x: cursorX, y: cursorY, w: cursorW, h: cursorH,
+        surfW: cursorSurfW, surfH: cursorSurfH,
+        r: cursorColorR, g: cursorColorG, b: cursorColorB,
+        alpha: effectiveStyle === 1 ? 0.75 : 1.0,
+        style: effectiveStyle,
+        visible: true,
+      };
+      // Apply blink phase
+      const blinkVisible = focused
+        ? (performance.now() % 1200) < 600
+        : true;
+      gpuRenderer.setCursor(blinkVisible ? committedCursor : null);
+    }
+  }
+
+  /** Re-render committed cursor with updated blink phase (idle only) */
+  function blinkCommittedCursor(): void {
+    if (!gpuRenderer) return;
+    if (!committedCursor) {
+      gpuRenderer.setCursor(null);
+    } else {
+      const focused = panelEl?.closest('.focused') ?? false;
+      const blinkVisible = focused
+        ? (performance.now() % 1200) < 600
+        : true;
+      gpuRenderer.setCursor(blinkVisible ? committedCursor : null);
+    }
+    gpuRenderer.renderCursorOnly();
+  }
+
+  // ============================================================================
+  // Prompt Overlay
+  // ============================================================================
+
+  /** Handle PROMPT_STATE message from server */
+  export function updatePromptState(state: number, col: number, row: number, cursorCol?: number, paddingX?: number): void {
+    switch (state) {
+      case PromptState.INPUT_START: {
+        promptInputCol = col;
+        promptInputRow = row;
+        // Store cursor grid column for correct padX on reconnect
+        cursorGridCol = cursorCol !== undefined ? cursorCol : col;
+        // Use server-provided padding_x directly — this is the terminal's
+        // left padding in pixels, which is the correct padX value.
+        // No need to derive it from cursor position (which may not be available yet).
+        if (paddingX !== undefined) {
+          promptPadX = paddingX;
+          promptPadXSet = true;
+        } else {
+          promptPadX = 0;
+          promptPadXSet = false;
+        }
+        // Flush any pending cursor so cursorX is available immediately.
+        // On reconnect, cursor may be queued in tick queue (tick > videoTick).
+        if (pendingCursors.size > 0) {
+          let best: CursorUpdate | null = null;
+          let bestTick = -1;
+          for (const [t, c] of pendingCursors) {
+            if (t > bestTick) { bestTick = t; best = c; }
+          }
+          if (best) {
+            pendingCursors.clear();
+            applyCursor(best.x, best.y, best.w, best.h, best.style, best.visible, best.surfW, best.surfH, best.r, best.g, best.b);
+          }
+        }
+        // Create or reset WASM terminal for this prompt session
+        if (wasmTerminal) wasmTerminal.destroy();
+        wasmTerminal = null;
+        if (wasmReady) {
+          const gridCols = inspectorState?.cols ?? 80;
+          const gridRows = inspectorState?.rows ?? 24;
+          wasmTerminal = WasmTerminal.create(gridCols, gridRows);
+        }
+        promptAnchorX = 0;
+        promptAnchorY = 0;
+        promptState = PromptState.INPUT_START;
+        promptSeq++;
+        requestAnimationFrame(() => renderPromptCanvas());
+        break;
+      }
+      case PromptState.COMMAND_RUNNING:
+      case PromptState.NONE:
+        if (wasmTerminal) { wasmTerminal.destroy(); wasmTerminal = null; }
+        promptRenderer = null;
+        promptRendererInitializing = false;
+        // Clear stale cell data so the next prompt activation doesn't
+        // render old prompt content before new cell data arrives
+        promptRowCells = null;
+        promptRowCols = 0;
+        promptRowCount = 0;
+        promptStartRow = 0;
+        promptState = PromptState.NONE;
+        promptSeq++;
+        break;
+      case PromptState.PROMPT_START:
+        promptState = PromptState.PROMPT_START;
+        promptSeq++;
+        break;
+    }
+  }
+
+  /** Receive full prompt row cell data from server — store and render */
+  export function updatePromptCells(startRow: number, rowCount: number, colsPerRow: number, cellData: Uint8Array): void {
+    promptRowCells = cellData;
+    promptRowCols = colsPerRow;
+    // server caught up
+    promptRowCount = rowCount;
+    promptStartRow = startRow;
+
+    // Also feed to WASM terminal if available: convert cell data to VT sequences
+    // so the WASM terminal mirrors the server's screen state for the prompt region
+    if (wasmTerminal) {
+      // Reset cursor to (0,0) and write the cell characters
+      const resetSeq = new Uint8Array([0x1b, 0x5b, 0x48]); // ESC[H (cursor home)
+      wasmTerminal.feed(resetSeq);
+      const encoder = new TextEncoder();
+      for (let r = 0; r < rowCount; r++) {
+        for (let c = 0; c < colsPerRow; c++) {
+          const off = (r * colsPerRow + c) * 10;
+          if (off + 10 > cellData.byteLength) break;
+          const cp = cellData[off] | (cellData[off+1] << 8) | (cellData[off+2] << 16) | (cellData[off+3] << 24);
+          // Emit space for empty cells to keep cursor position in sync
+          wasmTerminal.feed(cp > 0 ? encoder.encode(String.fromCodePoint(cp)) : encoder.encode(' '));
+        }
+        if (r < rowCount - 1) {
+          // CR+LF to return to column 0 before moving to next row
+          wasmTerminal.feed(new Uint8Array([0x0d, 0x0a]));
+        }
+      }
+    }
+
+    promptSeq++;
+    requestAnimationFrame(() => renderPromptCanvas());
+  }
+
+  /** Feed a keystroke to the WASM terminal for local echo (called before sending to server) */
+  function feedPromptKey(key: string, code: string, ctrlKey: boolean): void {
+    if (!wasmTerminal || promptState !== PromptState.INPUT_START) return;
+
+    // Capture anchor on first keystroke
+    if (promptAnchorX === 0 && promptAnchorY === 0 && cursorX > 0) {
+      promptAnchorX = cursorX;
+      promptAnchorY = cursorY - 2;
+      // Only derive padX from cursor if server didn't provide paddingX
+      if (!promptPadXSet) {
+        promptPadX = cursorX - cursorGridCol * (cursorW + 1);
+        promptPadXSet = true;
+      }
+    }
+
+    // Tab/ArrowUp/ArrowDown change the line unpredictably — don't feed to WASM
+    // terminal, but keep overlay active. Server cells will update the content.
+    if (key === 'Tab' || key === 'ArrowUp' || key === 'ArrowDown') {
+      return;
+    }
+    if (key === 'Enter') return; // server will send COMMAND_RUNNING
+    if (ctrlKey && key.length === 1) {
+      if (wasmTerminal) { wasmTerminal.destroy(); wasmTerminal = null; }
+      promptState = PromptState.NONE;
+      promptSeq++;
+      return;
+    }
+
+    // Convert keystroke to VT bytes and feed to WASM terminal
+    let vtBytes: Uint8Array | null = null;
+    if (key.length === 1 && !ctrlKey) {
+      vtBytes = sharedTextEncoder.encode(key);
+    } else if (key === 'Backspace') {
+      vtBytes = new Uint8Array([0x7f]);
+    } else if (key === 'Delete') {
+      vtBytes = new Uint8Array([0x1b, 0x5b, 0x33, 0x7e]); // ESC[3~
+    } else if (key === 'ArrowLeft') {
+      vtBytes = new Uint8Array([0x1b, 0x5b, 0x44]); // ESC[D
+    } else if (key === 'ArrowRight') {
+      vtBytes = new Uint8Array([0x1b, 0x5b, 0x43]); // ESC[C
+    } else if (key === 'Home') {
+      vtBytes = new Uint8Array([0x1b, 0x5b, 0x48]); // ESC[H
+    } else if (key === 'End') {
+      vtBytes = new Uint8Array([0x1b, 0x5b, 0x46]); // ESC[F
+    }
+
+    if (vtBytes && wasmTerminal) {
+      wasmTerminal.feed(vtBytes);
+      // Immediately advance cursor for instant feedback
+      const cellW = cursorW + 1;
+      if (key.length === 1 && !ctrlKey) {
+        cursorX += cellW; // printable char: advance right
+      } else if (key === 'Backspace') {
+        cursorX = Math.max(0, cursorX - cellW);
+      } else if (key === 'ArrowLeft') {
+        cursorX = Math.max(0, cursorX - cellW);
+      } else if (key === 'ArrowRight') {
+        cursorX += cellW;
+      }
+      promptSeq++;
+      requestAnimationFrame(() => renderPromptCanvas());
+    } else {
+      console.log(`[PromptOverlay] feedKey skipped: vtBytes=${!!vtBytes}, wasm=${!!wasmTerminal}, key='${key}'`);
+    }
+  }
+
+  // Prompt overlay canvas ref and renderer
+  let promptCanvasEl: HTMLCanvasElement | undefined = $state();
+  let promptRenderer: PromptRenderer | null = null;
+  let promptRendererInitializing = false;
+  async function initPromptRenderer(): Promise<void> {
+    if (promptRendererInitializing || promptRenderer || !promptCanvasEl) return;
+    promptRendererInitializing = true;
+    try {
+      promptRenderer = await createPromptRenderer(promptCanvasEl);
+    } catch (e) {
+      console.warn('[PromptOverlay] renderer init failed:', e);
+    }
+    promptRendererInitializing = false;
+    requestAnimationFrame(() => renderPromptCanvas());
+  }
+
+  /** Convert mouse event to cell coordinates within the prompt overlay */
+  function promptMouseToCell(e: MouseEvent): { col: number; row: number } | null {
+    if (!promptCanvasEl || cursorW === 0 || cursorH === 0) return null;
+    const rect = promptCanvasEl.getBoundingClientRect();
+    // Convert CSS pixels to surface pixels
+    const scaleX = pctW / rect.width;
+    const scaleY = pctH / rect.height;
+    const surfX = (e.clientX - rect.left) * scaleX;
+    const surfY = (e.clientY - rect.top) * scaleY;
+
+    const cellW = cursorW + 1;
+    const cellH = cursorH + 2;
+    const padX = promptPadXSet ? promptPadX : (cursorX - cursorGridCol * cellW);
+    const cursorRowY = cursorY - 2;
+    const serverCursorGridRow = promptStartRow + promptRowCount - 1;
+    const startY = cursorRowY - (serverCursorGridRow - promptStartRow) * cellH;
+
+    const col = Math.floor((surfX - padX) / cellW);
+    const row = Math.floor((surfY - startY) / cellH);
+    if (col < 0 || row < 0 || row >= promptRowCount || col >= promptRowCols) return null;
+    return { col, row };
+  }
+
+  function handlePromptMouseDown(e: MouseEvent): void {
+    const cell = promptMouseToCell(e);
+    if (!cell) return;
+    promptSelStart = cell;
+    promptSelEnd = cell;
+    promptSelecting = true;
+    e.preventDefault();
+    requestAnimationFrame(() => renderPromptCanvas());
+  }
+
+  function handlePromptMouseMove(e: MouseEvent): void {
+    if (!promptSelecting) return;
+    const cell = promptMouseToCell(e);
+    if (!cell) return;
+    promptSelEnd = cell;
+    requestAnimationFrame(() => renderPromptCanvas());
+  }
+
+  function handlePromptMouseUp(e: MouseEvent): void {
+    if (!promptSelecting) return;
+    promptSelecting = false;
+    const cell = promptMouseToCell(e);
+    if (cell) promptSelEnd = cell;
+
+    // Copy selection to clipboard
+    if (promptSelStart && promptSelEnd && promptRowCells) {
+      const text = getPromptSelectionText();
+      if (text) navigator.clipboard.writeText(text).catch(() => {});
+    }
+  }
+
+  function handlePromptDblClick(e: MouseEvent): void {
+    const cell = promptMouseToCell(e);
+    if (!cell || !promptRowCells) return;
+
+    // Select word at click position
+    const rowOff = cell.row * promptRowCols;
+    const dv = new DataView(promptRowCells.buffer, promptRowCells.byteOffset, promptRowCells.byteLength);
+
+    // Find word boundaries (non-space characters)
+    let left = cell.col;
+    while (left > 0) {
+      const cp = dv.getUint32((rowOff + left - 1) * 10, true);
+      if (cp === 0 || cp === 0x20) break;
+      left--;
+    }
+    let right = cell.col;
+    while (right < promptRowCols - 1) {
+      const cp = dv.getUint32((rowOff + right + 1) * 10, true);
+      if (cp === 0 || cp === 0x20) break;
+      right++;
+    }
+
+    promptSelStart = { col: left, row: cell.row };
+    promptSelEnd = { col: right, row: cell.row };
+    promptSelecting = false;
+
+    const text = getPromptSelectionText();
+    if (text) navigator.clipboard.writeText(text).catch(() => {});
+    requestAnimationFrame(() => renderPromptCanvas());
+  }
+
+  /** Extract selected text from prompt cell data */
+  function getPromptSelectionText(): string | null {
+    if (!promptSelStart || !promptSelEnd || !promptRowCells) return null;
+    const dv = new DataView(promptRowCells.buffer, promptRowCells.byteOffset, promptRowCells.byteLength);
+
+    const startRow = Math.min(promptSelStart.row, promptSelEnd.row);
+    const endRow = Math.max(promptSelStart.row, promptSelEnd.row);
+    const startCol = startRow === endRow
+      ? Math.min(promptSelStart.col, promptSelEnd.col)
+      : (promptSelStart.row <= promptSelEnd.row ? promptSelStart.col : promptSelEnd.col);
+    const endCol = startRow === endRow
+      ? Math.max(promptSelStart.col, promptSelEnd.col)
+      : (promptSelStart.row <= promptSelEnd.row ? promptSelEnd.col : promptSelStart.col);
+
+    let text = '';
+    for (let r = startRow; r <= endRow; r++) {
+      const cStart = r === startRow ? startCol : 0;
+      const cEnd = r === endRow ? endCol : promptRowCols - 1;
+      for (let c = cStart; c <= cEnd; c++) {
+        const off = (r * promptRowCols + c) * 10;
+        if (off + 4 > promptRowCells.byteLength) break;
+        const cp = dv.getUint32(off, true);
+        text += cp > 0 ? String.fromCodePoint(cp) : ' ';
+      }
+      if (r < endRow) text += '\n';
+    }
+    return text.trimEnd();
+  }
+
+  function renderPromptCanvas(): void {
+    if (!promptCanvasEl || !promptActive) return;
+    if (cursorW === 0 || cursorH === 0 || pctW === 0 || pctH === 0) return;
+    if (!promptRowCells || promptRowCols === 0 || promptRowCount === 0) return;
+
+    if (!promptRenderer) {
+      initPromptRenderer();
+      return;
+    }
+
+    const cellW = cursorW + 1;
+    const cellH = cursorH + 2;
+
+    const padX = promptPadXSet ? promptPadX : (cursorX - cursorGridCol * (cursorW + 1));
+    if (padX < 0) return;
+
+    const cursorRowY = cursorY - 2;
+    const serverCursorGridRow = promptStartRow + promptRowCount - 1;
+    const startRowY = cursorRowY - (serverCursorGridRow - promptStartRow) * cellH;
+
+    // Build cell grid from server data.
+    // Only render the user's input region — everything else is transparent
+    // so the H264 video shows through:
+    //   - Row 0: skip columns before promptInputCol (PS1 prompt chars)
+    //   - Last row: skip columns after cursorGridCol (stale screen content)
+    const cellGrid: PromptCell[][] = [];
+    const dv = new DataView(promptRowCells.buffer, promptRowCells.byteOffset, promptRowCells.byteLength);
+    const emptyCell: PromptCell = { codepoint: 0, char: '', fgR: 0, fgG: 0, fgB: 0, bgR: 0, bgG: 0, bgB: 0 };
+    const lastDataRow = promptRowCount - 1;
+    for (let row = 0; row < promptRowCount; row++) {
+      const rowCells: PromptCell[] = [];
+      const skipBefore = (row === 0) ? promptInputCol : 0;
+      // On the last row (cursor row), don't render past the cursor
+      const skipAfter = (row === lastDataRow) ? cursorGridCol + 1 : promptRowCols;
+      for (let col = 0; col < promptRowCols; col++) {
+        const off = (row * promptRowCols + col) * 10;
+        if (off + 10 > promptRowCells.byteLength) break;
+        if (col < skipBefore || col >= skipAfter) {
+          rowCells.push(emptyCell);
+          continue;
+        }
+        const cp = dv.getUint32(off, true);
+        rowCells.push({
+          codepoint: cp,
+          char: cp > 0 ? String.fromCodePoint(cp) : '',
+          fgR: promptRowCells[off + 4],
+          fgG: promptRowCells[off + 5],
+          fgB: promptRowCells[off + 6],
+          bgR: promptRowCells[off + 7],
+          bgG: promptRowCells[off + 8],
+          bgB: promptRowCells[off + 9],
+        });
+      }
+      cellGrid.push(rowCells);
+    }
+
+    promptRenderer.render(cellGrid, padX, startRowY, cellW, cellH, pctW, pctH);
+
+    // Draw selection highlight
+    if (promptSelStart && promptSelEnd && promptCanvasEl) {
+      try {
+        const selCanvas = document.createElement('canvas');
+        selCanvas.width = pctW;
+        selCanvas.height = pctH;
+        const selCtx = selCanvas.getContext('2d');
+        if (selCtx) {
+          const sr = Math.min(promptSelStart.row, promptSelEnd.row);
+          const er = Math.max(promptSelStart.row, promptSelEnd.row);
+          const sc = sr === er ? Math.min(promptSelStart.col, promptSelEnd.col) : (promptSelStart.row <= promptSelEnd.row ? promptSelStart.col : promptSelEnd.col);
+          const ec = sr === er ? Math.max(promptSelStart.col, promptSelEnd.col) : (promptSelStart.row <= promptSelEnd.row ? promptSelEnd.col : promptSelStart.col);
+
+          selCtx.fillStyle = 'rgba(100, 150, 255, 0.3)';
+          for (let r = sr; r <= er; r++) {
+            const cStart = r === sr ? sc : 0;
+            const cEnd = r === er ? ec : promptRowCols - 1;
+            const x = padX + cStart * cellW;
+            const y = startRowY + r * cellH;
+            const w = (cEnd - cStart + 1) * cellW;
+            selCtx.fillRect(x, y, w, cellH);
+          }
+        }
+      } catch { /* selection highlight is optional */ }
+    }
   }
 
   // ============================================================================
@@ -1472,8 +1882,8 @@
       if (rawFrameBuffer.length > 0) {
         const frames = rawFrameBuffer;
         rawFrameBuffer = [];
-        for (const frameData of frames) {
-          handleFrame(frameData);
+        for (const frame of frames) {
+          handleFrame(frame.data, frame.isKeyframe);
         }
       }
 
@@ -1482,6 +1892,15 @@
         renderFrame(cachedFrame);
         cachedFrame = null;
       }
+
+      // Cursor blink timer — re-renders from persistent GPU texture during idle.
+      // Only fires when no new video frames have arrived recently (idle terminal).
+      cursorBlinkIntervalId = setInterval(() => {
+        if (destroyed || paused || !gpuRenderer) return;
+        // Only re-render for blink during idle — active streaming already renders
+        if (performance.now() - lastFrameRenderTime < CURSOR_BLINK_INTERVAL) return;
+        blinkCommittedCursor();
+      }, CURSOR_BLINK_INTERVAL);
     });
 
     // Initialize throttled mouse move
@@ -1552,6 +1971,12 @@
       decoder = null;
     }
 
+    // Cleanup cursor blink timer
+    if (cursorBlinkIntervalId) {
+      clearInterval(cursorBlinkIntervalId);
+      cursorBlinkIntervalId = null;
+    }
+
     // Cleanup WebGPU renderer
     if (gpuRenderer) {
       gpuRenderer.dispose();
@@ -1613,7 +2038,7 @@
         autocorrect="off"
         autocapitalize="off"
         spellcheck={false}
-        style="top:{cursorPct ? cursorPct.top : 50}%;left:{cursorPct ? cursorPct.left : 0}%"
+        style="top:{cursorSurfH > 0 ? (cursorY / cursorSurfH) * 100 : 50}%;left:{cursorSurfW > 0 ? (cursorX / cursorSurfW) * 100 : 0}%"
       ></textarea>
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -1640,19 +2065,17 @@
       </div>
     {/if}
     {#if viewportW > 0 && viewportH > 0}
-      <div class="cursor-container" style="--fw:{viewportW};--fh:{viewportH};--cursor-color:{cursorColor}">
+      <div class="cursor-container" style="--fw:{viewportW};--fh:{viewportH}">
         <div class="cursor-viewport">
-          {#if cursorPct}
-            {#key cursorKey}
-              <div
-                class="cursor-overlay"
-                class:cursor-bar={cursorStyle === 0}
-                class:cursor-block={cursorStyle === 1}
-                class:cursor-underline={cursorStyle === 2}
-                class:cursor-hollow={cursorStyle === 3}
-                style="left:{cursorPct.left}%;top:{cursorPct.top}%;width:{cursorPct.width}%;height:{cursorPct.height}%"
-              ></div>
-            {/key}
+          {#if promptActive}
+            <canvas
+              class="prompt-overlay-canvas"
+              bind:this={promptCanvasEl}
+              onmousedown={handlePromptMouseDown}
+              onmousemove={handlePromptMouseMove}
+              onmouseup={handlePromptMouseUp}
+              ondblclick={handlePromptDblClick}
+            ></canvas>
           {/if}
         </div>
       </div>
@@ -1667,6 +2090,7 @@
         <span class="stat">Queue: {pendingDecode}</span>
         <span class="stat" class:good={displayedLatency <= STATS_THRESHOLD.LATENCY_GOOD} class:warn={displayedLatency > STATS_THRESHOLD.LATENCY_GOOD && displayedLatency <= STATS_THRESHOLD.LATENCY_WARN} class:bad={displayedLatency > STATS_THRESHOLD.LATENCY_WARN}>Decode: {displayedLatency}ms</span>
         <span class="stat" class:good={displayedHealth >= STATS_THRESHOLD.HEALTH_GOOD} class:warn={displayedHealth < STATS_THRESHOLD.HEALTH_GOOD && displayedHealth >= STATS_THRESHOLD.HEALTH_WARN} class:bad={displayedHealth < STATS_THRESHOLD.HEALTH_WARN}>Health: {displayedHealth}%</span>
+        <span class="stat" class:good={promptActive}>Prompt: {promptState}</span>
       </div>
     {/if}
   </div>
@@ -1944,38 +2368,15 @@
     height: min(100cqb, calc(100cqi * var(--fh) / var(--fw)));
   }
 
-  .cursor-overlay {
+  .prompt-overlay-canvas {
     position: absolute;
-    pointer-events: none;
-    box-sizing: border-box;
-    animation: cursor-blink 1.2s step-end infinite;
-  }
-  .cursor-bar {
-    background: var(--cursor-color, var(--text, #c8c8c8));
-    max-width: 2px;
-  }
-  .cursor-block { background: var(--cursor-color, var(--text, #c8c8c8)); opacity: 0.75; }
-  .cursor-underline {
-    background: transparent;
-    border-bottom: 2px solid var(--cursor-color, var(--text, #c8c8c8));
-  }
-  .cursor-hollow {
-    background: transparent;
-    border: 1px solid var(--cursor-color, var(--text, #c8c8c8));
-  }
-
-  /* Inactive panel: show hollow cursor without blink */
-  :global(.panel:not(.focused)) .cursor-overlay {
-    background: transparent;
-    border: 1px solid var(--cursor-color, var(--text, #c8c8c8));
-    max-width: none;
-    opacity: 1;
-    animation: none;
-  }
-
-  @keyframes cursor-blink {
-    0%, 49% { visibility: visible; }
-    50%, 100% { visibility: hidden; }
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: auto;
+    z-index: 1;
+    cursor: text;
   }
 
   .panel-loading {

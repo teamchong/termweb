@@ -68,6 +68,8 @@ export const PANEL = {
   APPROX_FRAME_DURATION_MS: 33,
   /** Wheel deltaMode=1 (line) multiplier */
   LINE_SCROLL_MULTIPLIER: 20,
+  /** Maximum pending decode queue size before dropping P-frames */
+  MAX_DECODE_QUEUE_SIZE: 1,
 } as const;
 
 // ============================================================================
@@ -314,6 +316,10 @@ export const SERVER_MSG = {
   SURFACE_DIMS: 0x15,
   /** Screen/selection content for browser download */
   SCREEN_DUMP: 0x16,
+  /** Prompt lifecycle: [type:u8][panel_id:u32][state:u8][col:u16][row:u16] = 10 bytes */
+  PROMPT_STATE: 0x17,
+  /** Raw PTY output during prompt: [type:u8][panel_id:u32][bytes...] */
+  PTY_BYTES: 0x18,
   /** Inspector open/closed state */
   INSPECTOR_OPEN_STATE: 0x1E,
   /** Config reloaded: payload contains updated config JSON */
