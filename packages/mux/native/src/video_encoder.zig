@@ -369,9 +369,8 @@ pub const VideoEncoder = struct {
         // Prioritize speed over power efficiency
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_MaximizePowerEfficiency, c.kCFBooleanFalse);
 
-        // Prioritize encoding speed — produces simpler frames that decode faster.
-        // Terminal text quality is maintained by high bitrate and idle keyframes.
-        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, c.kCFBooleanTrue);
+        // Prioritize quality for sharp terminal text rendering.
+        _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, c.kCFBooleanFalse);
 
         // Disable B-frames (critical for zero latency)
         _ = c.VTSessionSetProperty(session, c.kVTCompressionPropertyKey_AllowFrameReordering, c.kCFBooleanFalse);

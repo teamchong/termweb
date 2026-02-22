@@ -163,7 +163,7 @@ export async function initWebGPURenderer(
             primitive: { topology: 'triangle-strip', stripIndexFormat: undefined },
           });
 
-          const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+          const sampler = device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
           const bindGroupLayout = pipeline.getBindGroupLayout(0);
 
           // Cursor uniform buffer (persistent, updated per frame)

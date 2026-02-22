@@ -185,6 +185,8 @@ pub const BinaryCtrlMsg = enum(u8) {
     cursor_state = 0x14,  // Cursor position/style/color for frontend CSS blink [type:u8][panel_id:u32][x:u16][y:u16][w:u16][h:u16][style:u8][visible:u8][r:u8][g:u8][b:u8] = 18 bytes
     surface_dims = 0x15,  // Surface pixel dimensions (sent on resize, not per-frame) [type:u8][panel_id:u32][width:u16][height:u16] = 9 bytes
     screen_dump = 0x16,   // Screen/selection content for browser download [type:u8][filename_len:u8][filename...][content_len:u32_le][content...]
+    prompt_state = 0x17,  // Prompt lifecycle: [type:u8][panel_id:u32][state:u8][col:u16][row:u16] = 10 bytes  (state: 0=none, 1=prompt, 2=input, 3=command)
+    pty_bytes = 0x18,     // Raw PTY output during prompt: [type:u8][panel_id:u32][bytes...] = 5+ bytes
     config_content = 0x20, // Config file content: [type:u8][path_len:u16_le][path...][content_len:u32_le][content...]
     inspector_state_open = 0x1E,  // Inspector open/closed state (0x09 is already inspector_state)
     config_updated = 0x1F,  // Config reloaded: clients should refetch /config
@@ -648,6 +650,7 @@ const Panel = struct {
     idle_keyframe_sent: bool, // One-shot: sent a quality keyframe during this idle period
     had_input: bool, // Set by processInputQueue on key/scroll events, cleared by render loop
     last_encode_exceeded_budget: bool, // Previous frame's encode exceeded 16ms budget (for frame skip)
+    frames_since_input_keyframe: u8, // Frames since last proactive keyframe during rapid input
 
     // Cursor state tracking (for frontend CSS blink overlay)
     last_cursor_col: u16 = 0,
@@ -675,6 +678,14 @@ const Panel = struct {
 
     // Tick counter for cursor-vs-video divergence tracking
     render_tick: u32 = 0,
+
+    // Prompt overlay state tracking (for OSC 133 semantic prompt detection)
+    last_prompt_state: u8 = 0, // 0=none, 1=prompt, 2=input, 3=command
+    last_semantic_content: u8 = 0, // 0=output, 1=input, 2=prompt
+    prompt_input_col: u16 = 0, // cursor col when input started
+    prompt_input_row: u16 = 0, // cursor row when input started
+    prompt_decor_row: u16 = 0, // first decoration row (fixed at prompt activation)
+    had_key_input: bool = false, // Set on key press, read by queryPromptAndBroadcast
 
     const TARGET_FPS: i64 = 60; // 60 FPS for video
     /// After this many consecutive unchanged frames, reduce tick rate to save CPU/GPU.
@@ -830,6 +841,7 @@ const Panel = struct {
             .idle_keyframe_sent = false,
             .had_input = false,
             .last_encode_exceeded_budget = false,
+            .frames_since_input_keyframe = 0,
         };
 
         return panel;
@@ -1107,14 +1119,17 @@ const Panel = struct {
                         if (csiUForKey(key_event.input.keycode)) |csi_action| {
                             _ = c.ghostty_surface_binding_action(self.surface, csi_action.ptr, csi_action.len);
                             self.had_input = true;
+                            self.had_key_input = true;
                             continue;
                         }
                     }
                     _ = c.ghostty_surface_key(self.surface, key_event.input);
                     self.had_input = true;
+                    self.had_key_input = true;
                 },
                 .text => |text| {
                     c.ghostty_surface_text(self.surface, &text.data, text.len);
+                    self.had_key_input = true;
                 },
                 .mouse_pos => |pos| {
                     c.ghostty_surface_mouse_pos(self.surface, pos.x, pos.y, pos.mods);
@@ -1722,6 +1737,7 @@ const Server = struct {
     config: ?c.ghostty_config_t,
     config_json: ?[]const u8,  // Pre-built JSON for config (colors + keybindings)
     ghostty_initialized: bool,  // Whether ghostty_init() has been called
+    resources_dir_buf: [512]u8,  // Buffer for resolved GHOSTTY_RESOURCES_DIR path
     panels: std.AutoHashMap(u32, *Panel),
     h264_connections: std.ArrayList(*ws.Connection),
     control_connections: std.ArrayList(*ws.Connection),
@@ -1845,6 +1861,7 @@ const Server = struct {
             .config = null,
             .config_json = null,
             .ghostty_initialized = false,
+            .resources_dir_buf = undefined,
             .panels = std.AutoHashMap(u32, *Panel).init(allocator),
             .h264_connections = .{},
             .control_connections = .{},
@@ -1924,6 +1941,36 @@ const Server = struct {
         return server;
     }
 
+    /// Resolve the ghostty resources directory for shell integration.
+    /// Checks: 1) already set via env, 2) vendor/ghostty/zig-out/share/ghostty relative to exe,
+    /// 3) /usr/share/ghostty (system install).
+    fn resolveGhosttyResourcesDir(self: *Server) ?[:0]const u8 {
+        // If already set, don't override
+        if (std.posix.getenv("GHOSTTY_RESOURCES_DIR")) |existing| {
+            if (existing.len > 0) return null;
+        }
+
+        // Try relative to executable: exe_dir/../../vendor/ghostty/zig-out/share/ghostty
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExePath(&exe_buf)) |exe_path| {
+            const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+            const base_dir = std.fs.path.dirname(exe_dir) orelse "."; // up from bin/
+            const base_dir2 = std.fs.path.dirname(base_dir) orelse "."; // up from zig-out/
+            const candidate = std.fmt.bufPrintZ(&self.resources_dir_buf, "{s}/vendor/ghostty/zig-out/share/ghostty", .{base_dir2}) catch return null;
+            if (std.fs.cwd().access(candidate, .{})) |_| {
+                return candidate;
+            } else |_| {}
+        } else |_| {}
+
+        // Try /usr/share/ghostty (system-wide install)
+        const system_dir: [:0]const u8 = "/usr/share/ghostty";
+        if (std.fs.cwd().access(system_dir, .{})) |_| {
+            return system_dir;
+        } else |_| {}
+
+        return null;
+    }
+
     // Lazy initialize ghostty when first panel is created
     fn ensureGhosttyInit(self: *Server) !void {
         self.mutex.lock();
@@ -1932,6 +1979,17 @@ const Server = struct {
         if (self.app != null) return; // Already initialized
 
         if (!self.ghostty_initialized) {
+            // Set GHOSTTY_RESOURCES_DIR so shell integration (OSC 133 prompt markers)
+            // is automatically injected into bash/zsh/fish. This enables the prompt
+            // overlay feature by having the shell emit semantic prompt sequences.
+            const resources_dir = self.resolveGhosttyResourcesDir();
+            if (resources_dir) |dir| {
+                // Use C setenv to make it available to ghostty's init
+                const clib = @cImport(@cInclude("stdlib.h"));
+                _ = clib.setenv("GHOSTTY_RESOURCES_DIR", dir.ptr, 1);
+            } else {
+            }
+
             const init_result = c.ghostty_init(0, null);
             if (init_result != c.GHOSTTY_SUCCESS) return error.GhosttyInitFailed;
             self.ghostty_initialized = true;
@@ -2204,6 +2262,14 @@ const Server = struct {
 
         // Initialize ghostty runtime (safe to call before app creation)
         if (!self.ghostty_initialized) {
+            // Set GHOSTTY_RESOURCES_DIR for shell integration (OSC 133 prompt markers)
+            const resources_dir = self.resolveGhosttyResourcesDir();
+            if (resources_dir) |dir| {
+                const clib = @cImport(@cInclude("stdlib.h"));
+                _ = clib.setenv("GHOSTTY_RESOURCES_DIR", dir.ptr, 1);
+            } else {
+            }
+
             const init_result = c.ghostty_init(0, null);
             if (init_result != c.GHOSTTY_SUCCESS) {
                 std.debug.print("Warning: ghostty_init failed, config unavailable\n", .{});
@@ -2842,10 +2908,11 @@ const Server = struct {
         self.mutex.unlock();
     }
 
-    // Send H264 frame to authorized H264 clients with [panel_id:u32][frame_data...] prefix.
+    // Send H264 frame to authorized H264 clients with [panel_id:u32][render_tick:u32][flags:u8][frame_data...] prefix.
+    // flags bit 0: keyframe (1=IDR with SPS/PPS)
     // Non-admin connections only receive frames for panels assigned to their session.
     // Returns true if sent to at least one client, false if all sends failed.
-    fn sendH264Frame(self: *Server, panel_id: u32, frame_data: []const u8, render_tick: u32) bool {
+    fn sendH264Frame(self: *Server, panel_id: u32, frame_data: []const u8, render_tick: u32, is_keyframe: bool) bool {
         var conns_buf: [max_broadcast_conns]*ws.Connection = undefined;
         var conns_count: usize = 0;
         {
@@ -2876,9 +2943,10 @@ const Server = struct {
         }
         if (conns_count == 0) return false;
 
-        var id_buf: [8]u8 = undefined;
+        var id_buf: [9]u8 = undefined;
         std.mem.writeInt(u32, id_buf[0..4], panel_id, .little);
         std.mem.writeInt(u32, id_buf[4..8], render_tick, .little);
+        id_buf[8] = if (is_keyframe) 1 else 0;
 
         var any_sent = false;
         for (conns_buf[0..conns_count]) |conn| {
@@ -2887,7 +2955,7 @@ const Server = struct {
         }
         if (comptime enable_benchmark) {
             if (any_sent) {
-                _ = self.bw_h264_bytes.fetchAdd(8 + frame_data.len, .monotonic);
+                _ = self.bw_h264_bytes.fetchAdd(9 + frame_data.len, .monotonic);
                 _ = self.bw_h264_frames.fetchAdd(1, .monotonic);
             }
         }
@@ -3951,6 +4019,20 @@ const Server = struct {
         return buf;
     }
 
+    /// Build 14-byte prompt state message.
+    /// [type:u8][panel_id:u32][state:u8][col:u16][row:u16][cursor_col:u16][padding_x:u16]
+    fn buildPromptStateBuf(panel_id: u32, state: u8, col: u16, row: u16, cursor_col: u16, padding_x: u16) [14]u8 {
+        var buf: [14]u8 = undefined;
+        buf[0] = @intFromEnum(BinaryCtrlMsg.prompt_state);
+        std.mem.writeInt(u32, buf[1..5], panel_id, .little);
+        buf[5] = state;
+        std.mem.writeInt(u16, buf[6..8], col, .little);
+        std.mem.writeInt(u16, buf[8..10], row, .little);
+        std.mem.writeInt(u16, buf[10..12], cursor_col, .little);
+        std.mem.writeInt(u16, buf[12..14], padding_x, .little);
+        return buf;
+    }
+
     /// Query cursor state from ghostty and broadcast if changed.
     /// Only call when the frame changed or input was pending — avoids
     /// unnecessary ghostty_surface_cursor_info() calls on idle panels.
@@ -3999,6 +4081,151 @@ const Server = struct {
             const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, cur_style, cur_visible, cur_color_r, cur_color_g, cur_color_b, panel.render_tick);
             self.broadcastControlData(&cursor_buf);
         }
+
+        // Prompt state detection via OSC 133 semantic prompt info
+        self.queryPromptAndBroadcast(panel);
+    }
+
+    /// Detect prompt state using a dual strategy:
+    /// 1. OSC 133 semantic prompt (if shell integration is active)
+    /// 2. Heuristic fallback: cursor visible + idle on same row after input → assume prompt
+    ///
+    /// The heuristic works by tracking whether the cursor row changes after user input.
+    /// When the user types and the cursor stays on the same row, we're at a prompt.
+    /// When output starts scrolling (cursor row changes without input), command is running.
+    fn queryPromptAndBroadcast(self: *Server, panel: *Panel) void {
+        // First try OSC 133 semantic prompt
+        var row_prompt: u8 = 0;
+        var cursor_content: u8 = 0;
+        var prompt_col: u16 = 0;
+        var prompt_row: u16 = 0;
+        c.ghostty_surface_semantic_prompt_info(panel.surface, &row_prompt, &cursor_content, &prompt_col, &prompt_row);
+
+        const new_state: u8 = if (cursor_content != 0)
+            // OSC 133 is active — use it
+            // Both prompt (2) and input (1) mean "user is at prompt, overlay should be active"
+            switch (cursor_content) {
+                2 => 2, // prompt region → input_start (overlay active)
+                1 => 2, // input region → input_start (overlay active)
+                else => 0,
+            }
+        else blk: {
+            // Heuristic fallback: no OSC 133 data available.
+            // Detect prompt by: cursor visible + had recent input + cursor staying on same row.
+            const cur_row = panel.last_cursor_row;
+            const cur_col = panel.last_cursor_col;
+            const visible = panel.last_cursor_visible;
+
+            if (visible == 0) break :blk @as(u8, 0); // cursor hidden → not at prompt
+
+            const had_key = panel.had_key_input;
+            panel.had_key_input = false;
+
+            if (had_key) {
+                // User just typed something
+                if (panel.last_prompt_state == 0) {
+                    // Transition: no_prompt → input_start
+                    // Record the cursor position as the prompt input start
+                    panel.prompt_input_row = cur_row;
+                    // Estimate input start col: for first keystroke, current col is where
+                    // the cursor was before the char was echoed, so use col - 1 if possible
+                    panel.prompt_input_col = if (cur_col > 0) cur_col - 1 else 0;
+                    break :blk @as(u8, 2); // input_start
+                } else if (panel.last_prompt_state == 2) {
+                    // Already in input state — check if cursor row changed (command ran)
+                    if (cur_row != panel.prompt_input_row) {
+                        // Cursor moved to different row → command output started
+                        break :blk @as(u8, 3); // command_running
+                    }
+                    break :blk @as(u8, 2); // still at prompt
+                }
+            }
+
+            if (panel.last_prompt_state == 2) {
+                // Was at prompt, no new input — check if cursor moved rows (output scrolling)
+                if (cur_row != panel.prompt_input_row) {
+                    break :blk @as(u8, 3); // command_running
+                }
+                break :blk @as(u8, 2); // still at prompt
+            }
+
+            if (panel.last_prompt_state == 3) {
+                // Was running command — transition back to none after output settles
+                if (panel.consecutive_unchanged > 10 and visible == 1) {
+                    // Output stopped, cursor visible again → back to idle (new prompt likely)
+                    break :blk @as(u8, 0);
+                }
+                break :blk @as(u8, 3); // still running
+            }
+
+            break :blk @as(u8, 0); // no_prompt
+        };
+
+        if (new_state != panel.last_prompt_state) {
+            panel.last_prompt_state = new_state;
+            panel.last_semantic_content = cursor_content;
+            if (new_state == 2) {
+                // Only use OSC 133 values when they're available (cursor_content != 0).
+                // In heuristic mode (cursor_content == 0), prompt_input_col/row were
+                // already set inline in the heuristic block above.
+                if (cursor_content != 0) {
+                    panel.prompt_input_col = prompt_col;
+                    panel.prompt_input_row = prompt_row;
+                }
+                const prow = if (cursor_content != 0) prompt_row else panel.prompt_input_row;
+                // Record decoration start row: scan up to 3 rows above cursor
+                panel.prompt_decor_row = if (prow >= 3) prow - 3 else 0;
+            }
+            const pad_x: u16 = if (panel.surface) |surf| blk: {
+                const sz = c.ghostty_surface_size(surf);
+                break :blk @intCast(sz.padding_left_px);
+            } else 0;
+            const prompt_buf = buildPromptStateBuf(panel.id, new_state, panel.prompt_input_col, panel.prompt_input_row, panel.last_cursor_col, pad_x);
+            self.broadcastControlData(&prompt_buf);
+        }
+
+        // When prompt is active, send row cells every cycle
+        if (panel.last_prompt_state == 2) {
+            self.sendPromptRowCells(panel);
+        }
+    }
+
+    /// Read prompt row cells from ghostty's screen and send as PTY_BYTES message.
+    /// Scans upward from the cursor row to find all prompt rows, then sends them all.
+    /// Format: [0x18][panel_id:u32][start_row:u16][row_count:u16][cols:u16][cell_data...]
+    fn sendPromptRowCells(self: *Server, panel: *Panel) void {
+        // Send only the input rows: prompt_input_row to cursor_row.
+        // The prompt character (e.g. "> ") is on prompt_input_row itself
+        // (offset by prompt_input_col). Rows above are command output or
+        // decoration — the video already renders those correctly.
+        const start_row = panel.prompt_input_row;
+        const cursor_row = panel.last_cursor_row;
+        const row_count = if (cursor_row >= start_row) cursor_row - start_row + 1 else 1;
+        const max_cols: u16 = 256;
+        const max_rows: u16 = 8;
+        const actual_rows = @min(row_count, max_rows);
+        var cell_buf: [max_cols * max_rows * 10]u8 = undefined;
+        const cells_written = c.ghostty_surface_read_row_cells(
+            panel.surface,
+            start_row,
+            actual_rows,
+            &cell_buf,
+            cell_buf.len,
+        );
+        if (cells_written == 0) return;
+
+        const cell_data_len = cells_written * 10;
+        // Build message: [type:u8][panel_id:u32][start_row:u16][row_count:u16][cols_per_row:u16][cell_data...]
+        const cols_per_row: u16 = @intCast(cells_written / actual_rows);
+        var msg_buf: [11 + 256 * 8 * 10]u8 = undefined;
+        msg_buf[0] = @intFromEnum(BinaryCtrlMsg.pty_bytes);
+        std.mem.writeInt(u32, msg_buf[1..5], panel.id, .little);
+        std.mem.writeInt(u16, msg_buf[5..7], start_row, .little);
+        std.mem.writeInt(u16, msg_buf[7..9], actual_rows, .little);
+        std.mem.writeInt(u16, msg_buf[9..11], cols_per_row, .little);
+        @memcpy(msg_buf[11..][0..cell_data_len], cell_buf[0..cell_data_len]);
+
+        self.broadcastControlData(msg_buf[0 .. 11 + cell_data_len]);
     }
 
     /// Compute cursor pixel coordinates from grid position and surface metrics.
@@ -4034,12 +4261,62 @@ const Server = struct {
             if (panel.surface == null) continue;
             const cp = computeCursorPixelCoords(panel.surface, panel.last_cursor_col, panel.last_cursor_row);
 
+            // 1. Surface dimensions first (needed for pctW/pctH)
             const dims_buf = buildSurfaceDimsBuf(panel.id, cp.surf_w, cp.surf_h);
             conn.sendBinary(&dims_buf) catch {};
 
-            const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, panel.last_cursor_style, panel.last_cursor_visible, panel.last_cursor_color_r, panel.last_cursor_color_g, panel.last_cursor_color_b, panel.render_tick);
+            // 2. Prompt state BEFORE cursor — so promptState=INPUT_START is set
+            //    when the cursor message arrives, allowing the cursor to bypass
+            //    the tick queue on reconnect (client queues cursors with tick > videoTick
+            //    unless promptState is INPUT_START).
+            if (panel.last_prompt_state != 0) {
+                const pad_x: u16 = @intCast(c.ghostty_surface_size(panel.surface).padding_left_px);
+                const prompt_buf = buildPromptStateBuf(panel.id, panel.last_prompt_state, panel.prompt_input_col, panel.prompt_input_row, panel.last_cursor_col, pad_x);
+                conn.sendBinary(&prompt_buf) catch {};
+            }
+
+            // 3. Cursor with tick=0 so it always bypasses the tick queue on reconnect
+            //    (client's videoTick starts at 0 on page load, so tick=0 is not > 0).
+            const cursor_buf = buildCursorBuf(panel.id, cp.x, cp.y, cp.w, cp.h, panel.last_cursor_style, panel.last_cursor_visible, panel.last_cursor_color_r, panel.last_cursor_color_g, panel.last_cursor_color_b, 0);
             conn.sendBinary(&cursor_buf) catch {};
+
+            // 4. Send prompt row cells so the overlay can render immediately
+            if (panel.last_prompt_state == 2) {
+                self.sendPromptRowCellsToConn(panel, conn);
+            }
         }
+    }
+
+    /// Send prompt row cells to a single connection (used on reconnect).
+    fn sendPromptRowCellsToConn(self: *Server, panel: *Panel, conn: *ws.Connection) void {
+        _ = self;
+        const start_row = panel.prompt_input_row;
+        const cursor_row = panel.last_cursor_row;
+        const row_count = if (cursor_row >= start_row) cursor_row - start_row + 1 else 1;
+        const max_cols: u16 = 256;
+        const max_rows: u16 = 8;
+        const actual_rows = @min(row_count, max_rows);
+        var cell_buf: [max_cols * max_rows * 10]u8 = undefined;
+        const cells_written = c.ghostty_surface_read_row_cells(
+            panel.surface,
+            start_row,
+            actual_rows,
+            &cell_buf,
+            cell_buf.len,
+        );
+        if (cells_written == 0) return;
+
+        const cell_data_len = cells_written * 10;
+        const cols_per_row: u16 = @intCast(cells_written / actual_rows);
+        var msg_buf: [11 + 256 * 8 * 10]u8 = undefined;
+        msg_buf[0] = @intFromEnum(BinaryCtrlMsg.pty_bytes);
+        std.mem.writeInt(u32, msg_buf[1..5], panel.id, .little);
+        std.mem.writeInt(u16, msg_buf[5..7], start_row, .little);
+        std.mem.writeInt(u16, msg_buf[7..9], actual_rows, .little);
+        std.mem.writeInt(u16, msg_buf[9..11], cols_per_row, .little);
+        @memcpy(msg_buf[11..][0..cell_data_len], cell_buf[0..cell_data_len]);
+
+        conn.sendBinary(msg_buf[0 .. 11 + cell_data_len]) catch {};
     }
 
     /// Copy control connection list under mutex so sends can happen without holding it.
@@ -6403,6 +6680,30 @@ const Server = struct {
                     const tick_elapsed: u64 = @intCast(std.time.nanoTimestamp() - t_tick);
                     perf_tick_ns += tick_elapsed;
 
+                    // Proactive keyframes during rapid input: force a keyframe every 5
+                    // frames so the client can reset its decoder and jump to latest state,
+                    // skipping stale P-frames in the decode queue.
+                    if (panel.has_pending_input.load(.acquire)) {
+                        panel.frames_since_input_keyframe +|= 1;
+                        if (panel.frames_since_input_keyframe >= 5) {
+                            panel.force_keyframe = true;
+                            panel.frames_since_input_keyframe = 0;
+                        }
+                    } else {
+                        panel.frames_since_input_keyframe = 0;
+                    }
+
+                    // Halve encode rate during rapid input: skip odd frames so the client
+                    // receives fewer frames to decode, reducing queue buildup. The terminal
+                    // still ticks every cycle (ghostty processes input above), so the next
+                    // encoded frame captures all accumulated state. Keyframes are never skipped.
+                    if (panel.has_pending_input.load(.acquire) and
+                        !panel.force_keyframe and
+                        panel.frames_since_input_keyframe % 2 == 1)
+                    {
+                        continue;
+                    }
+
                     // Frame skip during rapid input: if previous encode exceeded budget
                     // and there's pending input, skip capture+encode for this frame.
                     // Ghostty already rendered internally (tick above), so the next frame
@@ -6604,6 +6905,7 @@ const Server = struct {
                     const t_frame_start = std.time.nanoTimestamp();
 
                     var frame_data: ?[]const u8 = null;
+                    var frame_is_keyframe = false;
                     var enc_elapsed: u64 = 0;
                     var send_failed = false;
                     const was_keyframe = panel.captured_was_keyframe;
@@ -6611,6 +6913,7 @@ const Server = struct {
                     if (comptime is_macos) {
                         if (panel.prepareFrame() catch null) |result| {
                             frame_data = result.data;
+                            frame_is_keyframe = result.is_keyframe;
                         }
                     } else if (comptime is_linux) {
                         if (panel.captured_dma_fd != -1) {
@@ -6627,6 +6930,7 @@ const Server = struct {
                                 panel.force_keyframe,
                             ) catch null) |result| {
                                 frame_data = result.data;
+                                frame_is_keyframe = result.is_keyframe;
                                 panel.force_keyframe = false;
                                 if (self.dma_buf_fail_count > 0) {
                                     logToFile(dbg_log, "DMA_BUF_RECOVERED after {d} failures\n", .{self.dma_buf_fail_count});
@@ -6662,6 +6966,7 @@ const Server = struct {
                             const t_enc = std.time.nanoTimestamp();
                             if (panel.video_encoder.?.encodeWithDimensions(panel.bgra_buffer.?, panel.force_keyframe, pixel_width, pixel_height) catch null) |result| {
                                 frame_data = result.data;
+                                frame_is_keyframe = result.is_keyframe;
                                 panel.force_keyframe = false;
                                 logToFile(dbg_log, "ENCODED panel={d} tick={d} kf={} size={d} fc={d}\n", .{ panel.id, panel.ticks_since_connect, was_keyframe, result.data.len, if (panel.video_encoder) |enc| enc.frame_count else -1 });
                             } else {
@@ -6678,7 +6983,7 @@ const Server = struct {
                     self.queryCursorAndBroadcast(panel);
 
                     if (frame_data) |data| {
-                        if (self.sendH264Frame(panel.id, data, panel.render_tick)) {
+                        if (self.sendH264Frame(panel.id, data, panel.render_tick, frame_is_keyframe)) {
                             frames_sent += 1;
                             panel.last_frame_time = t_frame_start; // For per-panel adaptive FPS
                             if (panel.ticks_since_connect < 10)
@@ -6716,6 +7021,15 @@ const Server = struct {
                     const budget_ns: u64 = Panel.FRAME_INTERVAL_MS * std.time.ns_per_ms;
                     panel.last_encode_exceeded_budget = (frame_total_ns > budget_ns);
 
+                }
+
+                // Prompt state detection + cursor update — runs every cycle
+                for (panels_buf[0..panels_count]) |panel| {
+                    self.queryPromptAndBroadcast(panel);
+                    // When prompt active, also send cursor at full rate
+                    if (panel.last_prompt_state == 2) {
+                        self.queryCursorAndBroadcast(panel);
+                    }
                 }
 
                 fps_counter += frames_sent;
@@ -8060,10 +8374,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             }
         } else if (std.mem.eql(u8, arg, "--local")) {
             args.mode = .local;
-        } else if (std.mem.eql(u8, arg, "--cloudflare")) {
-            args.mode = .{ .tunnel = .cloudflare };
-        } else if (std.mem.eql(u8, arg, "--ngrok")) {
-            args.mode = .{ .tunnel = .ngrok };
         } else if (std.mem.eql(u8, arg, "--tailscale")) {
             args.mode = .{ .tunnel = .tailscale };
         }

@@ -68,8 +68,11 @@ export const PANEL = {
   APPROX_FRAME_DURATION_MS: 33,
   /** Wheel deltaMode=1 (line) multiplier */
   LINE_SCROLL_MULTIPLIER: 20,
-  /** Maximum pending decode queue size before dropping P-frames */
-  MAX_DECODE_QUEUE_SIZE: 1,
+  /** Maximum pending decode queue size before dropping P-frames.
+   *  Terminal P-frames are tiny (~200-500 bytes) and decode in <1ms on
+   *  hardware. Only drop if the decoder is truly stalled — aggressive
+   *  dropping breaks the P-frame chain and forces a keyframe stall. */
+  MAX_DECODE_QUEUE_SIZE: 10,
 } as const;
 
 // ============================================================================

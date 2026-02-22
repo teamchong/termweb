@@ -1132,8 +1132,10 @@ pub const VideoEncoder = struct {
         // VPP: convert BGRX → NV12 on GPU (same resolution, no scaling).
         var pipeline_param = std.mem.zeroes(c.VAProcPipelineParameterBuffer);
         pipeline_param.surface = self.rgba_surface;
-        pipeline_param.surface_color_standard = c.VAProcColorStandardNone;
-        pipeline_param.output_color_standard = c.VAProcColorStandardBT601;
+        pipeline_param.surface_color_standard = c.VAProcColorStandardSRGB;
+        pipeline_param.output_color_standard = c.VAProcColorStandardBT709;
+        pipeline_param.input_color_properties.color_range = c.VA_SOURCE_RANGE_FULL;
+        pipeline_param.output_color_properties.color_range = c.VA_SOURCE_RANGE_FULL;
 
         var pipeline_buf: c.VABufferID = 0;
         status = vaCreateBuffer(
@@ -1230,7 +1232,8 @@ pub const VideoEncoder = struct {
                 const b = @as(u32, rgba_data[src_idx]);
                 const g = @as(u32, rgba_data[src_idx + 1]);
                 const r = @as(u32, rgba_data[src_idx + 2]);
-                mapped[y_offset + y * y_pitch + x] = @intCast(@min(255, 16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)));
+                // Full-range BT.709: Y = (54*R + 183*G + 19*B + 128) >> 8
+                mapped[y_offset + y * y_pitch + x] = @intCast(@min(255, (54 * r + 183 * g + 19 * b + 128) >> 8));
             }
         }
 
@@ -1247,8 +1250,10 @@ pub const VideoEncoder = struct {
                 const b = @as(i32, @intCast(rgba_data[src_idx]));
                 const g = @as(i32, @intCast(rgba_data[src_idx + 1]));
                 const r = @as(i32, @intCast(rgba_data[src_idx + 2]));
-                mapped[uv_offset + y * uv_pitch + x * 2] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8))))));
-                mapped[uv_offset + y * uv_pitch + x * 2 + 1] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((112 * r - 94 * g - 18 * b + 128) >> 8))))));
+                // Full-range BT.709: Cb = 128 + (-30*R - 99*G + 128*B + 128) >> 8
+                mapped[uv_offset + y * uv_pitch + x * 2] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((-30 * r - 99 * g + 128 * b + 128) >> 8))))));
+                // Full-range BT.709: Cr = 128 + (128*R - 116*G - 12*B + 128) >> 8
+                mapped[uv_offset + y * uv_pitch + x * 2 + 1] = @intCast(@as(u32, @intCast(@max(0, @min(255, 128 + ((128 * r - 116 * g - 12 * b + 128) >> 8))))));
             }
         }
 
@@ -1412,10 +1417,8 @@ pub const VideoEncoder = struct {
 
         writeU8(&slice_param, SLICE_cabac_init_idc, 0);
         writeI8(&slice_param, SLICE_slice_qp_delta, -4);
-        // Disable in-loop deblocking filter — saves ~20-30% decode time.
-        // Terminal text (sharp edges, solid colors) doesn't benefit from
-        // deblocking like natural video. idc=1 disables entirely.
-        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 1);
+        // Deblocking filter smooths block boundary artifacts around text edges.
+        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 0);
         writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 0);
         writeI8(&slice_param, SLICE_slice_beta_offset_div2, 0);
 
@@ -1612,8 +1615,10 @@ pub const VideoEncoder = struct {
         // VPP: convert imported BGRX surface → NV12 src_surface (with scaling if needed)
         var pipeline_param = std.mem.zeroes(c.VAProcPipelineParameterBuffer);
         pipeline_param.surface = imported;
-        pipeline_param.surface_color_standard = c.VAProcColorStandardNone;
-        pipeline_param.output_color_standard = c.VAProcColorStandardBT601;
+        pipeline_param.surface_color_standard = c.VAProcColorStandardSRGB;
+        pipeline_param.output_color_standard = c.VAProcColorStandardBT709;
+        pipeline_param.input_color_properties.color_range = c.VA_SOURCE_RANGE_FULL;
+        pipeline_param.output_color_properties.color_range = c.VA_SOURCE_RANGE_FULL;
 
         var pipeline_buf: c.VABufferID = 0;
         var status = vaCreateBuffer(
@@ -1737,8 +1742,8 @@ pub const VideoEncoder = struct {
 
         writeU8(&slice_param, SLICE_cabac_init_idc, 0);
         writeI8(&slice_param, SLICE_slice_qp_delta, -4);
-        // Disable in-loop deblocking filter (same as CPU path above)
-        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 1);
+        // Deblocking filter smooths block boundary artifacts around text edges.
+        writeU8(&slice_param, SLICE_disable_deblocking_filter_idc, 0);
         writeI8(&slice_param, SLICE_slice_alpha_c0_offset_div2, 0);
         writeI8(&slice_param, SLICE_slice_beta_offset_div2, 0);
 

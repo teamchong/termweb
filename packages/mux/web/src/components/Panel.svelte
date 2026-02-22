@@ -190,24 +190,10 @@
   const videoTickQueue: number[] = [];  // FIFO: ticks pushed when frame submitted to decoder, popped on render
   const pendingCursors = new Map<number, CursorUpdate>();
 
-  /** Advance videoTick and flush matching cursors — used when a frame is dropped
-   *  so cursor position stays current even without a rendered frame. */
+  /** Advance videoTick when a frame is dropped. Cursors stay in pendingCursors
+   *  and get flushed by renderFrame so cursor and text always appear together. */
   function advanceVideoTick(tick: number): void {
     if (tick > videoTick) videoTick = tick;
-    if (pendingCursors.size > 0) {
-      let best: CursorUpdate | null = null;
-      let bestTick = 0;
-      for (const [t, c] of pendingCursors) {
-        if (t <= videoTick && t > bestTick) { bestTick = t; best = c; }
-      }
-      if (best) {
-        for (const t of pendingCursors.keys()) { if (t <= bestTick) pendingCursors.delete(t); }
-        applyCursor(best.x, best.y, best.w, best.h, best.style, best.visible, best.surfW, best.surfH, best.r, best.g, best.b);
-        // Show updated cursor on persistent texture immediately
-        commitCursorToGpu();
-        if (gpuRenderer) gpuRenderer.renderCursorOnly();
-      }
-    }
   }
 
   // Reactive canvas buffer dimensions (encoder-aligned) — updated from video frames.
@@ -266,6 +252,16 @@
   let cursorBlinkIntervalId: ReturnType<typeof setInterval> | null = null;
   let lastFrameRenderTime = 0;
   const CURSOR_BLINK_INTERVAL = 600; // ms — half of 1.2s blink cycle
+
+  // Measured H264 decode latency (EMA) — available for diagnostics/stats.
+  let decodeLatencyMs = 0;
+
+  // Output frame coalescing: during rapid decode bursts, multiple VideoFrames
+  // may arrive between vsyncs. Only the last frame matters (screen shows one
+  // image per vsync). We defer rendering to a microtask — if another frame
+  // arrives before the microtask runs, we close the stale one and keep the newer.
+  let coalescedFrame: VideoFrame | null = null;
+  let coalesceScheduled = false;
 
   // ============================================================================
   // WebSocket Helpers
@@ -326,6 +322,14 @@
     if (frameWidth !== frame.displayWidth || frameHeight !== frame.displayHeight) {
       frameWidth = frame.displayWidth;
       frameHeight = frame.displayHeight;
+    }
+
+    // Measure actual decode latency (frame.timestamp was set to performance.now()
+    // at decode submission time, in microseconds). Track EMA for cursor delay.
+    const decodeMs = performance.now() - frame.timestamp / 1000;
+    if (decodeMs > 0 && decodeMs < 200) {
+      // EMA with α=0.3 — responsive to changes but smooths jitter
+      decodeLatencyMs = decodeLatencyMs === 0 ? decodeMs : decodeLatencyMs * 0.7 + decodeMs * 0.3;
     }
 
     // Pop this frame's tick from the FIFO queue — each decoded frame gets
@@ -414,7 +418,28 @@
       decodeLatencies.push(decodeMs);
     }
 
-    renderFrame(frame);
+    // Output coalescing: if another decoded frame is already waiting to render,
+    // close it and keep this newer one. The microtask renders only the latest
+    // frame, skipping intermediate GPU submits that the display would never show.
+    if (coalescedFrame) {
+      // Pop the skipped frame's tick so the queue stays aligned
+      const skippedTick = videoTickQueue.shift();
+      if (skippedTick !== undefined && skippedTick > videoTick) videoTick = skippedTick;
+      coalescedFrame.close();
+    }
+    coalescedFrame = frame;
+
+    if (!coalesceScheduled) {
+      coalesceScheduled = true;
+      queueMicrotask(flushCoalescedFrame);
+    }
+  }
+
+  function flushCoalescedFrame(): void {
+    coalesceScheduled = false;
+    const frame = coalescedFrame;
+    coalescedFrame = null;
+    if (frame) renderFrame(frame);
   }
 
   function getCodecFromSps(sps: Uint8Array): string {
@@ -472,9 +497,9 @@
     if (!decoder) { console.debug('[Panel] handleFrame: no decoder'); return; }
 
     // Parse AVCC format (4-byte big-endian length prefixed NAL units) to find SPS/PPS
+    let frameSps: Uint8Array | null = null;
+    let framePps: Uint8Array | null = null;
     if (isKeyframe) {
-      let sps: Uint8Array | null = null;
-      let pps: Uint8Array | null = null;
       let offset = 0;
       while (offset + 4 < frameData.length) {
         const nalLen = (frameData[offset] << 24) | (frameData[offset + 1] << 16) |
@@ -482,14 +507,14 @@
         offset += 4;
         if (nalLen <= 0 || offset + nalLen > frameData.length) break;
         const nalType = frameData[offset] & NAL.TYPE_MASK;
-        if (nalType === NAL.TYPE_SPS) sps = frameData.subarray(offset, offset + nalLen);
-        else if (nalType === NAL.TYPE_PPS) pps = frameData.subarray(offset, offset + nalLen);
+        if (nalType === NAL.TYPE_SPS) frameSps = frameData.subarray(offset, offset + nalLen);
+        else if (nalType === NAL.TYPE_PPS) framePps = frameData.subarray(offset, offset + nalLen);
         offset += nalLen;
       }
 
       // Configure decoder with avc1 codec + AVCDecoderConfigurationRecord description.
-      if (sps && pps) {
-        const codec = getCodecFromSps(sps);
+      if (frameSps && framePps) {
+        const codec = getCodecFromSps(frameSps);
         const needReconfigure = !decoderConfigured || codec !== lastCodec;
         if (needReconfigure) {
           try {
@@ -501,7 +526,7 @@
               codec,
               optimizeForLatency: true,
               hardwareAcceleration: 'prefer-hardware',
-              description: buildAvcDescription(sps, pps),
+              description: buildAvcDescription(frameSps, framePps),
             });
             decoderConfigured = true;
             lastCodec = codec;
@@ -522,9 +547,10 @@
       gotFirstKeyframe = true;
     }
 
-    // Drop P-frames when decode queue is too deep (reduces pipeline latency).
-    // Advance videoTick so pending cursors for this tick still get flushed —
-    // cursor position stays current even when frame rendering is skipped.
+    // Only drop P-frames if the decoder is truly stalled (deep queue).
+    // Terminal P-frames are tiny (~200-500 bytes) and decode in <1ms on
+    // hardware, so a moderate queue is fine. Aggressive dropping breaks
+    // the P-frame chain and forces a keyframe wait, causing visible stalls.
     if (!isKeyframe && decoder && decoder.decodeQueueSize > PANEL.MAX_DECODE_QUEUE_SIZE) {
       if (frameTick !== undefined) advanceVideoTick(frameTick);
       requestKeyframe(`queue_overflow_queueSize=${decoder.decodeQueueSize}`);
@@ -533,6 +559,22 @@
 
     if (isKeyframe) {
       keyframeRequested = false;
+
+      // Proactive keyframe jump: if the decoder has queued frames, reset and
+      // decode only this keyframe. Skips stale P-frames to jump to latest state.
+      // The server sends proactive keyframes every ~5 frames during rapid input.
+      if (decoder && decoder.decodeQueueSize > 0 && frameSps && framePps) {
+        decoder.reset();
+        decoder.configure({
+          codec: lastCodec!,
+          optimizeForLatency: true,
+          hardwareAcceleration: 'prefer-hardware',
+          description: buildAvcDescription(frameSps, framePps),
+        });
+        // Clear stale ticks from flushed frames
+        videoTickQueue.length = 0;
+        if (frameTick !== undefined) videoTick = frameTick;
+      }
     }
 
     // Frame will be submitted to decoder — push tick to FIFO so renderFrame
@@ -2007,7 +2049,7 @@
       decoder = null;
     }
 
-    // Cleanup cursor blink timer
+    // Cleanup cursor timers
     if (cursorBlinkIntervalId) {
       clearInterval(cursorBlinkIntervalId);
       cursorBlinkIntervalId = null;
@@ -2268,6 +2310,7 @@
     background: var(--bg);
     outline: none;
     touch-action: pinch-zoom;
+    image-rendering: pixelated;
   }
 
   .mobile-input {
