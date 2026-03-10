@@ -746,11 +746,21 @@ pub const Server = struct {
         self.allocator.destroy(conn);
     }
 
+    /// Maximum concurrent WebSocket connections. Prevents thread-exhaustion DoS.
+    const max_connections: u32 = 512;
+
     /// Run server loop. Blocks until stop() is called (which closes listener to unblock accept).
     pub fn run(self: *Server) !void {
         self.running.store(true, .release);
 
         while (self.running.load(.acquire)) {
+            // Reject when at connection limit to prevent resource exhaustion
+            if (self.active_connections.load(.acquire) >= max_connections) {
+                const rejected = self.listener.accept() catch break;
+                rejected.stream.close();
+                continue;
+            }
+
             // Blocking accept — stop() closes listener to unblock
             const conn = self.acceptOne() catch break;
 

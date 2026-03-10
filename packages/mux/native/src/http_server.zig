@@ -293,6 +293,9 @@ pub const HttpServer = struct {
         self.listener.deinit();
     }
 
+    /// Maximum concurrent HTTP connections. Prevents thread-exhaustion DoS.
+    const max_connections: u32 = 512;
+
     pub fn run(self: *HttpServer) !void {
         self.running.store(true, .release);
         std.debug.print("HTTP server listening on port {}\n", .{self.listener.listen_address.getPort()});
@@ -300,6 +303,12 @@ pub const HttpServer = struct {
         while (self.running.load(.acquire)) {
             // Blocking accept — stop() closes listener to unblock
             const conn = self.listener.accept() catch break;
+
+            // Reject when at connection limit to prevent resource exhaustion
+            if (self.active_connections.load(.acquire) >= max_connections) {
+                conn.stream.close();
+                continue;
+            }
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn.stream, conn.address }) catch {
                 conn.stream.close();
