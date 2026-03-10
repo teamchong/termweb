@@ -26,6 +26,7 @@ const Channel = @import("async/channel.zig").Channel;
 const goroutine_runtime = @import("async/runtime.zig");
 const gchannel = @import("async/gchannel.zig");
 pub const tunnel_mod = @import("tunnel.zig");
+const webauthn = @import("webauthn.zig");
 
 /// Default HTTP port for the mux server.
 /// Port 7681 is the conventional port for terminal-over-web tools (e.g. ttyd).
@@ -8374,8 +8375,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             }
         } else if (std.mem.eql(u8, arg, "--local")) {
             args.mode = .local;
-        } else if (std.mem.eql(u8, arg, "--tailscale")) {
-            args.mode = .{ .tunnel = .tailscale };
+        } else if (std.mem.eql(u8, arg, "--cloudflare")) {
+            args.mode = .{ .tunnel = .cloudflared };
         }
     }
 
@@ -8716,6 +8717,24 @@ pub fn run(allocator: std.mem.Allocator, http_port: u16, mode: tunnel_mod.Mode) 
     );
     server.http_server.auth_state = server.auth_state;
     server.http_server.rate_limiter = &server.rate_limiter;
+
+    // WebAuthn passkey support
+    var challenge_store = webauthn.ChallengeStore.init(allocator);
+    defer challenge_store.deinit();
+    server.http_server.challenge_store = &challenge_store;
+
+    // Generate setup PIN if no passkeys are configured
+    const has_passkeys = server.auth_state.passkey_credentials.items.len > 0;
+    var pin_buf: [6]u8 = undefined;
+    if (!has_passkeys) {
+        var pin_rand: [3]u8 = undefined;
+        std.crypto.random.bytes(&pin_rand);
+        const pin_num = @as(u32, pin_rand[0]) * 256 * 256 + @as(u32, pin_rand[1]) * 256 + @as(u32, pin_rand[2]);
+        _ = std.fmt.bufPrint(&pin_buf, "{d:0>6}", .{pin_num % 1000000}) catch unreachable;
+        server.http_server.setup_pin = &pin_buf;
+        std.debug.print("\n  \x1b[1;33m🔑 No passkeys configured. Setup PIN: {s}\x1b[0m\n", .{&pin_buf});
+        std.debug.print("  Visit the login page and use this PIN to register a passkey.\n\n", .{});
+    }
     if (comptime enable_benchmark) {
         server.http_server.api_callback = handleApiRequest;
         server.http_server.api_user_data = server;

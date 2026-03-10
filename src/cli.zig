@@ -421,9 +421,7 @@ fn printHelp() void {
         .{mux.default_http_port},
     ) ++
         \\  --local               Local only, skip connection picker
-        \\  --tailscale           Expose via Tailscale Serve (VPN)
-        \\  --cloudflare          Expose via Cloudflare Tunnel (Public)
-        \\  --ngrok               Expose via ngrok (Public)
+        \\  --cloudflare          Expose via Cloudflare Tunnel
         \\
         \\Token commands:
         \\  termweb token                              List sessions and tokens
@@ -442,7 +440,7 @@ fn printHelp() void {
         .{mux.default_http_port},
     ) ++
         \\  termweb mux --local
-        \\  termweb mux --tailscale
+        \\  termweb mux --cloudflare
         \\
         \\Requirements:
         \\  - Chrome or Chromium (set CHROME_BIN if not auto-detected)
@@ -699,12 +697,8 @@ fn cmdMux(allocator: std.mem.Allocator, args: []const []const u8) !void {
             }
         } else if (std.mem.eql(u8, arg, "--local")) {
             mode = .local;
-        } else if (std.mem.eql(u8, arg, "--tailscale")) {
-            mode = .{ .tunnel = .tailscale };
         } else if (std.mem.eql(u8, arg, "--cloudflare")) {
-            mode = .{ .tunnel = .cloudflare };
-        } else if (std.mem.eql(u8, arg, "--ngrok")) {
-            mode = .{ .tunnel = .ngrok };
+            mode = .{ .tunnel = .cloudflared };
         }
     }
 
