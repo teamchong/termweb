@@ -202,16 +202,28 @@ export class CommandPalette {
 
     this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredCommands.length - 1));
 
-    this.list.innerHTML = this.filteredCommands.map((cmd, i) => {
+    this.list.innerHTML = '';
+    this.filteredCommands.forEach((cmd, i) => {
       const disabled = this.isCommandDisabled(cmd);
-      return `
-      <div class="command-item ${i === this.selectedIndex ? 'selected' : ''} ${disabled ? 'disabled' : ''}" data-index="${i}">
-        <div class="command-title">${cmd.title}</div>
-        <div class="command-desc">${cmd.description}</div>
-        ${cmd.shortcut ? `<div class="command-shortcut">${cmd.shortcut}</div>` : ''}
-      </div>
-    `;
-    }).join('');
+      const item = document.createElement('div');
+      item.className = `command-item ${i === this.selectedIndex ? 'selected' : ''} ${disabled ? 'disabled' : ''}`;
+      item.dataset.index = String(i);
+      const title = document.createElement('div');
+      title.className = 'command-title';
+      title.textContent = cmd.title;
+      item.appendChild(title);
+      const desc = document.createElement('div');
+      desc.className = 'command-desc';
+      desc.textContent = cmd.description;
+      item.appendChild(desc);
+      if (cmd.shortcut) {
+        const shortcut = document.createElement('div');
+        shortcut.className = 'command-shortcut';
+        shortcut.textContent = cmd.shortcut;
+        item.appendChild(shortcut);
+      }
+      this.list!.appendChild(item);
+    });
 
     // Cache querySelectorAll result for use in updateSelection()
     // Note: innerHTML replaces elements, so old handlers are automatically cleaned up
@@ -460,11 +472,21 @@ export function showDryRunPreview(
   // Build entries list
   const entriesEl = document.getElementById('preview-entries');
   if (entriesEl) {
-    const entriesHtml = report.entries.map(e => {
-      const icon = e.action === 'create' ? '+' : e.action === 'update' ? '~' : '-';
-      return `<div class="preview-entry ${e.action}">${icon} ${e.path} (${formatBytes(e.size)})</div>`;
-    }).join('');
-    entriesEl.innerHTML = entriesHtml || '<div style="color: var(--text-dim);">No changes</div>';
+    entriesEl.innerHTML = '';
+    if (report.entries.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.color = 'var(--text-dim)';
+      empty.textContent = 'No changes';
+      entriesEl.appendChild(empty);
+    } else {
+      for (const e of report.entries) {
+        const icon = e.action === 'create' ? '+' : e.action === 'update' ? '~' : '-';
+        const entry = document.createElement('div');
+        entry.className = `preview-entry ${e.action}`;
+        entry.textContent = `${icon} ${e.path} (${formatBytes(e.size)})`;
+        entriesEl.appendChild(entry);
+      }
+    }
   }
 
   // Show dialog

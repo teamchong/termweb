@@ -17,6 +17,7 @@ const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
+const webauthn = @import("webauthn.zig");
 const build_options = @import("build_options");
 
 // Set socket read timeout for blocking I/O with periodic wakeup
@@ -78,23 +79,25 @@ const login_page_html =
     \\h1{font-size:20px;font-weight:600;margin-bottom:4px;color:#fff}
     \\.subtitle{font-size:13px;color:#888;margin-bottom:24px}
     \\.divider{border:none;border-top:1px solid rgba(255,255,255,0.1);margin:16px 0}
-    \\form{display:flex;flex-direction:column;gap:8px}
-    \\input[type=text]{background:#0f1629;border:1px solid rgba(255,255,255,0.15);border-radius:6px;
-    \\padding:10px 12px;color:#fff;font-size:14px;outline:none}
-    \\input[type=text]:focus{border-color:#7c3aed}
-    \\input[type=text]::placeholder{color:#555}
     \\.btn{padding:10px 16px;border:none;border-radius:6px;font-size:14px;font-weight:500;
     \\cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;width:100%;
     \\transition:background .15s}
-    \\.btn-primary{background:#7c3aed;color:#fff}
-    \\.btn-primary:hover{background:#6d28d9}
     \\.btn-github{background:#24292e;color:#fff}
     \\.btn-github:hover{background:#2f363d}
     \\.btn-google{background:#fff;color:#333}
     \\.btn-google:hover{background:#f0f0f0}
+    \\.btn-passkey{background:#0ea5e9;color:#fff}
+    \\.btn-passkey:hover{background:#0284c7}
     \\.oauth-section{display:flex;flex-direction:column;gap:8px}
     \\.error{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);
     \\border-radius:6px;padding:8px;font-size:13px;color:#ef4444;margin-bottom:8px}
+    \\.setup-section{background:rgba(14,165,233,0.1);border:1px solid rgba(14,165,233,0.3);
+    \\border-radius:8px;padding:16px;margin-bottom:12px}
+    \\.setup-section h2{font-size:14px;color:#0ea5e9;margin-bottom:8px}
+    \\.setup-section p{font-size:12px;color:#888;margin-bottom:12px}
+    \\.setup-section input{background:#0f1629;border:1px solid rgba(255,255,255,0.15);border-radius:6px;
+    \\padding:10px 12px;color:#fff;font-size:14px;outline:none;width:100%;margin-bottom:8px;text-align:center;letter-spacing:0.3em}
+    \\.setup-section input:focus{border-color:#0ea5e9}
     \\.hidden{display:none}
     \\</style></head><body>
     \\<div class="card">
@@ -102,6 +105,13 @@ const login_page_html =
     \\<h1>termweb</h1>
     \\<div class="subtitle">Terminal in your browser</div>
     \\<div id="error" class="error hidden"></div>
+    \\<div id="setup-section" class="setup-section hidden">
+    \\<h2>First-time Setup</h2>
+    \\<p>Enter the PIN shown in your terminal to register a passkey.</p>
+    \\<input type="text" id="setup-pin" placeholder="000000" maxlength="6" autocomplete="off">
+    \\<button class="btn btn-passkey" onclick="setupPasskey()">Register Passkey</button>
+    \\</div>
+    \\<button id="pk-btn" class="btn btn-passkey hidden" onclick="loginPasskey()" style="margin-bottom:8px">Sign in with Passkey</button>
     \\<div class="oauth-section">
     \\<a id="gh-btn" class="btn btn-github hidden" href="/auth/github">
     \\<svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -110,26 +120,59 @@ const login_page_html =
     \\<svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
     \\Sign in with Google</a>
     \\</div>
-    \\<hr class="divider">
-    \\<form method="POST" action="/auth/login">
-    \\<input type="text" name="token" placeholder="Paste token or URL..." autocomplete="off" autofocus>
-    \\<button type="submit" class="btn btn-primary">Sign in with Token</button>
-    \\</form>
     \\</div>
     \\<script>
     \\var p=new URLSearchParams(location.search);
     \\if(p.get('error')){var e=document.getElementById('error');e.textContent=p.get('error');e.classList.remove('hidden')}
     \\if(document.body.dataset.github==='1')document.getElementById('gh-btn').classList.remove('hidden');
     \\if(document.body.dataset.google==='1')document.getElementById('gg-btn').classList.remove('hidden');
-    \\var f=document.querySelector('form'),ti=f.querySelector('input[name=token]');
-    \\f.addEventListener('submit',function(ev){var v=ti.value.trim();
-    \\var m=v.match(/[?&]token=([^&]*)/);if(m)ti.value=decodeURIComponent(m[1])});
+    \\if(document.body.dataset.setup==='1')document.getElementById('setup-section').classList.remove('hidden');
+    \\else if(window.PublicKeyCredential)document.getElementById('pk-btn').classList.remove('hidden');
+    \\function b64url(buf){return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+    \\function b64urlDec(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var b=atob(s),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a}
+    \\function showErr(msg){var e=document.getElementById('error');e.textContent=msg;e.classList.remove('hidden')}
+    \\async function setupPasskey(){
+    \\var pin=document.getElementById('setup-pin').value.trim();
+    \\if(pin.length!==6){showErr('Enter the 6-digit PIN from your terminal');return}
+    \\try{
+    \\var r=await fetch('/auth/passkey/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:pin})});
+    \\if(!r.ok){showErr(await r.text());return}
+    \\var opts=await r.json();
+    \\opts.challenge=b64urlDec(opts.challenge);
+    \\opts.user.id=b64urlDec(opts.user.id);
+    \\var cred=await navigator.credentials.create({publicKey:opts});
+    \\var att=cred.response;
+    \\var r2=await fetch('/auth/passkey/register/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    \\rawId:b64url(cred.rawId),attestationObject:b64url(att.attestationObject),clientDataJSON:b64url(att.clientDataJSON)})});
+    \\if(!r2.ok){showErr(await r2.text());return}
+    \\location.reload();
+    \\}catch(e){showErr(e.message||'Registration failed')}
+    \\}
+    \\async function loginPasskey(){
+    \\try{
+    \\var r=await fetch('/auth/passkey/login',{method:'POST'});
+    \\if(!r.ok){showErr(await r.text());return}
+    \\var opts=await r.json();
+    \\opts.challenge=b64urlDec(opts.challenge);
+    \\var cred=await navigator.credentials.get({publicKey:opts});
+    \\var resp=cred.response;
+    \\var r2=await fetch('/auth/passkey/login/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    \\id:b64url(cred.rawId),authenticatorData:b64url(resp.authenticatorData),clientDataJSON:b64url(resp.clientDataJSON),signature:b64url(resp.signature)})});
+    \\if(!r2.ok){showErr(await r2.text());return}
+    \\var d=await r2.json();
+    \\if(d.token)location.href='/?token='+d.token;
+    \\else showErr('No token received');
+    \\}catch(e){showErr(e.message||'Authentication failed')}
+    \\}
     \\</script></body></html>
 ;
 
 // Comptime split of login page around <body> tag for data attribute injection
 const login_body_tag = "<body>";
-const login_body_pos = std.mem.indexOf(u8, login_page_html, login_body_tag) orelse @compileError("<body> tag not found in login page");
+const login_body_pos = blk: {
+    @setEvalBranchQuota(10000);
+    break :blk std.mem.indexOf(u8, login_page_html, login_body_tag) orelse @compileError("<body> tag not found in login page");
+};
 const login_before_body = login_page_html[0..login_body_pos];
 const login_after_body = login_page_html[login_body_pos + login_body_tag.len ..];
 
@@ -142,7 +185,10 @@ const login_after_body = login_page_html[login_body_pos + login_body_tag.len ..]
 const cross_origin_headers = "Cross-Origin-Resource-Policy: cross-origin\r\n" ++
     "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n" ++
     "Pragma: no-cache\r\n" ++
-    "Expires: 0\r\n";
+    "Expires: 0\r\n" ++
+    "X-Content-Type-Options: nosniff\r\n" ++
+    "X-Frame-Options: DENY\r\n" ++
+    "Referrer-Policy: strict-origin-when-cross-origin\r\n";
 
 /// Callback for WebSocket upgrade requests.
 /// Called when a client requests upgrade to WebSocket protocol.
@@ -176,6 +222,9 @@ pub const HttpServer = struct {
     auth_state: ?*auth.AuthState = null,
     // Rate limiter for failed auth attempts
     rate_limiter: ?*auth.RateLimiter = null,
+    // WebAuthn challenge store and setup PIN
+    challenge_store: ?*webauthn.ChallengeStore = null,
+    setup_pin: ?[]const u8 = null,
 
     pub fn init(allocator: Allocator, address: []const u8, port: u16, config_json: ?[]const u8) !*HttpServer {
         const server = try allocator.create(HttpServer);
@@ -396,6 +445,14 @@ pub const HttpServer = struct {
             defer stream.close();
             if (std.mem.eql(u8, path, "/auth/login")) {
                 self.handleAuthLogin(stream, request, n);
+            } else if (std.mem.eql(u8, path, "/auth/passkey/register")) {
+                self.handlePasskeyRegister(stream, request, n);
+            } else if (std.mem.eql(u8, path, "/auth/passkey/register/complete")) {
+                self.handlePasskeyRegisterComplete(stream, request, n);
+            } else if (std.mem.eql(u8, path, "/auth/passkey/login")) {
+                self.handlePasskeyLogin(stream, request);
+            } else if (std.mem.eql(u8, path, "/auth/passkey/login/complete")) {
+                self.handlePasskeyLoginComplete(stream, request, n);
             } else {
                 self.sendError(stream, 404, "Not Found");
             }
@@ -463,7 +520,7 @@ pub const HttpServer = struct {
                 if (self.api_callback) |cb| {
                     if (cb(path, self.api_user_data)) |json| {
                         var api_header_buf: [512]u8 = undefined;
-                        const api_header = std.fmt.bufPrint(&api_header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{json.len}) catch {
+                        const api_header = std.fmt.bufPrint(&api_header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{json.len}) catch {
                             self.sendError(stream, 500, "Internal Server Error");
                             return;
                         };
@@ -551,15 +608,17 @@ pub const HttpServer = struct {
         const has_github: bool = if (self.auth_state) |as| as.github_oauth != null else false;
         const has_google: bool = if (self.auth_state) |as| as.google_oauth != null else false;
 
-        var body_tag_buf: [64]u8 = undefined;
-        const body_tag = std.fmt.bufPrint(&body_tag_buf, "<body data-github=\"{}\" data-google=\"{}\">", .{
+        const has_setup = self.setup_pin != null;
+        var body_tag_buf: [128]u8 = undefined;
+        const body_tag = std.fmt.bufPrint(&body_tag_buf, "<body data-github=\"{}\" data-google=\"{}\" data-setup=\"{}\">", .{
             @as(u8, if (has_github) 1 else 0),
             @as(u8, if (has_google) 1 else 0),
+            @as(u8, if (has_setup) 1 else 0),
         }) catch "<body>";
 
         const total_len = login_before_body.len + body_tag.len + login_after_body.len;
         var header_buf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{total_len}) catch return;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{total_len}) catch return;
         _ = stream.write(header) catch return;
         _ = stream.write(login_before_body) catch return;
         _ = stream.write(body_tag) catch return;
@@ -621,6 +680,359 @@ pub const HttpServer = struct {
             self.sendRedirectPage(stream, jwt);
         } else {
             self.sendLoginRedirectWithError(stream, "Session not found");
+        }
+    }
+
+
+    // ─── Passkey (WebAuthn) endpoints ──────────────────────────────────
+
+    /// Derive the RP ID and origin from the Host header.
+    fn deriveRpInfo(request: []const u8) struct { rp_id: []const u8, origin: []const u8, origin_buf: [256]u8 } {
+        const host = extractHeader(request, "Host:") orelse "localhost";
+        // RP ID = hostname without port
+        const rp_id = if (std.mem.indexOf(u8, host, ":")) |colon| host[0..colon] else host;
+        // Origin = scheme + host
+        const is_localhost = std.mem.startsWith(u8, rp_id, "localhost") or std.mem.startsWith(u8, rp_id, "127.");
+        const scheme: []const u8 = if (is_localhost) "http://" else "https://";
+        var origin_buf: [256]u8 = undefined;
+        const origin = std.fmt.bufPrint(&origin_buf, "{s}{s}", .{ scheme, host }) catch "https://localhost";
+        return .{ .rp_id = rp_id, .origin = origin, .origin_buf = origin_buf };
+    }
+
+    fn sendJsonOk(self: *HttpServer, stream: net.Stream, json: []const u8) void {
+        _ = self;
+        var header_buf: [256]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n" ++ cross_origin_headers ++ "Connection: close\r\n\r\n", .{json.len}) catch return;
+        _ = stream.write(header) catch return;
+        _ = stream.write(json) catch return;
+    }
+
+    /// POST /auth/passkey/register — start registration (requires setup PIN or valid JWT)
+    fn handlePasskeyRegister(self: *HttpServer, stream: net.Stream, request: []const u8, request_len: usize) void {
+        const store = self.challenge_store orelse {
+            self.sendError(stream, 500, "WebAuthn not configured");
+            return;
+        };
+        const auth_st = self.auth_state orelse {
+            self.sendError(stream, 500, "Auth not configured");
+            return;
+        };
+
+        // Check authorization: setup PIN (first-time) or valid JWT
+        const body = findRequestBody(request, request_len);
+        var authorized = false;
+        var session_id: ?[]const u8 = null;
+
+        // Check for setup PIN
+        if (self.setup_pin) |pin| {
+            if (body) |b| {
+                if (extractJsonStringValue(b, "pin")) |submitted_pin| {
+                    if (std.mem.eql(u8, submitted_pin, pin)) {
+                        authorized = true;
+                        session_id = "default";
+                    }
+                }
+            }
+        }
+
+        // Check for valid JWT token
+        if (!authorized) {
+            const full_path = extractPath(request) orelse "/";
+            const raw_token = auth.extractTokenFromQuery(full_path);
+            var token_buf: [256]u8 = undefined;
+            const token = if (raw_token) |t| auth.decodeToken(&token_buf, t) else null;
+            if (token) |t| {
+                const result = auth_st.validateToken(t);
+                if (result.role != .none) {
+                    authorized = true;
+                    session_id = result.session_id;
+                }
+            }
+        }
+
+        if (!authorized) {
+            self.sendError(stream, 401, "Unauthorized");
+            return;
+        }
+
+        const rp = deriveRpInfo(request);
+        const challenge = store.create(session_id) catch {
+            self.sendError(stream, 500, "Challenge creation failed");
+            return;
+        };
+
+        var options_buf: [1024]u8 = undefined;
+        const json = webauthn.buildRegistrationOptions(
+            &options_buf, challenge, rp.rp_id, "termweb", session_id orelse "default", session_id orelse "admin",
+        ) catch {
+            self.sendError(stream, 500, "Options build failed");
+            return;
+        };
+
+        self.sendJsonOk(stream, json);
+    }
+
+    /// POST /auth/passkey/register/complete — verify attestation and store credential
+    fn handlePasskeyRegisterComplete(self: *HttpServer, stream: net.Stream, request: []const u8, request_len: usize) void {
+        const store = self.challenge_store orelse {
+            self.sendError(stream, 500, "WebAuthn not configured");
+            return;
+        };
+        const auth_st = self.auth_state orelse {
+            self.sendError(stream, 500, "Auth not configured");
+            return;
+        };
+
+        const body = findRequestBody(request, request_len) orelse {
+            self.sendError(stream, 400, "No body");
+            return;
+        };
+
+        // Parse JSON fields from the body
+        const att_obj_b64 = extractJsonStringValue(body, "attestationObject") orelse {
+            self.sendError(stream, 400, "Missing attestationObject");
+            return;
+        };
+        const client_data_b64 = extractJsonStringValue(body, "clientDataJSON") orelse {
+            self.sendError(stream, 400, "Missing clientDataJSON");
+            return;
+        };
+        const cred_id_b64 = extractJsonStringValue(body, "rawId") orelse {
+            self.sendError(stream, 400, "Missing rawId");
+            return;
+        };
+
+        // Base64url decode
+        const att_obj = webauthn.base64urlDecode(self.allocator, att_obj_b64) catch {
+            self.sendError(stream, 400, "Invalid attestationObject encoding");
+            return;
+        };
+        defer self.allocator.free(att_obj);
+
+        const client_data = webauthn.base64urlDecode(self.allocator, client_data_b64) catch {
+            self.sendError(stream, 400, "Invalid clientDataJSON encoding");
+            return;
+        };
+        defer self.allocator.free(client_data);
+
+        const cred_id_raw = webauthn.base64urlDecode(self.allocator, cred_id_b64) catch {
+            self.sendError(stream, 400, "Invalid rawId encoding");
+            return;
+        };
+        defer self.allocator.free(cred_id_raw);
+
+        // We need to find the challenge in the clientDataJSON to look it up
+        // Parse clientDataJSON to extract the challenge
+        const parsed_cd = std.json.parseFromSlice(std.json.Value, self.allocator, client_data, .{}) catch {
+            self.sendError(stream, 400, "Invalid clientDataJSON");
+            return;
+        };
+        defer parsed_cd.deinit();
+
+        const challenge_b64 = switch (parsed_cd.value) {
+            .object => |obj| switch (obj.get("challenge") orelse {
+                self.sendError(stream, 400, "No challenge in clientData");
+                return;
+            }) {
+                .string => |s| s,
+                else => {
+                    self.sendError(stream, 400, "Invalid challenge field");
+                    return;
+                },
+            },
+            else => {
+                self.sendError(stream, 400, "Invalid clientDataJSON structure");
+                return;
+            },
+        };
+
+        // Decode and consume the challenge
+        const challenge_raw = webauthn.base64urlDecode(self.allocator, challenge_b64) catch {
+            self.sendError(stream, 400, "Invalid challenge encoding");
+            return;
+        };
+        defer self.allocator.free(challenge_raw);
+
+        const consumed_sid = store.consume(challenge_raw);
+        if (consumed_sid == null and challenge_raw.len != 32) {
+            self.sendError(stream, 400, "Unknown or expired challenge");
+            return;
+        }
+        defer if (consumed_sid) |s| self.allocator.free(s);
+
+        const rp = deriveRpInfo(request);
+
+        // Verify the registration
+        const cred = webauthn.verifyRegistration(
+            self.allocator, client_data, att_obj, challenge_raw, rp.origin, rp.rp_id,
+        ) catch {
+            self.sendError(stream, 400, "Registration verification failed");
+            return;
+        };
+
+        // Store the credential as hex-encoded ID + raw public key
+        const cred_id_hex = webauthn.base64urlEncode(self.allocator, cred.credential_id) catch {
+            self.sendError(stream, 500, "Encoding failed");
+            return;
+        };
+        defer self.allocator.free(cred_id_hex);
+
+        auth_st.addPasskeyCredential(cred_id_hex, &cred.public_key, null) catch {
+            self.sendError(stream, 500, "Failed to store credential");
+            return;
+        };
+
+        // Invalidate setup PIN after successful registration
+        self.setup_pin = null;
+
+        self.sendJsonOk(stream, "{\"ok\":true}");
+    }
+
+    /// POST /auth/passkey/login — start authentication (no auth required)
+    fn handlePasskeyLogin(self: *HttpServer, stream: net.Stream, request: []const u8) void {
+        const store = self.challenge_store orelse {
+            self.sendError(stream, 500, "WebAuthn not configured");
+            return;
+        };
+
+        const challenge = store.create(null) catch {
+            self.sendError(stream, 500, "Challenge creation failed");
+            return;
+        };
+
+        const rp = deriveRpInfo(request);
+        var options_buf: [512]u8 = undefined;
+        const json = webauthn.buildAuthenticationOptions(&options_buf, challenge, rp.rp_id) catch {
+            self.sendError(stream, 500, "Options build failed");
+            return;
+        };
+
+        self.sendJsonOk(stream, json);
+    }
+
+    /// POST /auth/passkey/login/complete — verify assertion, return JWT
+    fn handlePasskeyLoginComplete(self: *HttpServer, stream: net.Stream, request: []const u8, request_len: usize) void {
+        const store = self.challenge_store orelse {
+            self.sendError(stream, 500, "WebAuthn not configured");
+            return;
+        };
+        const auth_st = self.auth_state orelse {
+            self.sendError(stream, 500, "Auth not configured");
+            return;
+        };
+
+        const body = findRequestBody(request, request_len) orelse {
+            self.sendError(stream, 400, "No body");
+            return;
+        };
+
+        // Parse response fields
+        const cred_id_b64 = extractJsonStringValue(body, "id") orelse {
+            self.sendError(stream, 400, "Missing id");
+            return;
+        };
+        const auth_data_b64 = extractJsonStringValue(body, "authenticatorData") orelse {
+            self.sendError(stream, 400, "Missing authenticatorData");
+            return;
+        };
+        const client_data_b64 = extractJsonStringValue(body, "clientDataJSON") orelse {
+            self.sendError(stream, 400, "Missing clientDataJSON");
+            return;
+        };
+        const sig_b64 = extractJsonStringValue(body, "signature") orelse {
+            self.sendError(stream, 400, "Missing signature");
+            return;
+        };
+
+        // Decode all fields
+        const auth_data = webauthn.base64urlDecode(self.allocator, auth_data_b64) catch {
+            self.sendError(stream, 400, "Invalid authenticatorData");
+            return;
+        };
+        defer self.allocator.free(auth_data);
+
+        const client_data = webauthn.base64urlDecode(self.allocator, client_data_b64) catch {
+            self.sendError(stream, 400, "Invalid clientDataJSON");
+            return;
+        };
+        defer self.allocator.free(client_data);
+
+        const sig = webauthn.base64urlDecode(self.allocator, sig_b64) catch {
+            self.sendError(stream, 400, "Invalid signature");
+            return;
+        };
+        defer self.allocator.free(sig);
+
+        // Find the stored passkey credential
+        const stored_cred = auth_st.findPasskeyByCredentialId(cred_id_b64) orelse {
+            self.sendError(stream, 401, "Unknown credential");
+            return;
+        };
+
+        if (stored_cred.public_key.len != 65) {
+            self.sendError(stream, 500, "Stored key invalid");
+            return;
+        }
+
+        // Extract challenge from clientDataJSON
+        const parsed_cd = std.json.parseFromSlice(std.json.Value, self.allocator, client_data, .{}) catch {
+            self.sendError(stream, 400, "Invalid clientDataJSON");
+            return;
+        };
+        defer parsed_cd.deinit();
+
+        const challenge_b64 = switch (parsed_cd.value) {
+            .object => |obj| switch (obj.get("challenge") orelse {
+                self.sendError(stream, 400, "No challenge");
+                return;
+            }) {
+                .string => |s| s,
+                else => { self.sendError(stream, 400, "Bad challenge"); return; },
+            },
+            else => { self.sendError(stream, 400, "Bad clientData"); return; },
+        };
+
+        const challenge_raw = webauthn.base64urlDecode(self.allocator, challenge_b64) catch {
+            self.sendError(stream, 400, "Invalid challenge");
+            return;
+        };
+        defer self.allocator.free(challenge_raw);
+
+        // Consume the challenge (one-time use)
+        _ = store.consume(challenge_raw);
+
+        const rp = deriveRpInfo(request);
+        var pk: [65]u8 = undefined;
+        @memcpy(&pk, stored_cred.public_key);
+
+        // Verify the ECDSA signature
+        const new_sign_count = webauthn.verifyAuthentication(
+            client_data, auth_data, sig, &pk,
+            stored_cred.sign_count, challenge_raw, rp.origin, rp.rp_id,
+        ) catch {
+            self.sendError(stream, 401, "Verification failed");
+            return;
+        };
+
+        // Update sign count
+        auth_st.updatePasskeySignCount(cred_id_b64, new_sign_count) catch {};
+
+        // Issue JWT for the default session
+        const session = auth_st.getSession(stored_cred.session_id orelse "default")
+            orelse auth_st.getSessionByRole(.admin)
+            orelse auth_st.getSession("default");
+
+        if (session) |s| {
+            var jwt_buf: [256]u8 = undefined;
+            const jwt = auth_st.createJwt(s, &jwt_buf);
+            var response_buf: [512]u8 = undefined;
+            const response = std.fmt.bufPrint(&response_buf, "{{\"ok\":true,\"token\":\"{s}\"}}", .{jwt}) catch {
+                self.sendError(stream, 500, "JWT error");
+                return;
+            };
+            self.sendJsonOk(stream, response);
+        } else {
+            self.sendError(stream, 500, "No session found");
         }
     }
 
@@ -900,6 +1312,15 @@ pub const HttpServer = struct {
 // --- Free functions for HTTP client and helpers ---
 
 /// Extract a header value from raw HTTP request (case-insensitive key match).
+
+/// Extract the full request path (including query string) from the first line.
+fn extractPath(request: []const u8) ?[]const u8 {
+    // "GET /path?query HTTP/1.1"
+    const start = (std.mem.indexOf(u8, request, " ") orelse return null) + 1;
+    const end = std.mem.indexOfPos(u8, request, start, " ") orelse return null;
+    return request[start..end];
+}
+
 fn extractHeader(request: []const u8, header_name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < request.len) {
@@ -931,6 +1352,27 @@ fn findRequestBody(request: []const u8, request_len: usize) ?[]const u8 {
 }
 
 /// Extract a value from URL-encoded form data (e.g., "token=abc&foo=bar" → "abc" for key "token").
+
+/// Extract a string value from a JSON body by key (simple parser, no nesting).
+fn extractJsonStringValue(body: []const u8, key: []const u8) ?[]const u8 {
+    // Search for "key":"value"
+    var search_buf: [128]u8 = undefined;
+    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, body, needle) orelse {
+        // Also try in nested response object: "key":"value"
+        return null;
+    };
+    const val_start = pos + needle.len;
+    // Find closing quote (handle escaped quotes)
+    var i: usize = val_start;
+    while (i < body.len) : (i += 1) {
+        if (body[i] == '"' and (i == val_start or body[i - 1] != '\\')) {
+            return body[val_start..i];
+        }
+    }
+    return null;
+}
+
 fn extractFormValue(body: []const u8, key: []const u8) ?[]const u8 {
     // Find key= at start of body or after &
     var pos: usize = 0;

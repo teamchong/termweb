@@ -108,7 +108,7 @@ pub const OAuthProvider = struct {
 
 pub const AuthState = struct {
     // Admin auth (optional - if not set, first connection is admin)
-    admin_password_hash: ?[64]u8,  // Argon2 hash
+    admin_password_hash: ?[64]u8,  // PBKDF2-HMAC-SHA256 hash
     admin_password_salt: ?[32]u8,
 
     // Passkey credentials (WebAuthn) - stored as JSON for simplicity
@@ -129,6 +129,9 @@ pub const AuthState = struct {
 
     /// Default role assigned to new OAuth users.
     oauth_default_role: Role = .editor,
+
+    /// Protects share_links mutations (use_count increment) from concurrent access.
+    state_mutex: std.Thread.Mutex = .{},
 
     allocator: Allocator,
     config_path: []const u8,
@@ -177,6 +180,7 @@ pub const AuthState = struct {
             self.allocator.free(cred.id);
             self.allocator.free(cred.public_key);
             if (cred.name) |n| self.allocator.free(n);
+            if (cred.session_id) |sid| self.allocator.free(sid);
         }
         self.passkey_credentials.deinit(self.allocator);
         for (self.share_links.items) |link| {
@@ -410,11 +414,16 @@ pub const AuthState = struct {
                 }
             }
 
-            // Check share links (constant-time)
-            for (self.share_links.items) |*link| {
-                if (constantTimeEql(&decoded, &link.token) and link.isValid()) {
-                    link.use_count += 1;
-                    return .{ .role = link.role, .session_id = null };
+            // Check share links (constant-time, mutex-protected)
+            {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                for (self.share_links.items) |*link| {
+                    if (constantTimeEql(&decoded, &link.token) and link.isValid()) {
+                        link.use_count += 1;
+                        self.save() catch {};
+                        return .{ .role = link.role, .session_id = null };
+                    }
                 }
             }
         }
@@ -539,17 +548,39 @@ pub const AuthState = struct {
     // Admin Password
     
 
+    /// Number of HMAC-SHA256 iterations for password hashing.
+    /// 600k iterations ≈ 0.5-1s on modern hardware, per OWASP recommendation.
+    const password_hash_iterations = 600_000;
+
+    /// PBKDF2-HMAC-SHA256: derives a 32-byte key from password + salt.
+    fn pbkdf2HmacSha256(out: *[32]u8, password: []const u8, salt: *const [32]u8) void {
+        // PBKDF2 with dkLen=32 needs only block 1 (INT(1) = 0x00000001)
+        var block_input: [36]u8 = undefined;
+        @memcpy(block_input[0..32], salt);
+        block_input[32] = 0;
+        block_input[33] = 0;
+        block_input[34] = 0;
+        block_input[35] = 1;
+
+        // U1 = PRF(password, salt || INT(1))
+        var u: [32]u8 = undefined;
+        HmacSha256.create(&u, &block_input, password);
+        var result = u;
+
+        // U2..Uc: each Ui = PRF(password, U_{i-1}), XOR into result
+        for (1..password_hash_iterations) |_| {
+            HmacSha256.create(&u, &u, password);
+            for (&result, u) |*r, x| r.* ^= x;
+        }
+        out.* = result;
+    }
+
     pub fn setAdminPassword(self: *AuthState, password: []const u8) !void {
-        // Generate salt
         var salt: [32]u8 = undefined;
         crypto.random.bytes(&salt);
 
-        // Hash password using SHA-256 (simple for now, could use Argon2)
         var hash: [32]u8 = undefined;
-        var hasher = crypto.hash.sha2.Sha256.init(.{});
-        hasher.update(&salt);
-        hasher.update(password);
-        hasher.final(&hash);
+        pbkdf2HmacSha256(&hash, password, &salt);
 
         // Store as 64-byte combined salt+hash
         var combined: [64]u8 = undefined;
@@ -568,12 +599,12 @@ pub const AuthState = struct {
         const stored_hash = self.admin_password_hash orelse return false;
 
         var hash: [32]u8 = undefined;
-        var hasher = crypto.hash.sha2.Sha256.init(.{});
-        hasher.update(&salt);
-        hasher.update(password);
-        hasher.final(&hash);
+        pbkdf2HmacSha256(&hash, password, &salt);
 
-        return std.mem.eql(u8, &hash, stored_hash[32..64]);
+        // Constant-time comparison to prevent timing attacks
+        var diff: u8 = 0;
+        for (hash, stored_hash[32..64]) |a, b| diff |= a ^ b;
+        return diff == 0;
     }
 
     pub fn clearAdminPassword(self: *AuthState) !void {
@@ -611,6 +642,7 @@ pub const AuthState = struct {
                 self.allocator.free(cred.id);
                 self.allocator.free(cred.public_key);
                 if (cred.name) |n| self.allocator.free(n);
+                if (cred.session_id) |sid| self.allocator.free(sid);
                 _ = self.passkey_credentials.swapRemove(i);
 
                 // If no passkeys and no password, disable auth
@@ -621,6 +653,22 @@ pub const AuthState = struct {
                 try self.save();
                 return;
             }
+        }
+    }
+
+    /// Find a passkey by its credential ID (hex-encoded).
+    pub fn findPasskeyByCredentialId(self: *AuthState, credential_id_hex: []const u8) ?*PasskeyCredential {
+        for (self.passkey_credentials.items) |*cred| {
+            if (std.mem.eql(u8, cred.id, credential_id_hex)) return cred;
+        }
+        return null;
+    }
+
+    /// Update the sign count for a passkey after successful authentication.
+    pub fn updatePasskeySignCount(self: *AuthState, credential_id_hex: []const u8, new_count: u32) !void {
+        if (self.findPasskeyByCredentialId(credential_id_hex)) |cred| {
+            cred.sign_count = new_count;
+            try self.save();
         }
     }
 
@@ -753,8 +801,8 @@ pub const AuthState = struct {
                 try file.writeAll(n);
                 try file.writeAll("\"");
             }
-            const created_at_str = std.fmt.bufPrint(&buf, ", \"created_at\": {}}}", .{cred.created_at}) catch continue;
-            try file.writeAll(created_at_str);
+            const extra = std.fmt.bufPrint(&buf, ", \"created_at\": {}, \"sign_count\": {}}}", .{ cred.created_at, cred.sign_count }) catch continue;
+            try file.writeAll(extra);
         }
         try file.writeAll("\n  ]\n");
 
@@ -880,6 +928,85 @@ pub const AuthState = struct {
                 pos = role_val_start + 1;
             }
         }
+
+        // Parse passkey_credentials
+        if (std.mem.indexOf(u8, content, "\"passkey_credentials\":")) |pk_start| {
+            var pos: usize = pk_start;
+            while (std.mem.indexOfPos(u8, content, pos, "\"id\": \"")) |id_marker| {
+                const id_hex_start = id_marker + 7;
+                const id_hex_end = std.mem.indexOfPos(u8, content, id_hex_start, "\"") orelse break;
+                const id_hex = content[id_hex_start..id_hex_end];
+
+                // Decode hex to get the original base64url string
+                const id_bytes = hexDecode(self.allocator, id_hex) catch { pos = id_hex_end; continue; };
+
+                // Find public_key
+                const pk_marker = std.mem.indexOfPos(u8, content, id_hex_end, "\"public_key\": \"") orelse {
+                    self.allocator.free(id_bytes);
+                    break;
+                };
+                const pk_hex_start = pk_marker + 15;
+                const pk_hex_end = std.mem.indexOfPos(u8, content, pk_hex_start, "\"") orelse {
+                    self.allocator.free(id_bytes);
+                    break;
+                };
+                const pk_hex = content[pk_hex_start..pk_hex_end];
+                const pk_bytes = hexDecode(self.allocator, pk_hex) catch {
+                    self.allocator.free(id_bytes);
+                    pos = pk_hex_end;
+                    continue;
+                };
+
+                // Find the closing brace for this entry to parse optional fields
+                const entry_end = std.mem.indexOfPos(u8, content, pk_hex_end, "}") orelse pk_hex_end;
+                const entry_slice = content[pk_hex_end..entry_end];
+
+                // Parse optional name
+                const name = if (extractJsonString(entry_slice, "\"name\": \"")) |n|
+                    self.allocator.dupe(u8, n) catch null
+                else
+                    null;
+
+                // Parse sign_count
+                var sign_count: u32 = 0;
+                if (std.mem.indexOf(u8, entry_slice, "\"sign_count\":")) |sc_pos| {
+                    const sc_start = sc_pos + 13;
+                    var sc_end = sc_start;
+                    while (sc_end < entry_slice.len and (entry_slice[sc_end] == ' ' or (entry_slice[sc_end] >= '0' and entry_slice[sc_end] <= '9'))) : (sc_end += 1) {}
+                    const sc_trimmed = std.mem.trim(u8, entry_slice[sc_start..sc_end], " ");
+                    sign_count = std.fmt.parseInt(u32, sc_trimmed, 10) catch 0;
+                }
+
+                const cred = PasskeyCredential{
+                    .id = id_bytes,
+                    .public_key = pk_bytes,
+                    .name = name,
+                    .created_at = std.time.timestamp(),
+                    .sign_count = sign_count,
+                };
+
+                self.passkey_credentials.append(self.allocator, cred) catch {
+                    self.allocator.free(id_bytes);
+                    self.allocator.free(pk_bytes);
+                    if (name) |n| self.allocator.free(n);
+                    pos = entry_end;
+                    continue;
+                };
+
+                pos = entry_end + 1;
+            }
+        }
+    }
+
+    fn hexDecode(allocator: Allocator, hex: []const u8) ![]u8 {
+        if (hex.len % 2 != 0) return error.InvalidLength;
+        const out = try allocator.alloc(u8, hex.len / 2);
+        for (0..out.len) |i| {
+            const hi = hexVal(hex[i * 2]) orelse { allocator.free(out); return error.InvalidHex; };
+            const lo = hexVal(hex[i * 2 + 1]) orelse { allocator.free(out); return error.InvalidHex; };
+            out[i] = (@as(u8, hi) << 4) | @as(u8, lo);
+        }
+        return out;
     }
 };
 
@@ -892,6 +1019,8 @@ pub const PasskeyCredential = struct {
     public_key: []const u8,
     name: ?[]const u8,
     created_at: i64,
+    sign_count: u32 = 0,
+    session_id: ?[]const u8 = null,
 };
 
 
