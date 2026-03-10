@@ -7,7 +7,7 @@
   import { initWebGPURenderer, type WebGPUFrameRenderer, type CursorParams } from '../webgpu-renderer';
   import { PromptState } from '../prompt-buffer';
   import { initTerminalWasm, WasmTerminal } from '../terminal-wasm';
-  import { createPromptRenderer, type PromptRenderer, type PromptCell } from '../prompt-renderer';
+  import type { PromptCell } from '../prompt-renderer';
 
   // ============================================================================
   // Props
@@ -205,8 +205,7 @@
   let wasmReady = false;
   let promptState = $state(PromptState.NONE);
   let promptSeq = $state(0); // reactive trigger
-  // VT overlay disabled while reworking the pipeline
-  let promptActive = $derived(false && promptState === PromptState.INPUT_START && promptSeq >= 0);
+  let promptActive = $derived(promptState === PromptState.INPUT_START && promptSeq >= 0);
   let promptAnchorX = 0;
   let promptAnchorY = 0;
   let promptInputCol = 0;
@@ -1591,8 +1590,6 @@
       case PromptState.COMMAND_RUNNING:
       case PromptState.NONE:
         if (wasmTerminal) { wasmTerminal.destroy(); wasmTerminal = null; }
-        promptRenderer = null;
-        promptRendererInitializing = false;
         // Clear stale cell data so the next prompt activation doesn't
         // render old prompt content before new cell data arrives
         promptRowCells = null;
@@ -1709,29 +1706,15 @@
     }
   }
 
-  // Prompt overlay canvas ref and renderer
-  let promptCanvasEl: HTMLCanvasElement | undefined = $state();
-  let promptRenderer: PromptRenderer | null = null;
-  let promptRendererInitializing = false;
-  async function initPromptRenderer(): Promise<void> {
-    if (promptRendererInitializing || promptRenderer || !promptCanvasEl) return;
-    promptRendererInitializing = true;
-    try {
-      promptRenderer = await createPromptRenderer(promptCanvasEl);
-    } catch (e) {
-      console.warn('[PromptOverlay] renderer init failed:', e);
-    }
-    promptRendererInitializing = false;
-    requestAnimationFrame(() => renderPromptCanvas());
-  }
+  // Prompt overlay rendering disabled — H264 video handles display
 
   /** Convert mouse event to cell coordinates within the prompt overlay */
   function promptMouseToCell(e: MouseEvent): { col: number; row: number } | null {
-    if (!promptCanvasEl || cursorW === 0 || cursorH === 0) return null;
-    const rect = promptCanvasEl.getBoundingClientRect();
+    if (!canvasEl || cursorW === 0 || cursorH === 0) return null;
+    const rect = canvasEl.getBoundingClientRect();
     // Convert CSS pixels to surface pixels
-    const scaleX = pctW / rect.width;
-    const scaleY = pctH / rect.height;
+    const scaleX = cursorSurfW / rect.width;
+    const scaleY = cursorSurfH / rect.height;
     const surfX = (e.clientX - rect.left) * scaleX;
     const surfY = (e.clientY - rect.top) * scaleY;
 
@@ -1840,88 +1823,7 @@
   }
 
   function renderPromptCanvas(): void {
-    if (!promptCanvasEl || !promptActive) return;
-    if (cursorW === 0 || cursorH === 0 || pctW === 0 || pctH === 0) return;
-    if (!promptRowCells || promptRowCols === 0 || promptRowCount === 0) return;
-
-    if (!promptRenderer) {
-      initPromptRenderer();
-      return;
-    }
-
-    const cellW = cursorW + 1;
-    const cellH = cursorH + 2;
-
-    const padX = promptPadXSet ? promptPadX : (cursorX - cursorGridCol * (cursorW + 1));
-    if (padX < 0) return;
-
-    const cursorRowY = cursorY - 2;
-    const serverCursorGridRow = promptStartRow + promptRowCount - 1;
-    const startRowY = cursorRowY - (serverCursorGridRow - promptStartRow) * cellH;
-
-    // Build cell grid from server data.
-    // Only render the user's input region — everything else is transparent
-    // so the H264 video shows through:
-    //   - Row 0: skip columns before promptInputCol (PS1 prompt chars)
-    //   - Last row: skip columns after cursorGridCol (stale screen content)
-    const cellGrid: PromptCell[][] = [];
-    const dv = new DataView(promptRowCells.buffer, promptRowCells.byteOffset, promptRowCells.byteLength);
-    const emptyCell: PromptCell = { codepoint: 0, char: '', fgR: 0, fgG: 0, fgB: 0, bgR: 0, bgG: 0, bgB: 0 };
-    const lastDataRow = promptRowCount - 1;
-    for (let row = 0; row < promptRowCount; row++) {
-      const rowCells: PromptCell[] = [];
-      const skipBefore = (row === 0) ? promptInputCol : 0;
-      // On the last row (cursor row), don't render past the cursor
-      const skipAfter = (row === lastDataRow) ? cursorGridCol + 1 : promptRowCols;
-      for (let col = 0; col < promptRowCols; col++) {
-        const off = (row * promptRowCols + col) * 10;
-        if (off + 10 > promptRowCells.byteLength) break;
-        if (col < skipBefore || col >= skipAfter) {
-          rowCells.push(emptyCell);
-          continue;
-        }
-        const cp = dv.getUint32(off, true);
-        rowCells.push({
-          codepoint: cp,
-          char: cp > 0 ? String.fromCodePoint(cp) : '',
-          fgR: promptRowCells[off + 4],
-          fgG: promptRowCells[off + 5],
-          fgB: promptRowCells[off + 6],
-          bgR: promptRowCells[off + 7],
-          bgG: promptRowCells[off + 8],
-          bgB: promptRowCells[off + 9],
-        });
-      }
-      cellGrid.push(rowCells);
-    }
-
-    promptRenderer.render(cellGrid, padX, startRowY, cellW, cellH, pctW, pctH);
-
-    // Draw selection highlight
-    if (promptSelStart && promptSelEnd && promptCanvasEl) {
-      try {
-        const selCanvas = document.createElement('canvas');
-        selCanvas.width = pctW;
-        selCanvas.height = pctH;
-        const selCtx = selCanvas.getContext('2d');
-        if (selCtx) {
-          const sr = Math.min(promptSelStart.row, promptSelEnd.row);
-          const er = Math.max(promptSelStart.row, promptSelEnd.row);
-          const sc = sr === er ? Math.min(promptSelStart.col, promptSelEnd.col) : (promptSelStart.row <= promptSelEnd.row ? promptSelStart.col : promptSelEnd.col);
-          const ec = sr === er ? Math.max(promptSelStart.col, promptSelEnd.col) : (promptSelStart.row <= promptSelEnd.row ? promptSelEnd.col : promptSelStart.col);
-
-          selCtx.fillStyle = 'rgba(100, 150, 255, 0.3)';
-          for (let r = sr; r <= er; r++) {
-            const cStart = r === sr ? sc : 0;
-            const cEnd = r === er ? ec : promptRowCols - 1;
-            const x = padX + cStart * cellW;
-            const y = startRowY + r * cellH;
-            const w = (cEnd - cStart + 1) * cellW;
-            selCtx.fillRect(x, y, w, cellH);
-          }
-        }
-      } catch { /* selection highlight is optional */ }
-    }
+    // Prompt overlay rendering disabled — H264 video handles display
   }
 
   // ============================================================================
@@ -2145,16 +2047,6 @@
     {#if viewportW > 0 && viewportH > 0}
       <div class="cursor-container" style="--fw:{viewportW};--fh:{viewportH}">
         <div class="cursor-viewport">
-          {#if promptActive}
-            <canvas
-              class="prompt-overlay-canvas"
-              bind:this={promptCanvasEl}
-              onmousedown={handlePromptMouseDown}
-              onmousemove={handlePromptMouseMove}
-              onmouseup={handlePromptMouseUp}
-              ondblclick={handlePromptDblClick}
-            ></canvas>
-          {/if}
         </div>
       </div>
     {/if}
@@ -2445,17 +2337,6 @@
     position: relative;
     width: min(100cqi, calc(100cqb * var(--fw) / var(--fh)));
     height: min(100cqb, calc(100cqi * var(--fh) / var(--fw)));
-  }
-
-  .prompt-overlay-canvas {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: auto;
-    z-index: 1;
-    cursor: text;
   }
 
   .panel-loading {
